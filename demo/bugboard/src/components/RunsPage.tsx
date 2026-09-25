@@ -2,7 +2,7 @@ import {useEffect, useState} from 'react';
 import {artifactUrl, continueRun, loadRun, loadRunTrace, Run, TraceEvent} from '../api';
 import {eventLabel, outcomeLabel, phaseLabel, serviceLabel} from '../presentation';
 
-const statuses: Record<string, string> = {idle: '空闲', running: '运行中', completed: '已结束', failed: '失败', cancelled: '已停止', paused: '已暂停', waiting_input: '等待输入', waiting_approval: '等待审批', stopping: '停止中'};
+const statuses: Record<string, string> = {idle: '空闲', running: '运行中', completed: '已结束', abnormal: '异常结束', failed: '失败', cancelled: '已停止', paused: '已暂停', waiting_input: '等待输入', waiting_approval: '等待审批', stopping: '停止中'};
 export const statusLabel = (status: string) => statuses[status.toLowerCase()] || status;
 export const timeLabel = (value?: string) => value ? new Date(value).toLocaleString('zh-CN', {hour12: false}) : '—';
 export function RunList({runs, onSelect, selectedId}: {runs: Run[]; onSelect: (run: Run) => void; selectedId?: string}) {

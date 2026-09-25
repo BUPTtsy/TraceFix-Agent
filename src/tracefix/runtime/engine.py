@@ -7,7 +7,6 @@ import html
 import json
 import os
 import re
-import time
 from collections import Counter
 from typing import TypedDict
 
@@ -49,12 +48,35 @@ def repeated_action(fingerprints, count=2):
     return len(fingerprints) >= count and len(set(fingerprints[-count:])) == 1
 
 
+def repeated_action_cycles(fingerprints, *, max_period=4, cycles=3):
+    """Return the shortest repeated action period, if one is present."""
+    if not fingerprints:
+        return None
+    for period in range(1, min(max_period, len(fingerprints)) + 1):
+        required = period * cycles
+        if len(fingerprints) < required:
+            continue
+        tail = fingerprints[-required:]
+        if all(tail[index] == tail[index % period] for index in range(required)):
+            return period
+    return None
+
+
 def stable_snapshot(snapshot):
     snapshot = re.sub(r'^- Console:.*$', '', snapshot, flags=re.MULTILINE)
     return re.sub(r'\s*\[ref=[^\]]+\]', '', snapshot)
 
 
 class Engine:
+    LOOP_STATE_WARNING = 2
+    LOOP_STATE_LIMIT = 3
+    LOOP_ACTION_WARNING = 2
+    LOOP_ACTION_LIMIT = 3
+    LOOP_ERROR_WARNING = 3
+    LOOP_ERROR_LIMIT = 5
+    LOOP_NO_PROGRESS_WARNING = 20
+    LOOP_NO_PROGRESS_LIMIT = 40
+
     def __init__(self, store, artifacts, scopes, context, profile, workspace, runner,
                  browser, model, retriever, source, checkpointer, notify=None):
         self.store, self.artifacts, self.scopes, self.context = store, artifacts, scopes, context
@@ -104,15 +126,108 @@ class Engine:
                 pass
 
     def changed(self, s, **delta):
-        # 乐观并发：期望版本取自已持久化的状态，过期的内存状态不得覆盖更新的版本。
         persisted = self.store.load(s.run_id, s.scope_id)
+        if 'loop_no_progress_steps' not in delta:
+            progress_fields = {
+                'phase', 'observation_ref', 'evidence_refs', 'failure_signatures',
+                'validation_index', 'patch_hash', 'reproduced', 'source_aligned',
+            }
+            progressed = any(field in delta and delta[field] != getattr(s, field)
+                             for field in progress_fields)
+            delta['loop_no_progress_steps'] = 0 if progressed else s.loop_no_progress_steps + 1
         new = reduce_state(s, persisted.revision, **delta)
-        # 探索期的进展只认快照变化（见 execute）；其余阶段每一次成功推进都刷新停滞计时器。
-        if new.phase != Phase.EXPLORE or new.phase != s.phase:
-            new.budget.last_progress = time.time()
         self.store.save(new)
         self.event(new, 'state.changed', {'phase': new.phase, 'status': new.run_status})
         return new
+
+    def _loop_state_fingerprint(self, s):
+        observation = self.get(s, s.observation_ref) if s.observation_ref else None
+        snapshot = stable_snapshot(observation.get('snapshot', '')) if observation else ''
+        pending = s.pending_action
+        if isinstance(pending, dict):
+            pending = {key: value for key, value in pending.items()
+                       if key not in {'observation_id', 'element_ref'}}
+        return digest([str(s.phase), s.trial, s.validation_index, s.replay_index,
+                       snapshot, pending, s.patch_hash,
+                       s.last_error_signature or (s.failure_signatures[-1]
+                                                  if s.failure_signatures else None)])
+
+    @staticmethod
+    def _error_signature(error):
+        message = re.sub(r'\s+', ' ', sanitize(str(error))).strip()
+        return digest([type(error).__name__, message])
+
+    def _loop_assessment(self, s):
+        fingerprint = self._loop_state_fingerprint(s)
+        state_history = s.loop_state_fingerprints + [fingerprint]
+        state_count = state_history.count(fingerprint)
+        action_period = repeated_action_cycles(s.action_fingerprints,
+                                               cycles=self.LOOP_ACTION_LIMIT)
+        error_count = 0
+        if s.last_error_signature:
+            for value in reversed(s.loop_error_signatures):
+                if value != s.last_error_signature:
+                    break
+                error_count += 1
+            if not error_count or s.loop_error_signatures[-1] != s.last_error_signature:
+                error_count += 1
+        signals = []
+        if state_count >= self.LOOP_STATE_LIMIT:
+            signals.append({'kind': 'state_repeated', 'fingerprint': fingerprint,
+                            'count': state_count})
+        if action_period:
+            signals.append({'kind': 'action_cycle', 'period': action_period,
+                            'cycles': self.LOOP_ACTION_LIMIT})
+        if error_count >= self.LOOP_ERROR_LIMIT:
+            signals.append({'kind': 'error_repeated', 'signature': s.last_error_signature,
+                            'count': error_count})
+        if s.loop_no_progress_steps >= self.LOOP_NO_PROGRESS_LIMIT:
+            signals.append({'kind': 'no_progress', 'steps': s.loop_no_progress_steps})
+        warnings = []
+        if state_count == self.LOOP_STATE_WARNING:
+            warnings.append({'kind': 'state_repeated', 'fingerprint': fingerprint,
+                             'count': state_count})
+        if len(s.action_fingerprints) >= self.LOOP_ACTION_WARNING:
+            period = repeated_action_cycles(s.action_fingerprints,
+                                            cycles=self.LOOP_ACTION_WARNING)
+            if period:
+                warnings.append({'kind': 'action_cycle', 'period': period,
+                                 'cycles': self.LOOP_ACTION_WARNING})
+        if error_count == self.LOOP_ERROR_WARNING:
+            warnings.append({'kind': 'error_repeated', 'signature': s.last_error_signature,
+                             'count': error_count})
+        if s.loop_no_progress_steps == self.LOOP_NO_PROGRESS_WARNING:
+            warnings.append({'kind': 'no_progress', 'steps': s.loop_no_progress_steps})
+        return fingerprint, warnings, signals
+
+    def _mark_loop(self, s, fingerprint, warnings, signals):
+        evidence = {'signals': signals, 'state_fingerprint': fingerprint,
+                    'state_tail': (s.loop_state_fingerprints + [fingerprint])[-12:],
+                    'action_tail': s.action_fingerprints[-12:],
+                    'error_tail': s.loop_error_signatures[-12:],
+                    'step': s.step}
+        s = self.changed(s, loop_state_fingerprints=s.loop_state_fingerprints + [fingerprint],
+                         loop_warnings=s.loop_warnings + warnings,
+                         loop_evidence=evidence, abnormal_termination=True,
+                         phase=Phase.FINALIZE, outcome=Outcome.LOOP_DETECTED,
+                         run_status=RunStatus.RUNNING, pending_action=None,
+                         error='检测到死循环')
+        self.event(s, 'loop.detected', evidence)
+        return s
+
+    def _record_loop_boundary(self, s):
+        fingerprint, warnings, signals = self._loop_assessment(s)
+        if signals:
+            return self._mark_loop(s, fingerprint, warnings, signals), True
+        history = s.loop_state_fingerprints + [fingerprint]
+        if warnings:
+            s = self.changed(s, loop_state_fingerprints=history,
+                             loop_warnings=s.loop_warnings + warnings)
+            for warning in warnings:
+                self.event(s, 'loop.suspected', warning)
+            return s, False
+        s = self.changed(s, loop_state_fingerprints=history)
+        return s, False
 
     async def operation(self, s, name, intent, fn, reconcile=None):
         op_id = f'{s.run_id}:{s.revision}:{name}'
@@ -140,19 +255,18 @@ class Engine:
             ctx = {**ctx, 'user_continuation': s.continuation_instruction,
                    'continuation_count': s.continuation_count,
                    'previous_termination': s.continuation_markers[-1] if s.continuation_markers else None}
+        if s.loop_warnings:
+            ctx = {**ctx, 'loop_warning': s.loop_warnings[-1]}
+        if s.error:
+            ctx = {**ctx, 'runtime_feedback': s.error,
+                   'runtime_error_details': s.error_details}
         budget = s.budget
         logical_call = s.budget.model_calls + 1
 
         def attempt(model, request, attempt_number):
             nonlocal budget
             budget = s.budget
-            budget.check_time()
             budget = budget.charge('model_calls')
-            # A conservative UTF-8 byte bound plus output reservation prevents
-            # accepting a request with no accounting headroom.
-            reserve = len(json.dumps(ctx, ensure_ascii=False).encode()) + 4096 + (4096 if image else 0)
-            if budget.tokens + reserve > budget.max_tokens:
-                raise BudgetExceeded('令牌预留不足')
             s.budget = budget
             self.store.save(s)
             exchange = {'exchange_id': request.get('logical_exchange_id') or new_id('model'),
@@ -189,6 +303,10 @@ class Engine:
             exchange = exchange or {'exchange_id': new_id('model'), 'schema': schema.__name__,
                                     'phase': str(s.phase)}
             raw = raw if isinstance(raw, dict) else {'message': sanitize(str(raw))}
+            message = re.sub(r'\s+', ' ', sanitize(str(raw.get('message') or raw.get('type') or raw.get('category') or raw))).strip()
+            signature = digest([raw.get('type') or raw.get('category'), message])
+            s.last_error_signature = signature
+            s.loop_error_signatures.append(signature)
             error_ref = self.put(s, {**exchange, 'error': raw},
                                  name=f'模型调用{logical_call:03d}_尝试{exchange.get("attempt", 1)}_错误')
             s.model_exchange_refs.append(error_ref)
@@ -196,22 +314,23 @@ class Engine:
             self.event(s, 'model.error.persisted', {**exchange, 'error_ref': error_ref,
                 'status': raw.get('status'), 'category': raw.get('category'),
                 'details': redact(raw)})
+            trailing = 0
+            for value in reversed(s.loop_error_signatures):
+                if value != signature:
+                    break
+                trailing += 1
+            if trailing >= self.LOOP_ERROR_LIMIT:
+                raise ModelOutputError('检测到同一模型错误连续重复')
 
         def usage(u):
             nonlocal budget
-            # Actual usage is never discarded/refunded even when it exceeds a cap.
             budget = s.budget
             data = budget.model_dump()
             data['tokens'] += int(u['total_tokens'])
-            input_rate = float(os.getenv('TRACEFIX_INPUT_USD_PER_M', '1'))
-            output_rate = float(os.getenv('TRACEFIX_OUTPUT_USD_PER_M', '4'))
-            data['cost_usd'] += (u.get('prompt_tokens', 0)*input_rate + u.get('completion_tokens', 0)*output_rate)/1_000_000
             budget = type(budget)(**data)
             s.budget = budget
             self.store.save(s)
-            self.event(s, 'model.usage', {'usage': u, 'cost_is_configured_estimate': True})
-            if budget.tokens > budget.max_tokens or budget.cost_usd > budget.max_cost_usd:
-                raise BudgetExceeded('实际用量超过预算')
+            self.event(s, 'model.usage', {'usage': u, 'cost_is_configured_estimate': False})
 
         validation = {'validate_output': validate_output} if validate_output else {}
         result = await self.model.generate(schema, ctx, image=image,
@@ -282,6 +401,14 @@ class Engine:
                 except Exception as e:
                     if node == 'finalize':
                         raise
+                    current = self.store.load(s.run_id, s.scope_id)
+                    signature = self._error_signature(e)
+                    s = self.changed(current, last_error_signature=signature,
+                                     loop_error_signatures=current.loop_error_signatures + [signature])
+                    _, _, loop_signals = self._loop_assessment(s)
+                    if loop_signals:
+                        s = self._mark_loop(s, self._loop_state_fingerprint(s), [], loop_signals)
+                        return self.output(s, 'finalize')
                     error_details = None
                     if isinstance(e, (ModelError, MCPConnectionError, MCPActionUnknown)):
                         error_details = redact({**e.details, 'status': e.status,
@@ -301,8 +428,29 @@ class Engine:
                             self.event(s, 'run.error', {'error': s.error,
                                 'status': s.run_status, 'error_details': error_details})
                             return self.output(s, 'paused')
-                    outcome = (Outcome.POLICY_BLOCKED if isinstance(e, PermissionError) else
-                               Outcome.INCONCLUSIVE if isinstance(e, (BudgetExceeded, ModelOutputError, ReplayUnbound)) else Outcome.INFRA_FAILURE)
+                    if isinstance(e, ReplayUnbound):
+                        target = Phase.EXPLORE if s.phase == Phase.REPRODUCE else Phase.DIAGNOSE
+                        s = self.changed(s, phase=target, replay_plan_ref=None,
+                                         replay_index=0, pending_action=None,
+                                         error=sanitize(f'{type(e).__name__}: {error_message(e)}')[:1500])
+                        self.event(s, 'run.error', {'error': s.error, 'error_details': error_details,
+                                                    'action': '重新录制重放计划'})
+                        return self.output(s, 'prelude')
+                    if isinstance(e, (ModelOutputError, BudgetExceeded)):
+                        s = self.changed(s, error=sanitize(f'{type(e).__name__}: {error_message(e)}')[:1500],
+                                         error_details={'feedback': '输出未通过校验，请依据错误重新输出'},
+                                         pending_action=None)
+                        self.event(s, 'run.error', {'error': s.error, 'error_details': s.error_details,
+                                                    'action': '反馈给模型并重试'})
+                        return self.output(s, 'prelude')
+                    if isinstance(e, PermissionError):
+                        s = self.changed(s, error=sanitize(f'{type(e).__name__}: {error_message(e)}')[:1500],
+                                         error_details={'feedback': '该动作被策略拒绝，请根据原因重新决策'},
+                                         pending_action=None)
+                        self.event(s, 'run.error', {'error': s.error, 'error_details': s.error_details,
+                                                    'action': '反馈给模型'})
+                        return self.output(s, 'prelude')
+                    outcome = Outcome.INFRA_FAILURE
                     s = self.changed(self.store.load(s.run_id, s.scope_id), phase=Phase.FINALIZE, outcome=outcome,
                                      error=sanitize(f'{type(e).__name__}: {error_message(e)}')[:1500],
                                      error_details=error_details, pending_action=None)
@@ -331,7 +479,10 @@ class Engine:
             self.control = None
             s = self.changed(s, run_status=RunStatus.PAUSED)
             return self.output(s, 'paused')
-        s.budget.check_time()
+        if s.phase != Phase.FINALIZE and (s.phase != Phase.PREPARE or s.last_error_signature):
+            s, looped = self._record_loop_boundary(s)
+            if looped:
+                return self.output(s, 'finalize')
         if self.notes:
             for note in self.notes:
                 self.event(s, 'input.applied', {'text': note, 'effect': '已记录澄清；冻结的 TestSpec 未改变'})
@@ -419,12 +570,6 @@ class Engine:
             canonical = action.model_copy(update={'observation_id': None, 'element_ref': None}).model_dump()
             plan.append(canonical)
         plan_ref = self.put(s, plan, name='操作重放计划')
-        if ref != s.observation_ref:
-            # Only a changed snapshot counts as progress (new UUIDs do not).
-            before = self.get(s, s.observation_ref)
-            after = self.get(s, ref)
-            if before['snapshot'] != after['snapshot']:
-                s.budget.last_progress = time.time()
         s = self.changed(s, observation_ref=ref, replay_plan_ref=plan_ref, step=s.step+1)
         return self.output(s, 'explore_gate')
 
@@ -441,15 +586,10 @@ class Engine:
 
     async def explore_gate(self, s, _):
         done = s.pending_action['kind'] == 'finish'
-        limit = s.step >= self.spec(s).max_steps
-        stalled = repeated_action(s.action_fingerprints)
-        if not done and not limit and not stalled:
+        if not done:
             return self.output(self.changed(s, pending_action=None), 'prelude')
         result, ref = self.check(s, self.spec(s).assertions)
-        if not done and limit:
-            s = self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.INCONCLUSIVE,
-                error='已达到探索步骤上限；模型没有提出停止动作', evidence_refs=s.evidence_refs+[ref], pending_action=None)
-        elif result['passed']:
+        if result['passed']:
             s = self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.NO_BUG_FOUND,
                 evidence_refs=s.evidence_refs+[ref], pending_action=None)
         else:
@@ -490,13 +630,12 @@ class Engine:
                 if stable and s.mode == 'repair':
                     s = self.changed(s, phase=Phase.DIAGNOSE, reproduced=True)
                 else:
-                    s = self.changed(s, phase=Phase.FINALIZE, reproduced=stable, outcome=Outcome.INCONCLUSIVE,
+                    s = self.changed(s, phase=Phase.FINALIZE, reproduced=stable,
+                                     outcome=Outcome.BUG_CONFIRMED if stable else Outcome.INCONCLUSIVE,
                                      error='已验证缺陷报告（仅测试模式）' if stable else '故障无法在三次试验中的至少两次复现')
         return self.output(s, 'prelude')
 
     async def diagnose(self, s, _):
-        if s.budget.patches >= s.budget.max_patches:
-            return self.output(self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.REPAIR_EXHAUSTED), 'prelude')
         self.workspace.check_frozen(self.source)
         overlay = s.source_manifest + (':' + s.patch_hash if s.patch_hash else '')
         await self.retriever.index(self.workspace, overlay)
@@ -511,7 +650,7 @@ class Engine:
                        allowed_files=self.workspace.allowed_files, repair_memory=recipes, retrieval_ids=[x['id'] for x in code],
                        failures=[self.get(s, r) for r in s.evidence_refs[-4:]],
                        previous_validation=[self.get(s, r) for r in s.validation_refs])
-        if os.getenv('TRACEFIX_WORKER') == '1' and s.budget.subtasks < s.budget.max_subtasks:
+        if os.getenv('TRACEFIX_WORKER') == '1':
             from tracefix.runtime.worker import ReadOnlyWorker, SubtaskSpec
             spec = SubtaskSpec(s.goal, 'code_investigator', s.revision,
                 tuple(c['path'] for c in cards[:3]), tuple(s.evidence_refs[-2:]))
@@ -631,6 +770,7 @@ class Engine:
             except Exception as e:
                 cleanup.append(label(name) + '：' + sanitize(error_message(e))[:300])
         status = (RunStatus.CANCELLED if s.error == '用户已取消' else
+                  RunStatus.ABNORMAL if s.outcome == Outcome.LOOP_DETECTED else
                   RunStatus.FAILED if s.outcome in {Outcome.INFRA_FAILURE, Outcome.POLICY_BLOCKED, Outcome.REPAIR_EXHAUSTED}
                   or isinstance(s.error, str) and s.error.startswith('ModelOutputError:') else RunStatus.COMPLETED)
         report = {'schema_version': s.schema_version, 'run_id': s.run_id, 'scope_id': s.scope_id,

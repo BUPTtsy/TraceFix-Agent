@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import time
 from enum import StrEnum
 from typing import Any, Literal
 from uuid import uuid4
@@ -48,53 +47,62 @@ class RunStatus(StrEnum):
     PAUSED = "PAUSED"
     COMPLETED = "COMPLETED"
     CANCELLED = "CANCELLED"
+    ABNORMAL = "ABNORMAL"
+    # Historical records may still contain FAILED. New automatic termination
+    # paths use ABNORMAL only for detected loops.
     FAILED = "FAILED"
 
 
 class Outcome(StrEnum):
     FIX_VERIFIED = "FIX_VERIFIED"
     NO_BUG_FOUND = "NO_BUG_FOUND"
+    BUG_CONFIRMED = "BUG_CONFIRMED"
     INCONCLUSIVE = "INCONCLUSIVE"
+    LOOP_DETECTED = "LOOP_DETECTED"
+    # Retained for deserializing records created before W-29.
     REPAIR_EXHAUSTED = "REPAIR_EXHAUSTED"
     POLICY_BLOCKED = "POLICY_BLOCKED"
     INFRA_FAILURE = "INFRA_FAILURE"
 
 
-class Budget(Contract):
+class Usage(Contract):
+    """Usage counters. They are observed and never used as run limits."""
+
+    model_config = ConfigDict(extra="ignore")
     model_calls: int = 0
     browser_actions: int = 0
     patches: int = 0
     subtasks: int = 0
     tokens: int = 0
     cost_usd: float = 0
-    max_model_calls: int = 80
-    max_browser_actions: int = 100
-    max_patches: int = 3
-    max_subtasks: int = 2
-    max_tokens: int = 160_000
-    max_cost_usd: float = 10
-    deadline: float = Field(default_factory=lambda: time.time() + 1800)
-    last_progress: float = Field(default_factory=time.time)
-    stall_seconds: int = 300
+    # Deprecated fields stay assignable while old checkpoints are read, but
+    # are excluded from serialized usage and never enforce a limit.
+    max_model_calls: int | None = Field(default=80, exclude=True)
+    max_browser_actions: int | None = Field(default=100, exclude=True)
+    max_patches: int | None = Field(default=3, exclude=True)
+    max_subtasks: int | None = Field(default=2, exclude=True)
+    max_tokens: int | None = Field(default=160_000, exclude=True)
+    max_cost_usd: float | None = Field(default=10, exclude=True)
+    deadline: float | None = Field(default=None, exclude=True)
+    last_progress: float | None = Field(default=None, exclude=True)
+    stall_seconds: int | None = Field(default=None, exclude=True)
 
-    def charge(self, kind: str, amount: int = 1) -> Budget:
+    def charge(self, kind: str, amount: int = 1) -> Usage:
         if kind not in {"model_calls", "browser_actions", "patches", "subtasks", "tokens"}:
-            raise ValueError("未知的预算维度")
+            raise ValueError("未知的用量维度")
         if amount < 0:
-            raise ValueError("费用不可退还")
+            raise ValueError("用量不可退回")
         data = self.model_dump()
         data[kind] += amount
-        if data[kind] > data[f"max_{kind}"]:
-            description = {'model_calls': '模型调用次数', 'browser_actions': '浏览器动作数',
-                           'patches': '补丁次数', 'subtasks': '子任务数', 'tokens': '令牌用量'}[kind]
-            raise BudgetExceeded(f'{description}超过预算上限（{kind}）')
-        return Budget(**data)
+        return type(self)(**data)
 
     def check_time(self) -> None:
-        if time.time() >= self.deadline or time.time() - self.last_progress > self.stall_seconds:
-            raise BudgetExceeded("已超过截止时间或长时间没有进展")
-        if self.cost_usd >= self.max_cost_usd:
-            raise BudgetExceeded("费用达到预算上限")
+        # Kept as a source-compatible no-op for older callers.
+        return None
+
+
+# Compatibility import for code and persisted state written before W-29.
+Budget = Usage
 
 
 class BudgetExceeded(RuntimeError):
@@ -135,6 +143,8 @@ class Assertion(Contract):
 
 
 class TestSpec(Contract):
+    # Ignore the removed max_steps field when reading old artifacts.
+    model_config = ConfigDict(extra="ignore")
     goal: str = Field(min_length=5)
     preconditions: list[str] = Field(default_factory=list)
     authorized_actions: list[ActionKind] = Field(default_factory=lambda: ["navigate", "click", "type", "select", "press", "observe", "finish"],
@@ -142,8 +152,6 @@ class TestSpec(Contract):
     assertions: list[Assertion] = Field(min_length=1)
     regression_plan: list[BrowserAction] = Field(default_factory=list)
     regression_assertions: list[Assertion] = Field(min_length=1)
-    max_steps: int = Field(default=24, ge=1, le=60)
-
     @model_validator(mode="after")
     def validate_actions(self):
         if not {'navigate', 'finish'} <= set(self.authorized_actions):
@@ -217,7 +225,7 @@ class RunState(Contract):
     patch_hash: str | None = None
     validation_refs: list[str] = Field(default_factory=list)
     pending_action: dict | None = None
-    budget: Budget = Field(default_factory=Budget)
+    budget: Usage = Field(default_factory=Usage)
     subtask_refs: list[str] = Field(default_factory=list)
     approval_ref: str | None = None
     report_ref: str | None = None
@@ -235,6 +243,12 @@ class RunState(Contract):
     error_details: dict | None = None
     local_branch: str | None = None
     action_fingerprints: list[str] = Field(default_factory=list)
+    loop_state_fingerprints: list[str] = Field(default_factory=list)
+    loop_error_signatures: list[str] = Field(default_factory=list)
+    loop_no_progress_steps: int = 0
+    loop_warnings: list[dict] = Field(default_factory=list)
+    loop_evidence: dict | None = None
+    last_error_signature: str | None = None
     baseline_validation_refs: list[str] = Field(default_factory=list)
     model_exchange_refs: list[str] = Field(default_factory=list)
 
@@ -242,7 +256,7 @@ class RunState(Contract):
 TRANSITIONS = {
     Phase.PREPARE: {Phase.EXPLORE, Phase.FINALIZE},
     Phase.EXPLORE: {Phase.REPRODUCE, Phase.FINALIZE},
-    Phase.REPRODUCE: {Phase.DIAGNOSE, Phase.FINALIZE},
+    Phase.REPRODUCE: {Phase.EXPLORE, Phase.DIAGNOSE, Phase.FINALIZE},
     Phase.DIAGNOSE: {Phase.PATCH, Phase.FINALIZE},
     Phase.PATCH: {Phase.VERIFY, Phase.FINALIZE},
     Phase.VERIFY: {Phase.DIAGNOSE, Phase.REVIEW, Phase.FINALIZE},
@@ -255,7 +269,8 @@ IMMUTABLE = {"run_id", "scope_id", "schema_version", "mode", "goal", "url"}
 def reduce_state(state: RunState, expected_revision: int, **delta) -> RunState:
     if state.revision != expected_revision:
         raise ValueError("版本已过期")
-    if state.run_status in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.FAILED}:
+    if state.run_status in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL,
+                            RunStatus.FAILED}:
         raise ValueError("终止状态不可变更")
     if IMMUTABLE & delta.keys() or "revision" in delta:
         raise ValueError("该状态字段不可变更")

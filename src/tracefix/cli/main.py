@@ -158,12 +158,12 @@ class Session:
                         'abnormalTermination': state.abnormal_termination,
                         'continuationMarkers': state.continuation_markers,
                         'continuationInstruction': state.continuation_instruction})
-        if state.run_status in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.FAILED} or error:
+        if state.run_status in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL, RunStatus.FAILED} or error:
             changes['finishedAt'] = timestamp()
         else:
             changes['finishedAt'] = None
         if error:
-            changes['status'] = 'failed'
+            changes['status'] = str(state.run_status).lower()
         changes['pid'] = os.getpid() if state.run_status == RunStatus.RUNNING and not error else None
         knowledge = event.get('payload') if event and event['type'] == 'knowledge.selected' else None
         if event:
@@ -195,7 +195,7 @@ class Session:
         if self.task and not self.task.done():
             return True
         if self.run_id:
-            return self.store.load(self.run_id, self.scope).run_status not in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.FAILED}
+            return self.store.load(self.run_id, self.scope).run_status not in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL, RunStatus.FAILED}
         return False
 
     def state(self):
@@ -255,10 +255,7 @@ class Session:
                 markers[-1].update(previous_revision=previous.revision,
                     previous_state_ref=self.artifacts.put(self.scope, previous.run_id,
                         redact(previous.model_dump(mode='json')), label='继续执行前状态'),
-                    previous_budget=previous.budget.model_dump())
-                if 'budget_allocation' not in markers[0]:
-                    markers[0]['budget_allocation'] = {name: value for name, value in previous.budget.model_dump().items()
-                                                     if name.startswith('max_')}
+                    previous_usage=previous.budget.model_dump())
                 self.documents.update_run(record['id'], {'continuationMarkers': markers})
                 continued = continuation_state(previous, instruction, markers,
                     process_ended=markers[-1]['previous_status'] in {'failed', 'cancelled'})
@@ -358,15 +355,16 @@ class Session:
             self.render.status(self.state())
         except Exception as e:
             latest = self.state()
-            if latest.run_status not in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.FAILED}:
-                latest.run_status = RunStatus.FAILED
+            if latest.run_status not in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL, RunStatus.FAILED}:
+                latest.run_status = RunStatus.PAUSED
                 latest.error = sanitize(error_message(e))
+                latest.error_details = {'requires_manual_review': True, 'source': 'runtime'}
                 latest.revision += 1
                 self.store.save(latest)
                 self.engine.event(latest, 'run.error', {'error': latest.error})
             self.publish_console(error=error_message(e))
-            self.render.stop(RunStatus.FAILED)
-            self.render.panel('运行已停止', error_message(e))
+            self.render.stop(RunStatus.PAUSED)
+            self.render.panel('运行已暂停，等待人工核查', error_message(e))
 
     async def resume(self, run_id):
         if self.task and not self.task.done():
@@ -531,7 +529,8 @@ class Session:
         elif command == 'context':
             s=self.state()
             knowledge = self.documents.run(self.console_run_id).get('knowledge', []) if self.console_run_id else []
-            self.render.panel('上下文',json.dumps({'spec_ref':s.test_spec_ref,'observation_ref':s.observation_ref,'memory_ref':s.memory_snapshot_ref,'knowledge':knowledge,'budget':s.budget.model_dump()},ensure_ascii=False,indent=2))
+            usage = getattr(s, 'usage', None) or s.budget
+            self.render.panel('上下文',json.dumps({'spec_ref':s.test_spec_ref,'observation_ref':s.observation_ref,'memory_ref':s.memory_snapshot_ref,'knowledge':knowledge,'usage':usage.model_dump()},ensure_ascii=False,indent=2))
         elif command == 'skills':
             self.render.panel('流程 Skill',json.dumps(SkillCatalog(Path(self.args.skills)).index(),ensure_ascii=False,indent=2))
         elif command in {'pause','cancel'}:

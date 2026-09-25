@@ -12,7 +12,7 @@ Do not delete or skip tests, alter oracle definitions, add bug switches or write
 """
 
 
-def build_context(state, spec, observation=None, cards=None, pairs=None, max_chars=65_000):
+def build_context(state, spec, observation=None, cards=None, pairs=None):
     available_evidence_refs = list(state.evidence_refs)
     if observation is not None and state.observation_ref:
         available_evidence_refs.append(state.observation_ref)
@@ -29,10 +29,7 @@ def build_context(state, spec, observation=None, cards=None, pairs=None, max_cha
             if raw in seen:
                 continue
             seen.add(raw)
-            if len(json.dumps(result, ensure_ascii=False)) + len(raw) < max_chars:
-                result[field].append(value)
-    if len(json.dumps(result, ensure_ascii=False)) > max_chars:
-        raise ValueError("受保护的上下文超出预算；请缩小 TestSpec/observation")
+            result[field].append(value)
     return result
 
 

@@ -22,7 +22,6 @@ class SubtaskSpec:
     generation: int
     allowed_files: tuple[str, ...]
     allowed_artifacts: tuple[str, ...]
-    deadline_seconds: int = 60
     depth: int = 1
 
 
@@ -43,7 +42,7 @@ class ReadOnlyWorker:
         cards = [{'path': p, 'content': self.engine.workspace.read(p)} for p in spec.allowed_files]
         # No browser, shell, patch, approval, memory writer or recursive delegation
         # object is exposed to the model; it only gets this schema and frozen input.
-        async with self.semaphore, asyncio.timeout(spec.deadline_seconds):
+        async with self.semaphore:
             result = await self.engine.model_call(state, SubtaskResult,
                 {'goal':spec.goal,'role':spec.role,'scope':state.scope_id,'files':cards,
                  'evidence':[self.engine.get(state,r) for r in spec.allowed_artifacts]})
@@ -51,12 +50,9 @@ class ReadOnlyWorker:
             raise ValueError('worker 版本已过期')
         if not set(result.evidence_refs) <= set(spec.allowed_artifacts) or not set(result.files) <= set(spec.allowed_files):
             raise PermissionError('worker 返回了未被授权委派的引用')
-        if len(result.model_dump_json()) > 4000:
-            raise ValueError('worker 结果超出重新注入预算')
         return result
 
     async def group(self, state, specs):
         async with asyncio.TaskGroup() as group:
             tasks=[group.create_task(self.run(state,s)) for s in specs]
         return [t.result() for t in tasks]
-

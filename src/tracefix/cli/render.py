@@ -156,8 +156,9 @@ class Renderer:
             self.started_at = time.monotonic()
         self.timeline(str(state.phase))
         self.run_status = str(state.run_status)
-        self.tokens = state.budget.tokens
-        self.model_calls = state.budget.model_calls
+        usage = getattr(state, 'usage', None) or state.budget
+        self.tokens = usage.tokens
+        self.model_calls = usage.model_calls
         if self.run_status != 'RUNNING':
             self.activity = ''
             self.finished_at = self.finished_at or time.monotonic()
@@ -165,10 +166,9 @@ class Renderer:
             self.finished_at = None
         summary = (f'项目 {state.scope_id} · {label(state.mode)} · {label(state.run_status)} · 本次会话 {self.elapsed()}\n'
                    f'运行 {state.run_id}\n'
-                   f'模型调用 {state.budget.model_calls}/{state.budget.max_model_calls}   '
-                   f'浏览器动作 {state.budget.browser_actions}/{state.budget.max_browser_actions}   '
-                   f'补丁 {state.budget.patches}/{state.budget.max_patches}\n'
-                   f'Token 数 {state.budget.tokens:,}   预估成本 ${state.budget.cost_usd:.4f}')
+                   f'模型调用 {usage.model_calls}   浏览器动作 {usage.browser_actions}   '
+                   f'补丁 {usage.patches}   只读子任务 {usage.subtasks}\n'
+                   f'Token 数 {usage.tokens:,}')
         if state.outcome:
             summary = f'{label(state.outcome)}\n\n'+summary
         self.panel('运行结果' if state.outcome else '运行状态', summary)
@@ -224,7 +224,7 @@ class Renderer:
             if kind in {'run.error', 'run.finished'}:
                 if kind == 'run.error':
                     self.run_status = str(payload.get('status', 'FAILED'))
-                elif self.run_status not in {'CANCELLED', 'FAILED', 'COMPLETED'}:
+                elif self.run_status not in {'CANCELLED', 'FAILED', 'ABNORMAL', 'COMPLETED'}:
                     self.run_status = 'COMPLETED'
                 self.finished_at = time.monotonic()
             elif kind == 'run.started':

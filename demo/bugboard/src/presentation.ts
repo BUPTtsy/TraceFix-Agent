@@ -4,6 +4,7 @@ const phases: Record<string, string> = {
 };
 const outcomes: Record<string, string> = {
   FIX_VERIFIED: '修复已通过本地验证', NO_BUG_FOUND: '当前测试范围内未发现问题',
+  BUG_CONFIRMED: '已确认存在缺陷', LOOP_DETECTED: '检测到死循环',
   INCONCLUSIVE: '证据不足，无法确定', REPAIR_EXHAUSTED: '修复次数已用尽',
   POLICY_BLOCKED: '被策略阻止', INFRA_FAILURE: '运行环境故障',
 };
@@ -16,6 +17,7 @@ const events: Record<string, string> = {
   'state.changed': '状态切换', 'tool.started': '工具开始', 'tool.completed': '工具完成',
   'tool.error': '工具执行失败', 'knowledge.selected': '知识来源已选择', 'evidence.damaged': '证据损坏',
   'gate.decided': '验证门禁结论', 'patch.applied': '补丁已应用', 'validation.failed': '验证失败',
+  'loop.suspected': '疑似死循环', 'loop.detected': '检测到死循环',
   'input.applied': '补充输入已记录', 'subtask.completed': '子任务已完成',
 };
 const services: Record<string, string> = {test: '测试', repair: '修复', chat: '对话', unknown: '模式未记录'};
