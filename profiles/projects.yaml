@@ -1,0 +1,8 @@
+projects:
+  - id: bugboard
+    repo_id: bugboard-demo
+    root: ../.tracefix/demo-repo
+    allowed_files: ["src/**", "server/**"]
+    memory_revision: 1
+    access_epoch: 1
+    agent_instructions: AGENTS.md

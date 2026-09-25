@@ -1,0 +1,17 @@
+project: bugboard
+source_commit: HEAD
+url: http://app:3000
+allowed_origins: ["http://app:3000"]
+image: tracefix-bugboard:1.0
+browser_image: tracefix-browser:1.0
+commands:
+  start: ["node", "scripts/serve.mjs"]
+  reset: ["node", "scripts/reset.mjs"]
+  static: ["node", "node_modules/typescript/bin/tsc", "--noEmit"]
+  unit: ["node", "--test", "tests/tasks.test.mjs"]
+  build: ["node", "scripts/build.mjs"]
+port: 3000
+health_path: /health
+version_path: /version
+timeout_seconds: 120
+screenshot_redaction: public_demo

@@ -1,0 +1,9 @@
+{
+  "goal":"Mark Write project brief as Done, reload the page and verify that the completed state persists.",
+  "preconditions":["Fresh seeded BugBoard sandbox; no credentials or personal data"],
+  "authorized_actions":["navigate","click","type","select","press","observe","finish"],
+  "assertions":[{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"checked"}],
+  "regression_plan":[],
+  "regression_assertions":[{"locator":{"role":"heading","name":"Task board"},"condition":"visible"},{"locator":{"role":"button","name":"Add task"},"condition":"enabled"}],
+  "max_steps":12
+}

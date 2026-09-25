@@ -1,0 +1,9 @@
+# 复制到本地未提交的配置后再使用。不要把令牌写入此文件。
+projects:
+  - id: github-target
+    repo_id: github-fork
+    root: ../.tracefix/github-run
+    allowed_files: ["src/**", "server/**", "tests/**"]
+    memory_revision: 1
+    access_epoch: 1
+    agent_instructions: AGENTS.md
