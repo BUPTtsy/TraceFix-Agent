@@ -1,0 +1,9 @@
+FROM mcr.microsoft.com/playwright:v1.58.2-noble
+USER root
+WORKDIR /opt/mcp
+COPY browser-package.json ./package.json
+COPY browser-package-lock.json ./package-lock.json
+RUN npm ci --ignore-scripts && npx playwright install chromium && npm cache clean --force
+ENV HOME=/tmp PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+USER pwuser
+ENTRYPOINT ["node", "/opt/mcp/node_modules/@playwright/mcp/cli.js"]
