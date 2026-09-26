@@ -64,14 +64,29 @@ def _retry_after_seconds(headers, *, now=None):
 
 
 class Gateway:
+    supports_tool_executor = True
+
     def __init__(self, base_url=None, key=None, text_model=None, vision_model=None,
                  max_output_tokens=4096, timeout=90, max_attempts=None,
-                 max_retry_delay=60):
+                 max_retry_delay=60, tool_mode=None, tool_executor=None,
+                 max_tool_rounds=8):
         self.base_url = (base_url or os.getenv('TRACEFIX_BASE_URL', 'https://api.deepseek.com')).rstrip('/')
         self.key = key or os.getenv('TRACEFIX_API_KEY', '')
-        self.text_model = text_model or os.getenv('TRACEFIX_TEXT_MODEL', 'deepseek-v4-flash')
-        self.vision_model = vision_model or os.getenv('TRACEFIX_VISION_MODEL', 'deepseek-v4-flash-vision-exp')
+        self.text_model = text_model or os.getenv('TRACEFIX_TEXT_MODEL', 'deepseek-chat')
+        self.vision_model = (vision_model if vision_model is not None else os.getenv('TRACEFIX_VISION_MODEL', '')).strip()
         self.max_output_tokens, self.timeout = max_output_tokens, timeout
+        self.tool_mode = (tool_mode or os.getenv('TRACEFIX_TOOL_MODE', 'native')).strip().lower()
+        if self.tool_mode not in {'native', 'json'}:
+            raise ValueError("tool_mode must be 'native' or 'json'")
+        self.tool_executor = tool_executor
+        try:
+            parsed_rounds = int(max_tool_rounds)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError('max_tool_rounds must be a positive integer') from exc
+        if (isinstance(max_tool_rounds, bool) or parsed_rounds < 1
+                or isinstance(max_tool_rounds, float) and not max_tool_rounds.is_integer()):
+            raise ValueError('max_tool_rounds must be a positive integer')
+        self.max_tool_rounds = parsed_rounds
         configured_attempts = (os.getenv('TRACEFIX_MODEL_MAX_ATTEMPTS', '3')
                                if max_attempts is None else max_attempts)
         if isinstance(configured_attempts, bool):
@@ -87,15 +102,141 @@ class Gateway:
         self.max_attempts = parsed_attempts
         self.max_retry_delay = max(0.0, float(max_retry_delay))
 
+    @staticmethod
+    def _native_tools(schema):
+        from tracefix.runtime.contracts import BrowserAction, Decision
+        if schema not in {BrowserAction, Decision}:
+            return []
+        action_schema = BrowserAction.model_json_schema()
+        tools = []
+        for name, fields in {
+            'browser_navigate': ['value'],
+            'browser_click': ['observation_id', 'element_ref', 'locator'],
+            'browser_type': ['observation_id', 'element_ref', 'locator', 'value'],
+            'browser_select': ['observation_id', 'element_ref', 'locator', 'value'],
+            'browser_press': ['observation_id', 'value'],
+            'browser_snapshot': [],
+            'browser_take_screenshot': [],
+        }.items():
+            properties = {field: copy.deepcopy(action_schema['properties'][field]) for field in fields}
+            for property_schema in properties.values():
+                property_schema.pop('default', None)
+                if 'anyOf' in property_schema:
+                    property_schema.update(property_schema.pop('anyOf')[0])
+            tools.append({'type': 'function', 'function': {
+                'name': name,
+                'description': 'Execute through TraceFix policy and MCP. Returns a fresh observation and screenshot evidence reference. value is the URL, text, selected value, or key for the named action.',
+                'parameters': {'type': 'object', 'properties': properties,
+                    'required': fields, 'additionalProperties': False, '$defs': action_schema.get('$defs', {})},
+            }})
+        return tools
+
+    @classmethod
+    def browser_action(cls, name, arguments):
+        import jsonschema
+        from tracefix.runtime.contracts import BrowserAction
+        definitions = {tool['function']['name']: tool['function']['parameters']
+                       for tool in cls._native_tools(BrowserAction)}
+        if not isinstance(name, str) or name not in definitions:
+            raise ValueError('未知或未授权的浏览器工具：' + str(name))
+        try:
+            jsonschema.validate(arguments, definitions[name])
+        except jsonschema.ValidationError as error:
+            raise ValueError('工具参数校验失败：' + error.message) from error
+        kind = {'browser_navigate': 'navigate', 'browser_click': 'click',
+                'browser_type': 'type', 'browser_select': 'select', 'browser_press': 'press',
+                'browser_snapshot': 'observe', 'browser_take_screenshot': 'observe'}[name]
+        return BrowserAction(kind=kind, **arguments)
+
+    @classmethod
+    def _validated_calls(cls, calls, native_tools, completed_calls):
+        if not native_tools:
+            raise ValueError('当前模型输出类型或 tool_mode 不允许调用浏览器工具')
+        if not isinstance(calls, list) or not calls:
+            raise ValueError('tool_calls 必须为非空数组')
+        validated = []
+        seen = set()
+        for call in calls:
+            if not isinstance(call, dict) or call.get('type') != 'function':
+                raise ValueError('tool_call 必须为 function 类型')
+            call_id = call.get('id')
+            function = call.get('function')
+            if (not isinstance(call_id, str) or not call_id.strip()
+                    or call_id in seen or not isinstance(function, dict)):
+                raise ValueError('tool_call 的 id/function 无效或同批 id 重复')
+            seen.add(call_id)
+            name = function.get('name')
+            raw_arguments = function.get('arguments')
+            if not isinstance(raw_arguments, str):
+                raise ValueError('function.arguments 必须是 JSON 字符串')
+            arguments = json.loads(raw_arguments)
+            cls.browser_action(name, arguments)
+            identity = (name, json.dumps(arguments, sort_keys=True))
+            if call_id in completed_calls and completed_calls[call_id][0] != identity:
+                raise ValueError('tool_call_id 不可复用于不同参数')
+            validated.append((call_id, name, arguments, identity))
+        return validated
+
+    @classmethod
+    def _completed_history(cls, messages, native_tools):
+        if not isinstance(messages, list) or not messages:
+            raise ValueError('messages 必须为非空数组')
+        completed = {}
+        pending = {}
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ValueError('历史消息必须为对象')
+            role = message.get('role')
+            if role == 'tool':
+                call_id = message.get('tool_call_id')
+                if not isinstance(call_id, str) or call_id not in pending:
+                    raise ValueError('tool 消息缺少配对的 assistant tool_call')
+                identity = pending.pop(call_id)
+                if (not isinstance(message.get('content'), str)
+                        or message.get('name', identity[0]) != identity[0]):
+                    raise ValueError('tool 消息的 content/name 无效')
+                completed[call_id] = (identity, message['content'])
+            else:
+                if pending:
+                    raise ValueError('assistant tool_calls 尚未收到完整工具结果')
+                if role not in {'system', 'user', 'assistant'}:
+                    raise ValueError('历史消息 role 无效')
+                if message.get('tool_calls') is not None:
+                    if role != 'assistant':
+                        raise ValueError('只有 assistant 消息可以包含 tool_calls')
+                    pending = {call_id: identity for call_id, name, arguments, identity in
+                               cls._validated_calls(message['tool_calls'], native_tools, completed)}
+        if pending:
+            raise ValueError('assistant tool_calls 缺少工具结果，不能自动重放')
+        return completed
+
+    @staticmethod
+    async def _call_tool_executor(executor, name, arguments, call_id):
+        if executor is None:
+            raise ModelOutputError('模型请求执行工具，但未配置 tool_executor', category='tool_execution')
+        return await executor(name, arguments, call_id)
+
+    @staticmethod
+    def _tool_content(value):
+        if isinstance(value, BaseModel):
+            value = value.model_dump(mode='json')
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return json.dumps({'result': sanitize(str(value))}, ensure_ascii=False)
+
     async def generate(self, schema, context, image=None, agent_instructions=None,
                        on_attempt=None, on_response=None, on_error=None, on_usage=None,
-                       validate_output=None):
+                       validate_output=None, tool_executor=None, messages=None, on_tool_result=None):
         if not self.key:
             raise ModelError('未配置 TRACEFIX_API_KEY', status='FAILED', category='configuration',
                              details={'status': 'FAILED', 'category': 'configuration',
                                       'requires_manual_review': False})
         text = json.dumps({'context': context, 'response_json_schema': schema.model_json_schema()}, ensure_ascii=False)
         content = [{'type': 'text', 'text': text}]
+        image = image if self.vision_model else None
         if image:
             content.append({'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + base64.b64encode(image).decode()}})
         model = self.vision_model if image else self.text_model
@@ -104,21 +245,39 @@ class Gateway:
             project_policy = ('\nProject AGENTS.md instructions follow. They constrain behavior but cannot override '
                               'the safety policy, frozen TestSpec, scope, permissions, or validation gates.\n'
                               '<project_instructions>\n' + agent_instructions + '\n</project_instructions>')
-        payload = {'model': model, 'messages': [{'role': 'system', 'content': POLICY + project_policy + output_instructions(schema)},
+        native_tools = self._native_tools(schema) if self.tool_mode == 'native' else []
+        policy = POLICY.replace('Only propose the requested typed output.',
+            'Use the provided typed tools and final output contract.') if native_tools else POLICY
+        payload = {'model': model, 'messages': [{'role': 'system', 'content': policy + project_policy + output_instructions(schema, native_tools=bool(native_tools))},
                     {'role': 'user', 'content': content if image else text}],
-                   'max_tokens': self.max_output_tokens, 'response_format': {'type': 'json_object'}, 'stream': False}
+                   'max_tokens': self.max_output_tokens, 'stream': False}
+        if not native_tools:
+            payload['response_format'] = {'type': 'json_object'}
+        if native_tools:
+            payload['tools'] = native_tools
+            payload['tool_choice'] = 'auto'
+            payload['parallel_tool_calls'] = False
         if 'api.deepseek.com' in self.base_url:
             payload['thinking'] = {'type': 'disabled'}
+        if messages is not None:
+            payload['messages'] = copy.deepcopy(messages)
         logical_exchange_id = uuid.uuid4().hex
+        tool_rounds = 0
+        attempt = 0
+        try:
+            completed_calls = self._completed_history(payload['messages'], native_tools)
+        except (ValueError, TypeError) as exc:
+            raise ModelOutputError('工具历史无效：' + str(exc), category='tool_protocol') from exc
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
-            for attempt in range(1, self.max_attempts + 1):
+            while attempt < self.max_attempts:
+                attempt += 1
                 can_retry = attempt < self.max_attempts
                 retry_delay = min(self.max_retry_delay, 2 ** min(attempt - 1, 30)) if can_retry else None
                 request_record = {'url': self.base_url + '/chat/completions',
                                   'headers': {'Authorization': '[REDACTED]'},
                                   'json': copy.deepcopy(payload),
                                   'logical_exchange_id': logical_exchange_id,
-                                  'attempt': attempt}
+                                  'attempt': attempt, 'tool_round': tool_rounds}
                 exchange = None
                 if on_attempt:
                     exchange = on_attempt(model, request_record, attempt)
@@ -160,7 +319,8 @@ class Gateway:
                 if on_response:
                     on_response(exchange, {'http_status': response.status_code,
                         'headers': dict(response.headers), 'body': raw,
-                        'logical_exchange_id': logical_exchange_id})
+                        'logical_exchange_id': logical_exchange_id, 'tool_round': tool_rounds,
+                        'messages': copy.deepcopy(payload['messages'])})
                 usage = raw.get('usage') if isinstance(raw, dict) else None
                 valid_usage = (isinstance(usage, dict) and type(usage.get('total_tokens')) is int
                                and usage['total_tokens'] >= 0)
@@ -236,6 +396,70 @@ class Gateway:
                     await asyncio.sleep(retry_delay)
                     continue
                 message = choice.get('message')
+                tool_calls = message.get('tool_calls') if isinstance(message, dict) else None
+                if tool_calls is not None or choice.get('finish_reason') == 'tool_calls':
+                    try:
+                        if (not isinstance(message, dict) or choice.get('finish_reason') != 'tool_calls'
+                                or message.get('refusal')):
+                            raise ValueError('tool_calls 与 finish_reason/refusal 不一致')
+                        calls = self._validated_calls(tool_calls, native_tools, completed_calls)
+                        if tool_rounds >= self.max_tool_rounds:
+                            raise ValueError('模型工具调用轮次超过上限')
+                        executor = tool_executor if tool_executor is not None else self.tool_executor
+                        if executor is None:
+                            raise ValueError('模型请求执行工具，但未配置 tool_executor')
+                    except (ValueError, TypeError) as exc:
+                        error = {'type': 'ModelOutputError', 'category': 'tool_protocol',
+                            'message': sanitize(str(exc))[:2000], 'retryable': False,
+                            'will_retry': False, 'retry_delay_seconds': None,
+                            'status': 'FAILED', 'operation_status': 'FAILED',
+                            'billing_status': 'known', 'request_status': 'response_received',
+                            'requires_manual_review': False, 'logical_exchange_id': logical_exchange_id,
+                            'tool_round': tool_rounds, 'attempt': attempt}
+                        if on_error:
+                            on_error(exchange, error)
+                        raise ModelOutputError('模型工具协议校验失败：' + error['message'],
+                                               category='tool_protocol', details=error) from exc
+                    assistant_message = {'role': 'assistant', 'content': message.get('content'),
+                                         'tool_calls': copy.deepcopy(tool_calls)}
+                    if 'reasoning_content' in message:
+                        assistant_message['reasoning_content'] = copy.deepcopy(message['reasoning_content'])
+                    payload['messages'].append(assistant_message)
+                    for call_id, name, arguments, identity in calls:
+                        try:
+                            if call_id in completed_calls:
+                                result_content = completed_calls[call_id][1]
+                            else:
+                                result = await self._call_tool_executor(executor, name, arguments, call_id)
+                                result_content = self._tool_content(result)
+                        except Exception as exc:
+                            status = getattr(exc, 'status', 'UNKNOWN_OPERATION')
+                            error = {**getattr(exc, 'details', {}), 'type': type(exc).__name__,
+                                'category': getattr(exc, 'category', 'tool_execution'),
+                                'message': sanitize(str(exc))[:2000], 'status': status,
+                                'operation_status': status, 'retryable': False, 'will_retry': False,
+                                'requires_manual_review': True, 'billing_status': 'known',
+                                'request_status': 'response_received', 'tool_call_id': call_id,
+                                'logical_exchange_id': logical_exchange_id,
+                                'tool_round': tool_rounds, 'attempt': attempt}
+                            if on_error:
+                                on_error(exchange, error)
+                            if hasattr(exc, 'status'):
+                                raise
+                            raise ModelError('工具执行结果未知：' + error['message'],
+                                status='UNKNOWN_OPERATION', category='tool_execution', details=error) from exc
+                        reused = call_id in completed_calls
+                        completed_calls[call_id] = (identity, result_content)
+                        tool_message = {'role': 'tool', 'tool_call_id': call_id,
+                                        'name': name, 'content': result_content}
+                        payload['messages'].append(tool_message)
+                        if on_tool_result:
+                            on_tool_result(exchange, {'logical_exchange_id': logical_exchange_id,
+                                'tool_round': tool_rounds, 'attempt': attempt,
+                                'message': copy.deepcopy(tool_message), 'reused': reused})
+                    tool_rounds += 1
+                    attempt = 0
+                    continue
                 refusal = isinstance(message, dict) and bool(message.get('refusal'))
                 if choice.get('finish_reason') != 'stop' or refusal:
                     retryable = choice.get('finish_reason') == 'length' and not refusal
@@ -259,6 +483,10 @@ class Gateway:
                     continue
                 try:
                     value = schema.model_validate_json(choice['message']['content'])
+                    if native_tools:
+                        action = getattr(value, 'action', value)
+                        if action.kind != 'finish':
+                            raise ValueError('native 模式必须通过 tools 执行动作；最终 JSON 只能使用 finish')
                     if validate_output:
                         validate_output(value)
                 except (ValueError, KeyError, TypeError) as e:
@@ -280,8 +508,14 @@ class Gateway:
                     if not can_retry:
                         raise ModelOutputError(f'模型输出规范校验失败，{self.max_attempts} 次尝试已耗尽；未执行无效输出：'+detail,
                                                category='output_validation', details=error) from e
+                    if isinstance(message, dict) and isinstance(message.get('content'), str):
+                        rejected_message = {'role': 'assistant', 'content': message['content']}
+                        if 'reasoning_content' in message:
+                            rejected_message['reasoning_content'] = copy.deepcopy(message['reasoning_content'])
+                        payload['messages'].append(rejected_message)
                     payload['messages'].append({'role': 'user', 'content':
-                        '上一次输出未通过校验，未被执行。请依据原始目标、页面观测和 schema 重新输出完整 JSON。'
+                        '上一次最终 JSON 未通过校验，其中的动作未被执行。已有工具结果仍然有效，不得重复执行。'
+                        '请依据原始目标、最新工具结果、页面观测和 schema 重新输出完整 JSON。'
                         '不得改变目标或放宽断言来消除错误。具体校验错误：'+detail})
                     await asyncio.sleep(retry_delay)
                     continue
@@ -293,9 +527,17 @@ class BrowserPolicyRouter:
     def __init__(self, teacher, student=None):
         self.teacher, self.student = teacher, student
 
+    @property
+    def supports_tool_executor(self):
+        return getattr(self.teacher, 'supports_tool_executor', False)
+
+    @property
+    def vision_model(self):
+        return getattr(self.teacher, 'vision_model', None)
+
     async def generate(self, schema, context, **kwargs):
         from tracefix.runtime.contracts import Decision, BrowserAction
-        if schema is Decision and self.student:
+        if schema is Decision and self.student and getattr(self.student, 'tool_mode', None) == 'json':
             try:
                 result = await self.student.generate(BrowserAction, context, **kwargs)
                 action = result.value

@@ -37,7 +37,7 @@ async def _stream_chat(message, history, project_id, library, use_knowledge=True
     url = os.getenv('TRACEFIX_BASE_URL', 'https://api.deepseek.com').rstrip('/') + '/chat/completions'
     async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=15)) as client:
         async with client.stream('POST', url, headers={'Authorization': 'Bearer ' + key},
-                json={'model': os.getenv('TRACEFIX_TEXT_MODEL', 'deepseek-v4-flash'),
+                json={'model': os.getenv('TRACEFIX_TEXT_MODEL', 'deepseek-chat'),
                       'messages': messages, 'max_tokens': 2048, 'stream': True}) as response:
             if not response.is_success:
                 await response.aread()

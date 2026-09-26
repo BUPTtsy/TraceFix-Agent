@@ -16,7 +16,7 @@ from langgraph.errors import GraphInterrupt
 
 from tracefix.execution.browser import (MCPActionUnknown, MCPConnectionError, assertions,
     resolve_locator, validate_spec_observation)
-from tracefix.model.gateway import ModelError, ModelOutputError
+from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
 from tracefix.knowledge.context import build_context
 from tracefix.knowledge.selection import select_documents
 from tracefix.runtime.contracts import (BudgetExceeded, BrowserAction, Decision, Outcome,
@@ -272,6 +272,7 @@ class Engine:
             exchange = {'exchange_id': request.get('logical_exchange_id') or new_id('model'),
                         'logical_exchange_id': request.get('logical_exchange_id'),
                         'logical_call': logical_call,
+                        'tool_round': request.get('tool_round', 0),
                         'attempt': attempt_number, 'phase': str(s.phase),
                         'schema': schema.__name__, 'model': model}
             request_ref = self.put(s, {**exchange, 'request': request},
@@ -332,7 +333,55 @@ class Engine:
             self.store.save(s)
             self.event(s, 'model.usage', {'usage': u, 'cost_is_configured_estimate': False})
 
+        def tool_result(exchange, raw):
+            record = {**(exchange or {}), 'tool_result': raw}
+            result_ref = self.put(s, record, name=f'模型调用{logical_call:03d}_工具结果')
+            s.model_exchange_refs.append(result_ref)
+            self.store.save(s)
+            self.event(s, 'model.tool.result.persisted', {
+                'result_ref': result_ref, 'tool_call_id': raw['message']['tool_call_id'],
+                'logical_exchange_id': raw['logical_exchange_id'], 'tool_round': raw['tool_round'],
+                'reused': raw['reused']})
+
         validation = {'validate_output': validate_output} if validate_output else {}
+        if getattr(self.model, 'supports_tool_executor', False):
+            if s.error_details and s.error_details.get('status') == 'WAITING_NETWORK':
+                for audit_ref in reversed(s.model_exchange_refs):
+                    audit = self.get(s, audit_ref)
+                    request = audit.get('request', {})
+                    history = request.get('json', {}).get('messages', [])
+                    if audit.get('schema') == schema.__name__ and history:
+                        if any(message.get('role') == 'tool' for message in history):
+                            validation['messages'] = history
+                        break
+            async def execute_tool(name, arguments, call_id):
+                self.scopes.assert_current(self.context)
+                action = Gateway.browser_action(name, arguments)
+                observation = self.get(s, s.observation_ref) if s.observation_ref else None
+                try:
+                    self.browser.policy.browser(s, action, self.spec(s), observation)
+                except (ValueError, PermissionError, ModelOutputError) as exc:
+                    if isinstance(exc, ModelOutputError) and (exc.status != 'FAILED'
+                            or exc.details.get('requires_manual_review')):
+                        raise
+                    self.event(s, 'tool.rejected', {'tool_call_id': call_id,
+                        'action': action.model_dump(), 'error': sanitize(str(exc))})
+                    return {'isError': True, 'error': {'type': type(exc).__name__,
+                        'message': sanitize(str(exc)), 'executed': False},
+                        'observation_ref': s.observation_ref, 'observation': observation}
+                ref = await self.act(s, action, tool_call_id=call_id)
+                canonical = action.model_copy(update={'observation_id': None, 'element_ref': None})
+                plan = self.get(s, s.replay_plan_ref) if s.replay_plan_ref else []
+                plan.append(canonical.model_dump())
+                plan_ref = self.put(s, plan, name='操作重放计划')
+                fingerprint = digest([canonical.model_dump(), stable_snapshot(observation['snapshot']) if observation else ''])
+                updated = self.changed(s, observation_ref=ref, replay_plan_ref=plan_ref,
+                    step=s.step+1, action_fingerprints=(s.action_fingerprints+[fingerprint])[-12:])
+                for field in type(s).model_fields:
+                    setattr(s, field, getattr(updated, field))
+                return {'observation_ref': ref, 'observation': self.get(s, ref)}
+            validation['tool_executor'] = execute_tool
+            validation['on_tool_result'] = tool_result
         result = await self.model.generate(schema, ctx, image=image,
             agent_instructions=self.agent_instructions(s), on_attempt=attempt,
             on_response=response, on_error=error, on_usage=usage, **validation)
@@ -354,7 +403,7 @@ class Engine:
         raw['redaction'] = 'public_demo_no_credentials'
         return self.put(s, raw, name='页面观察')
 
-    async def act(self, s, action, *, frozen=False):
+    async def act(self, s, action, *, frozen=False, tool_call_id=None):
         self.scopes.assert_current(self.context)
         spec = self.spec(s)
         obs = self.get(s, s.observation_ref) if s.observation_ref else None
@@ -372,7 +421,10 @@ class Engine:
         async def perform():
             raw = await self.browser.action(action)
             return {'observation_ref': await self.capture(s, raw)}
-        receipt = await self.operation(s, 'browser', action.model_dump(), perform)
+        intent = action.model_dump()
+        if tool_call_id:
+            intent['tool_call_id'] = tool_call_id
+        receipt = await self.operation(s, 'browser', intent, perform)
         return receipt['observation_ref']
 
     def _graph(self, saver):
@@ -547,13 +599,15 @@ class Engine:
     async def decide(self, s, _):
         spec = self.spec(s)
         obs = self.get(s, s.observation_ref)
-        image = self.artifacts.read(s.scope_id, s.run_id, obs['screenshot_ref'])
+        image = (self.artifacts.read(s.scope_id, s.run_id, obs['screenshot_ref'])
+                 if getattr(self.model, 'vision_model', None) else None)
         plan = self.get(s, s.replay_plan_ref) if s.replay_plan_ref else []
         context = build_context(s, spec.model_dump(), obs, pairs=[{'action': a, 'result': 'see current observation'} for a in plan[-4:]])
         context['reference_documents'] = await select_documents(self, s, obs)
-        context['instruction'] = '每次只返回一个浏览器动作。必须匹配当前 observation_id 和 element_ref。完成请求的交互后使用 finish；它只是请求运行时执行确定性断言检查。'
+        context['instruction'] = '每次只请求一个浏览器动作，并等待最新观测。必须匹配当前 observation_id 和 element_ref。完成请求的交互后使用 finish；它只是请求运行时执行确定性断言检查。'
         decision = await self.model_call(s, Decision, context, image=image)
         decision.evidence_refs = normalize_decision_evidence_refs(
+        obs = self.get(s, s.observation_ref)
             decision.evidence_refs, s.evidence_refs, s.observation_ref, obs)
         self.browser.policy.browser(s, decision.action, spec, obs)
         canonical = decision.action.model_copy(update={'observation_id': None, 'element_ref': None})

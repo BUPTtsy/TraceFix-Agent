@@ -41,7 +41,7 @@ tracefix/
 ```bash
 cp .env.example .env
 # 用编辑器打开 .env，填写 TRACEFIX_API_KEY。
-# 默认已配置 api.deepseek.com 与两个用户指定的模型名称。
+# 默认已配置 api.deepseek.com 与文本模型；视觉模型默认关闭。
 chmod +x scripts/start.sh
 ./scripts/start.sh --mode repair --spec profiles/persistence.spec.json
 ```
@@ -110,11 +110,19 @@ npm start
 
 ## 5. 模型接口测试
 
+浏览器交互默认使用 `TRACEFIX_TOOL_MODE=native`，通过 Chat Completions 的 `tools` / `tool_calls` 调用受限浏览器工具，并把真实执行结果以 `role=tool` 和原始 `tool_call_id` 回传模型。工具仍由 TraceFix 的策略校验、操作回执和 Playwright MCP 执行；不开放脚本执行、shell 或任意 MCP 工具。TestSpec、补丁方案及工具执行后的最终结果仍按各自 JSON schema 校验。若供应商不支持原生工具，可显式设置 `TRACEFIX_TOOL_MODE=json`，使用 JSON 动作兼容模式及 `response_format=json_object`；运行时不会自动切换模式。
+
+`TRACEFIX_VISION_MODEL` 默认留空，DeepSeek 文本请求不发送图像。只有明确填写支持图像的模型名称时才附带截图并选择该视觉模型；无论是否启用视觉模型，浏览器截图都会保留为证据。
+
 ```bash
 .venv/bin/python scripts/check_api.py
 ```
 
-这个命令发送两次小请求：文本 JSON 与红色测试图片。当前交付中的实测记录位于 `artifacts/connectivity.json` 和 `artifacts/gateway-connectivity.json`。Token 用量来自实际响应；正式 Run 会把供应商返回的 `reasoning_content` 保存到受作用域保护的审计 artifact，但不会保存 API key、Authorization 或 Cookie。
+配置面向 DeepSeek 及兼容的 Chat Completions API，默认地址为 `https://api.deepseek.com`、文本模型为 `deepseek-chat`。`TRACEFIX_BASE_URL` 填写接口根地址，不附加 `/chat/completions`；模型名称可通过 `TRACEFIX_TEXT_MODEL` 覆盖。
+
+这个命令会发送真实 API 请求。默认检查文本 JSON，再检查一次 `browser_snapshot` 原生工具调用及结果回传，正常共三次模型请求；工具返回明确标记的本地合成观测，不启动浏览器，也不验证 MCP 执行。`TRACEFIX_TOOL_MODE=json` 时仅检查文本 JSON，不探测原生工具。只有配置 `TRACEFIX_VISION_MODEL` 时才追加红色测试图片请求，否则输出跳过原因。诊断请求不自动重试，native 检查的用量列出每次实际响应。
+
+`artifacts/connectivity.json` 和 `artifacts/gateway-connectivity.json` 是历史实测记录，不代表当前配置已通过上述检查。Token 用量来自实际响应；正式 Run 会把供应商返回的 `reasoning_content` 保存到受作用域保护的审计 artifact，但不会保存 API key、Authorization 或 Cookie。
 
 费用账本使用 `.env` 中配置的输入/输出单价估算；示例单价是预算参数，不代表供应商实时账单。每 Run 默认最多 80 次模型请求、100 次浏览器动作、3 次补丁、2 个只读子任务，以及 deadline/token/估算费用限制。
 
