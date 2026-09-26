@@ -293,6 +293,7 @@ class Engine:
             self.store.save(s)
             body = raw.get('body') if isinstance(raw, dict) else None
             choices = body.get('choices', []) if isinstance(body, dict) else []
+            choices = choices if isinstance(choices, list) else []
             reasoning_present = any(isinstance(choice, dict) and
                 isinstance(choice.get('message'), dict) and
                 choice['message'].get('reasoning_content') is not None for choice in choices)
@@ -320,7 +321,8 @@ class Engine:
                 if value != signature:
                     break
                 trailing += 1
-            if trailing >= self.LOOP_ERROR_LIMIT:
+            if (trailing >= self.LOOP_ERROR_LIMIT
+                    and raw.get('status') not in {'UNKNOWN_OPERATION', 'WAITING_NETWORK'}):
                 raise ModelOutputError('检测到同一模型错误连续重复')
 
         def usage(u):
@@ -344,15 +346,22 @@ class Engine:
                 'reused': raw['reused']})
 
         validation = {'validate_output': validate_output} if validate_output else {}
+        recovery = s.error_details or {}
+        recovering_model_request = (recovery.get('status') == 'WAITING_NETWORK'
+            and recovery.get('request_status') == 'not_sent'
+            and not recovery.get('requires_manual_review') and not recovery.get('requires_new_run'))
         if getattr(self.model, 'supports_tool_executor', False):
-            if s.error_details and s.error_details.get('status') == 'WAITING_NETWORK':
+            failed_exchange_id = recovery.get('logical_exchange_id')
+            if recovering_model_request and failed_exchange_id:
                 for audit_ref in reversed(s.model_exchange_refs):
                     audit = self.get(s, audit_ref)
                     request = audit.get('request', {})
+                    if (audit.get('schema') != schema.__name__
+                            or request.get('logical_exchange_id') != failed_exchange_id):
+                        continue
                     history = request.get('json', {}).get('messages', [])
-                    if audit.get('schema') == schema.__name__ and history:
-                        if any(message.get('role') == 'tool' for message in history):
-                            validation['messages'] = history
+                    if history:
+                        validation['messages'] = history
                         break
             async def execute_tool(name, arguments, call_id):
                 self.scopes.assert_current(self.context)
@@ -385,6 +394,10 @@ class Engine:
         result = await self.model.generate(schema, ctx, image=image,
             agent_instructions=self.agent_instructions(s), on_attempt=attempt,
             on_response=response, on_error=error, on_usage=usage, **validation)
+        if recovering_model_request:
+            s.error = None
+            s.error_details = None
+            self.store.save(s)
         self.event(s, 'model.called', {'model_revision': result.model_revision, 'usage': result.usage,
                                       'finish_reason': result.finish_reason})
         if isinstance(result.value, (Decision, PatchProposal)):
@@ -415,6 +428,10 @@ class Engine:
                 # 这不是基础设施故障，应作为无结论收尾。
                 raise ReplayUnbound('已记录的动作无法在当前页面重放：' + str(e)) from e
             action = action.model_copy(update={'observation_id': obs['id'], 'element_ref': element_ref})
+        elif frozen and action.kind == 'press':
+            if not obs or not obs.get('id'):
+                raise ReplayUnbound('已记录的按键动作缺少当前页面观测，无法重放')
+            action = action.model_copy(update={'observation_id': obs['id']})
         self.browser.policy.browser(s, action, spec, obs)
         s.budget = s.budget.charge('browser_actions')
         self.store.save(s)
@@ -458,7 +475,8 @@ class Engine:
                     s = self.changed(current, last_error_signature=signature,
                                      loop_error_signatures=current.loop_error_signatures + [signature])
                     _, _, loop_signals = self._loop_assessment(s)
-                    if loop_signals:
+                    if (loop_signals and not (isinstance(e, (ModelError, MCPConnectionError, MCPActionUnknown))
+                            and e.status in {'UNKNOWN_OPERATION', 'WAITING_NETWORK'})):
                         s = self._mark_loop(s, self._loop_state_fingerprint(s), [], loop_signals)
                         return self.output(s, 'finalize')
                     error_details = None
@@ -813,7 +831,13 @@ class Engine:
                 'error_details': s.error_details,
                 'reason': '恢复已阻止：操作结果或浏览器页面状态需要人工核对；可取消当前 Run。'})
             return self.output(s, 'paused')
-        s = self.changed(s, run_status=RunStatus.RUNNING, error=None, error_details=None)
+        recovery = s.error_details or {}
+        preserve_request = (recovery.get('source') == 'model'
+            and recovery.get('status') == 'WAITING_NETWORK'
+            and recovery.get('request_status') == 'not_sent'
+            and not recovery.get('requires_manual_review') and not recovery.get('requires_new_run'))
+        s = self.changed(s, run_status=RunStatus.RUNNING, error=None,
+                         error_details=recovery if preserve_request else None)
         return self.output(s, 'prelude')
 
     async def finalize(self, s, _):

@@ -268,6 +268,8 @@ class Gateway:
             completed_calls = self._completed_history(payload['messages'], native_tools)
         except (ValueError, TypeError) as exc:
             raise ModelOutputError('工具历史无效：' + str(exc), category='tool_protocol') from exc
+        tool_rounds = sum(message.get('role') == 'assistant' and bool(message.get('tool_calls'))
+                          for message in payload['messages'])
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
             while attempt < self.max_attempts:
                 attempt += 1
@@ -302,7 +304,8 @@ class Gateway:
                                      'billing_status': 'unknown' if request_sent else 'not_confirmed',
                                      'request_status': 'unknown' if request_sent else 'not_sent',
                                      'requires_manual_review': request_sent,
-                                     'logical_exchange_id': logical_exchange_id}
+                                     'logical_exchange_id': logical_exchange_id,
+                                     'tool_round': tool_rounds, 'attempt': attempt}
                     if on_error:
                         on_error(exchange, request_error)
                     if will_retry:
@@ -320,6 +323,7 @@ class Gateway:
                     on_response(exchange, {'http_status': response.status_code,
                         'headers': dict(response.headers), 'body': raw,
                         'logical_exchange_id': logical_exchange_id, 'tool_round': tool_rounds,
+                        'attempt': attempt,
                         'messages': copy.deepcopy(payload['messages'])})
                 usage = raw.get('usage') if isinstance(raw, dict) else None
                 valid_usage = (isinstance(usage, dict) and type(usage.get('total_tokens')) is int
@@ -341,7 +345,8 @@ class Gateway:
                              'billing_status': 'known' if valid_usage else 'unknown',
                              'request_status': 'response_received',
                              'requires_manual_review': False,
-                             'logical_exchange_id': logical_exchange_id}
+                             'logical_exchange_id': logical_exchange_id,
+                             'tool_round': tool_rounds, 'attempt': attempt}
                     if on_error:
                         on_error(exchange, error)
                     if can_retry:
@@ -357,7 +362,8 @@ class Gateway:
                         'billing_status': 'known' if valid_usage else 'unknown',
                         'request_status': 'response_received',
                         'requires_manual_review': False,
-                        'logical_exchange_id': logical_exchange_id}
+                        'logical_exchange_id': logical_exchange_id,
+                        'tool_round': tool_rounds, 'attempt': attempt}
                     if on_error:
                         on_error(exchange, error)
                     raise ModelError(f'模型返回 HTTP {response.status_code}；请检查接口地址、模型名称与凭证',
@@ -369,7 +375,8 @@ class Gateway:
                              'operation_status': 'UNKNOWN_OPERATION',
                              'billing_status': 'unknown', 'request_status': 'response_received',
                              'requires_manual_review': True,
-                             'logical_exchange_id': logical_exchange_id}
+                             'logical_exchange_id': logical_exchange_id,
+                             'tool_round': tool_rounds, 'attempt': attempt}
                     if on_error:
                         on_error(exchange, error)
                     raise ModelError('服务方未返回有效的用量统计信息；计费用量未知',
@@ -387,7 +394,8 @@ class Gateway:
                              'operation_status': 'RETRYING' if can_retry else 'FAILED',
                              'billing_status': 'known', 'request_status': 'response_received',
                              'requires_manual_review': False,
-                             'logical_exchange_id': logical_exchange_id}
+                             'logical_exchange_id': logical_exchange_id,
+                             'tool_round': tool_rounds, 'attempt': attempt}
                     if on_error:
                         on_error(exchange, error)
                     if not can_retry:
@@ -473,7 +481,8 @@ class Gateway:
                              'request_status': 'response_received', 'requires_manual_review': False,
                              'finish_reason': choice.get('finish_reason'),
                              'refusal': refusal,
-                             'logical_exchange_id': logical_exchange_id}
+                             'logical_exchange_id': logical_exchange_id,
+                             'tool_round': tool_rounds, 'attempt': attempt}
                     if on_error:
                         on_error(exchange, error)
                     if not will_retry:
@@ -502,7 +511,8 @@ class Gateway:
                              'operation_status': 'RETRYING' if can_retry else 'FAILED',
                              'billing_status': 'known', 'request_status': 'response_received',
                              'requires_manual_review': False,
-                             'logical_exchange_id': logical_exchange_id}
+                             'logical_exchange_id': logical_exchange_id,
+                             'tool_round': tool_rounds, 'attempt': attempt}
                     if on_error:
                         on_error(exchange, error)
                     if not can_retry:

@@ -1,13 +1,15 @@
+import base64
 import copy
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
-from tracefix.execution.browser import MCPActionUnknown
+from tracefix.execution.browser import MCPActionUnknown, MCPBrowser
 from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
 from tracefix.runtime.contracts import BrowserAction, Decision, Phase
-from tracefix.runtime.smoke import make_engine
+from tracefix.runtime.smoke import PNG, make_engine
 
 
 async def prepare_engine(root):
@@ -161,3 +163,72 @@ async def test_policy_unknown_status_is_never_converted_to_tool_rejection(tmp_pa
         await engine.model_call(state, Decision, {})
     assert raised.value is failure
     assert len(requests) == 1 and engine.browser.calls == []
+
+
+async def test_stale_native_press_is_rejected_before_operation_and_mcp(tmp_path, monkeypatch):
+    engine, state = await prepare_engine(tmp_path)
+    observation = engine.get(state, state.observation_ref)
+    browser = MCPBrowser(['unused'], engine.browser.policy)
+    browser.observation = observation
+    engine.browser = browser
+    requests, mcp_calls = [], []
+
+    async def call(kind, arguments=None):
+        mcp_calls.append(kind)
+        pytest.fail('stale press must be rejected before reaching MCP')
+
+    async def post(client, url, **kwargs):
+        requests.append(copy.deepcopy(kwargs['json']))
+        if len(requests) == 1:
+            return completion('stale-press', 'browser_press', {
+                'observation_id': 'previous-observation', 'value': 'Enter'})
+        return completion()
+
+    monkeypatch.setattr(browser, 'call', call)
+    monkeypatch.setattr(httpx.AsyncClient, 'post', post)
+    await engine.model_call(state, Decision, {})
+    result = json.loads(requests[-1]['messages'][-1]['content'])
+    assert result['isError'] is True
+    assert result['error']['executed'] is False
+    assert result['observation']['id'] == observation['id']
+    assert mcp_calls == [] and state.budget.browser_actions == 0
+    assert not engine.store.operations
+    assert not any(event['type'] == 'tool.started'
+                   for event in engine.store.trace(state.run_id, state.scope_id))
+
+
+async def test_frozen_press_rebinds_current_observation_before_real_mcp_guard(tmp_path, monkeypatch):
+    engine, state = await prepare_engine(tmp_path)
+    state.phase = Phase.REPRODUCE
+    engine.store.save(state)
+    observation = engine.get(state, state.observation_ref)
+    browser = MCPBrowser(['unused'], engine.browser.policy)
+    browser.observation = observation
+    engine.browser = browser
+    mcp_calls = []
+
+    async def call(kind, arguments=None):
+        mcp_calls.append((kind, arguments))
+        if kind == 'press':
+            return []
+        if kind == 'snapshot':
+            return [SimpleNamespace(type='text', text=observation['snapshot'])]
+        if kind == 'screenshot':
+            return [SimpleNamespace(type='image', data=base64.b64encode(PNG).decode())]
+        pytest.fail('unexpected MCP call: ' + kind)
+
+    monkeypatch.setattr(browser, 'call', call)
+    action = BrowserAction(kind='press', value='Enter')
+    result_ref = await engine.act(state, action, frozen=True)
+    assert action.observation_id is None
+    assert browser.last_action['status'] == 'DONE'
+    assert browser.last_action['observation_id'] == observation['id']
+    assert mcp_calls == [('press', {'key': 'Enter'}), ('snapshot', None),
+                         ('screenshot', {'type': 'png'})]
+    result = engine.get(state, result_ref)
+    assert result['id'] != observation['id']
+    assert engine.artifacts.exists(state.scope_id, state.run_id, result['screenshot_ref'])
+    events = engine.store.trace(state.run_id, state.scope_id)
+    intent = next(event['payload']['intent'] for event in events if event['type'] == 'tool.started')
+    assert intent['observation_id'] == observation['id']
+    assert len([event for event in events if event['type'] == 'tool.completed']) == 1

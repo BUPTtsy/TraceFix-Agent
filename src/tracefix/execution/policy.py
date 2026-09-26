@@ -33,9 +33,10 @@ class Policy:
             raise PermissionError(f'动作 {action.kind!r} 超出 TestSpec 授权范围：{spec.authorized_actions}')
         if action.kind == 'navigate':
             self.url(action.value)
-        if action.kind in {'click', 'type', 'select'}:
+        if action.kind in {'click', 'type', 'select', 'press'}:
             if not observation or action.observation_id != observation['id']:
                 raise PermissionError("浏览器观测已过期")
+        if action.kind in {'click', 'type', 'select'}:
             from tracefix.execution.browser import resolve_locator
             try:
                 ref = resolve_locator(observation['snapshot'], action.locator)
