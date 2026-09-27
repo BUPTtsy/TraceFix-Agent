@@ -1,0 +1,10 @@
+{
+  "name": "@tracefix/api-client",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/api.ts",
+    "./*": "./src/*.ts"
+  }
+}

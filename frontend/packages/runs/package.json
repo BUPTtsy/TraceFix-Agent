@@ -1,0 +1,17 @@
+{
+  "name": "@tracefix/runs-ui",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/RunsPage.tsx",
+    "./*": "./src/*.ts"
+  },
+  "dependencies": {
+    "@tracefix/api-client": "*",
+    "@tracefix/presentation": "*"
+  },
+  "peerDependencies": {
+    "react": "19.0.0"
+  }
+}

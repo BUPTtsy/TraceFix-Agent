@@ -1,0 +1,18 @@
+{
+  "name": "@tracefix/cli",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --outdir=dist --out-extension:.js=.mjs"
+  },
+  "dependencies": {
+    "@tracefix/console-service": "*"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.0"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

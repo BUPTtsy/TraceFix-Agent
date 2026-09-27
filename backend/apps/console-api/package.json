@@ -1,0 +1,17 @@
+{
+  "name": "@tracefix/console-api",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server/index.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@tracefix/console-service": "*",
+    "esbuild": "0.25.0"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}
