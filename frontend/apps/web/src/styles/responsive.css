@@ -1,0 +1,387 @@
+/* ==========================================================================
+   TraceFix · 响应式层
+   四个断点（1600 / 1220 / 980 / 640）。
+   原则：优先只覆盖 tokens.css 里的布局令牌，让间距、留白整体缩放；
+   仅在结构确实需要重排时才写具体规则，避免同一属性在多处互相覆盖。
+   ========================================================================== */
+
+/* ---------- 超宽屏：放大留白与栏宽 --------------------------------------- */
+@media (min-width: 1600px) {
+  :root {
+    --sidebar-w: 238px;
+    --dock-w: 390px;
+    --gutter: 42px;
+    --card-pad-x: 28px;
+    --card-pad-y: 26px;
+    --page-head-pad: 40px;
+    --metric-pad: 25px;
+    --dock-pad-x: 26px;
+    --dock-pad-y: 30px;
+  }
+
+  .document-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+/* ---------- 中等桌面：收窄栏宽，页头改为纵向堆叠 ------------------------- */
+@media (max-width: 1220px) {
+  :root {
+    --sidebar-w: 180px;
+    --dock-w: 310px;
+    --main-min: 320px;
+    --gutter: 18px;
+    --card-pad-x: 18px;
+    --card-pad-y: 18px;
+    --sidebar-pad-x: 12px;
+    --sidebar-pad-y: 25px;
+    --dock-pad-x: 15px;
+    --dock-pad-y: 24px;
+    --metric-pad: 14px;
+  }
+
+  .workspace-label {
+    padding-left: 0;
+    padding-right: 0;
+  }
+
+  .page-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .project-picker {
+    flex-direction: row;
+    align-items: center;
+    gap: var(--space-3);
+  }
+
+  .featured {
+    padding: var(--space-5);
+    flex-wrap: wrap;
+  }
+
+  .document-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .run-symbol {
+    display: none;
+  }
+
+  /* 规则表在中屏压缩列宽，仍保持五列可读 */
+  .rule-row {
+    grid-template-columns:
+      minmax(150px, 1.5fr) minmax(90px, 1fr) minmax(78px, 0.8fr)
+      minmax(100px, 1fr) 66px;
+    gap: var(--space-2);
+  }
+}
+
+/* ---------- 平板：助手面板从侧栏降为主区下方的卡片 ----------------------- */
+@media (max-width: 980px) {
+  :root {
+    --sidebar-w: 155px;
+  }
+
+  .app-shell {
+    grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  }
+
+  .sidebar {
+    grid-row: 1 / span 2;
+  }
+
+  .main-content {
+    grid-column: 2;
+  }
+
+  .assistant-dock {
+    position: relative;
+    top: auto;
+    grid-column: 2;
+    height: 580px;
+    min-height: 0;
+    margin: 0 var(--gutter) var(--space-6);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
+  }
+
+  .brand {
+    font-size: var(--fs-xl);
+    padding: 0 var(--space-1);
+  }
+
+  .workspace-avatar {
+    display: none;
+  }
+
+  .workspace-label {
+    padding: var(--space-5) var(--space-1);
+  }
+
+  .sidebar nav a {
+    padding: var(--space-2);
+    font-size: var(--fs-xs);
+    gap: var(--space-2);
+  }
+
+  .sidebar-bottom {
+    padding-left: var(--space-1);
+  }
+
+  .page-heading {
+    flex-direction: row;
+    align-items: flex-end;
+  }
+
+  .document-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .project-picker {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .run-symbol {
+    display: grid;
+  }
+}
+
+/* ---------- 手机：侧栏变顶部导航条，全部改为单列 ------------------------- */
+@media (max-width: 640px) {
+  :root {
+    --gutter: 14px;
+    --card-pad-x: 16px;
+    --card-pad-y: 16px;
+    --card-gap: 14px;
+    --topbar-h: 50px;
+    --page-head-pad: 24px;
+    --metric-pad: 12px;
+  }
+
+  .app-shell {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .sidebar {
+    position: relative;
+    height: auto;
+    overflow: visible;
+    padding: var(--space-3) var(--space-4);
+  }
+
+  .brand {
+    font-size: var(--fs-xl);
+    line-height: var(--lh-tight);
+  }
+
+  .brand-mark {
+    font-size: var(--fs-xl);
+  }
+
+  .workspace-label,
+  .nav-label,
+  .sidebar-projects,
+  .sidebar-bottom {
+    display: none;
+  }
+
+  .sidebar nav {
+    flex-direction: row;
+    gap: 2px;
+    margin-top: var(--space-3);
+  }
+
+  .sidebar nav a {
+    flex: 1;
+    justify-content: center;
+    padding: var(--space-2) 2px;
+    font-size: var(--fs-2xs);
+    gap: var(--space-1);
+  }
+
+  .sidebar nav a > span {
+    font-size: var(--fs-md);
+    width: auto;
+  }
+
+  .sidebar nav a.active {
+    box-shadow: inset 0 -2px var(--sidebar-accent);
+  }
+
+  .topbar {
+    font-size: var(--fs-2xs);
+  }
+
+  .page-heading {
+    align-items: flex-start;
+    gap: var(--space-3);
+    flex-direction: column;
+  }
+
+  .page-heading h1 {
+    font-size: var(--fs-2xl);
+  }
+
+  .project-picker {
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .project-picker select {
+    min-width: 150px;
+  }
+
+  .metric-grid {
+    gap: var(--space-2);
+  }
+
+  .metric > strong {
+    font-size: var(--fs-2xl);
+  }
+
+  .featured {
+    padding: var(--space-4);
+  }
+
+  .featured h2 {
+    font-size: var(--fs-xl);
+  }
+
+  .section-heading {
+    gap: var(--space-2);
+    flex-wrap: wrap;
+  }
+
+  .section-heading h2 {
+    font-size: var(--fs-md);
+  }
+
+  .toolbar {
+    gap: var(--space-2);
+  }
+
+  .toolbar input,
+  .toolbar select {
+    font-size: var(--fs-xs);
+  }
+
+  .toolbar select {
+    max-width: 120px;
+  }
+
+  .run-row {
+    gap: var(--space-2);
+  }
+
+  .run-symbol {
+    display: none;
+  }
+
+  .run-state > small {
+    max-width: 100px;
+  }
+
+  .project-grid,
+  .document-grid,
+  .rule-metrics {
+    grid-template-columns: 1fr;
+  }
+
+  .project-card {
+    padding: var(--space-4);
+  }
+
+  .form-grid {
+    gap: var(--space-2);
+  }
+
+  .editor-footer {
+    flex-wrap: wrap;
+  }
+
+  .document-content {
+    min-height: 300px;
+  }
+
+  .run-detail dl,
+  .project-detail dl {
+    grid-template-columns: 84px minmax(0, 1fr);
+    font-size: var(--fs-xs);
+  }
+
+  .journey {
+    gap: 0;
+  }
+
+  .journey > button {
+    padding: var(--space-2) var(--space-1);
+  }
+
+  .journey strong {
+    font-size: var(--fs-xs);
+  }
+
+  .journey span,
+  .journey > div {
+    font-size: var(--fs-2xs);
+  }
+
+  .assistant-dock {
+    height: 570px;
+    padding: var(--space-5) var(--space-4);
+  }
+
+  /* 规则表在窄屏横向滚动，容器自身裁剪，页面不产生横向滚动条 */
+  .rule-table {
+    overflow: auto;
+  }
+
+  .rule-row {
+    min-width: 670px;
+  }
+
+  .rule-head {
+    display: none;
+  }
+
+  .rule-json {
+    min-height: 150px;
+  }
+
+  .version-list > div {
+    grid-template-columns: 44px minmax(0, 1fr);
+  }
+
+  .version-list small {
+    grid-column: 2;
+  }
+}
+
+/* ==========================================================================
+   动效
+   ========================================================================== */
+
+@keyframes pulse {
+  50% {
+    box-shadow: 0 0 0 4px var(--accent-ring);
+  }
+}
+
+/* 尊重系统的减少动态效果偏好 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

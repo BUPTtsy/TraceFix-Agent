@@ -1,0 +1,377 @@
+/* ==========================================================================
+   TraceFix · 基础层
+   Reset、排版、表单控件、按钮等全局原子样式。
+   ========================================================================== */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+/* 根字号 87.5% 约等于 14px；所有字号令牌用 rem 表达，
+   因此浏览器的字号设置仍然可以整体放大界面。
+   注意：这里不能再写 font-size: var(--fs-base)，
+   根元素上的 rem 会回到 16px 初始值，反而抵消 87.5%。 */
+html {
+  font-size: 87.5%;
+  -webkit-text-size-adjust: 100%;
+  font-family: var(--font-sans);
+  line-height: var(--lh-normal);
+  color: var(--text);
+  background: var(--bg-page);
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-variant-numeric: tabular-nums;
+}
+
+body {
+  margin: 0;
+  font-size: var(--fs-base);
+  background: var(--bg-page);
+  color: var(--text);
+  min-height: 100dvh;
+}
+
+/* ---------- 排版 ---------------------------------------------------------- */
+
+h1,
+h2,
+h3,
+h4,
+p,
+dl,
+figure {
+  margin-top: 0;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-display);
+  color: var(--text-strong);
+  text-wrap: balance;
+}
+
+h1 {
+  font-size: var(--fs-3xl);
+  font-weight: var(--fw-semibold);
+  line-height: var(--lh-tight);
+  letter-spacing: var(--tracking-tight);
+  margin-bottom: var(--space-2);
+}
+
+h2 {
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-semibold);
+  line-height: var(--lh-snug);
+  letter-spacing: var(--tracking-tight);
+  margin-bottom: var(--space-1);
+}
+
+h3 {
+  font-size: var(--fs-md);
+  font-weight: var(--fw-semibold);
+  line-height: var(--lh-snug);
+  margin-bottom: var(--space-3);
+}
+
+p {
+  margin-bottom: var(--space-3);
+}
+
+strong,
+b {
+  font-weight: var(--fw-semibold);
+}
+
+code,
+pre,
+kbd,
+samp {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  font-variant-ligatures: none;
+}
+
+code {
+  overflow-wrap: anywhere;
+}
+
+small {
+  font-size: var(--fs-xs);
+  line-height: var(--lh-snug);
+}
+
+hr {
+  border: 0;
+  border-top: 1px solid var(--border-subtle);
+  margin: var(--space-5) 0;
+}
+
+::selection {
+  background: var(--accent-soft-hover);
+  color: var(--text-strong);
+}
+
+/* 全局辅助类 */
+.muted {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.danger {
+  color: var(--danger-fg);
+}
+
+/* ---------- 链接与焦点 --------------------------------------------------- */
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button,
+a,
+input,
+textarea,
+select,
+summary {
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* 统一的可见焦点环：键盘可达性的核心保障 */
+:where(button, a, input, textarea, select, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* 深色侧栏内部换成亮色焦点环，保证对比度 */
+.sidebar :where(button, a):focus-visible {
+  outline-color: var(--sidebar-focus);
+}
+
+/* ---------- 表单控件 ----------------------------------------------------- */
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+  border: 0;
+  background: none;
+  transition:
+    background var(--dur) var(--ease),
+    color var(--dur) var(--ease),
+    border-color var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease),
+    transform var(--dur-fast) var(--ease);
+}
+
+button:disabled,
+input:disabled,
+textarea:disabled,
+select:disabled,
+fieldset:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+a {
+  transition:
+    background var(--dur) var(--ease),
+    color var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease);
+}
+
+input,
+textarea,
+select {
+  min-width: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  padding: var(--space-2) var(--space-3);
+  outline: none;
+  transition:
+    border-color var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+
+input:hover:not(:disabled),
+textarea:hover:not(:disabled),
+select:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+/* 控件已有自绘焦点样式时去掉重复的系统焦点环 */
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+::placeholder {
+  color: var(--text-muted);
+  opacity: 0.85;
+}
+
+textarea {
+  resize: vertical;
+  line-height: var(--lh-relaxed);
+}
+
+select {
+  cursor: pointer;
+  appearance: none;
+  padding-right: var(--space-7);
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position:
+    calc(100% - 16px) calc(50% + 1px),
+    calc(100% - 11px) calc(50% + 1px);
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+
+input[type='checkbox'] {
+  accent-color: var(--accent);
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+input[type='number'] {
+  font-variant-numeric: tabular-nums;
+}
+
+fieldset {
+  min-width: 0;
+}
+
+/* ---------- 按钮 --------------------------------------------------------- */
+
+.primary,
+.secondary {
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  white-space: nowrap;
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 36px;
+}
+
+.primary {
+  background: var(--accent);
+  color: var(--text-on-accent);
+  box-shadow: var(--shadow-xs);
+}
+
+.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  box-shadow: var(--shadow-sm);
+}
+
+.primary:active:not(:disabled) {
+  background: var(--accent-active);
+  transform: translateY(1px);
+  box-shadow: none;
+}
+
+.secondary {
+  background: var(--surface);
+  color: var(--accent-text);
+  border: 1px solid var(--border);
+}
+
+.secondary:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.secondary:active:not(:disabled) {
+  background: var(--accent-soft-hover);
+  transform: translateY(1px);
+}
+
+.text-button {
+  padding: var(--space-1) 0;
+  color: var(--accent-text);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  text-align: left;
+  border-radius: var(--radius-xs);
+}
+
+.text-button:hover:not(:disabled) {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.text-button.danger {
+  color: var(--danger-fg);
+}
+
+.button-row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* 按钮内出现 loading 文案时锁住最小宽度，避免宽度跳动 */
+.primary[disabled],
+.secondary[disabled] {
+  box-shadow: none;
+}
+
+/* ---------- 滚动条 ------------------------------------------------------- */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--radius-pill);
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+  background-clip: content-box;
+}
