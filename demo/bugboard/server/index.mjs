@@ -4,17 +4,22 @@ import {existsSync, readFileSync} from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import {spawn} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
+import {fileURLToPath, pathToFileURL} from 'node:url';
 import {seed, validateTitle, applyFields} from './tasks.mjs';
-import {consoleBridge} from './console.mjs';
 import {errorWithContext} from './errors.mjs';
 import crypto from 'node:crypto';
+import {build} from 'esbuild';
 
 const dataFile = process.env.BUGBOARD_DATA || path.join(os.tmpdir(), 'tracefix-bugboard-data.json');
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../dist');
 let tasks = seed();
 try {tasks = JSON.parse(await fs.readFile(dataFile, 'utf8'));} catch {}
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
+const consoleBundlePath = path.join(os.tmpdir(), `tracefix-console-${process.pid}.mjs`);
+await build({entryPoints: [path.join(projectRoot, 'console-ts/src/dispatch.ts')],
+  bundle: true, outfile: consoleBundlePath, platform: 'node', format: 'esm'});
+const {createConsoleService} = await import(pathToFileURL(consoleBundlePath).href);
+await fs.unlink(consoleBundlePath);
 function loadProjectEnv() {
   const envFile = path.join(projectRoot, '.env');
   if (!existsSync(envFile)) return;
@@ -30,9 +35,12 @@ function loadProjectEnv() {
   }
 }
 loadProjectEnv();
-process.env.TRACEFIX_CONSOLE_DB ||= path.join(projectRoot, '.tracefix', 'console.sqlite3');
-process.env.TRACEFIX_DATA ||= path.join(projectRoot, '.tracefix');
-const bridge = consoleBridge(projectRoot, pythonCommand);
+process.env.TRACEFIX_DATA = path.resolve(projectRoot, process.env.TRACEFIX_DATA || '.tracefix');
+process.env.TRACEFIX_CONSOLE_DB = path.resolve(projectRoot, process.env.TRACEFIX_CONSOLE_DB || path.join(process.env.TRACEFIX_DATA, 'console.sqlite3'));
+const dataService = createConsoleService({projectsPath: path.resolve(projectRoot, process.env.TRACEFIX_PROJECTS || 'profiles/projects.yaml'),
+  dataRoot: path.resolve(projectRoot, process.env.TRACEFIX_DATA), databasePath: path.resolve(projectRoot, process.env.TRACEFIX_CONSOLE_DB),
+  displayRoot: projectRoot});
+const bridge = (operation, fields) => Promise.resolve().then(() => dataService(operation, fields));
 let agent = {status: 'idle', pid: null, goal: '', mode: 'test', startedAt: null, finishedAt: null, exitCode: null, signal: null, logs: []};
 let agentProcess = null;
 let launching = false;
@@ -86,14 +94,16 @@ function pythonCommand() {
   const candidates = process.platform === 'win32' ? ['.venv\\Scripts\\python.exe', 'py'] : ['.venv/bin/python', 'python3'];
   return candidates.find(candidate => candidate === 'py' || existsSync(path.join(projectRoot, candidate))) || candidates[candidates.length - 1];
 }
-async function startAgent(goal, mode, projectId, continuation = null) {
+async function startAgent(goal, mode, projectId, continuation = null, derived = null) {
   if (agentProcess || launching || (agent.pid && isAlive(agent.pid))) throw new Error('已有 Agent Run 正在执行');
   launching = true;
   try {
-  agent = continuation ? await bridge('run.continue', {id: continuation.runId, instruction: continuation.instruction}) : await bridge('run.create', {goal, mode, projectId});
+  agent = continuation ? await bridge('run.continue', {id: continuation.runId, instruction: continuation.instruction}) : await bridge('run.create', {goal, mode, projectId, ...(derived || {})});
   const python = pythonCommand();
   const args = [...(python === 'py' ? ['-3.12'] : []), 'scripts/launch.py', '--plain',
     ...(continuation ? ['--continue-run', agent.id, '--instruction', continuation.instruction] : ['--run', '--goal', goal, '--mode', mode]),
+    ...(derived?.parentRunId ? ['--parent-run', derived.parentRunId] : []),
+    ...((derived?.additionalRuleIds || []).flatMap(ruleId => ['--rule', ruleId])),
     '--project', projectId, '--projects', agent.registry,
     ...(agent.profile ? ['--profile', agent.profile] : []), '--data', agent.dataRoot || process.env.TRACEFIX_DATA];
   const runId = agent.id;
@@ -177,6 +187,35 @@ const server = http.createServer(async (req,res) => {
       return send(res, 201, await bridge('document.save', {...await body(req), id: undefined}));
     }
     if (url.pathname === '/api/knowledge/search' && req.method === 'POST') return send(res, 200, await bridge('search', await body(req)));
+    if (url.pathname === '/api/rules' && req.method === 'GET') return send(res, 200, await bridge('rules', {
+      projectId: url.searchParams.get('projectId') || undefined,
+      status: url.searchParams.get('status') || undefined, q: url.searchParams.get('q') || '',
+      includeArchived: url.searchParams.get('includeArchived') === 'true'}));
+    if (url.pathname === '/api/rules' && req.method === 'POST') return send(res, 201, await bridge('rule.create', await body(req)));
+    if (url.pathname === '/api/rules/insights' && req.method === 'GET') return send(res, 200, await bridge('rule.insights', {
+      from: url.searchParams.get('from') || undefined, to: url.searchParams.get('to') || undefined}));
+    if (url.pathname === '/api/rule-sets' && req.method === 'GET') return send(res, 200, await bridge('rule-sets'));
+    if (url.pathname === '/api/rule-sets' && req.method === 'POST') return send(res, 201, await bridge('rule-set.save', await body(req)));
+    const ruleFindingsMatch = url.pathname.match(/^\/api\/rules\/([^/]+)\/findings$/);
+    if (ruleFindingsMatch && req.method === 'GET') return send(res, 200, await bridge('rule.findings', {
+      ruleId: decodeURIComponent(ruleFindingsMatch[1]), status: url.searchParams.get('status') || undefined,
+      limit: url.searchParams.get('limit') || 100}));
+    const ruleVersionsMatch = url.pathname.match(/^\/api\/rules\/([^/]+)\/versions$/);
+    if (ruleVersionsMatch && req.method === 'GET') return send(res, 200, await bridge('rule.versions', {id: decodeURIComponent(ruleVersionsMatch[1])}));
+    const rulePreviewMatch = url.pathname.match(/^\/api\/rules\/([^/]+)\/preview$/);
+    if (rulePreviewMatch && req.method === 'GET') return send(res, 200, await bridge('rule.preview', {id: decodeURIComponent(rulePreviewMatch[1])}));
+    const ruleActionMatch = url.pathname.match(/^\/api\/rules\/([^/:]+):([a-z]+)$/);
+    if (ruleActionMatch && req.method === 'POST') {
+      const id = decodeURIComponent(ruleActionMatch[1]); const action = ruleActionMatch[2]; const fields = await body(req);
+      if (action === 'publish') return send(res, 200, await bridge('rule.status', {id, status: 'enabled', expectedVersion: fields.expectedVersion}));
+      if (action === 'disable') return send(res, 200, await bridge('rule.status', {id, status: 'disabled', expectedVersion: fields.expectedVersion}));
+      if (action === 'archive') return send(res, 200, await bridge('rule.status', {id, status: 'archived', expectedVersion: fields.expectedVersion}));
+      if (action === 'rollback') return send(res, 200, await bridge('rule.rollback', {id, version: fields.version}));
+    }
+    const ruleMatch = url.pathname.match(/^\/api\/rules\/([^/]+)$/);
+    if (ruleMatch && req.method === 'GET') return send(res, 200, await bridge('rule', {id: decodeURIComponent(ruleMatch[1])}));
+    if (ruleMatch && req.method === 'PUT') return send(res, 200, await bridge('rule.update', {...await body(req), id: decodeURIComponent(ruleMatch[1])}));
+    if (ruleMatch && req.method === 'DELETE') return send(res, 200, await bridge('rule.delete', {id: decodeURIComponent(ruleMatch[1])}));
     const documentMatch = url.pathname.match(/^\/api\/knowledge\/([a-zA-Z0-9_-]+)$/);
     if (documentMatch && req.method === 'GET') return send(res, 200, await bridge('document', {id: documentMatch[1]}));
     if (documentMatch && req.method === 'PUT') {
@@ -197,6 +236,16 @@ const server = http.createServer(async (req,res) => {
       const record = await bridge('run', {id: continuationMatch[1]});
       if (!record.canContinue) return send(res, 409, {error: '只有非成功结束的任务可以继续'});
       await startAgent(record.goal, record.mode, record.projectId, {runId: record.id, instruction});
+      return send(res, 202, await agentView());
+    }
+    const deriveMatch = url.pathname.match(/^\/api\/runs\/([a-zA-Z0-9_-]+)\/derive$/);
+    if (deriveMatch && req.method === 'POST') {
+      const fields = await body(req); const parent = await bridge('run', {id: deriveMatch[1]});
+      const additionalRuleIds = fields.additionalRuleIds ?? [];
+      if (fields.mode !== undefined && !['test', 'repair'].includes(fields.mode)) return send(res, 400, {error: '未知 Agent 服务'});
+      await startAgent(typeof fields.goal === 'string' && fields.goal.trim() ? fields.goal.trim() : parent.goal,
+        fields.mode || (parent.mode === 'repair' ? 'repair' : 'test'), parent.projectId, null,
+        {parentRunId: parent.agentRunId || parent.id, additionalRuleIds});
       return send(res, 202, await agentView());
     }
     if (url.pathname === '/api/agent/stop' && req.method === 'POST') {await stopAgent(); return send(res, 202, await agentView());}

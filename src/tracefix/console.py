@@ -11,6 +11,9 @@ import yaml
 from tracefix.config import load_profile, load_projects
 from tracefix.knowledge.documents import ConflictError, DocumentLibrary, timestamp
 from tracefix.storage.artifacts import Artifacts
+from tracefix.rules.store import RuleConflictError, RuleLibrary
+from tracefix.rules.models import Rule
+from tracefix.rules.resolver import render_rule_context
 from tracefix.remote import RemoteConfigStore
 from tracefix.runtime.continuation import can_continue
 from tracefix.messages import error_message
@@ -68,6 +71,7 @@ def project_catalog(projects_path=None, data_root=None):
 
 def dispatch(operation, fields, *, library=None, projects_path=None, data_root=None):
     library = library or DocumentLibrary()
+    rule_library = RuleLibrary(library.path)
     data_root = Path(data_root or os.getenv('TRACEFIX_DATA', '.tracefix')).resolve()
 
     def catalog():
@@ -199,6 +203,44 @@ def dispatch(operation, fields, *, library=None, projects_path=None, data_root=N
             if source['projectId'] != project_id:
                 raise ValueError('运行经验须先归档到来源项目')
         return library.save_document(fields, fields.get('id'))
+    if operation == 'rules':
+        return [rule.model_dump(mode='json') for rule in rule_library.rules(
+            project_id=fields.get('projectId'), status=fields.get('status'),
+            query=fields.get('q', ''), include_archived=fields.get('includeArchived', False))]
+    if operation == 'rule':
+        return rule_library.rule(fields['id']).model_dump(mode='json')
+    if operation == 'rule.save':
+        data = dict(fields)
+        rule_id = data.pop('id', None)
+        expected = data.pop('expectedVersion', data.pop('expected_version', None))
+        return rule_library.save_rule(data, rule_id, expected_version=expected,
+                                      author=data.pop('author', 'web'), change_note=data.pop('changeNote', '')) .model_dump(mode='json')
+    if operation == 'rule.status':
+        return rule_library.set_status(fields['id'], fields['status'],
+                                       expected_version=fields.get('expectedVersion'),
+                                       author=fields.get('author', 'web')).model_dump(mode='json')
+    if operation == 'rule.delete':
+        rule_library.delete_rule(fields['id'])
+        return {'ok': True}
+    if operation == 'rule.versions':
+        return rule_library.versions(fields['id'])
+    if operation == 'rule.preview':
+        rule = rule_library.rule(fields['id'])
+        return {**render_rule_context([rule], max_tokens=int(fields.get('maxTokens', 1200))),
+                'rule': rule.model_dump(mode='json')}
+    if operation == 'rule.rollback':
+        return rule_library.rollback(fields['id'], int(fields['version']),
+                                     author=fields.get('author', 'web')).model_dump(mode='json')
+    if operation == 'rule.findings':
+        return [finding.model_dump(mode='json') for finding in rule_library.findings(
+            rule_id=fields.get('ruleId'), run_id=fields.get('runId'), status=fields.get('status'),
+            limit=int(fields.get('limit', 100)))]
+    if operation == 'rule.insights':
+        return rule_library.insights(from_time=fields.get('from'), to_time=fields.get('to'))
+    if operation == 'rule-sets':
+        return rule_library.rule_sets()
+    if operation == 'rule-set.save':
+        return rule_library.save_rule_set(fields, fields.get('id'))
     raise ValueError('未知控制台操作')
 
 
@@ -211,7 +253,7 @@ def main():
         result = dispatch(request['operation'], request.get('fields', {}))
         print(json.dumps({'result': result}, ensure_ascii=False))
     except Exception as error:
-        status = 409 if isinstance(error, ConflictError) else 404 if isinstance(error, FileNotFoundError) else 400
+        status = 409 if isinstance(error, (ConflictError, RuleConflictError)) else 404 if isinstance(error, FileNotFoundError) else 400
         print(json.dumps({'error': error_message(error), 'status': status}, ensure_ascii=False))
 
 

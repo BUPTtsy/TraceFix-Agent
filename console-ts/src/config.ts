@@ -42,7 +42,7 @@ export function parseConfig(text: string): Record<string, any> {
     while (position < entries.length && entries[position].indent === indent && entries[position].content.startsWith('- ')) {
       const content = entries[position++].content.slice(2).trim();
       const separator = content.indexOf(':');
-      if (separator > 0 && !content.startsWith('"') && !content.startsWith("'")) {
+      if (separator > 0 && /^\s|^$/.test(content.slice(separator + 1)) && !content.startsWith('"') && !content.startsWith("'")) {
         const key = content.slice(0, separator).trim();
         const value = content.slice(separator + 1).trim();
         const item: Record<string, any> = {[key]: value ? scalar(value) : null};
@@ -63,7 +63,7 @@ export function parseConfig(text: string): Record<string, any> {
 }
 
 export function loadConfig(filename: string): Record<string, any> {
-  const content = fs.readFileSync(filename, 'utf8');
+  const content = fs.readFileSync(filename, 'utf8').replace(/^\uFEFF/, '');
   return content.trimStart().startsWith('{') ? JSON.parse(content) : parseConfig(content);
 }
 
@@ -107,12 +107,24 @@ export function projectCatalog(projectsPath: string, dataRoot: string, displayRo
   for (const filename of fs.readdirSync(path.dirname(registry)).filter(name => name.endsWith('.yaml') && !name.includes('.example.')).sort()) {
     const fullPath = path.join(path.dirname(registry), filename);
     if (fullPath === registry) continue;
+    let declaredProject = path.parse(filename).name;
     try {
       const profile = loadConfig(fullPath);
-      if (typeof profile.project !== 'string' || !profile.commands) throw new Error('Profile 无效');
+      if (typeof profile.project === 'string') declaredProject = profile.project;
+      if (typeof profile.project !== 'string' || typeof profile.source_commit !== 'string' || !profile.source_commit ||
+          !profile.commands || typeof profile.commands !== 'object' || Array.isArray(profile.commands)) throw new Error('Profile 无效');
+      if (['start', 'reset', 'static', 'unit', 'build'].some(name => !profile.commands[name]) ||
+          Object.values(profile.commands).some(command => !Array.isArray(command) || !command.length ||
+            command.some(argument => typeof argument !== 'string' || !argument))) throw new Error('缺少有效的已批准命令');
+      const origins = profile.allowed_origins ?? ['http://app:3000'];
+      if (!Array.isArray(origins) || origins.some(origin => {
+        if (typeof origin !== 'string') return true;
+        const parsed = new URL(origin);
+        return !['http:', 'https:'].includes(parsed.protocol) || Boolean(parsed.username) || !['', '/'].includes(parsed.pathname);
+      })) throw new Error('origin 必须是精确的 http(s) 来源');
       profile.url ||= 'http://app:3000';
       if (!profiles.has(profile.project)) profiles.set(profile.project, {filename: fullPath, profile});
-    } catch (error) { errors.set(path.parse(filename).name, String(error)); }
+    } catch (error) { errors.set(declaredProject, String(error)); }
   }
   let remote: Record<string, any> = {};
   const remotePath = path.join(dataRoot, 'remote-config.json');

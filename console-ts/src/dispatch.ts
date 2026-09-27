@@ -26,7 +26,8 @@ export function createConsoleService(options: ConsoleOptions = {}) {
       ref.endsWith('.diff') || ref.endsWith('.html') || ref === record.reportRef || knowledgeRefs.has(ref) ||
       ['修复报告数据', '完整事件数据', '继续执行前状态'].some(name => entry['用途']?.includes(name)))
       .map(([ref, entry]) => ({ref, label: entry['用途'], bytes: entry['字节数']}));
-    return {...record, canContinue: canContinue(record.status, record.outcome), artifacts};
+    return {...record, canContinue: canContinue(record.status, record.outcome), artifacts,
+      ruleSnapshot: record.agentRunId ? rules.snapshot(record.agentRunId) : null};
   }
 
   function importRuns(): Data {
@@ -101,7 +102,30 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     if (operation === 'run.create') {
       const project = catalog().find(item => item.id === fields.projectId);
       if (!project?.ready) throw new DataError(project?.issue || '请选择已注册的项目');
+      if (typeof fields.goal !== 'string' || !fields.goal.trim() || fields.goal.trim().length > 4000 ||
+          !['test', 'repair'].includes(fields.mode)) throw new DataError('运行目标或模式无效');
+      if (fields.additionalRuleIds !== undefined && (!Array.isArray(fields.additionalRuleIds) ||
+          fields.additionalRuleIds.length > 50 || fields.additionalRuleIds.some((id: any) => typeof id !== 'string' || !id)))
+        throw new DataError('追加规则须为最多 50 个规则 ID');
+      let parentRunId: string | undefined;
+      let inheritedIds = new Set<string>();
+      if (fields.parentRunId) {
+        const parent = database.runs(project.id).find(run => run.id === fields.parentRunId || run.agentRunId === fields.parentRunId);
+        if (!parent?.agentRunId) throw new DataError('当前项目没有此父 Run', 404);
+        const snapshot = rules.snapshot(parent.agentRunId);
+        if (!snapshot) throw new DataError('父 Run 尚未生成规则快照，无法派生', 409);
+        parentRunId = parent.agentRunId;
+        inheritedIds = new Set(snapshot.refs.map((ref: Data) => ref.id));
+      }
+      const additionalRuleIds = [...new Set<string>(fields.additionalRuleIds || [])];
+      for (const id of additionalRuleIds) {
+        if (inheritedIds.has(id)) continue;
+        const rule = rules.rule(id);
+        if (!['enabled', 'draft'].includes(rule.status) ||
+            (rule.scope.project_ids.length && !rule.scope.project_ids.includes(project.id))) throw new DataError('追加规则已停用或不属于当前项目');
+      }
       return database.updateRun(randomUUID(), {...fields, profile: project.profile, registry: project.registry,
+        goal: fields.goal.trim(), ...(parentRunId ? {parentRunId} : {}), additionalRuleIds,
         status: 'running', phase: 'STARTING', outcome: null, finishedAt: null, origin: 'web', dataRoot}, true);
     }
     if (operation === 'run.update') return database.updateRun(fields.id, fields.changes);
@@ -135,6 +159,8 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     if (operation === 'rules') return rules.rules(fields);
     if (operation === 'rule') return rules.rule(fields.id);
     if (operation === 'rule.save') return rules.save(fields, fields.id, fields.expectedVersion ?? fields.expected_version);
+    if (operation === 'rule.create' || operation === 'rule.update')
+      return rules.save(fields, fields.id, fields.expectedVersion ?? fields.expected_version, operation === 'rule.create' ? 'create' : 'update');
     if (operation === 'rule.status') return rules.status(fields.id, fields.status, fields.expectedVersion);
     if (operation === 'rule.delete') return rules.delete(fields.id);
     if (operation === 'rule.versions') return rules.versions(fields.id);

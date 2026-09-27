@@ -166,6 +166,7 @@ class TestSpec(Contract):
 class Decision(Contract):
     action: BrowserAction
     evidence_refs: list[str] = Field(default_factory=list)
+    rule_refs: list[str] = Field(default_factory=list, max_length=50)
     expected_observation: str = ""
     summary: str = Field(default="", max_length=1200)
 
@@ -179,6 +180,7 @@ class FileEdit(Contract):
 class PatchProposal(Contract):
     summary: str
     evidence_refs: list[str] = Field(min_length=1)
+    rule_refs: list[str] = Field(default_factory=list, max_length=50)
     edits: list[FileEdit] = Field(min_length=1, max_length=8)
 
 
@@ -251,6 +253,10 @@ class RunState(Contract):
     last_error_signature: str | None = None
     baseline_validation_refs: list[str] = Field(default_factory=list)
     model_exchange_refs: list[str] = Field(default_factory=list)
+    rule_snapshot_ref: str | None = None
+    rule_snapshot_hash: str = ""
+    rule_refs: list[dict] = Field(default_factory=list)
+    additional_rule_ids: list[str] = Field(default_factory=list)
 
 
 TRANSITIONS = {

@@ -8,9 +8,14 @@ export interface Run {id: string; projectId: string; agentRunId?: string; goal: 
 export interface AgentStatus extends Partial<Run> {running: boolean}
 export interface TraceEvent {seq: number; agentSeq?: number; type: string; phase: string; at: number; payload: Record<string, unknown>}
 export interface Run {canContinue?: boolean}
+export interface Run {parentRunId?: string; additionalRuleIds?: string[]; ruleSnapshot?: {run_id: string; parent_run_id: string | null; snapshot_hash: string; refs: {id: string; version: number}[]} | null}
 export interface KnowledgeDocument {id: string; title: string; content: string; preview?: string; kind: 'repair' | 'testing' | 'experience'; projectId: string | null; tags: string[]; enabled: boolean; version: number; createdAt: string; updatedAt: string; sourceRunId: string | null}
 export type DocumentDraft = Omit<KnowledgeDocument, 'id' | 'createdAt' | 'updatedAt'> & {id?: string};
 export interface SearchHit extends Omit<KnowledgeDocument, 'content'> {excerpt: string; score: number; chunk: number}
+export type RuleStatus = 'draft' | 'enabled' | 'disabled' | 'archived';
+export interface DetectionRule {id: string; name: string; version: number; status: RuleStatus; category: string; severity: string; priority: number; pinned: boolean; scope: {level: string; project_ids: string[]; url_patterns: string[]; path_globs: string[]; frameworks: string[]}; phases: string[]; detection: {type: 'oracle' | 'static' | 'guided'; oracle?: Record<string, unknown>; static?: Record<string, unknown>; guided?: Record<string, unknown>}; fix_guidance: string; examples: Record<string, string>; tags: string[]; owner: string; created_at?: string; updated_at?: string}
+export interface RuleVersion {rule_id: string; version: number; body_hash: string; change_note: string; author: string; created_at: string}
+export interface RuleInsight {rule_id: string | null; total: number; reproduced: number; false_positive: number; fixed: number; reproduction_rate: number; false_positive_rate: number; fix_rate: number}
 export interface ChatMessage {role: 'user' | 'assistant'; content: string; sources?: Source[]}
 
 async function fetchResponse(url: string, options: RequestInit): Promise<Response> {
@@ -36,10 +41,20 @@ export const loadAgentStatus = () => request<AgentStatus>('/api/agent/status');
 export const startAgent = (goal: string, mode: Service, projectId: string) => request<AgentStatus>('/api/agent/start', {method: 'POST', body: JSON.stringify({goal, mode, projectId})});
 export const stopAgent = () => request<AgentStatus>('/api/agent/stop', {method: 'POST'});
 export const continueRun = (id: string, instruction: string) => request<AgentStatus>(`/api/runs/${encodeURIComponent(id)}/continue`, {method: 'POST', body: JSON.stringify({instruction})});
+export const deriveRun = (id: string, additionalRuleIds: string[], goal = '') => request<AgentStatus>(`/api/runs/${encodeURIComponent(id)}/derive`, {method: 'POST', body: JSON.stringify({additionalRuleIds, goal})});
 export const loadDocuments = (projectId: string, query = '') => request<KnowledgeDocument[]>(`/api/knowledge?${new URLSearchParams({projectId, q: query})}`);
 export const loadDocument = (id: string) => request<KnowledgeDocument>(`/api/knowledge/${encodeURIComponent(id)}`);
 export const saveDocument = (document: DocumentDraft) => request<KnowledgeDocument>(`/api/knowledge${document.id ? '/' + encodeURIComponent(document.id) : ''}`, {method: document.id ? 'PUT' : 'POST', body: JSON.stringify(document)});
 export const searchDocuments = (projectId: string, query: string) => request<SearchHit[]>('/api/knowledge/search', {method: 'POST', body: JSON.stringify({projectId, query})});
+export const loadRules = (projectId: string, filters: {status?: string; q?: string; includeArchived?: boolean} = {}) => request<DetectionRule[]>(`/api/rules?${new URLSearchParams({projectId, ...(filters.status ? {status: filters.status} : {}), ...(filters.q ? {q: filters.q} : {}), ...(filters.includeArchived ? {includeArchived: 'true'} : {})})}`);
+export const loadRule = (id: string) => request<DetectionRule>(`/api/rules/${encodeURIComponent(id)}`);
+export const saveRule = (rule: Partial<DetectionRule> & {id?: string; expectedVersion?: number; changeNote?: string}) => request<DetectionRule>(`/api/rules${rule.version && rule.id ? '/' + encodeURIComponent(rule.id) : ''}`, {method: rule.version ? 'PUT' : 'POST', body: JSON.stringify(rule)});
+export const changeRuleStatus = (id: string, action: 'publish' | 'disable' | 'archive', expectedVersion?: number) => request<DetectionRule>(`/api/rules/${encodeURIComponent(id)}:${action}`, {method: 'POST', body: JSON.stringify({expectedVersion})});
+export const deleteRule = (id: string) => request<{ok: boolean}>(`/api/rules/${encodeURIComponent(id)}`, {method: 'DELETE'});
+export const loadRuleVersions = (id: string) => request<RuleVersion[]>(`/api/rules/${encodeURIComponent(id)}/versions`);
+export const loadRuleInsights = () => request<RuleInsight[]>('/api/rules/insights');
+export const loadRuleFindings = (id: string) => request<Array<Record<string, unknown>>>(`/api/rules/${encodeURIComponent(id)}/findings`);
+export const loadRulePreview = (id: string) => request<{prompt: string; items: Array<Record<string, unknown>>; rule_ids: string[]; tokens: number}>(`/api/rules/${encodeURIComponent(id)}/preview`);
 export const artifactUrl = (id: string, ref: string) => `/api/runs/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(ref)}`;
 
 export async function streamChat(message: string, history: ChatMessage[], projectId: string, useKnowledge: boolean, onDelta: (delta: string) => void, onSources: (sources: Source[]) => void) {

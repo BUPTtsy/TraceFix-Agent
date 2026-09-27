@@ -229,7 +229,8 @@ class Gateway:
 
     async def generate(self, schema, context, image=None, agent_instructions=None,
                        on_attempt=None, on_response=None, on_error=None, on_usage=None,
-                       validate_output=None, tool_executor=None, messages=None, on_tool_result=None):
+                       validate_output=None, tool_executor=None, messages=None, on_tool_result=None,
+                       context_provider=None):
         if not self.key:
             raise ModelError('未配置 TRACEFIX_API_KEY', status='FAILED', category='configuration',
                              details={'status': 'FAILED', 'category': 'configuration',
@@ -273,6 +274,22 @@ class Gateway:
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
             while attempt < self.max_attempts:
                 attempt += 1
+                if context_provider:
+                    current_context = context_provider()
+                    current_text = json.dumps({'context': current_context,
+                        'response_json_schema': schema.model_json_schema()}, ensure_ascii=False)
+                    for context_message in payload['messages']:
+                        if context_message.get('role') != 'user':
+                            continue
+                        message_content = context_message.get('content')
+                        if isinstance(message_content, list):
+                            for part in message_content:
+                                if part.get('type') == 'text':
+                                    part['text'] = current_text
+                                    break
+                        else:
+                            context_message['content'] = current_text
+                        break
                 can_retry = attempt < self.max_attempts
                 retry_delay = min(self.max_retry_delay, 2 ** min(attempt - 1, 30)) if can_retry else None
                 request_record = {'url': self.base_url + '/chat/completions',

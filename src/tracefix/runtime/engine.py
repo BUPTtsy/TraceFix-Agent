@@ -1,4 +1,4 @@
-"""One LangGraph, one writer, bounded microsteps, evidence-driven transitions."""
+"""One LangGraph, one writer, usage accounting, and evidence-driven transitions."""
 from __future__ import annotations
 
 import asyncio
@@ -19,6 +19,8 @@ from tracefix.execution.browser import (MCPActionUnknown, MCPConnectionError, as
 from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
 from tracefix.knowledge.context import build_context
 from tracefix.knowledge.selection import select_documents
+from tracefix.rules import RuleResolver, RuleSnapshot, evaluate_oracle, evaluate_static
+from tracefix.rules.resolver import render_rule_context, rule_applies
 from tracefix.runtime.contracts import (BudgetExceeded, BrowserAction, Decision, Outcome,
     PatchProposal, Phase, ReplayUnbound, RunState, RunStatus, TestSpec, Validation, digest, new_id,
     reduce_state, verification_gate)
@@ -78,16 +80,85 @@ class Engine:
     LOOP_NO_PROGRESS_LIMIT = 40
 
     def __init__(self, store, artifacts, scopes, context, profile, workspace, runner,
-                 browser, model, retriever, source, checkpointer, notify=None):
+                 browser, model, retriever, source, checkpointer, notify=None,
+                 rule_resolver=None, rule_library=None):
         self.store, self.artifacts, self.scopes, self.context = store, artifacts, scopes, context
         self.profile, self.workspace, self.runner = profile, workspace, runner
         self.browser, self.model, self.retriever, self.source = browser, model, retriever, source
         self.notify = notify
+        self.rule_resolver = rule_resolver
+        self.rule_library = rule_library
         self.control = None
         self.notes = []
         self.documents = None
         self.document_context = {}
         self.graph = self._graph(checkpointer)
+
+    def _rule_snapshot(self, s):
+        if not self.rule_resolver:
+            return None
+        if s.rule_snapshot_ref:
+            try:
+                return RuleSnapshot.model_validate(self.get(s, s.rule_snapshot_ref))
+            except (FileNotFoundError, ValueError):
+                pass
+        if s.rule_refs:
+            return RuleSnapshot(run_id=s.parent_run_id or s.run_id, parent_run_id=None,
+                                refs=s.rule_refs, hash=s.rule_snapshot_hash or "")
+        if self.rule_library and s.parent_run_id:
+            snapshot = self.rule_library.snapshot(s.parent_run_id)
+            if snapshot is None:
+                raise ValueError('父 Run 尚未生成规则快照，无法派生')
+            return snapshot
+        return None
+
+    def active_rules(self, s, phase=None, observation=None, paths=None):
+        if not self.rule_resolver:
+            return []
+        snapshot = self._rule_snapshot(s)
+        rules = []
+        if snapshot:
+            for ref in snapshot.refs:
+                try:
+                    rule = self.rule_resolver.by_id(ref.id)
+                    if rule.version != ref.version and self.rule_library:
+                        rule = self.rule_library.version(ref.id, ref.version)
+                    rules.append(rule)
+                except (KeyError, FileNotFoundError) as error:
+                    raise ValueError(f'冻结规则版本不可用：{ref.id}@{ref.version}') from error
+        observation = observation if observation is not None else self.get(s, s.observation_ref) if s.observation_ref else {}
+        paths = list(self.workspace.files()) if paths is None else list(paths)
+        return [rule for rule in rules if rule_applies(rule, phase=phase or str(s.phase),
+                url=observation.get('url') or s.url, paths=paths)]
+
+    def inject_rules(self, s, context):
+        cards = context.get('cards')
+        paths = [card['path'] for card in cards if 'path' in card] if cards else None
+        injection = render_rule_context(self.active_rules(s, observation=context.get('observation'), paths=paths))
+        self.event(s, 'rules.injected', {'rule_ids': injection['rule_ids'],
+            'rule_versions': injection['rule_versions'], 'tokens': injection['tokens'],
+            'snapshot_hash': s.rule_snapshot_hash, 'context_hash': injection['snapshot_hash']})
+        return {**context, 'detection_rules': injection, 'rule_snapshot_hash': s.rule_snapshot_hash}
+
+    def ensure_rule_snapshot(self, s):
+        if not self.rule_resolver or s.rule_snapshot_ref:
+            return s
+        parent = self._rule_snapshot(s)
+        snapshot, rules = self.rule_resolver.resolve_snapshot(
+            run_id=s.run_id, project_id=s.scope_id, phase="*", parent=parent,
+            additional=s.additional_rule_ids, url=s.url, paths=self.workspace.files())
+        ref = self.put(s, snapshot.model_dump(mode="json"), name="检测规则快照")
+        delta = {"rule_snapshot_ref": ref, "rule_snapshot_hash": snapshot.hash,
+                 "rule_refs": [item.model_dump(mode="json") for item in snapshot.refs]}
+        if self.rule_library:
+            self.rule_library.save_snapshot(snapshot)
+        return self.changed(s, **delta)
+
+    def validate_rule_refs(self, s, refs):
+        allowed = {rule.id for rule in self.active_rules(s)}
+        invalid = sorted(set(refs) - allowed)
+        if invalid:
+            raise ValueError("模型引用了本次注入集合之外的规则：" + ", ".join(invalid))
 
     def put(self, s, value, ext='json', *, name='数据记录'):
         return self.artifacts.put(s.scope_id, s.run_id, value, ext, label=f'{label(s.phase)}_{name}')
@@ -251,6 +322,19 @@ class Engine:
         return result
 
     async def model_call(self, s, schema, ctx, image=None, validate_output=None):
+        if self.rule_resolver:
+            ctx = self.inject_rules(s, ctx)
+        original_validation = validate_output
+
+        def validate_candidate(candidate):
+            if original_validation:
+                original_validation(candidate)
+            if hasattr(candidate, 'rule_refs'):
+                allowed = set(ctx.get('detection_rules', {}).get('rule_ids', []))
+                if set(candidate.rule_refs) - allowed:
+                    raise ModelOutputError('模型引用了当前动态注入集合之外的规则')
+
+        validate_output = validate_candidate
         if s.continuation_instruction:
             ctx = {**ctx, 'user_continuation': s.continuation_instruction,
                    'continuation_count': s.continuation_count,
@@ -345,12 +429,15 @@ class Engine:
                 'logical_exchange_id': raw['logical_exchange_id'], 'tool_round': raw['tool_round'],
                 'reused': raw['reused']})
 
-        validation = {'validate_output': validate_output} if validate_output else {}
+        validation = {'validate_output': validate_output} if (original_validation or
+            (self.rule_resolver and getattr(self.model, 'supports_tool_executor', False))) else {}
         recovery = s.error_details or {}
         recovering_model_request = (recovery.get('status') == 'WAITING_NETWORK'
             and recovery.get('request_status') == 'not_sent'
             and not recovery.get('requires_manual_review') and not recovery.get('requires_new_run'))
         if getattr(self.model, 'supports_tool_executor', False):
+            if self.rule_resolver:
+                validation['context_provider'] = lambda: ctx
             failed_exchange_id = recovery.get('logical_exchange_id')
             if recovering_model_request and failed_exchange_id:
                 for audit_ref in reversed(s.model_exchange_refs):
@@ -364,6 +451,7 @@ class Engine:
                         validation['messages'] = history
                         break
             async def execute_tool(name, arguments, call_id):
+                nonlocal ctx
                 self.scopes.assert_current(self.context)
                 action = Gateway.browser_action(name, arguments)
                 observation = self.get(s, s.observation_ref) if s.observation_ref else None
@@ -388,12 +476,16 @@ class Engine:
                     step=s.step+1, action_fingerprints=(s.action_fingerprints+[fingerprint])[-12:])
                 for field in type(s).model_fields:
                     setattr(s, field, getattr(updated, field))
-                return {'observation_ref': ref, 'observation': self.get(s, ref)}
+                observation = self.get(s, ref)
+                if self.rule_resolver:
+                    ctx = self.inject_rules(s, {**ctx, 'observation': observation})
+                return {'observation_ref': ref, 'observation': observation}
             validation['tool_executor'] = execute_tool
             validation['on_tool_result'] = tool_result
         result = await self.model.generate(schema, ctx, image=image,
             agent_instructions=self.agent_instructions(s), on_attempt=attempt,
             on_response=response, on_error=error, on_usage=usage, **validation)
+        validate_candidate(result.value)
         if recovering_model_request:
             s.error = None
             s.error_details = None
@@ -407,14 +499,28 @@ class Engine:
                           {'kind': 'propose_patch', 'files': [edit.path for edit in result.value.edits]}})
         return result.value
 
-    async def capture(self, s, raw):
+    async def capture(self, s, raw, action=None):
+        previous = self.get(s, s.observation_ref) if s.observation_ref else None
         png = raw.pop('png')
         if self.profile.screenshot_redaction != 'public_demo':
             raise PermissionError('私有截图在捕获前需要经过批准的脱敏适配器处理')
         screenshot = self.put(s, png, 'png', name='页面截图')
         raw['screenshot_ref'] = screenshot
         raw['redaction'] = 'public_demo_no_credentials'
-        return self.put(s, raw, name='页面观察')
+        observation_ref = self.put(s, raw, name='页面观察')
+        if self.rule_library and self.rule_resolver:
+            for rule in self.active_rules(s, str(s.phase), observation=raw):
+                current_action = action or s.pending_action
+                if isinstance(current_action, BrowserAction):
+                    current_action = current_action.model_dump(mode='json')
+                for finding in evaluate_oracle(rule, raw, job_id=s.run_id, run_id=s.run_id,
+                                               evidence_ref=observation_ref, previous_observation=previous,
+                                               action=current_action):
+                    saved = self.rule_library.save_finding(finding)
+                    self.event(s, 'finding.created', {'finding_id': saved.id, 'rule_id': saved.rule_id,
+                                                     'rule_version': saved.rule_version,
+                                                     'status': saved.status, 'evidence_ref': observation_ref})
+        return observation_ref
 
     async def act(self, s, action, *, frozen=False, tool_call_id=None):
         self.scopes.assert_current(self.context)
@@ -437,7 +543,7 @@ class Engine:
         self.store.save(s)
         async def perform():
             raw = await self.browser.action(action)
-            return {'observation_ref': await self.capture(s, raw)}
+            return {'observation_ref': await self.capture(s, raw, action)}
         intent = action.model_dump()
         if tool_call_id:
             intent['tool_call_id'] = tool_call_id
@@ -520,12 +626,13 @@ class Engine:
                         self.event(s, 'run.error', {'error': s.error, 'error_details': s.error_details,
                                                     'action': '反馈给模型'})
                         return self.output(s, 'prelude')
-                    outcome = Outcome.INFRA_FAILURE
-                    s = self.changed(self.store.load(s.run_id, s.scope_id), phase=Phase.FINALIZE, outcome=outcome,
+                    current = self.store.load(s.run_id, s.scope_id)
+                    s = self.changed(current, run_status=RunStatus.PAUSED,
                                      error=sanitize(f'{type(e).__name__}: {error_message(e)}')[:1500],
-                                     error_details=error_details, pending_action=None)
-                    self.event(s, 'run.error', {'error': s.error, 'error_details': error_details})
-                    return {'data': s.model_dump(mode='json'), 'next_node': 'finalize'}
+                                     error_details=error_details or {'requires_manual_review': True},
+                                     pending_action=None)
+                    self.event(s, 'run.error', {'error': s.error, 'error_details': s.error_details})
+                    return self.output(s, 'paused')
             graph.add_node(name, wrapped)
             graph.add_conditional_edges(name, lambda data: data['next_node'], {n: n for n in names} | {'end': END})
         graph.add_edge(START, 'prelude')
@@ -541,6 +648,7 @@ class Engine:
 
     async def prelude(self, s, _):
         self.scopes.assert_current(self.context)
+        s = self.ensure_rule_snapshot(s)
         if self.control == 'cancel':
             self.control = None
             s = self.changed(s, phase=Phase.FINALIZE, error='用户已取消', outcome=Outcome.INCONCLUSIVE)
@@ -600,9 +708,11 @@ class Engine:
         if not s.test_spec_ref:
             observation = self.get(s, s.observation_ref)
             knowledge = await select_documents(self, s, observation)
+            rules = self.active_rules(s, str(Phase.PREPARE))
             spec = await self.model_call(s, TestSpec, {'goal': s.goal, 'url': s.url,
                 'observation': observation,
                 'reference_documents': knowledge,
+                'detection_rules': [rule.summary() for rule in rules],
                 'instruction': '根据用户目标和首次只读观测编译 TestSpec。授权动作必须使用 schema 枚举；'
                                '定位器使用页面中的完整可访问名称；保留用户要求的刷新后断言，并提供独立回归场景。'},
                 validate_output=lambda candidate: validate_spec_observation(candidate, observation))
@@ -620,12 +730,14 @@ class Engine:
         image = (self.artifacts.read(s.scope_id, s.run_id, obs['screenshot_ref'])
                  if getattr(self.model, 'vision_model', None) else None)
         plan = self.get(s, s.replay_plan_ref) if s.replay_plan_ref else []
-        context = build_context(s, spec.model_dump(), obs, pairs=[{'action': a, 'result': 'see current observation'} for a in plan[-4:]])
+        context = build_context(s, spec.model_dump(), obs, pairs=[{'action': a, 'result': 'see current observation'} for a in plan[-4:]],
+                                rules=self.active_rules(s, str(Phase.EXPLORE)))
         context['reference_documents'] = await select_documents(self, s, obs)
         context['instruction'] = '每次只请求一个浏览器动作，并等待最新观测。必须匹配当前 observation_id 和 element_ref。完成请求的交互后使用 finish；它只是请求运行时执行确定性断言检查。'
         decision = await self.model_call(s, Decision, context, image=image)
-        decision.evidence_refs = normalize_decision_evidence_refs(
+        self.validate_rule_refs(s, decision.rule_refs)
         obs = self.get(s, s.observation_ref)
+        decision.evidence_refs = normalize_decision_evidence_refs(
             decision.evidence_refs, s.evidence_refs, s.observation_ref, obs)
         self.browser.policy.browser(s, decision.action, spec, obs)
         canonical = decision.action.model_copy(update={'observation_id': None, 'element_ref': None})
@@ -716,7 +828,20 @@ class Engine:
         # Authorized current file reads validate retrieved cards and provide before_hash.
         preferred = [json.loads(card['content']).get('path') for card in code if card.get('content', '').startswith('{')]
         cards = self.workspace.cards(preferred_paths=preferred)
-        context = build_context(s, self.spec(s).model_dump(), cards=cards)
+        if self.rule_library and self.rule_resolver:
+            files = []
+            for path in self.workspace.files():
+                try:
+                    files.append((path, self.workspace.read(path)))
+                except (OSError, PermissionError, ValueError):
+                    continue
+            for rule in self.active_rules(s, str(Phase.DIAGNOSE)):
+                for finding in evaluate_static(rule, files, job_id=s.run_id, run_id=s.run_id):
+                    saved = self.rule_library.save_finding(finding)
+                    self.event(s, 'finding.created', {'finding_id': saved.id, 'rule_id': saved.rule_id,
+                                                     'rule_version': saved.rule_version, 'source': 'static'})
+        context = build_context(s, self.spec(s).model_dump(), cards=cards,
+                                rules=self.active_rules(s, str(Phase.DIAGNOSE)))
         context['reference_documents'] = await select_documents(self, s)
         context.update(instruction='请诊断并返回最小化的完整文件替换内容。只能编辑当前允许的文件。引用已有证据；每个 before_hash 必须匹配已提供的文件。',
                        allowed_files=self.workspace.allowed_files, repair_memory=recipes, retrieval_ids=[x['id'] for x in code],
@@ -732,6 +857,7 @@ class Engine:
             context['read_only_investigation'] = result.model_dump()
             self.event(s, 'subtask.completed', {'artifact_ref': worker_ref})
         patch = await self.model_call(s, PatchProposal, context)
+        self.validate_rule_refs(s, patch.rule_refs)
         if not set(patch.evidence_refs) <= set(s.evidence_refs):
             raise ValueError('补丁引用了不存在的证据')
         ref = self.put(s, patch.model_dump(), name='补丁方案')
@@ -794,7 +920,12 @@ class Engine:
             return self.output(self.changed(s, validation_index=s.validation_index+1), 'prelude')
         vals = [Validation(**self.get(s, r)) for r in s.validation_refs]
         if not verification_gate(s, vals, lambda ref: self.bundle_exists(s, ref)):
-            raise ValueError('确定性验证门禁拒绝了该证据')
+            s = self.changed(s, phase=Phase.VERIFY, validation_index=0, replay_index=0,
+                             validation_refs=[], error='确定性验证门禁拒绝了该证据',
+                             error_details={'feedback': '验证证据已失效，从第一项重新验证'})
+            self.event(s, 'run.error', {'error': s.error, 'error_details': s.error_details,
+                                        'action': '从第一项重新验证'})
+            return self.output(s, 'prelude')
         approval = self.store.approval(s, {'action': 'local_commit', 'branch': 'tracefix/'+s.run_id})
         s = self.changed(s, phase=Phase.REVIEW, outcome=Outcome.FIX_VERIFIED,
                          approval_ref=approval, run_status=RunStatus.WAITING_APPROVAL)

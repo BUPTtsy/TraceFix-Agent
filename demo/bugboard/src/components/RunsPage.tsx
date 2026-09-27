@@ -1,5 +1,5 @@
 import {useEffect, useState} from 'react';
-import {artifactUrl, continueRun, loadRun, loadRunTrace, Run, TraceEvent} from '../api';
+import {artifactUrl, continueRun, deriveRun, DetectionRule, loadRun, loadRules, loadRunTrace, Run, TraceEvent} from '../api';
 import {eventLabel, outcomeLabel, phaseLabel, serviceLabel} from '../presentation';
 
 const statuses: Record<string, string> = {idle: '空闲', running: '运行中', completed: '已结束', abnormal: '异常结束', failed: '失败', cancelled: '已停止', paused: '已暂停', waiting_input: '等待输入', waiting_approval: '等待审批', stopping: '停止中'};
@@ -11,17 +11,28 @@ export function RunList({runs, onSelect, selectedId}: {runs: Run[]; onSelect: (r
 interface Props {runs: Run[]; selectedId: string; onSelect: (id: string) => void; onDocument: (id: string) => void; onCapture: (run: Run) => void; report: (error: unknown) => void}
 export function RunsPage({runs, selectedId, onSelect, onDocument, onCapture, report}: Props) {
   const [query, setQuery] = useState(''), [status, setStatus] = useState(''), [detail, setDetail] = useState<Run | null>(null);
-  const [loading, setLoading] = useState(false), [continuing, setContinuing] = useState(false);
+  const [loading, setLoading] = useState(false), [continuing, setContinuing] = useState(false), [deriving, setDeriving] = useState(false);
   const [instruction, setInstruction] = useState(''), [trace, setTrace] = useState<TraceEvent[]>([]);
+  const [ruleOptions, setRuleOptions] = useState<DetectionRule[]>([]), [additionalRuleIds, setAdditionalRuleIds] = useState<string[]>([]), [deriveGoal, setDeriveGoal] = useState('');
   useEffect(() => {
     if (!selectedId) {setDetail(null); setTrace([]); return;}
     let active = true, timer: number;
-    setDetail(null); setLoading(true); setInstruction(''); setTrace([]);
+    let loadedRules = false;
+    setDetail(null); setLoading(true); setInstruction(''); setTrace([]); setRuleOptions([]); setAdditionalRuleIds([]); setDeriveGoal('');
     let lastSequence = 0;
     async function poll() {
       try {
         const [record, events] = await Promise.all([loadRun(selectedId), loadRunTrace(selectedId, lastSequence)]);
-        if (active) {setDetail(record); setTrace(previous => [...previous, ...events]); if (events.length) lastSequence = events[events.length - 1].seq;}
+        if (active) {
+          setDetail(record); setTrace(previous => [...previous, ...events]);
+          if (!loadedRules) {
+            loadedRules = true;
+            loadRules(record.projectId).then(items => {
+              if (active) setRuleOptions(items.filter(rule => rule.status === 'enabled' || rule.status === 'draft'));
+            }).catch(error => {loadedRules = false; if (active) report(error);});
+          }
+          if (events.length) lastSequence = events[events.length - 1].seq;
+        }
       }
       catch (error) {if (active) report(error);}
       finally {if (active) {setLoading(false); timer = window.setTimeout(poll, 2500);}}
@@ -40,6 +51,13 @@ export function RunsPage({runs, selectedId, onSelect, onDocument, onCapture, rep
       }}><label htmlFor="continue-instruction">继续此任务</label><textarea id="continue-instruction" value={instruction} onChange={event => setInstruction(event.target.value)} maxLength={4000} required placeholder="输入补充指令，将在当前任务中继续执行…"/><button className="primary" disabled={continuing || !instruction.trim()}>{continuing ? '启动中…' : '继续执行'}</button></form>}
       {!!detail.continuationMarkers?.length && <details><summary>非成功结束与继续执行标记</summary>{detail.continuationMarkers.map((marker, index) => <div className="knowledge-use" key={index}><strong>第 {index + 1} 次继续 · {timeLabel(marker.at)}</strong><p>此前状态：{statusLabel(marker.previous_status.toLowerCase())} · {marker.previous_error || '未记录错误'}</p><p>{marker.instruction}</p></div>)}</details>}
       <h3>任务轨迹</h3><div className="task-trace">{trace.map(event => <details className="knowledge-use" key={event.seq} open={event.type.startsWith('run.continu')}><summary>#{event.seq} · {phaseLabel(event.phase)} · {eventLabel(event.type)}</summary><pre className="log-view">{JSON.stringify(event.payload, null, 2)}</pre></details>)}</div>{!trace.length && <p className="muted">尚无已记录的轨迹事件</p>}
+      <h3>本次规则快照</h3>
+      {detail.ruleSnapshot ? <div className="knowledge-use"><p>{detail.ruleSnapshot.refs.length} 条规则 · 派生 Run 保留以下版本</p>{detail.ruleSnapshot.refs.map(ref => <div key={ref.id}>{ref.id} · v{ref.version}</div>)}{detail.parentRunId && <p>父 Run：{detail.parentRunId}</p>}</div> : <p className="muted">尚未生成规则快照，暂时不能派生 Run。</p>}
+      {detail.ruleSnapshot && detail.status !== 'running' && detail.status !== 'stopping' && <form className="derive-run-form" onSubmit={async event => {
+        event.preventDefault(); if (deriving) return; setDeriving(true);
+        try {const created = await deriveRun(detail.id, additionalRuleIds, deriveGoal.trim() || detail.goal); if (created.id) onSelect(created.id); setDeriveGoal(''); setAdditionalRuleIds([]);}
+        catch (error) {report(error);} finally {setDeriving(false);}
+      }}><label htmlFor="derive-goal">派生 Run 目标</label><textarea id="derive-goal" value={deriveGoal} onChange={event => setDeriveGoal(event.target.value)} maxLength={4000} placeholder="默认沿用父 Run 目标；可填写本次派生 Run 的补充目标"/><fieldset><legend>追加检测规则（父 Run 规则会自动继承）</legend><div className="derive-rule-list">{ruleOptions.filter(rule => !detail.ruleSnapshot?.refs.some(ref => ref.id === rule.id)).length ? ruleOptions.filter(rule => !detail.ruleSnapshot?.refs.some(ref => ref.id === rule.id)).map(rule => <label key={rule.id}><input type="checkbox" checked={additionalRuleIds.includes(rule.id)} onChange={event => setAdditionalRuleIds(previous => event.target.checked ? [...previous, rule.id] : previous.filter(id => id !== rule.id))}/><span>{rule.name}<small>{rule.id} · v{rule.version}</small></span></label>) : <span className="muted">暂无可追加的已启用规则或草稿</span>}</div></fieldset><button className="primary" disabled={deriving}>{deriving ? '启动中…' : '创建派生 Run'}</button></form>}
     </section>}
     {detail && <section className="card run-detail"><div className="section-heading"><div><span className="eyebrow">RUN DETAIL</span><h2>{detail.goal}</h2><p>{detail.agentRunId || detail.id}</p></div><button className="secondary" onClick={() => onCapture(detail)}>沉淀为知识</button></div>{detail.timeSource && <div className="notice">此记录导入自历史报告，未记录的服务模式与启动时间不作推断。</div>}<dl><dt>执行状态</dt><dd>{statusLabel(detail.status)} · {phaseLabel(detail.phase)}</dd><dt>验证结论</dt><dd>{detail.outcome ? outcomeLabel(detail.outcome) : '尚未生成验证结论'}</dd><dt>{detail.timeSource ? '报告文件时间' : '开始 / 结束'}</dt><dd>{detail.timeSource ? timeLabel(detail.finishedAt) : `${timeLabel(detail.startedAt)} / ${timeLabel(detail.finishedAt)}`}</dd><dt>退出码</dt><dd>{detail.exitCode ?? (detail.timeSource ? '历史未记录' : '进程尚未退出')}</dd><dt>工作分支</dt><dd>{detail.branch || '尚未生成候选分支'}</dd></dl>{detail.error && <div className="notice failure">{detail.error}</div>}
       <div className="detail-block"><h3>使用的知识来源</h3>{detail.knowledge.length ? detail.knowledge.map((entry, index) => <div className="knowledge-use" key={index}><span className="badge">{phaseLabel(entry.phase)}</span><p>检索：{entry.queries.join(' · ') || 'Agent 未请求检索'}</p><div className="source-links">{entry.documents.length ? entry.documents.map(document => <button key={document.id} onClick={() => onDocument(document.id)}>▤ {document.title} · v{document.version}</button>) : <span className="muted">未选择相关文档</span>}</div></div>) : <p className="muted">尚无知识检索记录。Agent 会在测试规划、探索或诊断阶段按需检索。</p>}</div>

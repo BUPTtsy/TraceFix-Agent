@@ -2,16 +2,18 @@ import {useCallback, useEffect, useState} from 'react';
 import {AgentStatus, DocumentDraft, loadAgentStatus, loadProjects, loadRuns, Project, Run} from './api';
 import {AgentDock} from './components/AgentDock';
 import {KnowledgePage} from './components/KnowledgePage';
+import {RulesPage} from './components/RulesPage';
 import {RunList, RunsPage, statusLabel} from './components/RunsPage';
 import {outcomeLabel, serviceLabel} from './presentation';
 import './style.css';
 
-type Page = 'overview' | 'runs' | 'projects' | 'knowledge';
+type Page = 'overview' | 'runs' | 'projects' | 'knowledge' | 'rules';
 const pages: {id: Page; label: string; icon: string; subtitle: string}[] = [
   {id: 'overview', label: '总览', icon: '◈', subtitle: '从一个目标开始，让每次验证与修复都有迹可循。'},
   {id: 'runs', label: '运行记录', icon: '⌁', subtitle: '查看真实的执行阶段、结果、日志与候选补丁。'},
   {id: 'projects', label: '项目空间', icon: '▱', subtitle: '管理目标项目的运行入口，连接项目、运行与经验。'},
   {id: 'knowledge', label: '知识库', icon: '▤', subtitle: '把修复方法和测试经验写成文档，让 Agent 在需要时找到它们。'},
+  {id: 'rules', label: '检测规则', icon: '◇', subtitle: '管理确定性检查、引导规则与 Run 级规则快照。'},
 ];
 function currentPage(): Page {return pages.find(page => '#' + page.id === window.location.hash)?.id || 'overview';}
 
@@ -83,6 +85,7 @@ export default function App() {
       {page === 'runs' && <RunsPage runs={scopedRuns} selectedId={selectedRun} onSelect={setSelectedRun} onDocument={openDocument} onCapture={captureExperience} report={report}/>}
       {page === 'projects' && <><div className="project-grid">{projects.map(item => <button key={item.id} className={'card project-card ' + (projectId === item.id ? 'selected' : '')} onClick={() => selectProject(item.id)}><div><span className="project-avatar">{item.id.slice(0, 1).toUpperCase()}</span><span className={'badge ' + (item.ready ? 'success' : 'warning')}>{item.ready ? '配置就绪' : '待配置'}</span></div><h2>{item.id}</h2><p>{item.repoId}</p><code>{item.root}</code><footer><span>{item.runCount} 次运行</span><span>{item.documentCount} 篇文档</span></footer></button>)}</div>{project && <section className="card project-detail"><div className="section-heading"><div><h2>{project.id} 的运行配置</h2><p>读取已注册仓库及其实际 Profile</p></div><span className="badge">{project.repoId}</span></div>{project.issue && <div className="notice">{project.issue}</div>}<dl><dt>目标目录</dt><dd><code>{project.root}</code></dd><dt>Profile</dt><dd><code>{project.profile || '缺失'}</code></dd><dt>测试地址</dt><dd>{project.url || '未配置'}</dd><dt>允许修改</dt><dd>{project.allowedFiles.join(' · ')}</dd></dl><div className="command-list">{Object.entries(project.commands).map(([name, command]) => <div key={name}><span>{name}</span><code>{command.join(' ')}</code></div>)}</div><div className="button-row"><button className="primary" onClick={() => navigate('runs')}>查看项目运行</button><button className="secondary" onClick={() => navigate('knowledge')}>查看项目知识</button></div></section>}<div className="notice">添加项目：在 profiles/projects.yaml 注册独立仓库，在同目录添加 project 字段匹配的 Profile。控制台自动同步配置；右侧 Test／Repair 使用当前项目启动 Agent。</div></>}
       {page === 'knowledge' && <KnowledgePage key={projectId} projectId={projectId} projects={projects} documentId={documentId} documentRequest={documentRequest} initialDraft={documentDraft} onDirty={setDirty} onSaved={() => {setDocumentDraft(null); refreshProjects().catch(report);}} onRun={id => {setSelectedRun(id); navigate('runs');}} report={report}/>}
+      {page === 'rules' && <RulesPage key={projectId} projectId={projectId} report={report}/>}
       <footer className="page-footer"><span>TRACEFIX · Evidence before confidence</span><span>{syncedAt ? `上次同步 ${syncedAt}` : '等待首次同步'}{agent.running && ` · ${statusLabel(agent.status || 'running')}`}</span></footer>
     </main>
     <AgentDock project={project} agent={agent} onStarted={status => {setAgent(status); if (status.id) setSelectedRun(status.id);}} onRun={() => {if (agent.projectId && !selectProject(agent.projectId)) return; if (agent.id) setSelectedRun(agent.id); navigate('runs');}} onDocument={openDocument} report={report}/>

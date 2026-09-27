@@ -113,8 +113,11 @@ let goal = option('goal');
 let activeAgent: ReturnType<typeof spawn> | null = null;
 const chatHistory = new Map<string, Array<{role: string; content: string}>>();
 const sessionRemote = new Map<string, Record<string, any>>();
-const agentEnvironment = () => sessionRemote.has(projectId) ?
-  {TRACEFIX_SESSION_REMOTE: JSON.stringify(sessionRemote.get(projectId))} : {};
+const agentEnvironment = () => ({
+  TRACEFIX_CONSOLE_DB: path.resolve(databasePath),
+  TRACEFIX_DATA: path.resolve(dataRoot),
+  ...(sessionRemote.has(projectId) ? {TRACEFIX_SESSION_REMOTE: JSON.stringify(sessionRemote.get(projectId))} : {}),
+});
 
 function interactiveAgent(args: string[], environment: Record<string, string>, recordId: string, commands: string[]): void {
   if (activeAgent) throw new DataError('已有 Agent Run 正在执行');
@@ -325,11 +328,15 @@ async function execute(text: string): Promise<boolean> {
 }
 
 async function startRun(interactive = false): Promise<void> {
+  if (activeAgent) throw new DataError('已有 Agent Run 正在执行');
   if (!goal.trim()) throw new DataError('先输入目标，再输入 /run');
   if (mode === 'chat') { await execute('/chat ' + JSON.stringify(goal)); return; }
-  const record = dispatch('run.create', {projectId, goal, mode});
+  const additionalRuleIds = cliArgs.flatMap((argument, index) => argument === '--rule' ? [cliArgs[index + 1]] : []);
+  const record = dispatch('run.create', {projectId, goal, mode, parentRunId: option('parent-run') || undefined, additionalRuleIds});
   dispatch('run.update', {id: record.id, changes: {origin: 'cli'}});
   const args = ['--project', projectId, '--projects', projectsPath, '--data', dataRoot, '--mode', mode,
+    ...(record.parentRunId ? ['--parent-run', record.parentRunId] : []),
+    ...record.additionalRuleIds.flatMap((id: string) => ['--rule', id]),
     ...(option('spec') ? ['--spec', option('spec')] : [])];
   if (interactive) {
     interactiveAgent(args, {...agentEnvironment(), TRACEFIX_CONSOLE_RUN_ID: record.id}, record.id, [goal, '/run']);
@@ -341,6 +348,7 @@ async function startRun(interactive = false): Promise<void> {
 }
 
 async function continueRun(id: string, instruction: string, interactive = false): Promise<void> {
+  if (activeAgent) throw new DataError('已有 Agent Run 正在执行');
   if (!id || !instruction.trim()) throw new DataError('用法：/continue RUN_ID INSTRUCTION');
   const run = findRun(id);
   const record = dispatch('run.continue', {id: run.id, instruction});

@@ -39,6 +39,7 @@ export class ConsoleDatabase {
   constructor(readonly filename: string) {
     fs.mkdirSync(path.dirname(filename), {recursive: true});
     this.db = new DatabaseSync(filename, {timeout: 15000});
+    this.db.exec('PRAGMA busy_timeout=15000');
     this.db.exec('CREATE TABLE IF NOT EXISTS documents (id TEXT PRIMARY KEY, data TEXT NOT NULL)');
     this.db.exec('CREATE TABLE IF NOT EXISTS console_runs (id TEXT PRIMARY KEY, data TEXT NOT NULL)');
     this.db.exec('CREATE TABLE IF NOT EXISTS console_events (run_id TEXT, seq INTEGER, event_key TEXT, data TEXT NOT NULL, PRIMARY KEY (run_id, seq), UNIQUE (run_id, event_key))');

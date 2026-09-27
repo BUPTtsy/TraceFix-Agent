@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 import sys
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
 
 from tracefix.cli.registry import COMMANDS, parse
@@ -28,6 +28,7 @@ from tracefix.messages import ChineseArgumentParser, error_message
 from tracefix.runtime.contracts import Phase, RunState, RunStatus, TestSpec, digest, new_id
 from tracefix.runtime.engine import Engine
 from tracefix.runtime.continuation import continuation_state
+from tracefix.rules import RuleLibrary, RuleResolver
 from tracefix.remote import RemoteConfigStore, effective, prepare_checkout
 from tracefix.storage.artifacts import Artifacts, redact, sanitize
 from tracefix.storage.presentation import label
@@ -55,8 +56,11 @@ class Session:
         self.chat_history = {}
         self.continuation_parent = None
         self.continuation_instruction = None
+        self.parent_run_id = getattr(args, 'parent_run', None)
+        self.additional_rule_ids = list(getattr(args, 'rule', None) or [])
         self.remote_store = RemoteConfigStore(Path(args.data) / 'remote-config.json')
-        self.session_remote = {}
+        session_remote = os.getenv('TRACEFIX_SESSION_REMOTE')
+        self.session_remote = {self.scope: json.loads(session_remote)} if session_remote else {}
 
     def remote_snapshot(self):
         project = self.remote_store.get(self.scope)
@@ -145,6 +149,10 @@ class Session:
         if self.continuation_parent:
             fields['parentRunId'] = self.continuation_parent
             fields['continuationInstruction'] = self.continuation_instruction
+        if self.parent_run_id:
+            fields['parentRunId'] = self.parent_run_id
+        if self.additional_rule_ids:
+            fields['additionalRuleIds'] = self.additional_rule_ids
         self.documents.update_run(self.console_run_id, redact(fields), create=True)
 
     def publish_console(self, event=None, error=None):
@@ -282,9 +290,9 @@ class Session:
         Policy(profile.allowed_origins).url(url)
         if state is None:
             state = RunState(scope_id=self.scope, goal=self.goal, url=url, mode=self.mode,
-                             parent_run_id=self.continuation_parent,
+                             parent_run_id=self.continuation_parent or self.parent_run_id,
                              continuation_instruction=self.continuation_instruction,
-                             remote_config=remote)
+                             remote_config=remote, additional_rule_ids=self.additional_rule_ids)
             record = self.documents.run(self.console_run_id)
             state.continuation_markers = record.get('continuationMarkers', [])
             state.continuation_count = len(state.continuation_markers)
@@ -338,12 +346,15 @@ class Session:
         if os.getenv('TRACEFIX_EMBEDDING_URL'):
             embedding = EmbeddingAdapter(os.environ['TRACEFIX_EMBEDDING_URL'], os.environ['TRACEFIX_EMBEDDING_REVISION'])
         retriever = Retriever(self.store, self.scopes, self.ctx, embedding)
+        rule_library = RuleLibrary(self.documents.path)
+        rule_resolver = RuleResolver(rule_library)
         student = None
         if os.getenv('TRACEFIX_STUDENT_URL'):
             student = Gateway(base_url=os.environ['TRACEFIX_STUDENT_URL'], key=os.getenv('TRACEFIX_STUDENT_KEY','local'),
                               text_model=os.environ['TRACEFIX_STUDENT_MODEL'], vision_model=os.environ['TRACEFIX_STUDENT_MODEL'])
         self.engine = Engine(self.store, self.artifacts, self.scopes, self.ctx, profile, workspace,
-            runner, browser, BrowserPolicyRouter(Gateway(), student), retriever, source, self.saver, self.notify)
+            runner, browser, BrowserPolicyRouter(Gateway(), student), retriever, source, self.saver, self.notify,
+            rule_resolver=rule_resolver, rule_library=rule_library)
         self.engine.documents = self.documents
         self.engine.current_run = state.run_id
         self.run_id = state.run_id
@@ -570,7 +581,7 @@ class Session:
         interactive = terminal and not self.render.plain
         generation=-1
         self.render.welcome(self.scope, self.mode, os.getenv('TRACEFIX_TEXT_MODEL', ''))
-        with patch_stdout(raw=True):
+        with patch_stdout(raw=True) if terminal else nullcontext():
             while True:
                 if interactive and generation!=self.history_generation:
                     history=Path(self.args.data)/'history'/self.scope
@@ -643,6 +654,8 @@ def main():
     execution.add_argument('--command',action='append',help='执行斜杠命令后退出；可重复指定，知识管理无需启动后端')
     execution.add_argument('--continue-run', help='继续原任务，保留任务 ID 和完整轨迹')
     parser.add_argument('--instruction', default='', help='本次继续执行的指令')
+    parser.add_argument('--parent-run', default=None, help='派生自指定 Run；继承其规则快照')
+    parser.add_argument('--rule', action='append', default=[], help='派生 Run 追加规则 ID；可重复指定')
     parser.add_argument('--doctor',action='store_true')
     parser.add_argument('--preview',action='store_true',help='离线界面预览；使用明确标记的演示数据，不连接外部服务')
     parser.add_argument('--smoke',action='store_true',help='显式使用 Fake 模型/工具的 CI Smoke 测试')
