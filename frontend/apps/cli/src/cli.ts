@@ -6,6 +6,10 @@ import {fileURLToPath} from 'node:url';
 import {createConsoleService} from '@tracefix/console-service/dispatch';
 import {DataError} from '@tracefix/console-service/database';
 import {configureProject, createProject} from '@tracefix/console-service/config';
+import {capabilities, palette} from './terminal.js';
+import {LineEditor} from './editor.js';
+import {banner, help as helpLines, PLAIN_HELP} from './render.js';
+import {suggest} from './registry.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..');
 process.chdir(root);
@@ -47,9 +51,21 @@ function argumentsOf(args: string[]): {options: Record<string, string | boolean>
   return {options, positionals};
 }
 
+/**
+ * 交互期间的行编辑器。非 TTY 路径下始终为 null，
+ * 因此 print / 错误输出与改造前完全一致（纯文本、直写 stdout）。
+ */
+let editor: LineEditor | null = null;
+
+/** 输出前先擦掉输入行，输出后重绘，避免流式输出冲掉用户正在敲的内容。 */
+function emit(write: () => void): void {
+  if (editor) editor.external(write);
+  else write();
+}
+
 function print(value: any): void {
-  if (typeof value === 'string') process.stdout.write(value + '\n');
-  else process.stdout.write(JSON.stringify(value, null, 2) + '\n');
+  const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  emit(() => process.stdout.write(text + '\n'));
 }
 
 function pythonCommand(): [string, string[]] {
@@ -107,6 +123,8 @@ const projectsPath = option('projects', process.env.TRACEFIX_PROJECTS || 'profil
 const dataRoot = option('data', process.env.TRACEFIX_DATA || '.tracefix');
 const databasePath = option('console-db', process.env.TRACEFIX_CONSOLE_DB || path.join(dataRoot, 'console.sqlite3'));
 const dispatch = createConsoleService({projectsPath, dataRoot, databasePath});
+const terminal = capabilities();
+const colors = palette(terminal.color);
 let projectId = option('project', 'bugboard');
 let mode = option('mode', 'test');
 let goal = option('goal');
@@ -126,15 +144,15 @@ function interactiveAgent(args: string[], environment: Record<string, string>, r
     cwd: root, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env: {...process.env, ...environment},
   });
   activeAgent = child;
-  child.stdout?.on('data', chunk => process.stdout.write(chunk));
-  child.stderr?.on('data', chunk => process.stderr.write(chunk));
-  child.stdin?.on('error', error => process.stderr.write(error.message + '\n'));
-  child.once('error', error => process.stderr.write(error.message + '\n'));
+  child.stdout?.on('data', chunk => emit(() => process.stdout.write(chunk)));
+  child.stderr?.on('data', chunk => emit(() => process.stderr.write(chunk)));
+  child.stdin?.on('error', error => emit(() => process.stderr.write(error.message + '\n')));
+  child.once('error', error => emit(() => process.stderr.write(error.message + '\n')));
   child.once('close', code => {
     activeAgent = null;
     if (code && cliArgs.includes('--command')) process.exitCode = code;
     try { dispatch('run.ended', {id: recordId, exitCode: code}); }
-    catch (error) { process.stderr.write(String(error) + '\n'); }
+    catch (error) { emit(() => process.stderr.write(String(error) + '\n')); }
   });
   for (const command of commands) child.stdin?.write(command + '\n');
   const monitor = setInterval(() => {
@@ -159,14 +177,24 @@ function findRun(id: string): any {
 async function execute(text: string): Promise<boolean> {
   const args = tokens(text.trim());
   if (!args.length) return true;
-  if (!args[0].startsWith('/')) { goal = text.trim(); print('目标已记录。输入 /run 开始。'); return true; }
+  if (!args[0].startsWith('/')) {
+    goal = text.trim();
+    // 非交互路径保持原样的一行文本；交互下额外回显记录到的目标。
+    if (editor) {
+      print(colors.grey('目标已记录：') + colors.bold(goal));
+      print(colors.grey('输入 ') + colors.bold('/run') + colors.grey(' 开始，或 ') +
+        colors.bold('/mode') + colors.grey(' 切换模式。'));
+    } else print('目标已记录。输入 /run 开始。');
+    return true;
+  }
   const command = args.shift()!.slice(1);
   const {options, positionals} = argumentsOf(args);
   if (command === 'quit') { if (activeAgent) activeAgent.stdin?.write('/quit\n'); return false; }
   if (command === 'help') {
-    print('/projects list|show|use  /knowledge list|show|search|new|import|edit|enable|disable|export');
-    print('/runs list|show|logs|trace|sources|export|remember|continue  /remote show|set|clear');
-    print('/mode test|repair|chat  /run  /continue  /status  /chat  /resume  /approve  /reject  /quit');
+    // 只有真正的交互会话（editor 已启动）才用分组帮助；
+    // --command / 管道等非交互路径保持改造前的三行纯文本。
+    const lines = editor ? helpLines(colors, process.stdout.columns || terminal.columns) : PLAIN_HELP;
+    for (const line of lines) print(line);
     return true;
   }
   if (command === 'mode') { if (!['test', 'repair', 'chat'].includes(positionals[0])) throw new DataError('用法：/mode test|repair|chat');
@@ -324,6 +352,11 @@ async function execute(text: string): Promise<boolean> {
     print(answer);
     return true;
   }
+  // 交互下额外给出最接近的命令建议；错误消息本身保持原文不变。
+  if (editor) {
+    const near = suggest(command);
+    if (near.length) print(colors.grey('最接近的命令：') + near.map(name => colors.cyan('/' + name)).join(colors.grey('、')));
+  }
   throw new DataError('未知命令；请输入 /help 查看帮助');
 }
 
@@ -375,6 +408,12 @@ async function main(): Promise<void> {
   if (cliArgs.includes('--run')) { await startRun(); return; }
   if (cliArgs.includes('--continue-run')) { await continueRun(option('continue-run'), option('instruction')); return; }
   if (commands.length) { for (const command of commands) await execute(command); return; }
+  if (terminal.rich) return interactive();
+  return basic();
+}
+
+/** 改造前的朴素交互路径：非 TTY、NO_COLOR、TERM=dumb 时使用，输出逐字保持原样。 */
+async function basic(): Promise<void> {
   const input = readline.createInterface({input: process.stdin, output: process.stdout});
   print(`TraceFix · ${projectId} · ${mode} · 输入 /help 查看命令`);
   try {
@@ -385,6 +424,37 @@ async function main(): Promise<void> {
       catch (error) { process.stderr.write((error instanceof Error ? error.message : String(error)) + '\n'); }
     }
   } finally { input.close(); }
+}
+
+/** TTY 交互路径：横幅、状态行、斜杠菜单、行编辑与历史。 */
+async function interactive(): Promise<void> {
+  const session = new LineEditor(terminal, colors,
+    {projectId: () => projectId, mode: () => mode, running: () => Boolean(activeAgent), goal: () => goal},
+    {interrupt: () => {
+      if (!activeAgent) return false;
+      activeAgent.stdin?.write('/interrupt\n');
+      return true;
+    }},
+    dataRoot);
+  editor = session;
+  for (const line of banner({projectId, mode, node: process.version, version: '0.1.1'}, colors, terminal.columns)) {
+    process.stdout.write(line + '\n');
+  }
+  session.start();
+  try {
+    while (true) {
+      const line = await session.read();
+      if (line === null) break;
+      try { if (!await execute(line)) break; }
+      catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        session.external(() => process.stderr.write(colors.red(message) + '\n'));
+      }
+    }
+  } finally {
+    session.stop();
+    editor = null;
+  }
 }
 
 main().catch(error => { process.stderr.write((error instanceof Error ? error.message : String(error)) + '\n'); process.exitCode = 2; });
