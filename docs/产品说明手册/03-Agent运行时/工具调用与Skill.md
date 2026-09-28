@@ -12,7 +12,7 @@
 | system 提示 | 安全策略 `POLICY` + 项目 `AGENTS.md` + 本阶段输出规范；区分原生工具交互与最终 JSON | `model/prompts.py:output_instructions` |
 | 浏览器交互 | 校验整个 batch 的函数类型、名称、调用 id、JSON 字符串参数和 schema 后串行执行；下一轮携带配对的 assistant/tool 消息 | `model/gateway.py:Gateway._validated_calls`、`Gateway._completed_history` |
 | 最终输出 | native 下 `Decision.action.kind` / `BrowserAction.kind` 只能为 `finish`；显式 JSON 模式仍返回单个动作。非浏览器契约继续使用 `response_format=json_object` | `model/gateway.py:Gateway.generate` |
-| 重试与防护 | 每个请求最多 `max_attempts` 次（默认 3）；每次逻辑交互最多 `max_tool_rounds` 个工具轮次（默认 8），恢复历史也计入轮次；与 Run 累计用量分开 | `model/gateway.py:Gateway.__init__`、`Gateway.generate` |
+| 重试与防护 | 每个请求最多 `max_attempts` 次（默认 3）；每次逻辑交互最多 `max_tool_rounds` 个工具轮次（默认 40），恢复历史也计入轮次；与 Run 累计用量分开 | `model/gateway.py:Gateway.__init__`、`Gateway.generate` |
 
 当前暴露的工具只有以下 7 个；这些是 TraceFix 的受限函数名，MCP 端可能使用不同名称：
 
@@ -47,18 +47,21 @@
 - 命令：`DockerRunner.command` 只允许执行 Profile 中已审计的命令键（`execution/runner.py:62-66`）。
 - 文件：`Workspace.apply`，带 before_hash 校验和原子写入（`execution/workspace.py:136-154`）。
 
-### 1.2 Skill：只有展示，没有注入
+### 1.2 Skill：渐进式索引、触发与审计
 
-- `backend/skills/` 下有 6 个 SKILL.md：`gui-reproduce`、`frontend-diagnose`、`minimal-patch`、`local-verify`、`report-and-review`、`delegation-readonly`。
-- `SkillCatalog` 能够索引和加载（`knowledge/context.py:39-56`），但全仓唯一的调用点是 `/skills` 展示命令（`cli/main.py:536`）。
-- 引擎、网关、prompts 里都没有引用 Skill 内容。**修改 SKILL.md 不会改变 Agent 行为。**
-- 真正生效的「项目级指令」只有 `AGENTS.md`，它会注入 system prompt（`gateway.py:91-94`）。
+- `backend/skills/` 下提供 13 个中文 SKILL.md，包含前期流程规划、探索/复现、诊断、补丁和验证，以及 React/空状态等具体问题方案。
+- `SkillCatalog.index()` 默认只返回 `name` 和 `description`；`details()` 保留版本、阶段和触发器，`load()` 返回未经截断的完整正文。
+- 引擎按当前阶段、框架、规则类别和文件触发器自动加载正文；规则摘要保留 `category`，缺少源码卡片时用授权工作区文件路径内部匹配；原生工具返回后重新选择 Skill，移除失配正文。
+- `phases` 对齐实际模型调用阶段：补丁在 `DIAGNOSE` 生成，补丁、验证和报告指导在诊断或前期计划中消费；确定性执行阶段不会为了加载 Skill 新增模型调用。
+- 网关 system prompt 只接收当前阶段的名称和描述索引；稳定策略和输出契约位于该索引之前。user context 中的完整 Skill 正文位于动态观测之前，减少相同 Skill 集合下的前缀变化。
+- Run 内首次读取一个版本时记录 `skill.loaded`，并把 `name@version#content_hash` 保存到 `RunState.skills_loaded`；每次模型请求尝试另记 `skills.injected`，以实际请求中的清单关联请求记录、重试和工具轮次。
+- 目录按文件状态缓存完整内容；`load_document()` 返回同次读取的元数据与全文，新增、修改、删除文件会使对应缓存更新。缓存与成本分析见 [Skill 加载与推理成本](Skill加载与推理成本.md)。
 
 ### 1.3 局限
 
 1. 尚无独立的读文件、搜代码或 console 查询工具；模型可请求浏览器观察，并从返回的快照及可用诊断信息继续决策，其他上下文仍由运行时提供。
 2. 浏览器工具串行执行；一次逻辑交互可包含多轮模型请求，但尚无通用并行工具调度。`ReadOnlyWorker.group()` 已实现并发，但未接入主循环（`runtime/worker.py`）。
-3. 原生工具调用与结果已经审计；通用 ToolSpec、代码检索工具、Skill 自动注入及统一训练轨迹导出仍未实现。
+3. 原生工具调用与结果已经审计；通用 ToolSpec、代码检索工具及统一训练轨迹导出仍未实现，Skill 自动注入已接入运行时。
 
 ## 2. 目标设计 📐
 
@@ -139,24 +142,22 @@ DeepSeek 类 Chat Completions tools / tool_calls
 name: react-state-bug-diagnose
 version: 1.2.0
 description: 诊断 React 状态未持久化 / 刷新后丢失类缺陷
-when_to_use: 断言涉及刷新后状态、localStorage、useEffect 依赖
 phases: [DIAGNOSE, PATCH]
 triggers:
   frameworks: [react]
   rule_categories: [functional]
   file_globs: ["src/**/*.tsx"]
 tools_hint: [code.ui_map, code.references, browser.console]
-max_tokens: 1500
 owner: platform-team
 ---
 ```
 
 加载方式采用渐进式披露：
 
-1. **索引层**：system prompt 中只放本阶段可用 Skill 的 `name + when_to_use`，每条不超过 60 token。
+1. **索引层**：system prompt 中只放本阶段可用 Skill 的 `name + description`；`SKILL.md` 只强制要求这两个标准字段，其他字段可选。
 2. **自动加载**：当 `triggers` 与当前上下文匹配（阶段、框架探测结果、命中规则类别、涉及文件）时，由运行时直接注入正文。
-3. **按需加载**：模型调用 `skill.load(name)` 获取正文。
-4. **记录**：每次加载都记录 `skill_name@version + content_hash`，写入 Step，用于复现和训练数据归因。
+3. **按需加载**：运行时调用 `SkillCatalog.load(name, phase)` 获取正文；受信的调用方可通过 `load_skills` 显式请求额外 Skill。
+4. **记录**：`skill.loaded` 和 `RunState.skills_loaded` 记录 Run 内首次加载的版本；`skills.injected` 记录每次请求尝试实际携带的名称、版本、哈希及请求坐标，用于复现和归因。该事件不是供应商接收或成功完成请求的证明。
 
 来源与优先级（同名时后者覆盖前者）：
 

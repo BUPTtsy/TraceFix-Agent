@@ -60,7 +60,7 @@ console / network 是运行时观察流程可收集的诊断信息，不是本�
 
 #### 模型重试与浏览器重连的区别 ✅
 
-- 模型连接失败且请求确定 `not_sent` 时可按退避重试，默认 `max_attempts=3`；耗尽后暂停。安全恢复按 schema 和 `logical_exchange_id` 取回原有 assistant/tool 历史，已完成调用不再执行，历史轮次计入默认 `max_tool_rounds=8`。
+- 模型连接失败且请求确定 `not_sent` 时可按退避重试，默认 `max_attempts=3`；耗尽后暂停。安全恢复按 schema 和 `logical_exchange_id` 取回原有 assistant/tool 历史，已完成调用不再执行，历史轮次计入默认 `max_tool_rounds=40`。
 - 模型读取超时、浏览器动作结果未知或缺少 receipt 时，不能根据模型重试策略重新执行浏览器动作。`UNKNOWN_OPERATION` / `WAITING_NETWORK` 优先进入相应暂停处理，不被循环检测覆盖。
 - MCP 故障仍没有自动 reconnect / replay；`reconnect()` 本身也不重试被打断的动作。需要人工核查的状态会阻止普通 resume。
 

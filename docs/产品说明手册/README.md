@@ -5,7 +5,7 @@ TraceFix 面向 Web GUI，产品目标是「自动化测试 → 缺陷定位 →
 
 ## 当前交付边界（2026-09-25）
 
-- 本次交付对应 `82d74ca`、`f5cc31b`：面向 DeepSeek 类 Chat Completions 服务，浏览器默认使用原生 function tools，经参数校验、运行时 policy 和 MCP 执行；`TRACEFIX_TOOL_MODE=json` 是显式 legacy 配置，没有自动协议回退。通用 ToolSpec 注册表、Skill 注入、Anthropic 原生协议和自动能力矩阵仍未实现。
+- 本次交付对应 `82d74ca`、`f5cc31b`：面向 DeepSeek 类 Chat Completions 服务，浏览器默认使用原生 function tools，经参数校验、运行时 policy 和 MCP 执行；`TRACEFIX_TOOL_MODE=json` 是显式 legacy 配置，没有自动协议回退。Skill 已支持按阶段和触发器渐进式注入；通用 ToolSpec 注册表、Anthropic 原生协议和自动能力矩阵仍未实现。
 - 默认文本模型为 `deepseek-chat`，`TRACEFIX_VISION_MODEL` 为空；只有显式配置视觉模型才向模型发送截图。页面截图仍作为运行证据保存。服务返回的模型响应、工具结果和 usage 会留存；DeepSeek 默认关闭 thinking，不能保证取得 reasoning。
 - Run 累计 `Usage` 只计量；单次请求仍默认最多尝试 3 次，一次工具交互默认最多 8 轮，恢复时已完成轮次继续计数。请求或 MCP 副作用结果不明时暂停核对，不被循环检测覆盖；确定 `not_sent` 的模型请求才可安全恢复对应历史。
 - 本次工作区离线重点测试 **85 项通过**，未完成真实 API + MCP + Docker 端到端验证，也不等同于干净 HEAD checkout 已通过。历史完成度与本次增量见[完成度评估](00-项目进度/完成度评估.md)；内部双模型等长期方案见[内部模型版开发计划](10-开发计划/开发计划与里程碑-内部模型版.md)，仍是规划。
