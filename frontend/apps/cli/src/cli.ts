@@ -278,6 +278,20 @@ async function execute(text: string): Promise<boolean> {
     else if (command === 'context') print({goal: run.goal, phase: run.phase, knowledge: run.knowledge, outcome: run.outcome});
     else if (command === 'model-log') print((run.artifacts || []).filter((item: any) => /模型|请求|响应/.test(item.label)));
     else {
+      if (command === 'report') {
+        if (run.reportError) throw new DataError(run.reportError);
+        if (run.issueReport) {
+          const statuses: Record<string, string> = {suspected: '待确认', confirmed: '已确认', reproduced: '已确认', fixed: '已验证修复', not_reproducible: '未稳定复现', wont_fix: '暂不修复', false_positive: '已判定误报'};
+          print(run.issueReport.summary);
+          run.issueReport.issues.forEach((issue: any, index: number) => {
+            print(`\n${index + 1}. [${statuses[issue.status] || issue.status}] ${issue.title}\n位置：${issue.location}\n预期：${issue.expected}\n实际：${issue.actual}\n复现步骤：`);
+            issue.steps.forEach((step: string, stepIndex: number) => print(`  ${stepIndex + 1}. ${step}`));
+            print(`验证：${issue.verification}\n证据：${issue.evidence_refs.join('、')}`);
+          });
+          print(run.issueReport.coverage);
+          print(run.issueReport.limits);
+        }
+      }
       const artifact = command === 'evidence' ? run.artifacts.find((item: any) => item.ref === positionals[0]) :
         command === 'diff' ? [...run.artifacts].reverse().find((item: any) => item.ref.endsWith('.diff')) :
           run.artifacts.find((item: any) => item.ref === run.reportRef || item.ref.endsWith('.html'));

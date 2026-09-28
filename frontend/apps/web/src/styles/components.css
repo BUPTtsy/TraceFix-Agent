@@ -101,6 +101,171 @@
   border-color: var(--danger-border);
 }
 
+/* ---------- Worker 执行面板 ----------------------------------------------- */
+.worker-panel {
+  padding: var(--card-pad-y) var(--card-pad-x);
+}
+
+.worker-panel-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+.worker-panel-heading h3 {
+  margin-bottom: var(--space-1);
+}
+
+.worker-panel-heading p {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  margin: 0;
+}
+
+.worker-panel-heading > strong {
+  color: var(--accent-text);
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.worker-group + .worker-group {
+  margin-top: var(--space-5);
+}
+
+.worker-group h4 {
+  margin: 0 0 var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+}
+
+.worker-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: var(--space-3);
+}
+
+.worker-card {
+  min-width: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised, var(--surface));
+}
+
+.worker-card.active {
+  border-color: var(--accent-soft);
+  box-shadow: inset 3px 0 var(--accent-text);
+}
+
+.worker-card.history {
+  opacity: 0.88;
+}
+
+.worker-card-heading,
+.worker-role,
+.worker-card-meta,
+.worker-card-footer {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.worker-card-heading {
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.worker-role {
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.worker-role strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.worker-role small {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.worker-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: var(--radius-pill);
+  background: var(--accent-text);
+}
+
+.worker-dot.success { background: var(--success-fg); }
+.worker-dot.warning { background: var(--warning-fg); }
+.worker-dot.failure { background: var(--danger-fg); }
+
+.worker-card-meta {
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--fs-2xs);
+  overflow: hidden;
+}
+
+.worker-card-meta span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.worker-card-meta span + span::before {
+  content: '·';
+  margin-right: var(--space-2);
+  color: var(--border-strong);
+}
+
+.worker-goal,
+.worker-summary {
+  margin: var(--space-2) 0 0;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-snug);
+  overflow-wrap: anywhere;
+}
+
+.worker-goal {
+  color: var(--text-strong);
+}
+
+.worker-summary {
+  color: var(--text-muted);
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-2);
+}
+
+.worker-summary.failure-text {
+  color: var(--danger-fg);
+}
+
+.worker-card-footer {
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--fs-2xs);
+  overflow: hidden;
+}
+
+.worker-card-footer span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ---------- 提示与错误横幅 ----------------------------------------------- */
 
 .error-banner,

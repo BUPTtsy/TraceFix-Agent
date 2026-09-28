@@ -7,7 +7,111 @@ export interface KnowledgeUse {phase: string; queries: string[]; documents: Sour
 export interface Run {id: string; projectId: string; agentRunId?: string; goal: string; mode: Service | 'unknown'; status: string; phase: string; outcome?: string; startedAt: string; finishedAt?: string; timeSource?: string; exitCode?: number; error?: string; branch?: string; continuationCount?: number; abnormalTermination?: boolean; continuationMarkers?: {instruction: string; previous_status: string; previous_error?: string; at: string}[]; knowledge: KnowledgeUse[]; logs?: string[]; artifacts?: {ref: string; label: string; bytes: number}[]}
 export interface AgentStatus extends Partial<Run> {running: boolean}
 export interface TraceEvent {seq: number; agentSeq?: number; type: string; phase: string; at: number; payload: Record<string, unknown>}
+export type WorkerStatus = 'CREATED' | 'QUEUED' | 'RUNNING' | 'RETRYING' | 'SUCCEEDED' | 'PARTIAL' | 'FAILED' | 'CANCELLED' | 'EXPIRED' | string;
+export interface WorkerSnapshot {
+  workerId: string;
+  taskId: string;
+  role: string;
+  roleLabel: string;
+  goal: string;
+  phase: string;
+  status: WorkerStatus;
+  attempt: number;
+  maxAttempts: number;
+  threadId?: string;
+  durationMs?: number;
+  summary?: string;
+  error?: string;
+  result?: unknown;
+  resultRef?: string;
+  active?: boolean;
+  updatedAt?: number;
+  lastEvent?: string;
+  lastSeq?: number;
+}
+export interface WorkerAggregate {
+  workers: WorkerSnapshot[];
+  active: number;
+  maxConcurrency: number;
+}
+
+const workerEventStatus: Record<string, WorkerStatus> = {
+  created: 'CREATED', queued: 'QUEUED', started: 'RUNNING', progress: 'RUNNING',
+  retrying: 'RETRYING', completed: 'SUCCEEDED', partial: 'PARTIAL', failed: 'FAILED',
+  cancelled: 'CANCELLED', canceled: 'CANCELLED', expired: 'EXPIRED',
+};
+const workerStatusAliases: Record<string, WorkerStatus> = {
+  COMPLETED: 'SUCCEEDED', SUCCESS: 'SUCCEEDED', SUCCEEDED: 'SUCCEEDED', DONE: 'SUCCEEDED',
+  CANCELED: 'CANCELLED', CANCELLED: 'CANCELLED', FAILED: 'FAILED',
+};
+const workerTerminalStatuses = new Set(['SUCCEEDED', 'PARTIAL', 'FAILED', 'CANCELLED', 'EXPIRED']);
+const workerActiveStatuses = new Set(['RUNNING', 'RETRYING']);
+const value = (payload: Record<string, unknown>, ...keys: string[]) => {
+  for (const key of keys) if (payload[key] !== undefined && payload[key] !== null) return payload[key];
+  return undefined;
+};
+const stringValue = (payload: Record<string, unknown>, ...keys: string[]) => {
+  const item = value(payload, ...keys);
+  return item === undefined ? '' : String(item);
+};
+const numberValue = (payload: Record<string, unknown>, fallback: number, ...keys: string[]) => {
+  const item = value(payload, ...keys);
+  const parsed = typeof item === 'number' ? item : Number(item);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+/** Fold append-only worker lifecycle events into the latest UI snapshots. */
+export function aggregateWorkers(events: TraceEvent[]): WorkerAggregate {
+  const snapshots = new Map<string, WorkerSnapshot>();
+  let maxConcurrency = 4;
+  for (const event of events) {
+    const kind = event.type.toLowerCase();
+    if (!(kind.startsWith('worker.') || kind.startsWith('subtask.'))) continue;
+    const payload = event.payload || {};
+    maxConcurrency = numberValue(payload, maxConcurrency, 'max_concurrency', 'maxConcurrency', 'worker_limit');
+    const suffix = kind.split('.').pop() || '';
+    const workerId = stringValue(payload, 'worker_id', 'workerId', 'id', 'task_id', 'taskId');
+    if (!workerId || suffix === 'joined') continue;
+    const previous = snapshots.get(workerId);
+    const rawStatus = stringValue(payload, 'status').toUpperCase();
+    const status = workerStatusAliases[rawStatus] || rawStatus || workerEventStatus[suffix] || previous?.status || 'UNKNOWN';
+    const taskId = stringValue(payload, 'task_id', 'taskId') || previous?.taskId || workerId;
+    const role = stringValue(payload, 'role') || previous?.role || 'worker';
+    const roleLabel = stringValue(payload, 'role_label', 'roleLabel') || previous?.roleLabel || role;
+    const goal = stringValue(payload, 'goal', 'task', 'description') || previous?.goal || '';
+    const snapshot: WorkerSnapshot = {
+      workerId,
+      taskId,
+      role,
+      roleLabel,
+      goal,
+      phase: stringValue(payload, 'phase') || previous?.phase || event.phase,
+      status,
+      attempt: numberValue(payload, previous?.attempt || 1, 'attempt', 'try', 'retry'),
+      maxAttempts: numberValue(payload, previous?.maxAttempts || 4, 'max_attempts', 'maxAttempts', 'retry_limit'),
+      threadId: stringValue(payload, 'thread_id', 'threadId', 'thread_name', 'threadName') || previous?.threadId,
+      durationMs: numberValue(payload, previous?.durationMs || 0, 'duration_ms', 'durationMs') || undefined,
+      summary: stringValue(payload, 'summary') || (payload.result && typeof payload.result === 'object' ? stringValue(payload.result as Record<string, unknown>, 'summary') : '') || previous?.summary,
+      error: stringValue(payload, 'error', 'message') || previous?.error,
+      result: value(payload, 'result') ?? previous?.result,
+      resultRef: stringValue(payload, 'result_ref', 'resultRef', 'artifact_ref', 'artifactRef') || previous?.resultRef,
+      active: workerActiveStatuses.has(status),
+      updatedAt: event.at,
+      lastEvent: kind,
+      lastSeq: event.seq,
+    };
+    snapshots.set(workerId, snapshot);
+  }
+  const workers = [...snapshots.values()].sort((a, b) => {
+    const activeDifference = Number(Boolean(b.active)) - Number(Boolean(a.active));
+    return activeDifference || (b.lastSeq || 0) - (a.lastSeq || 0);
+  });
+  const active = workers.filter(worker => worker.active && workerActiveStatuses.has(worker.status)).length;
+  return {workers, active, maxConcurrency};
+}
 export interface Run {canContinue?: boolean}
+export interface ReportIssue {id: string; title: string; source: string; status: string; location: string; expected: string; actual: string; steps: string[]; verification: string; evidence_refs: string[]}
+export interface Run {issueReport?: {summary: string; issues: ReportIssue[]; coverage: string; limits: string} | null; reportError?: string | null}
 export interface Run {parentRunId?: string; additionalRuleIds?: string[]; ruleSnapshot?: {run_id: string; parent_run_id: string | null; snapshot_hash: string; refs: {id: string; version: number}[]} | null}
 export interface KnowledgeDocument {id: string; title: string; content: string; preview?: string; kind: 'repair' | 'testing' | 'experience'; projectId: string | null; tags: string[]; enabled: boolean; version: number; createdAt: string; updatedAt: string; sourceRunId: string | null}
 export type DocumentDraft = Omit<KnowledgeDocument, 'id' | 'createdAt' | 'updatedAt'> & {id?: string};
@@ -16,7 +120,7 @@ export type RuleStatus = 'draft' | 'enabled' | 'disabled' | 'archived';
 export interface DetectionRule {id: string; name: string; version: number; status: RuleStatus; category: string; severity: string; priority: number; pinned: boolean; scope: {level: string; project_ids: string[]; url_patterns: string[]; path_globs: string[]; frameworks: string[]}; phases: string[]; detection: {type: 'oracle' | 'static' | 'guided'; oracle?: Record<string, unknown>; static?: Record<string, unknown>; guided?: Record<string, unknown>}; fix_guidance: string; examples: Record<string, string>; tags: string[]; owner: string; created_at?: string; updated_at?: string}
 export interface RuleVersion {rule_id: string; version: number; body_hash: string; change_note: string; author: string; created_at: string}
 export interface RuleInsight {rule_id: string | null; total: number; reproduced: number; false_positive: number; fixed: number; reproduction_rate: number; false_positive_rate: number; fix_rate: number}
-export interface ChatMessage {role: 'user' | 'assistant'; content: string; sources?: Source[]}
+export interface ChatMessage {role: 'user' | 'assistant'; content: string; reasoning?: string; sources?: Source[]}
 
 async function fetchResponse(url: string, options: RequestInit): Promise<Response> {
   try {return await fetch(url, options);}
@@ -57,9 +161,17 @@ export const loadRuleFindings = (id: string) => request<Array<Record<string, unk
 export const loadRulePreview = (id: string) => request<{prompt: string; items: Array<Record<string, unknown>>; rule_ids: string[]; tokens: number}>(`/api/rules/${encodeURIComponent(id)}/preview`);
 export const artifactUrl = (id: string, ref: string) => `/api/runs/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(ref)}`;
 
-export async function streamChat(message: string, history: ChatMessage[], projectId: string, useKnowledge: boolean, onDelta: (delta: string) => void, onSources: (sources: Source[]) => void) {
+export async function streamChat(message: string, history: ChatMessage[], projectId: string, useKnowledge: boolean, onDelta: (delta: string) => void, onSources: (sources: Source[]) => void, onReasoning?: (delta: string) => void) {
   const response = await fetchResponse('/api/chat', {method: 'POST', headers: {'Content-Type': 'application/json', Accept: 'text/event-stream'}, body: JSON.stringify({message, history: history.map(({role, content}) => ({role, content})), projectId, useKnowledge})});
   if (!response.ok) {const data = await responseJson(response); throw new Error(`对话请求失败（HTTP ${response.status}）${data?.error ? '：' + data.error : ''}`);}
+  if (response.headers.get('content-type')?.includes('application/json')) {
+    const payload = await responseJson(response);
+    if (payload.error) throw new Error(`对话服务返回错误：${payload.error}`);
+    if (payload.sources) onSources(payload.sources);
+    if (payload.reasoning) onReasoning?.(payload.reasoning);
+    if (payload.content) onDelta(payload.content);
+    return;
+  }
   if (!response.body) throw new Error('浏览器不支持流式响应');
   const reader = response.body.getReader(), decoder = new TextDecoder();
   let buffer = '';
@@ -71,6 +183,7 @@ export async function streamChat(message: string, history: ChatMessage[], projec
       for (const event of events) for (const line of event.split(/\r?\n/)) if (line.startsWith('data:')) {
         const payload = JSON.parse(line.slice(5));
         if (payload.error) throw new Error(`对话服务返回错误：${payload.error}`);
+        if (payload.reasoning) onReasoning?.(payload.reasoning);
         if (payload.delta) onDelta(payload.delta);
         if (payload.sources) onSources(payload.sources);
       }

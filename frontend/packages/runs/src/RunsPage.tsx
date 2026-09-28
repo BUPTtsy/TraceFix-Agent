@@ -1,12 +1,48 @@
-import {useEffect, useState} from 'react';
-import {artifactUrl, continueRun, deriveRun, DetectionRule, loadRun, loadRules, loadRunTrace, Run, TraceEvent} from '@tracefix/api-client';
-import {eventLabel, outcomeLabel, phaseLabel, serviceLabel} from '@tracefix/presentation';
+import {useEffect, useMemo, useState} from 'react';
+import {aggregateWorkers, artifactUrl, continueRun, deriveRun, DetectionRule, loadRun, loadRules, loadRunTrace, Run, TraceEvent, WorkerSnapshot} from '@tracefix/api-client';
+import {eventLabel, outcomeLabel, phaseLabel, serviceLabel, workerRoleLabel, workerStatusLabel} from '@tracefix/presentation';
 
 const statuses: Record<string, string> = {idle: '空闲', running: '运行中', completed: '已结束', abnormal: '异常结束', failed: '失败', cancelled: '已停止', paused: '已暂停', waiting_input: '等待输入', waiting_approval: '等待审批', stopping: '停止中'};
+const issueStatuses: Record<string, string> = {suspected: '待确认', confirmed: '已确认', reproduced: '已确认', fixed: '已验证修复', not_reproducible: '未稳定复现', wont_fix: '暂不修复', false_positive: '已判定误报'};
 export const statusLabel = (status: string) => statuses[status.toLowerCase()] || status;
 export const timeLabel = (value?: string) => value ? new Date(value).toLocaleString('zh-CN', {hour12: false}) : '—';
 export function RunList({runs, onSelect, selectedId}: {runs: Run[]; onSelect: (run: Run) => void; selectedId?: string}) {
   return runs.length ? <div className="run-list">{runs.map(run => <button className={'run-row ' + (selectedId === run.id ? 'selected' : '')} key={run.id} onClick={() => onSelect(run)} aria-current={selectedId === run.id ? 'true' : undefined}><span className={'run-symbol ' + run.mode} aria-hidden="true">{run.mode === 'repair' ? '↗' : '✓'}</span><div className="run-copy"><strong>{run.goal}</strong><small>{run.projectId} · {serviceLabel(run.mode)} · {run.timeSource ? '报告时间 ' : ''}{timeLabel(run.startedAt)}</small>{run.abnormalTermination && <small>曾非成功结束 · 已继续 {run.continuationCount || 0} 次</small>}</div><div className="run-state"><span className={'badge ' + (run.status === 'failed' ? 'failure' : run.status === 'running' ? 'success' : '')}>{statusLabel(run.status)}</span><small>{run.outcome ? outcomeLabel(run.outcome) : phaseLabel(run.phase)}</small></div></button>)}</div> : <div className="empty-state"><span aria-hidden="true">⌁</span><h3>还没有运行记录</h3><p>从右侧选择 Test 或 Repair 并启动，实际记录会出现在这里。</p></div>;
+}
+const workerStatusClass = (status: string) => {
+  const normalized = status.toUpperCase();
+  if (normalized === 'SUCCEEDED') return 'success';
+  if (normalized === 'PARTIAL' || normalized === 'RETRYING' || normalized === 'QUEUED') return 'warning';
+  if (normalized === 'FAILED' || normalized === 'CANCELLED' || normalized === 'EXPIRED') return 'failure';
+  return '';
+};
+function WorkerCard({worker}: {worker: WorkerSnapshot}) {
+  const role = workerRoleLabel(worker.roleLabel || worker.role) || 'Worker';
+  const status = workerStatusLabel(worker.status);
+  const summary = worker.summary || worker.error;
+  return <article className={'worker-card ' + (worker.active ? 'active' : 'history')}>
+    <div className="worker-card-heading">
+      <div className="worker-role"><span className={'worker-dot ' + workerStatusClass(worker.status)} aria-hidden="true"/><strong>{role}</strong><small>{worker.workerId}</small></div>
+      <span className={'badge ' + workerStatusClass(worker.status)}>{status}</span>
+    </div>
+    <div className="worker-card-meta"><span>{phaseLabel(worker.phase)}</span><span>任务 {worker.taskId}</span>{worker.threadId && <span>线程 {worker.threadId}</span>}</div>
+    <p className="worker-goal">{worker.goal || '未提供任务描述'}</p>
+    <div className="worker-card-footer"><span>尝试 {worker.attempt}/{worker.maxAttempts}</span>{worker.durationMs !== undefined && <span>{Math.max(0, Math.round(worker.durationMs / 1000))} 秒</span>}{worker.resultRef && <span>结果 {worker.resultRef}</span>}</div>
+    {summary && <p className={'worker-summary ' + (worker.error && !worker.summary ? 'failure-text' : '')}>{summary}</p>}
+  </article>;
+}
+function WorkerPanel({events}: {events: TraceEvent[]}) {
+  const aggregate = useMemo(() => aggregateWorkers(events), [events]);
+  if (!aggregate.workers.length) return null;
+  const activeWorkers = aggregate.workers.filter(worker => ['RUNNING', 'RETRYING'].includes(worker.status.toUpperCase()));
+  const queuedWorkers = aggregate.workers.filter(worker => ['CREATED', 'QUEUED'].includes(worker.status.toUpperCase()));
+  const historyWorkers = aggregate.workers.filter(worker => !activeWorkers.includes(worker) && !queuedWorkers.includes(worker));
+  return <section className="detail-block worker-panel" aria-label="Worker 执行情况">
+    <div className="worker-panel-heading"><div><h3>并发 Workers <span className="count">{aggregate.workers.length}</span></h3><p>动态角色由 Supervisor 派发；读取可并行，写入由运行时互斥。</p></div><strong>{aggregate.active} / {aggregate.maxConcurrency} 活动</strong></div>
+    {activeWorkers.length > 0 && <div className="worker-group"><h4>活动 Worker</h4><div className="worker-list">{activeWorkers.map(worker => <WorkerCard key={worker.workerId} worker={worker}/>)}</div></div>}
+    {queuedWorkers.length > 0 && <div className="worker-group"><h4>排队中</h4><div className="worker-list">{queuedWorkers.map(worker => <WorkerCard key={worker.workerId} worker={worker}/>)}</div></div>}
+    {historyWorkers.length > 0 && <div className="worker-group"><h4>历史结果</h4><div className="worker-list">{historyWorkers.map(worker => <WorkerCard key={worker.workerId} worker={worker}/>)}</div></div>}
+  </section>;
 }
 interface Props {runs: Run[]; selectedId: string; onSelect: (id: string) => void; onDocument: (id: string) => void; onCapture: (run: Run) => void; report: (error: unknown) => void}
 export function RunsPage({runs, selectedId, onSelect, onDocument, onCapture, report}: Props) {
@@ -43,6 +79,18 @@ export function RunsPage({runs, selectedId, onSelect, onDocument, onCapture, rep
   return <><section className="card"><div className="section-heading"><div><h2>Agent Runs <span className="count">{runs.length}</span></h2><p>按项目持久化，页面刷新后仍可追溯</p></div></div><div className="toolbar"><input aria-label="搜索运行记录" placeholder="搜索目标或 Run ID…" value={query} onChange={event => setQuery(event.target.value)}/><select aria-label="运行状态" value={status} onChange={event => setStatus(event.target.value)}><option value="">全部状态</option>{Object.entries(statuses).map(([key, label]) => <option value={key} key={key}>{label}</option>)}</select></div>{runs.length > 0 && !filtered.length ? <div className="empty-state"><span aria-hidden="true">⌕</span><h3>没有匹配的运行记录</h3><p>调整关键词或状态筛选，再看看其他运行。</p></div> : <RunList runs={filtered} onSelect={run => onSelect(run.id)} selectedId={selectedId}/>}</section>
     {loading && <div className="notice" role="status">正在加载运行详情…</div>}
     {detail && <section className="card detail-block continuation-detail">
+      <h3>问题清单</h3>
+      {detail.reportError && <div className="notice failure">{detail.reportError}</div>}
+      {detail.issueReport ? <>
+        <p>{detail.issueReport.summary}</p>
+        {detail.issueReport.issues.map((issue, index) => <article className="knowledge-use" key={issue.id}>
+          <h4>{index + 1}. {issue.title} <span className="badge">{issueStatuses[issue.status] || issue.status}</span></h4>
+          <dl><dt>位置</dt><dd>{issue.location}</dd><dt>预期表现</dt><dd>{issue.expected}</dd><dt>实际表现</dt><dd>{issue.actual}</dd><dt>验证结果</dt><dd>{issue.verification}</dd></dl>
+          <p>复现步骤</p><ol>{issue.steps.map((step, stepIndex) => <li key={stepIndex}>{step}</li>)}</ol>
+          <div className="source-links">{issue.evidence_refs.map(ref => <a href={artifactUrl(detail.id, ref)} key={ref} download>{ref}</a>)}</div>
+        </article>)}
+        <p className="muted">{detail.issueReport.coverage}</p><p className="muted">{detail.issueReport.limits}</p>
+      </> : !detail.reportError && <p className="muted">{['running', 'paused', 'waiting_input', 'waiting_approval', 'stopping'].includes(detail.status) ? '问题报告将在本次执行收尾后生成；检测过程可查看进程日志。' : '此历史运行未记录结构化问题描述，可查看原报告及进程日志。'}</p>}
       {detail.abnormalTermination && <div className="notice warning">此任务曾非成功结束，已继续执行 {detail.continuationCount || 0} 次。此前的轨迹与报告持续保留。</div>}
       {detail.canContinue && <form onSubmit={async event => {
         event.preventDefault(); setContinuing(true);
@@ -50,6 +98,7 @@ export function RunsPage({runs, selectedId, onSelect, onDocument, onCapture, rep
         catch (error) {report(error);} finally {setContinuing(false);}
       }}><label htmlFor="continue-instruction">继续此任务</label><textarea id="continue-instruction" value={instruction} onChange={event => setInstruction(event.target.value)} maxLength={4000} required placeholder="输入补充指令，将在当前任务中继续执行…"/><button className="primary" disabled={continuing || !instruction.trim()}>{continuing ? '启动中…' : '继续执行'}</button></form>}
       {!!detail.continuationMarkers?.length && <details><summary>非成功结束与继续执行标记</summary>{detail.continuationMarkers.map((marker, index) => <div className="knowledge-use" key={index}><strong>第 {index + 1} 次继续 · {timeLabel(marker.at)}</strong><p>此前状态：{statusLabel(marker.previous_status.toLowerCase())} · {marker.previous_error || '未记录错误'}</p><p>{marker.instruction}</p></div>)}</details>}
+      <WorkerPanel events={trace}/>
       <h3>任务轨迹</h3><div className="task-trace">{trace.map(event => <details className="knowledge-use" key={event.seq} open={event.type.startsWith('run.continu')}><summary>#{event.seq} · {phaseLabel(event.phase)} · {eventLabel(event.type)}</summary><pre className="log-view">{JSON.stringify(event.payload, null, 2)}</pre></details>)}</div>{!trace.length && <p className="muted">尚无已记录的轨迹事件</p>}
       <h3>本次规则快照</h3>
       {detail.ruleSnapshot ? <div className="knowledge-use"><p>{detail.ruleSnapshot.refs.length} 条规则 · 派生 Run 保留以下版本</p>{detail.ruleSnapshot.refs.map(ref => <div key={ref.id}>{ref.id} · v{ref.version}</div>)}{detail.parentRunId && <p>父 Run：{detail.parentRunId}</p>}</div> : <p className="muted">尚未生成规则快照，暂时不能派生 Run。</p>}
