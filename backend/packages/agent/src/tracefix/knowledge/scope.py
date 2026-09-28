@@ -1,3 +1,5 @@
+"""项目作用域层级、路径归属和记忆可见性校验。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,6 +12,7 @@ from tracefix.execution.workspace import is_frozen_path
 
 @dataclass(frozen=True)
 class ProjectContext:
+    """记录当前项目及其祖先的版本和访问时代，用于防止权限漂移。"""
     active_scope: str
     ancestors: tuple[str, ...]
     revisions: tuple[tuple[str, int], ...]
@@ -17,11 +20,15 @@ class ProjectContext:
 
     @property
     def readable_scopes(self):
+        """返回当前项目和所有可继承读取的祖先作用域。"""
         return (self.active_scope, *self.ancestors)
 
 
 class ScopeResolver:
+    """解析项目树，并在每次路径或记忆访问前重新确认权限上下文。"""
+
     def __init__(self, projects: dict[str, Project], source_path=None):
+        """校验项目 ID 和根目录唯一性后建立解析器。"""
         self.projects = projects
         self.source_path = source_path
         if len({p.casefold() for p in projects}) != len(projects):
@@ -33,6 +40,7 @@ class ScopeResolver:
             self.context(scope)
 
     def context(self, scope: str) -> ProjectContext:
+        """沿 parent_id 链构造作用域上下文，并检测循环引用。"""
         if scope not in self.projects:
             raise PermissionError("未注册的作用域")
         chain, seen, current = [], {scope}, self.projects[scope].parent_id
@@ -47,6 +55,7 @@ class ScopeResolver:
                               tuple((s, self.projects[s].access_epoch) for s in scopes))
 
     def assert_current(self, ctx: ProjectContext):
+        """确认配置、路径、写入策略和访问时代均未在运行中改变。"""
         if self.source_path:
             from tracefix.config import load_projects
             fresh = ScopeResolver(load_projects(self.source_path))
@@ -64,10 +73,12 @@ class ScopeResolver:
             raise PermissionError("作用域授权已变更；请创建新的 context")
 
     def owner(self, path: Path):
+        """返回包含路径的最具体项目 ID；路径不属于项目时返回 None。"""
         candidates = [p for p in self.projects.values() if path.resolve().is_relative_to(p.root.resolve())]
         return max(candidates, key=lambda p: len(p.root.parts)).id if candidates else None
 
     def path(self, ctx: ProjectContext, relative: str, write=False) -> Path:
+        """解析并授权项目内路径，拒绝越界、链接、受保护目录和未授权写入。"""
         self.assert_current(ctx)
         safe_relative(relative)
         root = self.projects[ctx.active_scope].root.resolve()
@@ -93,6 +104,7 @@ class ScopeResolver:
         return p
 
     def readable_memory(self, item: dict, ctx: ProjectContext, source_revision: str | None = None):
+        """判断记忆是否同时满足可信、作用域、版本和源快照可见性。"""
         self.assert_current(ctx)
         if item["status"] != "trusted":
             return False

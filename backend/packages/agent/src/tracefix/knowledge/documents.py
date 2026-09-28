@@ -1,4 +1,4 @@
-"""Transactional console records and bounded, project-scoped document retrieval."""
+"""事务化控制台记录，以及有界且按项目隔离的文档检索。"""
 import json
 import os
 import re
@@ -13,14 +13,17 @@ from tracefix.storage.artifacts import redact
 
 
 def timestamp():
+    """返回带时区的当前 UTC 时间字符串。"""
     return datetime.now(timezone.utc).isoformat()
 
 
 def database_path():
+    """读取控制台数据库路径配置，缺省使用项目私有目录。"""
     return Path(os.getenv('TRACEFIX_CONSOLE_DB', '.tracefix/console.sqlite3'))
 
 
 def terms(text):
+    """提取拉丁词和中文双字词，用于轻量级本地检索。"""
     result = set(re.findall(r'[a-z0-9_]{2,}', text.lower()))
     for phrase in re.findall(r'[\u4e00-\u9fff]+', text):
         result.update(phrase[index:index + 2] for index in range(max(1, len(phrase) - 1)))
@@ -28,11 +31,16 @@ def terms(text):
 
 
 class ConflictError(ValueError):
+    """表示乐观并发版本检查失败。"""
+
     pass
 
 
 class DocumentLibrary:
+    """封装文档、运行记录和事件的 SQLite 事务操作。"""
+
     def __init__(self, path=None):
+        """初始化数据库路径，并创建缺失的基础表。"""
         self.path = Path(path) if path is not None else database_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
@@ -42,6 +50,7 @@ class DocumentLibrary:
 
     @contextmanager
     def connect(self):
+        """打开带事务上下文的短连接，退出时始终关闭连接。"""
         connection = sqlite3.connect(self.path, timeout=15)
         try:
             with connection:
@@ -50,6 +59,7 @@ class DocumentLibrary:
             connection.close()
 
     def documents(self, project=None, include_disabled=True):
+        """按项目和启用状态筛选文档，并按更新时间倒序返回。"""
         with self.connect() as connection:
             records = [json.loads(row[0]) for row in connection.execute('SELECT data FROM documents')]
         return sorted((record for record in records
@@ -57,6 +67,7 @@ class DocumentLibrary:
                        and (include_disabled or record['enabled'])), key=lambda record: record['updatedAt'], reverse=True)
 
     def document(self, document_id):
+        """读取单份文档，不存在时抛出明确的文件错误。"""
         with self.connect() as connection:
             row = connection.execute('SELECT data FROM documents WHERE id=?', (document_id,)).fetchone()
         if row is None:
@@ -64,6 +75,7 @@ class DocumentLibrary:
         return json.loads(row[0])
 
     def save_document(self, fields, document_id=None):
+        """校验并保存文档；更新已有文档时执行版本冲突保护。"""
         title, content = fields.get('title', ''), fields.get('content', '')
         tags = fields.get('tags', [])
         if not isinstance(title, str) or not 1 <= len(title.strip()) <= 120:
@@ -95,6 +107,7 @@ class DocumentLibrary:
         return record
 
     def search(self, query, project, limit=8):
+        """在项目可见文档中按标题、标签和内容片段进行有界排序。"""
         query_terms = terms(query[:2000])
         if not query_terms:
             return []
@@ -111,12 +124,14 @@ class DocumentLibrary:
         return sorted(candidates, key=lambda item: (-item['score'], item['id']))[:max(1, min(limit, 20))]
 
     def runs(self, project=None):
+        """返回项目过滤后的运行记录，并按启动时间倒序排列。"""
         with self.connect() as connection:
             records = [json.loads(row[0]) for row in connection.execute('SELECT data FROM console_runs')]
         return sorted((record for record in records if project is None or record['projectId'] == project),
                       key=lambda record: record['startedAt'], reverse=True)
 
     def run(self, run_id):
+        """读取指定运行记录。"""
         with self.connect() as connection:
             row = connection.execute('SELECT data FROM console_runs WHERE id=?', (run_id,)).fetchone()
         if row is None:
@@ -124,6 +139,7 @@ class DocumentLibrary:
         return json.loads(row[0])
 
     def update_run(self, run_id, fields, create=False, knowledge=None):
+        """在写事务中更新运行字段，并限制保留的知识条目数量。"""
         with self.connect() as connection:
             connection.execute('BEGIN IMMEDIATE')
             row = connection.execute('SELECT data FROM console_runs WHERE id=?', (run_id,)).fetchone()
@@ -137,6 +153,7 @@ class DocumentLibrary:
         return record
 
     def continue_run(self, run_id, instruction):
+        """为可继续的失败运行写入恢复标记并重置运行状态。"""
         if not isinstance(instruction, str) or not 1 <= len(instruction.strip()) <= 4000:
             raise ValueError('请输入 1-4000 字的继续指令')
         with self.connect() as connection:
@@ -163,16 +180,19 @@ class DocumentLibrary:
         return record
 
     def _append_event(self, connection, run_id, event_key, event):
+        """在现有事务中以递增序号追加幂等事件。"""
         seq = connection.execute('SELECT COALESCE(MAX(seq),0)+1 FROM console_events WHERE run_id=?', (run_id,)).fetchone()[0]
         connection.execute('INSERT OR IGNORE INTO console_events VALUES (?,?,?,?)',
                            (run_id, seq, event_key, json.dumps(redact({**event, 'seq': seq}), ensure_ascii=False)))
 
     def append_event(self, run_id, event):
+        """将代理事件包装后追加到指定运行。"""
         with self.connect() as connection:
             connection.execute('BEGIN IMMEDIATE')
             self._append_event(connection, run_id, 'agent:' + str(event['seq']), {**event, 'agentSeq': event['seq']})
 
     def run_events(self, run_id, after=0):
+        """读取运行在给定序号之后的事件，保持数据库顺序。"""
         self.run(run_id)
         with self.connect() as connection:
             return [json.loads(row[0]) for row in connection.execute(

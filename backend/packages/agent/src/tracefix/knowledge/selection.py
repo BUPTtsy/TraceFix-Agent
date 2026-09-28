@@ -1,4 +1,4 @@
-"""The Agent formulates searches and selects bounded document excerpts."""
+"""由模型生成检索词，并选择数量受限的文档片段。"""
 from pydantic import Field
 
 from tracefix.runtime.contracts import Contract
@@ -6,14 +6,17 @@ from tracefix.storage.artifacts import redact
 
 
 class KnowledgeQueries(Contract):
+    """模型输出的最多三条知识库查询词。"""
     queries: list[str] = Field(max_length=3)
 
 
 class KnowledgeSelection(Contract):
+    """模型从候选文档中选择的 ID 列表。"""
     document_ids: list[str] = Field(max_length=3)
 
 
 async def select_documents(engine, state, observation=None):
+    """查询并校验当前作用域中的文档，缓存结果并记录可追溯事件。"""
     library = engine.documents
     if library is None:
         return []
