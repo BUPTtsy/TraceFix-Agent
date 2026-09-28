@@ -1,4 +1,4 @@
-"""Host differences only; application and browser sandboxes remain Linux containers."""
+"""封装宿主机差异；应用和浏览器沙箱仍运行在 Linux 容器中。"""
 import asyncio
 import csv
 import io
@@ -10,10 +10,12 @@ from pathlib import PureWindowsPath
 
 
 def is_windows():
+    """返回当前 Python 进程是否运行在 Windows 宿主机。"""
     return sys.platform == 'win32'
 
 
 def subprocess_options():
+    """生成不会继承错误进程组语义的异步子进程选项。"""
     if is_windows():
         # Windows asyncio uses ProactorEventLoop; no POSIX setsid/killpg calls.
         return {'creationflags': getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x200)}
@@ -21,6 +23,7 @@ def subprocess_options():
 
 
 async def terminate_tree(process):
+    """终止进程及其子树，并等待操作系统回收进程资源。"""
     if process.returncode is not None:
         return
     if is_windows():
@@ -48,6 +51,7 @@ async def terminate_tree(process):
 
 
 def container_user():
+    """选择容器内的非 root 用户映射，兼容 Windows 和 root 宿主机。"""
     if is_windows():
         return '1000:1000'
     uid, gid = os.getuid(), os.getgid()
@@ -55,6 +59,7 @@ def container_user():
 
 
 def bind_mount(root):
+    """生成 Docker CSV mount 参数，避免路径中的逗号被错误拆分。"""
     # Docker CLI --mount is CSV; quote commas without shell interpolation.
     host = PureWindowsPath(str(root)).as_posix() if is_windows() else str(root)
     stream = io.StringIO()
@@ -78,4 +83,5 @@ def safe_relative(value):
 
 
 def is_link(path):
+    """同时识别符号链接和 Windows junction。"""
     return path.is_symlink() or path.is_junction()

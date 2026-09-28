@@ -1,3 +1,5 @@
+"""MCP 浏览器传输、快照解析以及动作结果的不确定性处理。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -14,6 +16,7 @@ ELEMENT = re.compile(r'^\s*- (?P<role>[\w-]+)(?: "(?P<name>(?:[^"\\]|\\.)*)")?(?
 
 
 def elements(snapshot):
+    """将可访问性快照解析为带角色、名称和引用的元素记录。"""
     items = []
     for m in ELEMENT.finditer(snapshot):
         attrs = m['attrs']
@@ -23,6 +26,7 @@ def elements(snapshot):
 
 
 def resolve_locator(snapshot, locator):
+    """把模型定位器解析为唯一元素引用；零个或多个匹配均视为错误。"""
     matches = [e for e in elements(snapshot) if e['role'] == locator.role and e['name'] == locator.name]
     if len(matches) != 1 or not matches[0]['ref']:
         raise ValueError(f"定位器无法唯一匹配元素：{locator.role} / {locator.name}")
@@ -30,6 +34,7 @@ def resolve_locator(snapshot, locator):
 
 
 def validate_spec_observation(spec, observation):
+    """检查规范中的定位器是否能在初始快照中精确对应页面元素。"""
     observed = elements(observation['snapshot'])
     locators = [check.locator for check in spec.assertions + spec.regression_assertions
                 if check.condition != 'absent']
@@ -50,6 +55,7 @@ def validate_spec_observation(spec, observation):
 
 
 def assertions(snapshot, checks):
+    """在单个快照上执行元素存在、状态和禁用条件断言。"""
     results = []
     for a in checks:
         found = [e for e in elements(snapshot) if e['role'] == a.locator.role and e['name'] == a.locator.name]
@@ -65,7 +71,7 @@ def assertions(snapshot, checks):
 
 
 class MCPConnectionError(RuntimeError):
-    """MCP transport failed; the request may have reached the browser."""
+    """MCP 传输失败；请求可能已经到达浏览器但结果尚不可知。"""
 
     status = 'WAITING_NETWORK'
     category = 'browser_transport_error'
@@ -84,7 +90,7 @@ class MCPConnectionError(RuntimeError):
 
 
 class MCPActionUnknown(MCPConnectionError):
-    """A browser side effect may have happened but its result is unknown."""
+    """浏览器副作用可能已经发生，但动作结果无法确定。"""
 
     status = 'UNKNOWN_OPERATION'
     category = 'browser_action_unknown'
@@ -116,6 +122,8 @@ class _MCPRequest:
 
 
 class MCPBrowser:
+    """通过单独的服务任务串行化 MCP 会话，避免跨任务使用取消作用域。"""
+
     # Names are accepted only after actual discovery + input schema validation.
     MAP = {'snapshot': 'browser_snapshot', 'screenshot': 'browser_take_screenshot',
            'navigate': 'browser_navigate', 'click': 'browser_click', 'type': 'browser_type',
@@ -124,6 +132,7 @@ class MCPBrowser:
     DIAGNOSTIC_DEFAULTS = {'console': {'level': 'info'}, 'network': {'includeStatic': False}}
 
     def __init__(self, command, policy, timeout=45, env=None):
+        """初始化传输队列、观测缓存和连接状态机。"""
         self.command, self.policy, self.timeout = command, policy, timeout
         self.stack, self.session = None, None
         self.tools = {}
@@ -138,6 +147,7 @@ class MCPBrowser:
         self._action_dispatched = False
 
     async def open(self):
+        """启动会话所有者任务，并等待工具发现和初始化完成。"""
         if self.worker and not self.worker.done():
             raise RuntimeError('浏览器已处于打开状态')
         self.connection_state = 'connecting'
@@ -201,6 +211,7 @@ class MCPBrowser:
                 self._mark_connection_lost(e)
 
     async def close(self):
+        """停止服务任务并清空活动请求、工具发现和观测缓存。"""
         worker = self.worker
         try:
             if worker and not worker.done():
@@ -229,9 +240,25 @@ class MCPBrowser:
             self.queue = asyncio.Queue(maxsize=1)
 
     async def reconnect(self):
-        """Recreate the MCP session; never retries the interrupted action."""
+        """重建 MCP 会话；绝不自动重试已中断的动作。"""
         await self.close()
         await self.open()
+
+    async def _recover_connection(self, error, *, dispatched):
+        if error.details.get('reconnect_attempted'):
+            return
+        self._mark_connection_lost(error)
+        if dispatched is not False or self._action_dispatched or self.worker is None:
+            return
+        error.details['reconnect_attempted'] = True
+        try:
+            await self.reconnect()
+        except Exception as reconnect_error:
+            self._mark_connection_lost(error)
+            error.details.update(reconnected=False, reconnect_error=sanitize(
+                f'{type(reconnect_error).__name__}: {reconnect_error}'))
+        else:
+            error.details.update(reconnected=True, requires_new_observation=True)
 
     @staticmethod
     def _is_connection_error(error):
@@ -247,6 +274,7 @@ class MCPBrowser:
             'closed resource', 'transport closed', 'eof'))
 
     def _mark_connection_lost(self, error, *, details=None):
+        """记录连接丢失并取消服务任务，使后续调用快速失败。"""
         self.connection_state = 'lost'
         self.connection_error = error if isinstance(error, MCPConnectionError) else MCPConnectionError(
             f'MCP 传输已断开：{type(error).__name__}：{error}', details=details)
@@ -259,6 +287,14 @@ class MCPBrowser:
         self.tools = {}
 
     async def call(self, kind, args=None):
+        """校验工具参数后排队调用，并把传输错误转换为可审计异常。"""
+        try:
+            return await self._call(kind, args)
+        except MCPConnectionError as error:
+            await self._recover_connection(error, dispatched=error.details.get('dispatched'))
+            raise
+
+    async def _call(self, kind, args=None):
         import jsonschema
         name = self.MAP[kind]
         if self.connection_state == 'lost':
@@ -296,6 +332,7 @@ class MCPBrowser:
         return result.content
 
     def diagnostic_args(self, kind):
+        """根据已发现的 JSON Schema 生成诊断工具所需的最小参数。"""
         schema = self.tools[self.MAP[kind]]
         defaults = self.DIAGNOSTIC_DEFAULTS[kind]
         required = schema.get('required', [])
@@ -305,6 +342,7 @@ class MCPBrowser:
         return {name: defaults[name] for name in required}
 
     async def observe(self):
+        """获取快照、截图和诊断信息，并缓存带唯一 ID 的观测。"""
         try:
             return await self._observe()
         except MCPConnectionError:
@@ -330,10 +368,17 @@ class MCPBrowser:
                 extra[channel] = sanitize('\n'.join(c.text for c in result if c.type == 'text'))[-12000:]
             else:
                 extra[channel] = '该能力不可用'
-        self.observation = {'id': new_id('obs'), 'url': url, 'snapshot': text[-40000:], **extra}
+        snapshot = text
+        if len(snapshot) > 40000:
+            marker = '\n... [页面快照中间内容已省略] ...\n'
+            head_limit = (40000 - len(marker)) // 2
+            tail_limit = 40000 - len(marker) - head_limit
+            snapshot = text[:head_limit] + marker + text[-tail_limit:]
+        self.observation = {'id': new_id('obs'), 'url': url, 'snapshot': snapshot, **extra}
         return {**self.observation, 'png': png}
 
     async def action(self, action):
+        """执行经过策略校验的标准动作，记录成功、失败或未知状态。"""
         if action.kind in {'observe', 'finish'}:
             return await self.observe()
         if action.kind not in {'navigate', 'click', 'type', 'select', 'press'}:
@@ -362,9 +407,9 @@ class MCPBrowser:
         try:
             result = await self._execute_action(action)
         except MCPConnectionError as error:
-            self._mark_connection_lost(error)
-            self.observation = None
             dispatched = self._action_dispatched or error.details.get('dispatched')
+            await self._recover_connection(error, dispatched=dispatched)
+            self.observation = None
             if dispatched is False:
                 self.last_action.update(status='WAITING_NETWORK', finished_at=time.time(),
                                          error=type(error).__name__, details=error.details)
@@ -389,6 +434,7 @@ class MCPBrowser:
         return result
 
     async def _execute_action(self, action):
+        """将领域动作映射到 MCP 工具调用，再返回动作后的新观测。"""
         if action.kind == 'navigate':
             self.policy.url(action.value)
             await self.call('navigate', {'url': action.value})

@@ -1,3 +1,5 @@
+"""工作区路径授权、补丁原子应用和冻结证据校验。"""
+
 import difflib
 import os
 import re
@@ -22,7 +24,7 @@ def tokens(part: str):
 
 
 def is_frozen_path(relative) -> bool:
-    """补丁路径是否命中冻结的测试/判定/锁文件策略。
+    """判断补丁路径是否属于测试、判定或锁文件等冻结证据。
 
     唯一的策略实现；knowledge.scope.ScopeResolver.path 复用本函数，两处判定必须一致。
     每个路径段（目录与文件名同规则）切词后做整词匹配，而不是子串匹配：
@@ -45,12 +47,16 @@ def git(root: Path, *args):
 
 
 class Workspace:
+    """在项目根目录内提供经过路径和文件白名单校验的读写接口。"""
+
     def __init__(self, root: Path, allowed_files: list[str]):
+        """绑定根目录和允许写入的 glob 模式。"""
         self.root = root.resolve()
         self.allowed_files = allowed_files
 
     @classmethod
     def export(cls, scopes, ctx, commit: str, target: Path):
+        """将指定提交导出到临时目录，并构造对应的工作区对象。"""
         source = scopes.projects[ctx.active_scope].root
         top = Path(git(source, "rev-parse", "--show-toplevel").decode().strip()).resolve()
         resolved = git(source, "rev-parse", "--verify", f"{commit}^{{commit}}").decode().strip()
@@ -91,6 +97,7 @@ class Workspace:
         return workspace, {"commit": resolved, "files": manifest, "subdir": prefix}
 
     def path(self, relative, write=False):
+        """解析相对路径，同时检查符号链接、冻结文件和写入白名单。"""
         safe_relative(relative)
         p = self.root / relative
         parts = Path(relative).parts
@@ -106,6 +113,7 @@ class Workspace:
         return p
 
     def read(self, relative):
+        """读取已授权文件的 UTF-8 文本内容。"""
         p = self.path(relative)
         if p.stat().st_size > 200_000:
             raise ValueError("文件过大")
@@ -113,6 +121,7 @@ class Workspace:
         return p.read_bytes().decode('utf-8')
 
     def files(self):
+        """枚举根目录下可读的普通文件，排除链接和受保护目录。"""
         for p in sorted(self.root.rglob('*')):
             if p.is_file() and p.suffix in {'.ts', '.tsx', '.js', '.mjs', '.css'}:
                 rel = p.relative_to(self.root).as_posix()
@@ -123,6 +132,7 @@ class Workspace:
                 yield rel
 
     def cards(self, limit_chars=60_000, preferred_paths=()):
+        """按偏好顺序收集受字符预算限制的文件上下文卡片。"""
         result, total = [], 0
         ordered = sorted(self.files(), key=lambda p: (p not in preferred_paths, p))
         for path in ordered:
@@ -134,6 +144,7 @@ class Workspace:
         return result
 
     def apply(self, patch: PatchProposal):
+        """先完整校验补丁，再逐文件替换，返回可恢复的补丁摘要。"""
         if len({e.path for e in patch.edits}) != len(patch.edits):
             raise ValueError("存在重复的编辑路径")
         changes = []
@@ -154,15 +165,18 @@ class Workspace:
         return {"patch_hash": digest(self.diff().encode()), "files": [e.path for e in patch.edits]}
 
     def reconcile(self, patch: PatchProposal):
+        """确认磁盘状态是否与补丁的全部目标内容一致。"""
         hashes = [digest(self.path(e.path).read_bytes()) for e in patch.edits]
         if all(h == digest(e.content.encode()) for h, e in zip(hashes, patch.edits)):
             return {"patch_hash": digest(self.diff().encode()), "files": [e.path for e in patch.edits]}
         raise RuntimeError("补丁状态未知；请先检查工作区再恢复")
 
     def diff(self):
+        """返回工作区相对 HEAD 的纯文本差异。"""
         return git(self.root, "diff", "--no-ext-diff", "--no-color", "HEAD").decode()
 
     def check_frozen(self, source_manifest):
+        """验证文件集合和冻结文件摘要未被运行过程悄然改变。"""
         tracked = set(source_manifest['files'])
         actual = set()
         for p in self.root.rglob('*'):
@@ -179,6 +193,7 @@ class Workspace:
                 self.path(rel, write=True)
 
     def branch(self, name):
+        """创建并提交验证分支，确保分支名称只能属于本次运行命名空间。"""
         if not name.startswith('tracefix/run_'):
             raise PermissionError("本地分支名称无效")
         existing = git(self.root, "branch", "--list", name).decode().strip()
