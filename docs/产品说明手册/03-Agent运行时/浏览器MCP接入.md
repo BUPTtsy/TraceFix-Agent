@@ -24,9 +24,9 @@
 | 定位方式 | 只用 role + 精确 accessible name，不支持坐标 | `browser.py:16-29` |
 | 超时 | 单次调用 45 秒 + 2 秒余量 | `browser.py:126,281` |
 | 串行化 | `Queue(maxsize=1)`，同一时刻只有一个动作 | `browser.py:133` |
-| 截断 | snapshot 保留末尾 40000 字符，console / network 保留末尾 12000 字符 | `browser.py:330,333` |
+| 截断 | snapshot 超过 40000 字符时保留头尾并插入中间省略标记，总长不超过 40000 字符；console / network 仍保留末尾 12000 字符 | `backend/packages/agent/src/tracefix/execution/browser.py:MCPBrowser._observe` |
 | 断线分类 | `MCPConnectionError` 表示传输错误，是否派发需看 `details.dispatched`；可能已执行的动作使用 `MCPActionUnknown`，不能仅凭 `WAITING_NETWORK` 判断可重放 | `execution/browser.py:MCPConnectionError`、`MCPActionUnknown`、`MCPBrowser.action` |
-| 重连 | `reconnect()` 永不重试被打断的动作 | `browser.py:231-234` |
+| 重连 | 仅在确定未派发、没有已派发动作且存在 MCP worker 时尝试一次自动重连；原调用仍抛出异常，不重试原动作，旧 observation 失效 | `backend/packages/agent/src/tracefix/execution/browser.py:MCPBrowser._recover_connection` |
 | URL 策略 | 应用层 origin 白名单，与 MCP 自身的 `--allowed-origins` 形成双层校验 | `execution/policy.py:6-27` |
 
 #### 原生模型工具与 MCP 的边界 ✅
@@ -60,9 +60,9 @@ console / network 是运行时观察流程可收集的诊断信息，不是本�
 
 #### 模型重试与浏览器重连的区别 ✅
 
-- 模型连接失败且请求确定 `not_sent` 时可按退避重试，默认 `max_attempts=3`；耗尽后暂停。安全恢复按 schema 和 `logical_exchange_id` 取回原有 assistant/tool 历史，已完成调用不再执行，历史轮次计入默认 `max_tool_rounds=40`。
+- 模型连接失败且请求确定 `not_sent` 时可按退避重试，默认 `max_attempts=3`；耗尽后暂停。安全恢复按 schema 和 `logical_exchange_id` 取回原有 assistant/tool 历史，已完成调用不再执行，历史轮次计入默认 `max_tool_rounds=8`。
 - 模型读取超时、浏览器动作结果未知或缺少 receipt 时，不能根据模型重试策略重新执行浏览器动作。`UNKNOWN_OPERATION` / `WAITING_NETWORK` 优先进入相应暂停处理，不被循环检测覆盖。
-- MCP 故障仍没有自动 reconnect / replay；`reconnect()` 本身也不重试被打断的动作。需要人工核查的状态会阻止普通 resume。
+- MCP 连接在调用确定未派发时可自动 reconnect 一次，结果写入异常详情的 `reconnect_attempted`、`reconnected` 和 `requires_new_observation`。重连不重试原动作，后续交互必须取得新 observation；已派发或派发状态不明的动作继续暂停核查，需要人工核查的状态会阻止普通 resume。
 
 ### 1.3 本地准备工作
 
@@ -70,13 +70,13 @@ console / network 是运行时观察流程可收集的诊断信息，不是本�
 
 ### 1.4 局限
 
-1. **snapshot 从尾部截断**（`browser.py:333`）：页面较长时会丢掉顶部的导航和表单区域，而这些区域往往正是交互目标。
+1. **snapshot 仍按字符截断**：长页面中间区域可能被省略，语义压缩和差分观测尚未实现。
 2. 没有 trace / 录像，复现过程只能靠截图和 a11y 快照回看。
 3. 动作集合较窄：没有 hover、拖拽、文件上传、对话框处理、等待条件。
 4. 只支持 stdio 和单浏览器（chromium），不能接入远程浏览器集群。
 5. 没有登录态注入方案：需要登录的应用只能由模型「输入」测试账号密码。
 6. 镜像中未确认是否安装 CJK 字体，中文界面截图可能出现方框字。
-7. 调用失败后不会自动 reconnect：连接抖动就会让 Run 暂停，等待人工处理。
+7. 自动重连仅覆盖确定未派发的连接失败；不能据此宣称浏览器动作可自动续跑，真实网络故障恢复矩阵仍待验收。
 
 ## 2. 目标设计 📐
 
@@ -118,7 +118,7 @@ browser:
 | 端口 / 网络 | 创建与删除 Run 专属 internal 网络都成功 | 清理残留的 `tf-*` 网络 |
 | 资源 | 可用内存 ≥ 每个并发 Run 2 GB | 调低 `max_concurrency` |
 
-### 2.3 快照压缩（替代尾部截断）
+### 2.3 快照压缩（替代头尾字符截断）
 
 ```text
 原始 a11y 树
@@ -139,7 +139,7 @@ browser:
 
 | 场景 | 处理 |
 |---|---|
-| 连接断开、动作确定未派发 | 📐 未来可在确认未执行并取得新观测后设计 reconnect 与重绑定；尚未实现，不能直接复用模型 API 的重试或把旧 observation 当作可重放依据 |
+| 连接断开、动作确定未派发 | ✅ 已实现受限自动 reconnect，原调用仍失败、不重试原动作，旧 observation 清除；📐 取得新观测后的完整状态恢复与真实网络验收仍待完成 |
 | 动作已派发、结果未知 | 保持现有行为：PAUSED 等待人工核查 |
 | 浏览器容器崩溃 | 重建沙箱，从冻结场景重放到当前步骤（需要 `replay_plan_ref`） |
 | 页面长时间加载 | `browser.wait_for`（文本出现 / 网络空闲），单次等待 15 秒；到时返回当前观测，由模型决定继续等待还是换一种做法（单次操作超时，不结束 Run） |
