@@ -32,7 +32,8 @@ export function consoleBridge(projectRoot, pythonCommand) {
     });
   }
   return (operation, fields = {}) => {
-    if (!['document.save', 'run.create', 'run.continue', 'run.update', 'run.ended'].includes(operation)) return invoke(operation, fields);
+    // 引导提交和确认都修改共享账本，随其他写入操作串行排队，避免多个 Python 进程争用状态。
+    if (!['document.save', 'run.create', 'run.continue', 'run.update', 'run.ended', 'run.guidance.submit', 'run.guidance.confirm'].includes(operation)) return invoke(operation, fields);
     const pending = writes.then(() => invoke(operation, fields));
     writes = pending.catch(() => {});
     return pending;

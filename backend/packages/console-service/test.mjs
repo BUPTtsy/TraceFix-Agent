@@ -21,6 +21,22 @@ function fixture(context) {
   return {root, profiles, projectsPath, databasePath, dispatch};
 }
 
+test('停止请求按进程控制标识幂等更新并支持失败恢复', context => {
+  const {dispatch} = fixture(context);
+  const run = dispatch('run.create', {projectId: 'alpha', goal: '停止测试', mode: 'test'});
+  dispatch('run.update', {id: run.id, changes: {processControlId: 'control_test'}});
+  assert.throws(() => dispatch('run.stop.request', {id: run.id, processControlId: 'old_control'}), error => error.status === 409);
+  const stopping = dispatch('run.stop.request', {id: run.id, processControlId: 'control_test'});
+  assert.equal(stopping.status, 'stopping');
+  assert.equal(dispatch('run.stop.request', {id: run.id, processControlId: 'control_test'}).stopRequestedAt, stopping.stopRequestedAt);
+  const restored = dispatch('run.stop.failed', {id: run.id, processControlId: 'control_test', stopRequestedAt: stopping.stopRequestedAt, error: '权限不足'});
+  assert.equal(restored.status, 'running');
+  assert.equal(restored.stopRequestedAt, null);
+  assert.equal(restored.stopError, '权限不足');
+  dispatch('run.update', {id: run.id, changes: {status: 'completed', outcome: 'NO_BUG_FOUND'}});
+  assert.equal(dispatch('run.stop.request', {id: run.id, processControlId: 'control_test'}).status, 'completed');
+});
+
 test('新建与更新规则区分冲突、拒绝 Python 无法读取的配置', context => {
   const {dispatch, databasePath, projectsPath, root} = fixture(context);
   const fields = {id: 'new_rule', name: '新规则', detection: {type: 'guided', guided: {prompt: '检查空状态'}}};

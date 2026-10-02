@@ -1,10 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
+import {DatabaseSync} from 'node:sqlite';
 import {artifactIndex, readArtifact} from './artifacts.js';
-import {projectCatalog} from './config.js';
+import {loadConfig, projectCatalog} from './config.js';
 import {canContinue, ConsoleDatabase, DataError, timestamp} from './database.js';
 import {RuleDatabase} from './rules.js';
+import {classifyGuidance, guidanceUnsafe} from './guidance.js';
 
 type Data = Record<string, any>;
 
@@ -17,6 +19,52 @@ export function createConsoleService(options: ConsoleOptions = {}) {
   const rules = new RuleDatabase(database);
   const catalog = () => projectCatalog(projectsPath, dataRoot, options.displayRoot);
   const artifactRoot = (run: Data) => path.join(run.dataRoot || dataRoot, 'artifacts');
+  // 与 Python 运行时共用 guidance.sqlite3，Web 写入先排队，执行层在安全边界读取并应用。
+  const guidanceDb = (run: Data) => {
+    const filename = path.join(run.dataRoot || dataRoot, 'guidance.sqlite3');
+    fs.mkdirSync(path.dirname(filename), {recursive: true});
+    const database = new DatabaseSync(filename, {timeout: 15000});
+    database.exec('PRAGMA busy_timeout=15000');
+    database.exec('CREATE TABLE IF NOT EXISTS run_guidance (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, scope_id TEXT NOT NULL, data TEXT NOT NULL)');
+    return database;
+  };
+  const guidanceRead = (run: Data) => {
+    const sqlite = guidanceDb(run);
+    try { return (sqlite.prepare('SELECT data FROM run_guidance WHERE run_id=? AND scope_id=? ORDER BY rowid').all(run.agentRunId, run.projectId) as {data: string}[]).map(row => JSON.parse(row.data)); }
+    finally {sqlite.close();}
+  };
+  const guidanceWrite = (run: Data, fields: Data) => {
+    // L1 只补充提示，L2 收紧路径/变更量/动作约束，L3 需要后续确认；这里仅保存账本条目。
+    const text = String(fields.text || '').trim();
+    if (!text || text.length > 2000) throw new DataError('引导长度必须为 1-2000 字');
+    let classified;
+    try { classified = classifyGuidance(text, fields.level, fields.constraints); }
+    catch (error) { throw new DataError(error instanceof Error ? error.message : '约束无效'); }
+    const {level, constraints} = classified;
+    const id = 'guidance_' + randomUUID().replaceAll('-', '');
+    const entry: Data = {id, run_id: run.agentRunId, scope_id: run.projectId, author: 'web', level, text,
+      created_at: Date.now() / 1000, created_phase: run.phase || null, applied_step: null, applied_call: null,
+      expires: 'run', status: guidanceUnsafe(text) ? 'rejected' : 'queued', constraints,
+      confirmed_at: null, rejection_reason: guidanceUnsafe(text) ? '引导不能扩大权限或跳过验证门禁' : null,
+      how_applied: null, child_run_id: null};
+    const sqlite = guidanceDb(run);
+    try {sqlite.prepare('INSERT INTO run_guidance VALUES (?,?,?,?)').run(entry.id, entry.run_id, entry.scope_id, JSON.stringify(entry));}
+    finally {sqlite.close();}
+    return entry;
+  };
+  const guidanceConfirm = (run: Data, id: string) => {
+    // 确认请求仅落确认时间；替换父目标并派生子 Run 由执行层在安全边界完成。
+    const sqlite = guidanceDb(run);
+    try {
+      const row = sqlite.prepare('SELECT data FROM run_guidance WHERE id=? AND run_id=? AND scope_id=?').get(id, run.agentRunId, run.projectId) as {data: string} | undefined;
+      if (!row) throw new DataError('当前 Run 中没有此引导', 404);
+      const entry = JSON.parse(row.data);
+      if (entry.level !== 'retarget' || entry.status !== 'queued' || entry.confirmed_at) throw new DataError('只有尚未确认的改目标引导可以确认');
+      entry.confirmed_at = Date.now() / 1000;
+      sqlite.prepare('UPDATE run_guidance SET data=? WHERE id=?').run(JSON.stringify(entry), id);
+      return entry;
+    } finally {sqlite.close();}
+  };
 
   function runView(id: string): Data {
     const record = database.run(id);
@@ -65,6 +113,18 @@ export function createConsoleService(options: ConsoleOptions = {}) {
 
   function dispatch(operation: string, fields: Data = {}): any {
     if (operation === 'runs.import') return importRuns();
+    if (operation === 'chat.project') {
+      if (typeof fields.projectId !== 'string' || !fields.projectId) throw new DataError('请选择已注册的项目');
+      const project = catalog().find(item => item.id === fields.projectId);
+      const entry = (loadConfig(projectsPath).projects || []).find((item: Data) => item.id === fields.projectId);
+      if (!project || !entry || typeof entry.root !== 'string') throw new DataError('请选择已注册的项目');
+      if (!project.ready) throw new DataError(project.issue || '项目当前不可读');
+      const root = path.resolve(path.dirname(projectsPath), entry.root);
+      return {projectId: project.id, root, context: {id: project.id, repoId: project.repoId,
+        root: project.root, allowedFiles: project.allowedFiles, ready: project.ready, issue: project.issue,
+        access: 'read-only',
+        tools: ['project.list_files', 'project.read_file', 'project.search']}};
+    }
     if (operation === 'projects') {
       const runs = database.runs(), documents = database.documents();
       return catalog().map(project => ({...project,
@@ -86,6 +146,14 @@ export function createConsoleService(options: ConsoleOptions = {}) {
         }
       }
       return database.runEvents(record.id, Number(fields.after) || 0);
+    }
+    if (operation === 'run.guidance' || operation === 'run.guidance.submit' || operation === 'run.guidance.confirm') {
+      // 使用实际 Agent Run 和项目双重定位，避免将控制台记录 ID 当成运行时引导作用域。
+      const record = database.run(fields.id);
+      if (!record.agentRunId) throw new DataError('Agent 尚未建立 Run，暂时不能接收引导');
+      if (operation === 'run.guidance') return guidanceRead(record);
+      if (!['running', 'paused', 'waiting_input'].includes(record.status)) throw new DataError('只有运行中或已暂停的 Run 可以接收引导');
+      return operation.endsWith('confirm') ? guidanceConfirm(record, fields.guidanceId) : guidanceWrite(record, fields);
     }
     if (operation === 'run.continue') {
       const previous = database.run(fields.id);
@@ -129,12 +197,16 @@ export function createConsoleService(options: ConsoleOptions = {}) {
         status: 'running', phase: 'STARTING', outcome: null, finishedAt: null, origin: 'web', dataRoot}, true);
     }
     if (operation === 'run.update') return database.updateRun(fields.id, fields.changes);
+    if (operation === 'run.stop.request') return database.requestStop(fields.id, fields.processControlId);
+    if (operation === 'run.stop.failed') return database.stopFailed(fields.id, fields);
     if (operation === 'run.ended') {
       const record = database.run(fields.id);
-      const changes: Data = {exitCode: fields.exitCode ?? null, pid: null, processEndedAt: timestamp()};
+      const changes: Data = {exitCode: fields.exitCode ?? null, pid: null, processEndedAt: timestamp(),
+        processControlId: null, stopRequestedAt: null, stopPreviousStatus: null};
       if (['running', 'stopping'].includes(record.status)) Object.assign(changes, {
         status: record.status === 'stopping' ? 'cancelled' : 'failed', finishedAt: timestamp(),
-        error: fields.error || record.error || 'Agent 进程已结束，未记录最终结果；请查看日志',
+        error: fields.error || record.error || (record.status === 'stopping' ?
+          '用户已停止；进程退出，未生成完整收尾结果' : 'Agent 进程已结束，未记录最终结果；请查看日志'),
       });
       return database.updateRun(fields.id, changes);
     }

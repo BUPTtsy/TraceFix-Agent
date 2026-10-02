@@ -119,6 +119,29 @@ export class ConsoleDatabase {
       return record;
     });
   }
+  requestStop(id: string, processControlId?: string): RecordData {
+    return this.transaction(() => {
+      const record = this.run(id);
+      if (!['running', 'paused', 'waiting_input', 'waiting_approval', 'stopping'].includes(record.status)) return record;
+      if (record.processControlId !== processControlId) throw new DataError('任务进程已改变，请刷新后重试', 409);
+      if (record.status === 'stopping') return record;
+      const updated = {...record, status: 'stopping', stopRequestedAt: timestamp(),
+        stopPreviousStatus: record.status, stopError: null, updatedAt: timestamp()};
+      this.db.prepare('UPDATE console_runs SET data=? WHERE id=?').run(JSON.stringify(updated), id);
+      return updated;
+    });
+  }
+  stopFailed(id: string, fields: RecordData): RecordData {
+    return this.transaction(() => {
+      const record = this.run(id);
+      if (record.status !== 'stopping' || record.processControlId !== fields.processControlId ||
+          record.stopRequestedAt !== fields.stopRequestedAt) return record;
+      const updated = {...record, status: record.stopPreviousStatus || 'running', stopRequestedAt: null,
+        stopPreviousStatus: null, stopError: fields.error, updatedAt: timestamp()};
+      this.db.prepare('UPDATE console_runs SET data=? WHERE id=?').run(JSON.stringify(updated), id);
+      return updated;
+    });
+  }
   private appendEvent(runId: string, key: string, event: RecordData): void {
     const row = this.db.prepare('SELECT COALESCE(MAX(seq),0)+1 AS seq FROM console_events WHERE run_id=?').get(runId) as {seq: number};
     this.db.prepare('INSERT OR IGNORE INTO console_events VALUES (?,?,?,?)')
