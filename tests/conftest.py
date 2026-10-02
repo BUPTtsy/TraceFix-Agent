@@ -9,6 +9,11 @@ from tracefix.cli.main import Session
 
 
 @pytest.fixture
+def json_completion_transport(monkeypatch):
+    monkeypatch.setenv('TRACEFIX_STREAM', 'false')
+
+
+@pytest.fixture
 def cli_session(tmp_path, monkeypatch):
     monkeypatch.delenv('TRACEFIX_CONSOLE_RUN_ID', raising=False)
     monkeypatch.delenv('TRACEFIX_DATABASE_URL', raising=False)

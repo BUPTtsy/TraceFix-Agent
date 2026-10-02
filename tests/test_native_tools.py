@@ -8,6 +8,9 @@ from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
 from tracefix.runtime.contracts import BrowserAction, Decision, PatchProposal
 
 
+pytestmark = pytest.mark.usefixtures('json_completion_transport')
+
+
 def tool_call(call_id='call-1', name='BrowserSnapshot', arguments='{}'):
     return {'id': call_id, 'type': 'function',
             'function': {'name': name, 'arguments': arguments}}

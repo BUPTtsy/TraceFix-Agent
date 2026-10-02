@@ -12,7 +12,7 @@ from tracefix.model.gateway import Gateway
 
 
 def load_api_check():
-    path = Path(__file__).resolve().parents[1] / 'scripts/check_api.py'
+    path = Path(__file__).resolve().parents[1] / 'tools/checks/check_api.py'
     spec = importlib.util.spec_from_file_location('tracefix_api_check_test', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -31,7 +31,7 @@ def provider_response(content=None, tool_calls=None):
 
 def snapshot_call():
     return {'id': 'call-diagnostic', 'type': 'function',
-            'function': {'name': 'browser_snapshot', 'arguments': '{}'}}
+            'function': {'name': 'BrowserSnapshot', 'arguments': '{}'}}
 
 
 def mock_responses(monkeypatch, responses):
@@ -47,16 +47,18 @@ def mock_responses(monkeypatch, responses):
 
 def test_default_configuration_matches_deepseek_example(monkeypatch):
     for name in ('TRACEFIX_BASE_URL', 'TRACEFIX_TEXT_MODEL',
-                 'TRACEFIX_VISION_MODEL', 'TRACEFIX_TOOL_MODE'):
+                 'TRACEFIX_VISION_MODEL', 'TRACEFIX_TOOL_MODE', 'TRACEFIX_STREAM'):
         monkeypatch.delenv(name, raising=False)
     example = dotenv_values(Path(__file__).resolve().parents[1] / '.env.example')
     gateway = Gateway(key='ci')
     assert gateway.base_url == example['TRACEFIX_BASE_URL'] == 'https://api.deepseek.com'
     assert gateway.text_model == example['TRACEFIX_TEXT_MODEL'] == 'deepseek-chat'
     assert gateway.tool_mode == example['TRACEFIX_TOOL_MODE'] == 'native'
+    assert gateway.stream is True
     assert gateway.vision_model == example['TRACEFIX_VISION_MODEL'] == ''
 
 
+@pytest.mark.usefixtures('json_completion_transport')
 async def test_native_diagnostic_pairs_tool_messages_without_images(monkeypatch):
     module = load_api_check()
     call = snapshot_call()
@@ -71,7 +73,7 @@ async def test_native_diagnostic_pairs_tool_messages_without_images(monkeypatch)
     assert all(request['url'].endswith('/chat/completions') for request in requests)
     assert all(isinstance(request['json']['messages'][1]['content'], str) for request in requests)
     assert all('response_format' not in request['json'] for request in requests[1:])
-    assert any(tool['function']['name'] == 'browser_snapshot'
+    assert any(tool['function']['name'] == 'BrowserSnapshot'
                for tool in requests[1]['json']['tools'])
     assistant, tool = requests[2]['json']['messages'][-2:]
     assert assistant['role'] == 'assistant' and assistant['tool_calls'] == [call]
@@ -82,6 +84,7 @@ async def test_native_diagnostic_pairs_tool_messages_without_images(monkeypatch)
     assert results[-1]['status'] == 'skipped'
 
 
+@pytest.mark.usefixtures('json_completion_transport')
 async def test_json_diagnostic_skips_tools_and_unconfigured_vision(monkeypatch):
     module = load_api_check()
     requests = mock_responses(monkeypatch, [provider_response('{"ok":true,"sum":4}')])
@@ -94,6 +97,7 @@ async def test_json_diagnostic_skips_tools_and_unconfigured_vision(monkeypatch):
     assert results[-1]['status'] == 'skipped'
 
 
+@pytest.mark.usefixtures('json_completion_transport')
 async def test_explicit_vision_configuration_sends_image_to_vision_model(monkeypatch):
     module = load_api_check()
     requests = mock_responses(monkeypatch, [provider_response('{"ok":true,"sum":4}'),
@@ -108,6 +112,7 @@ async def test_explicit_vision_configuration_sends_image_to_vision_model(monkeyp
     assert results[-1]['output'] == {'color': 'red'}
 
 
+@pytest.mark.usefixtures('json_completion_transport')
 async def test_native_diagnostic_fails_when_provider_skips_tool_call(monkeypatch):
     module = load_api_check()
     requests = mock_responses(monkeypatch, [provider_response('{"kind":"finish"}')])
@@ -117,13 +122,14 @@ async def test_native_diagnostic_fails_when_provider_skips_tool_call(monkeypatch
     assert len(requests) == 1
 
 
+@pytest.mark.usefixtures('json_completion_transport')
 async def test_native_diagnostic_refuses_other_browser_actions(monkeypatch):
     module = load_api_check()
     call = snapshot_call()
-    call['function'] = {'name': 'browser_navigate', 'arguments': '{"value":"https://example.com"}'}
+    call['function'] = {'name': 'BrowserNavigate', 'arguments': '{"value":"https://example.com"}'}
     requests = mock_responses(monkeypatch, [provider_response(tool_calls=[call])])
     gateway = Gateway(key='ci', vision_model='', tool_mode='native', max_attempts=1)
-    with pytest.raises(RuntimeError, match='工具诊断只接受一次 browser_snapshot'):
+    with pytest.raises(RuntimeError, match='工具诊断只接受一次 BrowserSnapshot'):
         await module.check_native_protocol(gateway)
     assert len(requests) == 1
 

@@ -13,6 +13,9 @@ from tracefix.runtime.contracts import BrowserAction, Decision, Phase, RunState,
 from tracefix.runtime.smoke import PNG, make_engine
 
 
+pytestmark = pytest.mark.usefixtures('json_completion_transport')
+
+
 def response(value=None, *, tool_id=None, destination=None):
     if tool_id:
         message = {'content': None, 'tool_calls': [{

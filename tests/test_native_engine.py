@@ -12,6 +12,9 @@ from tracefix.runtime.contracts import BrowserAction, Decision, Phase
 from tracefix.runtime.smoke import PNG, make_engine
 
 
+pytestmark = pytest.mark.usefixtures('json_completion_transport')
+
+
 async def prepare_engine(root):
     engine, state = make_engine(root)
     state.phase = Phase.EXPLORE

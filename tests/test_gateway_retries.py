@@ -5,6 +5,9 @@ from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
 from tracefix.runtime.contracts import BrowserAction
 
 
+pytestmark = pytest.mark.usefixtures('json_completion_transport')
+
+
 def response(*, status=200, usage=1, finish='stop', content='{"kind":"finish"}', headers=None):
     body = {'choices': [{'finish_reason': finish, 'message': {'content': content}}]}
     if usage is not None:

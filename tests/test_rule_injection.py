@@ -11,6 +11,9 @@ from tracefix.runtime.contracts import BrowserAction, Decision, Phase
 from tracefix.runtime.smoke import make_engine
 
 
+pytestmark = pytest.mark.usefixtures('json_completion_transport')
+
+
 def guided(rule_id, **fields):
     return Rule(id=rule_id, name=rule_id, status='enabled',
                 detection={'type': 'guided', 'guided': {'prompt': '检查必需的反馈并记录证据'}}, **fields)

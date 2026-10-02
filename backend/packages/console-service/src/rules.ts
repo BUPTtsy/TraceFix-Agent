@@ -116,7 +116,7 @@ export class RuleDatabase {
   }
   preview(id: string, maxTokens: number): Data {
     const rule = this.rule(id);
-    const summary = {id: rule.id, version: rule.version, severity: rule.severity, name: rule.name,
+    const summary = {id: rule.id, version: rule.version, severity: rule.severity, name: rule.name, category: rule.category,
       check: rule.detection, fix_guidance: rule.fix_guidance};
     const cost = Math.max(1, Math.floor(Array.from(JSON.stringify(summary)).length / 4));
     const tokens = cost;

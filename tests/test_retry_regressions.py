@@ -10,6 +10,9 @@ from tracefix.runtime.contracts import (BrowserAction, Decision, FileEdit, Outco
 from tracefix.runtime.smoke import make_engine
 
 
+pytestmark = pytest.mark.usefixtures('json_completion_transport')
+
+
 def completion(*, calls=None, content='{"kind":"finish"}', usage=1, status=200):
     message = {'content': content}
     if calls is not None:

@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from tracefix.model.gateway import Gateway
 from tracefix.runtime.contracts import BrowserAction
+from tracefix.runtime.tools import model_tool_name
 
 
 def red_image():
@@ -37,8 +38,8 @@ async def check_native_protocol(gateway):
     executed_calls = []
 
     async def diagnostic_snapshot(name, arguments, call_id):
-        if name != "browser_snapshot" or arguments != {} or executed_calls:
-            raise RuntimeError("工具诊断只接受一次 browser_snapshot({})，未执行浏览器操作")
+        if model_tool_name(name) != "BrowserSnapshot" or arguments != {} or executed_calls:
+            raise RuntimeError("工具诊断只接受一次 BrowserSnapshot({})，未执行浏览器操作")
         executed_calls.append(call_id)
         return {"diagnostic": True, "browser_executed": False,
                 "observation": {"id": "diagnostic-only", "snapshot": "Synthetic diagnostic observation."}}
