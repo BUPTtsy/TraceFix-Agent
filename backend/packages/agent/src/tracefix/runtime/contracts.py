@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 from enum import StrEnum
+import time
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -48,8 +49,7 @@ class RunStatus(StrEnum):
     COMPLETED = "COMPLETED"
     CANCELLED = "CANCELLED"
     ABNORMAL = "ABNORMAL"
-    # Historical records may still contain FAILED. New automatic termination
-    # paths use ABNORMAL only for detected loops.
+    SUPERSEDED = "SUPERSEDED"
     FAILED = "FAILED"
 
 
@@ -59,7 +59,6 @@ class Outcome(StrEnum):
     BUG_CONFIRMED = "BUG_CONFIRMED"
     INCONCLUSIVE = "INCONCLUSIVE"
     LOOP_DETECTED = "LOOP_DETECTED"
-    # Retained for deserializing records created before W-29.
     REPAIR_EXHAUSTED = "REPAIR_EXHAUSTED"
     POLICY_BLOCKED = "POLICY_BLOCKED"
     INFRA_FAILURE = "INFRA_FAILURE"
@@ -142,6 +141,12 @@ class Assertion(Contract):
     condition: Literal["visible", "absent", "checked", "disabled", "enabled"] = "visible"
 
 
+class GuidanceAck(Contract):
+    # 模型逐条说明引导如何应用，运行时按 ID 校验后记录确认结果。
+    id: str = Field(min_length=1)
+    how_applied: str = Field(min_length=1, max_length=2000)
+
+
 class TestSpec(Contract):
     # Ignore the removed max_steps field when reading old artifacts.
     model_config = ConfigDict(extra="ignore")
@@ -152,6 +157,7 @@ class TestSpec(Contract):
     assertions: list[Assertion] = Field(min_length=1)
     regression_plan: list[BrowserAction] = Field(default_factory=list)
     regression_assertions: list[Assertion] = Field(min_length=1)
+    guidance_ack: list[GuidanceAck] = Field(default_factory=list)
     @model_validator(mode="after")
     def validate_actions(self):
         if not {'navigate', 'finish'} <= set(self.authorized_actions):
@@ -163,12 +169,61 @@ class TestSpec(Contract):
         return self
 
 
+class GuidanceConstraints(Contract):
+    # 只描述可执行的收窄条件；最终允许范围是项目授权与所有约束的交集。
+    include_paths: list[str] = Field(default_factory=list)
+    exclude_paths: list[str] = Field(default_factory=list)
+    max_files_changed: int | None = Field(default=None, ge=1)
+    max_lines_changed: int | None = Field(default=None, ge=1)
+    allowed_actions: list[ActionKind] | None = None
+
+    @model_validator(mode="after")
+    def validate_restrictions(self):
+        for pattern in self.include_paths + self.exclude_paths:
+            if not pattern.strip() or pattern.startswith(('/', '\\')) or ':' in pattern or '..' in pattern.replace('\\', '/').split('/'):
+                raise ValueError('约束路径必须是项目内的相对 glob')
+        if self.allowed_actions is not None and not {'navigate', 'finish'} <= set(self.allowed_actions):
+            raise ValueError('动作约束必须保留 navigate 和 finish')
+        if not (self.include_paths or self.exclude_paths or self.max_files_changed is not None
+                or self.max_lines_changed is not None or self.allowed_actions is not None):
+            raise ValueError('必须提供可强制执行的收窄约束')
+        return self
+
+
+class Guidance(Contract):
+    # hint 提供上下文，constraint 强制收窄，retarget 须确认后派生新的 Run。
+    id: str = Field(default_factory=lambda: new_id('guidance'))
+    run_id: str
+    scope_id: str
+    author: str = 'user'
+    level: Literal['hint', 'constraint', 'retarget'] = 'hint'
+    text: str = Field(min_length=1, max_length=2000)
+    created_at: float = Field(default_factory=time.time)
+    created_phase: Phase | None = None
+    applied_step: int | None = None
+    applied_call: int | None = None
+    expires: Literal['run', 'phase', 'once'] = 'run'
+    status: Literal['queued', 'applied', 'acknowledged', 'rejected', 'superseded'] = 'queued'
+    constraints: GuidanceConstraints | None = None
+    # L3 确认只记录用户意图，父子 Run 状态切换仍由运行时完成。
+    confirmed_at: float | None = None
+    rejection_reason: str | None = None
+    how_applied: str | None = None
+    child_run_id: str | None = None
+
+
 class Decision(Contract):
     action: BrowserAction
     evidence_refs: list[str] = Field(default_factory=list)
     rule_refs: list[str] = Field(default_factory=list, max_length=50)
     expected_observation: str = ""
     summary: str = Field(default="", max_length=1200)
+    guidance_ack: list[GuidanceAck] = Field(default_factory=list)
+
+
+class ReproductionPlan(Contract):
+    action_indices: list[int] = Field(min_length=1)
+    summary: str = Field(min_length=1)
 
 
 class FileEdit(Contract):
@@ -182,6 +237,7 @@ class PatchProposal(Contract):
     evidence_refs: list[str] = Field(min_length=1)
     rule_refs: list[str] = Field(default_factory=list, max_length=50)
     edits: list[FileEdit] = Field(min_length=1, max_length=8)
+    guidance_ack: list[GuidanceAck] = Field(default_factory=list)
 
 
 class Validation(Contract):
@@ -196,10 +252,12 @@ class Validation(Contract):
 
 
 class RunState(Contract):
+    # 状态快照保存引用，完整证据与模型响应存放在对应 artifact 中。
     schema_version: str = SCHEMA_VERSION
     run_id: str = Field(default_factory=lambda: new_id("run"))
     scope_id: str
     goal: str
+    job_id: str | None = None
     parent_run_id: str | None = None
     continuation_instruction: str | None = None
     continuation_count: int = 0
@@ -208,6 +266,7 @@ class RunState(Contract):
     remote_config: dict | None = None
     url: str
     mode: Literal["test", "repair"] = "test"
+    execution_mode: Literal["interactive", "batch"] = "interactive"
     phase: Phase = Phase.PREPARE
     run_status: RunStatus = RunStatus.RUNNING
     outcome: Outcome | None = None
@@ -219,6 +278,9 @@ class RunState(Contract):
     agent_instructions_path: str | None = None
     test_spec_ref: str | None = None
     replay_plan_ref: str | None = None
+    exploration_plan_ref: str | None = None
+    reproduction_plan_frozen: bool = False
+    skills_loaded: list[dict] = Field(default_factory=list)
     observation_ref: str | None = None
     evidence_refs: list[str] = Field(default_factory=list)
     hypothesis_refs: list[str] = Field(default_factory=list)
@@ -243,6 +305,8 @@ class RunState(Contract):
     validation_index: int = 0
     error: str | None = None
     error_details: dict | None = None
+    diagnosis_retry_count: int = 0
+    diagnosis_feedback_refs: list[str] = Field(default_factory=list)
     local_branch: str | None = None
     action_fingerprints: list[str] = Field(default_factory=list)
     loop_state_fingerprints: list[str] = Field(default_factory=list)
@@ -253,10 +317,22 @@ class RunState(Contract):
     last_error_signature: str | None = None
     baseline_validation_refs: list[str] = Field(default_factory=list)
     model_exchange_refs: list[str] = Field(default_factory=list)
+    # 模型实际返回的 reasoning 独立保存，便于审计且避免扩大状态快照。
+    reasoning_refs: list[str] = Field(default_factory=list)
+    context_manifest_refs: list[str] = Field(default_factory=list)
+    compaction_refs: list[str] = Field(default_factory=list)
+    working_memory_ref: str | None = None
+    context_phase: str | None = None
+    context_compaction_cursor: int = 0
     rule_snapshot_ref: str | None = None
     rule_snapshot_hash: str = ""
     rule_refs: list[dict] = Field(default_factory=list)
     additional_rule_ids: list[str] = Field(default_factory=list)
+    guidance: list[Guidance] = Field(default_factory=list)
+    # 已应用的强制约束持续参与动作/补丁检查，不因模型确认而解除。
+    guidance_constraints: list[GuidanceConstraints] = Field(default_factory=list)
+    superseded_by_run_id: str | None = None
+    inherited_evidence_refs: list[str] = Field(default_factory=list)
 
 
 TRANSITIONS = {
@@ -264,7 +340,7 @@ TRANSITIONS = {
     Phase.EXPLORE: {Phase.REPRODUCE, Phase.FINALIZE},
     Phase.REPRODUCE: {Phase.EXPLORE, Phase.DIAGNOSE, Phase.FINALIZE},
     Phase.DIAGNOSE: {Phase.PATCH, Phase.FINALIZE},
-    Phase.PATCH: {Phase.VERIFY, Phase.FINALIZE},
+    Phase.PATCH: {Phase.DIAGNOSE, Phase.VERIFY, Phase.FINALIZE},
     Phase.VERIFY: {Phase.DIAGNOSE, Phase.REVIEW, Phase.FINALIZE},
     Phase.REVIEW: {Phase.FINALIZE},
     Phase.FINALIZE: set(),
@@ -273,10 +349,11 @@ IMMUTABLE = {"run_id", "scope_id", "schema_version", "mode", "goal", "url"}
 
 
 def reduce_state(state: RunState, expected_revision: int, **delta) -> RunState:
+    # revision 防止并发更新覆盖；终止 Run（含已被改目标替代的 Run）不可再推进。
     if state.revision != expected_revision:
         raise ValueError("版本已过期")
     if state.run_status in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL,
-                            RunStatus.FAILED}:
+                            RunStatus.FAILED, RunStatus.SUPERSEDED}:
         raise ValueError("终止状态不可变更")
     if IMMUTABLE & delta.keys() or "revision" in delta:
         raise ValueError("该状态字段不可变更")

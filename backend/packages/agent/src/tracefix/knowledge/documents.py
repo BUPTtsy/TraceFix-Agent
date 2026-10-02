@@ -146,6 +146,9 @@ class DocumentLibrary:
             if row is None and not create:
                 raise FileNotFoundError('运行记录不存在')
             record = json.loads(row[0]) if row else {'id': run_id, 'startedAt': timestamp(), 'knowledge': [], 'logs': []}
+            if record.get('stopRequestedAt') and fields.get('status') in {
+                    'running', 'paused', 'waiting_input', 'waiting_approval'}:
+                fields = {**fields, 'status': 'stopping'}
             record.update(fields, updatedAt=timestamp())
             if knowledge is not None:
                 record['knowledge'] = [*record.get('knowledge', []), knowledge][-30:]
@@ -172,7 +175,9 @@ class DocumentLibrary:
             record.update(continuationMarkers=markers, continuationCount=len(markers), abnormalTermination=True,
                           continuationInstruction=marker['instruction'], continuationId=marker['id'],
                           status='running', phase='STARTING', outcome=None, error=None, reportRef=None,
-                          branch=None, finishedAt=None, exitCode=None, processEndedAt=None, pid=None, updatedAt=timestamp())
+                          branch=None, finishedAt=None, exitCode=None, processEndedAt=None, pid=None,
+                          processControlId=None, stopRequestedAt=None, stopPreviousStatus=None, stopError=None,
+                          updatedAt=timestamp())
             self._append_event(connection, run_id, 'continuation:' + marker['id'], {
                 'type': 'run.continuation_requested', 'phase': 'STARTING',
                 'at': datetime.fromisoformat(marker['at']).timestamp(), 'payload': marker})

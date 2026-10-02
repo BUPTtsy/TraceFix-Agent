@@ -3,6 +3,7 @@
 from urllib.parse import urlsplit
 
 from tracefix.runtime.contracts import BrowserAction, Phase, RunStatus
+from tracefix.runtime.guidance import GuidanceRejected
 
 
 def origin(url):
@@ -40,6 +41,11 @@ class Policy:
             raise PermissionError("当前状态下浏览器不可用")
         if action.kind not in spec.authorized_actions:
             raise PermissionError(f'动作 {action.kind!r} 超出 TestSpec 授权范围：{spec.authorized_actions}')
+        # L2 引导在冻结 TestSpec 授权后继续收窄；任何一条约束拒绝都不能执行动作。
+        for constraint in getattr(state, 'guidance_constraints', []):
+            if constraint.allowed_actions is not None and action.kind not in constraint.allowed_actions:
+                raise GuidanceRejected('浏览器动作违反用户约束：' + action.kind,
+                                       details={'kind': action.kind})
         if action.kind == 'navigate':
             self.url(action.value)
         if action.kind in {'click', 'type', 'select', 'press'}:

@@ -13,7 +13,7 @@ from tracefix.knowledge.retrieval import Retriever
 from tracefix.knowledge.scope import ScopeResolver
 from tracefix.model.gateway import ModelResult
 from tracefix.runtime.contracts import (Assertion, BrowserAction, Decision, FileEdit, Locator,
-    PatchProposal, RunState, TestSpec, digest, new_id)
+    PatchProposal, ReproductionPlan, RunState, TestSpec, digest, new_id)
 from tracefix.runtime.engine import Engine
 from tracefix.storage.artifacts import Artifacts
 from tracefix.storage.store import MemoryStore
@@ -50,7 +50,7 @@ class FakeBrowser:
 
 class FakeModel:
     def __init__(self, workspace): self.workspace=workspace
-    async def generate(self,schema,context, image=None, agent_instructions=None,on_attempt=None,on_response=None,on_error=None,on_usage=None):
+    async def generate(self,schema,context, image=None, agent_instructions=None,on_attempt=None,on_response=None,on_error=None,on_usage=None, **options):
         exchange = on_attempt('FAKE-CI', {'url':'https://fake.invalid/chat/completions',
             'headers':{'Authorization':'[REDACTED]'},'json':{'messages':[]}}, 1) if on_attempt else None
         usage={'prompt_tokens':10,'completion_tokens':10,'total_tokens':20}
@@ -59,6 +59,9 @@ class FakeModel:
             value=Decision(action=BrowserAction(kind='finish'),summary='CI 模拟停止动作')
         elif schema is PatchProposal:
             value=PatchProposal(summary='CI 模拟修复',evidence_refs=context['evidence_refs'][:1],edits=[FileEdit(path='src/value.ts',before_hash=digest(self.workspace.read('src/value.ts').encode()),content='export const persisted = true;\n')])
+        elif schema is ReproductionPlan:
+            value = ReproductionPlan(action_indices=list(range(len(context['exploration_actions']))),
+                                     summary='CI 保留已执行的复现步骤')
         else: raise ValueError('不支持的模拟输出结构')
         if on_response: on_response(exchange, {'http_status':200,'headers':{},'body':{
             'model':'FAKE-CI','usage':usage,'choices':[{'finish_reason':'stop','message':{

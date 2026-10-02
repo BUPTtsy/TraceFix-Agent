@@ -8,6 +8,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 
 from tracefix.runtime.contracts import PatchProposal, digest
+from tracefix.runtime.guidance import GuidanceRejected
 from tracefix.execution.platforms import safe_relative, is_link
 
 # 冻结证据的词元：测试与判定(oracle)不得被 Agent 自己的补丁改写。
@@ -38,12 +39,21 @@ def is_frozen_path(relative) -> bool:
     return any(FROZEN_TOKENS & tokens(part) for part in parts)
 
 
-def git(root: Path, *args):
+def git(root: Path, *args, env=None):
     p = subprocess.run(["git", "-c", "core.autocrlf=false", "-c", "core.safecrlf=false",
-                        "-c", "core.quotePath=false", "-C", str(root), *args], capture_output=True, timeout=30)
+                        "-c", "core.quotePath=false", "-C", str(root), *args], capture_output=True, timeout=30, env=env)
     if p.returncode:
         raise RuntimeError(f'Git 命令执行失败（退出码 {p.returncode}）：' + p.stderr.decode(errors="replace")[:500])
     return p.stdout
+
+
+def commit_workspace(root: Path, message: str):
+    name = os.getenv('TRACEFIX_GIT_AUTHOR_NAME', '').strip() or 'TraceFix'
+    email = os.getenv('TRACEFIX_GIT_AUTHOR_EMAIL', '').strip() or 'tracefix@localhost'
+    environment = dict(os.environ)
+    environment.update(GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email,
+                       GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email)
+    return git(root, 'commit', '-qm', message, env=environment)
 
 
 class Workspace:
@@ -53,6 +63,11 @@ class Workspace:
         """绑定根目录和允许写入的 glob 模式。"""
         self.root = root.resolve()
         self.allowed_files = allowed_files
+        self.guidance_constraints = []
+        # Local edit tools write into this overlay until a PatchProposal is
+        # accepted by the normal patch transaction.  Keeping the overlay out
+        # of the working tree preserves the frozen reproduction baseline.
+        self._staged_files = {}
 
     @classmethod
     def export(cls, scopes, ctx, commit: str, target: Path):
@@ -93,7 +108,7 @@ class Workspace:
         workspace = cls(target, scopes.projects[ctx.active_scope].allowed_files)
         git(target, "init", "-q")
         git(target, "add", ".")
-        git(target, "-c", "user.name=TraceFix", "-c", "user.email=tracefix@localhost", "commit", "-qm", "Frozen authorized source export")
+        commit_workspace(target, "Frozen authorized source export")
         return workspace, {"commit": resolved, "files": manifest, "subdir": prefix}
 
     def path(self, relative, write=False):
@@ -110,6 +125,14 @@ class Workspace:
         if write and (not any(fnmatchcase(relative, x) for x in self.allowed_files)
                       or is_frozen_path(relative)):
             raise PermissionError("补丁路径被拒绝")
+        if write:
+            normalized = relative.replace('\\', '/')
+            # 用户约束叠加在项目写入白名单上，取交集而不扩大原有授权范围。
+            for constraint in self.guidance_constraints:
+                if ((constraint.include_paths and not any(fnmatchcase(normalized, pattern) for pattern in constraint.include_paths))
+                        or any(fnmatchcase(normalized, pattern) for pattern in constraint.exclude_paths)):
+                    raise GuidanceRejected('补丁路径违反用户约束：' + normalized,
+                                           details={'path': normalized})
         return p
 
     def read(self, relative):
@@ -118,7 +141,91 @@ class Workspace:
         if p.stat().st_size > 200_000:
             raise ValueError("文件过大")
         # read_text's universal-newline conversion would invalidate CRLF hashes.
-        return p.read_bytes().decode('utf-8')
+        staged = self._staged_files.get(relative)
+        return (staged if staged is not None else p.read_bytes()).decode('utf-8')
+
+    def staged_content(self, relative):
+        return self._staged_files.get(relative)
+
+    def stage(self, relative, content):
+        """Stage an existing authorized file and enforce guidance limits."""
+        p = self.path(relative, write=True)
+        if not p.exists() or not p.is_file():
+            raise PermissionError('本地编辑工具不支持创建新文件')
+        data = content.encode('utf-8')
+        if not data.strip():
+            raise ValueError('不能暂存空文件')
+        previous = self._staged_files.get(relative)
+        self._staged_files[relative] = data
+        try:
+            self._validate_staged_constraints()
+        except Exception:
+            if previous is None:
+                self._staged_files.pop(relative, None)
+            else:
+                self._staged_files[relative] = previous
+            raise
+        return {'path': str(p), 'after_hash': digest(data), 'staged': True}
+
+    def stage_many(self, changes):
+        previous = dict(self._staged_files)
+        try:
+            for relative, content in changes.items():
+                p = self.path(relative, write=True)
+                if not p.exists() or not p.is_file():
+                    raise PermissionError('本地编辑工具不支持创建新文件')
+                data = content.encode('utf-8') if isinstance(content, str) else content
+                if not data.strip():
+                    raise ValueError('不能暂存空文件')
+                self._staged_files[relative] = data
+            self._validate_staged_constraints()
+        except Exception:
+            self._staged_files = previous
+            raise
+        return {'files_changed': list(changes), 'staged': True}
+
+    def clear_staged(self):
+        self._staged_files.clear()
+
+    def _validate_staged_constraints(self):
+        if not self.guidance_constraints:
+            return
+        changed_paths = set()
+        changed_lines = 0
+        for relative, data in self._staged_files.items():
+            baseline = self.path(relative).read_bytes()
+            if baseline == data:
+                continue
+            self.path(relative, write=True)
+            changed_paths.add(relative)
+            before = baseline.decode('utf-8').splitlines(keepends=True)
+            after = data.decode('utf-8').splitlines(keepends=True)
+            changed_lines += sum(end_before - start_before + end_after - start_after
+                                 for kind, start_before, end_before, start_after, end_after
+                                 in difflib.SequenceMatcher(a=before, b=after, autojunk=False).get_opcodes()
+                                 if kind != 'equal')
+        # Include committed working-tree edits as well as staged changes.
+        for relative in git(self.root, 'diff', '--name-only', 'HEAD').decode().splitlines():
+            if relative in self._staged_files:
+                continue
+            current = self.path(relative).read_bytes()
+            baseline = git(self.root, 'show', 'HEAD:' + relative)
+            if current == baseline:
+                continue
+            changed_paths.add(relative)
+            before = baseline.decode('utf-8').splitlines(keepends=True)
+            after = current.decode('utf-8').splitlines(keepends=True)
+            changed_lines += sum(end_before - start_before + end_after - start_after
+                                 for kind, start_before, end_before, start_after, end_after
+                                 in difflib.SequenceMatcher(a=before, b=after, autojunk=False).get_opcodes()
+                                 if kind != 'equal')
+        for constraint in self.guidance_constraints:
+            if constraint.max_files_changed is not None and len(changed_paths) > constraint.max_files_changed:
+                raise GuidanceRejected('暂存修改超过用户约束的文件数', details={
+                    'actual_files': len(changed_paths), 'max_files_changed': constraint.max_files_changed})
+            if constraint.max_lines_changed is not None and changed_lines > constraint.max_lines_changed:
+                raise GuidanceRejected('暂存修改超过用户约束的行数', details={
+                    'actual_lines': changed_lines, 'max_lines_changed': constraint.max_lines_changed})
 
     def files(self):
         """枚举根目录下可读的普通文件，排除链接和受保护目录。"""
@@ -140,8 +247,40 @@ class Workspace:
             if total + len(body) > limit_chars:
                 continue
             total += len(body)
-            result.append({"path": path, "content": body, "before_hash": digest(body.encode())})
+            baseline = self.path(path).read_bytes()
+            result.append({"path": path, "content": body, "before_hash": digest(baseline)})
         return result
+
+    def validate_guidance_patch(self, patch: PatchProposal):
+        # 相对当前 HEAD 计算已有改动与候选补丁的累计变化，执行用户指定的总量限制。
+        if not self.guidance_constraints:
+            return
+        replacements = dict(self._staged_files)
+        replacements.update({edit.path: edit.content.encode('utf-8') for edit in patch.edits})
+        paths = set(git(self.root, 'diff', '--name-only', 'HEAD').decode().splitlines()) | set(replacements)
+        changed_paths, changed_lines = [], 0
+        for relative in sorted(paths):
+            current = replacements.get(relative)
+            if current is None:
+                current = self.path(relative).read_bytes()
+            baseline = git(self.root, 'show', 'HEAD:' + relative)
+            if current == baseline:
+                continue
+            self.path(relative, write=True)
+            changed_paths.append(relative)
+            before = baseline.decode('utf-8').splitlines(keepends=True)
+            after = current.decode('utf-8').splitlines(keepends=True)
+            changed_lines += sum(before_end - before_start + after_end - after_start
+                                 for kind, before_start, before_end, after_start, after_end
+                                 in difflib.SequenceMatcher(a=before, b=after, autojunk=False).get_opcodes()
+                                 if kind != 'equal')
+        for constraint in self.guidance_constraints:
+            if constraint.max_files_changed is not None and len(changed_paths) > constraint.max_files_changed:
+                raise GuidanceRejected('补丁超过用户约束的文件数', details={
+                    'actual_files': len(changed_paths), 'max_files_changed': constraint.max_files_changed})
+            if constraint.max_lines_changed is not None and changed_lines > constraint.max_lines_changed:
+                raise GuidanceRejected('补丁超过用户约束的改动行数', details={
+                    'actual_lines': changed_lines, 'max_lines_changed': constraint.max_lines_changed})
 
     def apply(self, patch: PatchProposal):
         """先完整校验补丁，再逐文件替换，返回可恢复的补丁摘要。"""
@@ -156,12 +295,14 @@ class Workspace:
             if not edit.content.strip() or old == edit.content.encode():
                 raise ValueError("空补丁或无实际改动")
             changes.append((p, old, edit.content.encode()))
-        # All validation occurs before any write. Recovery reconciles the complete
-        # before/after set; mixed states remain UNKNOWN and require manual review.
+        self.validate_guidance_patch(patch)
+        # 所有校验在首次写入前完成；恢复时核对完整 before/after 集合。
+        # 文件只部分替换时保持 UNKNOWN，由人工检查后再恢复。
         for p, before, after in changes:
             tmp = p.with_name(p.name + '.tracefix-tmp')
             tmp.write_bytes(after)
             os.replace(tmp, p)
+        self.clear_staged()
         return {"patch_hash": digest(self.diff().encode()), "files": [e.path for e in patch.edits]}
 
     def reconcile(self, patch: PatchProposal):
@@ -200,5 +341,5 @@ class Workspace:
         if not existing:
             git(self.root, "checkout", "-qb", name)
             git(self.root, "add", ".")
-            git(self.root, "-c", "user.name=TraceFix", "-c", "user.email=tracefix@localhost", "commit", "-qm", "TraceFix verified candidate")
+            commit_workspace(self.root, "TraceFix verified candidate")
         return name

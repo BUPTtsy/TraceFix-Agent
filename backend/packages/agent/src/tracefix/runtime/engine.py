@@ -8,22 +8,28 @@ import json
 import os
 import re
 from collections import Counter
+from pathlib import Path
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
-from langgraph.errors import GraphInterrupt
+from langgraph.errors import GraphInterrupt, GraphRecursionError
 
 from tracefix.execution.browser import (MCPActionUnknown, MCPConnectionError, assertions,
     resolve_locator, validate_spec_observation)
 from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
-from tracefix.knowledge.context import build_context
+from tracefix.model.chat_completions import reasoning_records
+from tracefix.knowledge.context import SkillCatalog, build_context
 from tracefix.knowledge.selection import select_documents
 from tracefix.rules import RuleResolver, RuleSnapshot, evaluate_oracle, evaluate_static
 from tracefix.rules.resolver import render_rule_context, rule_applies
 from tracefix.runtime.contracts import (BudgetExceeded, BrowserAction, Decision, Outcome,
-    PatchProposal, Phase, ReplayUnbound, RunState, RunStatus, TestSpec, Validation, digest, new_id,
+    PatchProposal, Phase, ReplayUnbound, ReproductionPlan, RunState, RunStatus, TestSpec, Validation, digest, new_id,
     reduce_state, verification_gate)
+from tracefix.runtime.guidance import (GuidanceLedger, GuidanceRejected, active_guidance,
+                                      retarget_state)
+from tracefix.runtime.tool_handlers import build_runtime_tools
+from tracefix.knowledge.assembler import ContextAssembler, ContextWindowError
 from tracefix.storage.artifacts import redact, sanitize
 from tracefix.storage.presentation import label, readable, report_page
 from tracefix.storage.store import UnknownOperation
@@ -78,6 +84,7 @@ class Engine:
     LOOP_ERROR_LIMIT = 5
     LOOP_NO_PROGRESS_WARNING = 20
     LOOP_NO_PROGRESS_LIMIT = 40
+    DIAGNOSIS_RETRY_LIMIT = 3
 
     def __init__(self, store, artifacts, scopes, context, profile, workspace, runner,
                  browser, model, retriever, source, checkpointer, notify=None,
@@ -90,9 +97,30 @@ class Engine:
         self.rule_library = rule_library
         self.control = None
         self.notes = []
+        self.guidance_ledger = GuidanceLedger(self.artifacts.root.parent / 'guidance.sqlite3')
+        self.assembler = ContextAssembler(context_window=int(os.getenv('TRACEFIX_CONTEXT_WINDOW', '131072')))
+        self.memory = None
+        self.retarget_child = None
         self.documents = None
         self.document_context = {}
+        self.skills = SkillCatalog(Path(__file__).resolve().parents[5] / 'skills')
         self.graph = self._graph(checkpointer)
+
+    def load_skill(self, s, name):
+        entry, content = self.skills.load_document(name, str(s.phase))
+        identity = {key: entry[key] for key in ('name', 'version', 'content_hash')}
+        if identity not in s.skills_loaded:
+            s.skills_loaded.append(identity)
+            self.store.save(s)
+            self.event(s, 'skill.loaded', identity)
+        return {**identity, 'description': entry['description'], 'content': content}
+
+    def inject_skills(self, s, context):
+        selection_context = {**context, 'files': list(self.source.get('files', {}))}
+        names = [entry['name'] for entry in self.skills.select(str(s.phase), selection_context)]
+        names = list(dict.fromkeys(names + list(context.get('load_skills', []))))
+        return {**context, 'skill_index': self.skills.summaries(str(s.phase)),
+                'skills': [self.load_skill(s, name) for name in names]}
 
     def _rule_snapshot(self, s):
         if not self.rule_resolver:
@@ -111,6 +139,103 @@ class Engine:
                 raise ValueError('父 Run 尚未生成规则快照，无法派生')
             return snapshot
         return None
+
+    def submit_guidance(self, s, text, *, level=None, expires='run', constraints=None, author='user'):
+        if s.run_status in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL,
+                            RunStatus.FAILED, RunStatus.SUPERSEDED}:
+            raise ValueError('只有活动 Run 可以接收运行中引导')
+        entry = self.guidance_ledger.submit(s.run_id, s.scope_id, text, level=level,
+            author=author, phase=s.phase, expires=expires, constraints=constraints)
+        self.event(s, 'guidance.rejected' if entry.status == 'rejected' else 'guidance.queued',
+                   entry.model_dump(mode='json'))
+        return entry
+
+    def guidance_status(self, s):
+        return self.guidance_ledger.list(s.run_id, s.scope_id)
+
+    def sync_guidance(self, s):
+        # CLI/Web 通过同一 ledger 提交引导，运行时在安全边界同步并落入状态快照。
+        entries = {entry.id: entry for entry in s.guidance}
+        changed = False
+        for entry in self.guidance_status(s):
+            previous = entries.get(entry.id)
+            if previous is not None and previous == entry:
+                continue
+            if entry.level == 'constraint' and entry.status == 'queued':
+                # L2 先进入确定性执行门禁；模型尚未 ack 也必须遵守这些收窄约束。
+                if (entry.constraints.allowed_actions is not None and s.test_spec_ref
+                        and not set(entry.constraints.allowed_actions) <= set(self.spec(s).authorized_actions)):
+                    entry.status, entry.rejection_reason = 'rejected', '动作约束只能收窄冻结的 TestSpec 权限'
+                    self.event(s, 'guidance.rejected', entry.model_dump(mode='json'))
+                else:
+                    entry.status, entry.applied_step = 'applied', s.step
+                    s.guidance_constraints.append(entry.constraints)
+                    self.event(s, 'guidance.applied', entry.model_dump(mode='json'))
+                self.guidance_ledger.save(entry)
+            entries[entry.id] = entry
+            changed = True
+        if changed:
+            s.guidance = list(entries.values())
+            self.store.save(s)
+        self.workspace.guidance_constraints = list(s.guidance_constraints)
+        return next((entry for entry in s.guidance if entry.level == 'retarget'
+                     and entry.status == 'queued' and entry.confirmed_at), None)
+
+    def copy_retarget_evidence(self, previous, child):
+        # 将证据及其嵌套 artifact 复制到子 Run，并重写引用，保证作用域内可访问。
+        copied = {}
+        def transfer(ref):
+            if ref in copied:
+                return copied[ref]
+            raw = self.artifacts.read(previous.scope_id, previous.run_id, ref)
+            extension = ref.rsplit('.', 1)[-1]
+            if extension == 'json':
+                def rewrite(value):
+                    if isinstance(value, dict):
+                        return {key: rewrite(item) for key, item in value.items()}
+                    if isinstance(value, list):
+                        return [rewrite(item) for item in value]
+                    if isinstance(value, str) and self.artifacts.exists(previous.scope_id, previous.run_id, value):
+                        return transfer(value)
+                    return value
+                raw = rewrite(json.loads(raw))
+            copied[ref] = self.artifacts.put(child.scope_id, child.run_id, raw, extension,
+                                           label='继承已校验的父任务证据')
+            return copied[ref]
+        child.evidence_refs = [transfer(ref) for ref in previous.evidence_refs if self.bundle_exists(previous, ref)]
+        child.inherited_evidence_refs = list(child.evidence_refs)
+        self.event(previous, 'guidance.evidence.inherited', {'child_run_id': child.run_id,
+                   'references': copied})
+        return child
+
+    def guidance_context(self, s, ctx, logical_call):
+        # 受保护区块同时携带引导内容、实际约束和本次输出必须回应的 ID。
+        self.sync_guidance(s)
+        entries = active_guidance(s, logical_call=logical_call)
+        return {**ctx, 'user_guidance': [entry.model_dump(mode='json') for entry in entries],
+                'effective_constraints': [entry.model_dump(mode='json') for entry in s.guidance_constraints],
+                'guidance_ack_required': [entry.id for entry in entries]}
+
+    def acknowledge_guidance(self, s, candidate, ctx):
+        # ack 必须与本次注入集合一一对应；业务执行门禁仍独立校验约束。
+        if not hasattr(candidate, 'guidance_ack'):
+            return
+        expected = set(ctx.get('guidance_ack_required', []))
+        acknowledgements = candidate.guidance_ack
+        ids = [entry.id for entry in acknowledgements]
+        if set(ids) != expected or len(ids) != len(set(ids)):
+            raise ModelOutputError('guidance_ack 必须逐条回应本次注入的引导，不能遗漏或编造 id')
+
+    def record_guidance_ack(self, s, candidate):
+        acknowledgements = {entry.id: entry.how_applied for entry in getattr(candidate, 'guidance_ack', [])}
+        for entry in s.guidance:
+            if entry.id not in acknowledgements:
+                continue
+            entry.status, entry.how_applied = 'acknowledged', acknowledgements[entry.id]
+            self.guidance_ledger.save(entry)
+            self.event(s, 'guidance.acknowledged', entry.model_dump(mode='json'))
+        if acknowledgements:
+            self.store.save(s)
 
     def active_rules(self, s, phase=None, observation=None, paths=None):
         if not self.rule_resolver:
@@ -189,6 +314,23 @@ class Engine:
         e = self.store.event(s, kind, payload)
         self._notify(e)
 
+    def warn_retrieval_degraded(self, s):
+        # 检索和记忆共用后端，但分别发出事件，便于各展示层准确说明能力降级。
+        # 两类事件按 reason 独立去重，已有 retrieval 事件不能阻止 memory 事件写入。
+        degradation = self.retriever.degradation()
+        if not degradation:
+            return
+        events = self.store.trace(s.run_id, s.scope_id)
+        reason = degradation['reason']
+        if not any(event['type'] == 'retrieval.degraded' and
+                   event.get('payload', {}).get('reason') == reason
+                   for event in events):
+            self.event(s, 'retrieval.degraded', degradation)
+        if not any(event['type'] == 'memory.degraded' and
+                   event.get('payload', {}).get('reason') == reason
+                   for event in events):
+            self.event(s, 'memory.degraded', degradation)
+
     def _notify(self, event):
         if self.notify:
             try:
@@ -219,6 +361,7 @@ class Engine:
             pending = {key: value for key, value in pending.items()
                        if key not in {'observation_id', 'element_ref'}}
         return digest([str(s.phase), s.trial, s.validation_index, s.replay_index,
+                       s.diagnosis_retry_count,
                        snapshot, pending, s.patch_hash,
                        s.last_error_signature or (s.failure_signatures[-1]
                                                   if s.failure_signatures else None)])
@@ -300,8 +443,10 @@ class Engine:
         s = self.changed(s, loop_state_fingerprints=history)
         return s, False
 
-    async def operation(self, s, name, intent, fn, reconcile=None):
-        op_id = f'{s.run_id}:{s.revision}:{name}'
+    async def operation(self, s, name, intent, fn, reconcile=None, idempotency_key=None):
+        op_id = f'{s.run_id}:{s.revision}:{name}:{idempotency_key or digest(intent)[:24]}'
+        if idempotency_key:
+            intent = {**intent, 'idempotency_key': idempotency_key}
         try:
             receipt = self.store.begin(s, op_id, intent, notify=self._notify)
         except UnknownOperation:
@@ -318,15 +463,23 @@ class Engine:
                 'error': sanitize(error_message(error)), 'status': error.status,
                 'category': error.category, 'details': redact(error.details)})
             raise
+        except Exception as error:
+            error.tracefix_operation_id = op_id
+            raise
         self.store.finish(s, op_id, result, notify=self._notify)
         return result
 
     async def model_call(self, s, schema, ctx, image=None, validate_output=None):
+        ctx = {**ctx, 'phase': str(s.phase), 'execution_mode': s.execution_mode}
+        logical_call = s.budget.model_calls + 1
+        ctx = self.guidance_context(s, ctx, logical_call)
         if self.rule_resolver:
             ctx = self.inject_rules(s, ctx)
+        ctx = self.inject_skills(s, ctx)
         original_validation = validate_output
 
         def validate_candidate(candidate):
+            self.acknowledge_guidance(s, candidate, ctx)
             if original_validation:
                 original_validation(candidate)
             if hasattr(candidate, 'rule_refs'):
@@ -344,11 +497,23 @@ class Engine:
         if s.error:
             ctx = {**ctx, 'runtime_feedback': s.error,
                    'runtime_error_details': s.error_details}
+        if self.memory is not None:
+            # 每次调用重新读取 L1/L2，让工具写入的新记忆立即生效；L2 按源码 manifest 隔离。
+            ctx['working_memory'] = self.memory.working_memory(s.scope_id, s.run_id)
+            ctx['job_memory'] = self.memory.job_memory(s.scope_id, s.job_id, s.source_manifest)
         budget = s.budget
-        logical_call = s.budget.model_calls + 1
 
         def attempt(model, request, attempt_number):
             nonlocal budget
+            # 直到请求 attempt 才标记提示已应用；once 引导在同一逻辑调用内继续有效。
+            for entry in active_guidance(s, logical_call=logical_call):
+                if entry.status == 'queued':
+                    entry.status, entry.applied_step, entry.applied_call = 'applied', s.step, logical_call
+                    self.guidance_ledger.save(entry)
+                    self.event(s, 'guidance.applied', entry.model_dump(mode='json'))
+                elif entry.applied_call is None:
+                    entry.applied_call = logical_call
+                    self.guidance_ledger.save(entry)
             budget = s.budget
             budget = budget.charge('model_calls')
             s.budget = budget
@@ -366,6 +531,19 @@ class Engine:
             self.store.save(s)
             self.event(s, 'model.started', exchange)
             self.event(s, 'model.request.persisted', exchange)
+            for message in request.get('json', {}).get('messages', []):
+                if message.get('role') != 'user':
+                    continue
+                content = message.get('content')
+                if isinstance(content, list):
+                    content = next((part['text'] for part in content if part.get('type') == 'text'), '')
+                try:
+                    injected = json.loads(content)['context'].get('skills', [])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                self.event(s, 'skills.injected', {**exchange, 'skills': [
+                    {key: item[key] for key in ('name', 'version', 'content_hash')} for item in injected]})
+                break
             return exchange
 
         def response(exchange, raw):
@@ -378,12 +556,22 @@ class Engine:
             body = raw.get('body') if isinstance(raw, dict) else None
             choices = body.get('choices', []) if isinstance(body, dict) else []
             choices = choices if isinstance(choices, list) else []
-            reasoning_present = any(isinstance(choice, dict) and
-                isinstance(choice.get('message'), dict) and
-                choice['message'].get('reasoning_content') is not None for choice in choices)
+            # 只保存供应商实际返回的 reasoning/reasoning_content，不从正文推测或生成推理。
+            # 独立 artifact 通过 response_ref 关联完整响应，并保留流中断标记供审计判断完整性。
+            reasoning = reasoning_records(body)
+            reasoning_ref = None
+            if reasoning:
+                reasoning_ref = self.put(s, {**exchange, 'response_ref': response_ref,
+                    'reasoning': reasoning, 'stream_incomplete': bool(raw.get('stream_incomplete'))},
+                    name=f'模型调用{logical_call:03d}_尝试{exchange.get("attempt", 1)}_推理记录')
+                s.reasoning_refs.append(reasoning_ref)
+                self.store.save(s)
+                self.event(s, 'model.reasoning.persisted', {**exchange,
+                    'reasoning_ref': reasoning_ref, 'response_ref': response_ref,
+                    'stream_incomplete': bool(raw.get('stream_incomplete'))})
             self.event(s, 'model.response.persisted', {**exchange,
                 'response_ref': response_ref, 'http_status': raw.get('http_status'),
-                'reasoning_content_present': reasoning_present})
+                'reasoning_content_present': bool(reasoning), 'reasoning_ref': reasoning_ref})
 
         def error(exchange, raw):
             exchange = exchange or {'exchange_id': new_id('model'), 'schema': schema.__name__,
@@ -429,15 +617,19 @@ class Engine:
                 'logical_exchange_id': raw['logical_exchange_id'], 'tool_round': raw['tool_round'],
                 'reused': raw['reused']})
 
-        validation = {'validate_output': validate_output} if (original_validation or
+        validation = {'validate_output': validate_output} if (original_validation or ctx['guidance_ack_required'] or
             (self.rule_resolver and getattr(self.model, 'supports_tool_executor', False))) else {}
         recovery = s.error_details or {}
         recovering_model_request = (recovery.get('status') == 'WAITING_NETWORK'
             and recovery.get('request_status') == 'not_sent'
             and not recovery.get('requires_manual_review') and not recovery.get('requires_new_run'))
         if getattr(self.model, 'supports_tool_executor', False):
-            if self.rule_resolver:
-                validation['context_provider'] = lambda: ctx
+            def current_context():
+                nonlocal ctx
+                ctx = self.guidance_context(s, ctx, logical_call)
+                ctx = self.inject_skills(s, ctx)
+                return ctx
+            validation['context_provider'] = current_context
             failed_exchange_id = recovery.get('logical_exchange_id')
             if recovering_model_request and failed_exchange_id:
                 for audit_ref in reversed(s.model_exchange_refs):
@@ -449,9 +641,19 @@ class Engine:
                     history = request.get('json', {}).get('messages', [])
                     if history:
                         validation['messages'] = history
+                        validation['preserve_resumed_request'] = True
+                        for message in history:
+                            if message.get('role') != 'user':
+                                continue
+                            content = message['content']
+                            if isinstance(content, list):
+                                content = next(part['text'] for part in content if part.get('type') == 'text')
+                            ctx = json.loads(content)['context']
+                            break
                         break
             async def execute_tool(name, arguments, call_id):
                 nonlocal ctx
+                self.sync_guidance(s)
                 self.scopes.assert_current(self.context)
                 action = Gateway.browser_action(name, arguments)
                 observation = self.get(s, s.observation_ref) if s.observation_ref else None
@@ -479,13 +681,49 @@ class Engine:
                 observation = self.get(s, ref)
                 if self.rule_resolver:
                     ctx = self.inject_rules(s, {**ctx, 'observation': observation})
+                ctx = self.guidance_context(s, {**ctx, 'observation': observation}, logical_call)
                 return {'observation_ref': ref, 'observation': observation}
             validation['tool_executor'] = execute_tool
             validation['on_tool_result'] = tool_result
+        runtime_tools = build_runtime_tools(self, s, schema, ctx, validate_output=validate_output)
+        # 工具写入共享运行时 operation 回执，完整结果交由 artifact 保存。
+        async def tool_operation(name, intent, fn, *, idempotency_key=None):
+            return await self.operation(s, name, intent, fn, idempotency_key=idempotency_key)
+        tool_pipeline = runtime_tools.pipeline(
+            operation=tool_operation,
+            emit=lambda kind, payload: self.event(s, kind, payload),
+            store_artifact=lambda value: self.put(s, value, name='工具完整结果'),
+            scope_check=lambda: self.scopes.assert_current(self.context))
+        def context_record(manifest, compacted):
+            # 每次实际组装落盘 manifest，记录模型可见区块的 hash、token 和裁剪项。
+            # 事件仅引用清单及计数，避免把大段上下文重复塞入运行日志。
+            manifest_ref = self.put(s, manifest, name='上下文组装清单')
+            if manifest_ref not in s.context_manifest_refs:
+                s.context_manifest_refs.append(manifest_ref)
+                self.store.save(s)
+            self.event(s, 'context.assembled', {'manifest_ref': manifest_ref,
+                        'compacted': compacted, 'tokens': manifest['tokens_after']})
+            if compacted:
+                self.event(s, 'context.compacted', {'manifest_ref': manifest_ref,
+                    'tokens_before': manifest['tokens_before'], 'tokens_after': manifest['tokens_after']})
+        generation_kwargs = dict(validation)
+        if getattr(self.model, 'supports_tool_executor', False) and runtime_tools.registry.visible(s.phase):
+            generation_kwargs.update(tool_registry=runtime_tools.registry, tool_pipeline=tool_pipeline)
+        if getattr(self.model, 'supports_context_assembler', False):
+            # Gateway 支持时由其在每个 attempt 内重新组装，覆盖重试和工具多轮的新上下文。
+            generation_kwargs.update(context_assembler=self.assembler, on_context=context_record)
+        else:
+            assembly = self.assembler.assemble(ctx)
+            ctx = assembly.context
+            context_record(assembly.manifest, assembly.compacted)
         result = await self.model.generate(schema, ctx, image=image,
             agent_instructions=self.agent_instructions(s), on_attempt=attempt,
-            on_response=response, on_error=error, on_usage=usage, **validation)
+            on_response=response, on_error=error, on_usage=usage, **generation_kwargs)
+        if tool_pipeline.submission_value is not None:
+            result = type(result)(tool_pipeline.submission_value, result.usage,
+                                  result.model_revision, result.finish_reason)
         validate_candidate(result.value)
+        self.record_guidance_ack(s, result.value)
         if recovering_model_request:
             s.error = None
             s.error_details = None
@@ -523,6 +761,7 @@ class Engine:
         return observation_ref
 
     async def act(self, s, action, *, frozen=False, tool_call_id=None):
+        self.sync_guidance(s)
         self.scopes.assert_current(self.context)
         spec = self.spec(s)
         obs = self.get(s, s.observation_ref) if s.observation_ref else None
@@ -559,11 +798,20 @@ class Engine:
                 s = RunState(**data['data'])
                 # Usage committed before a crash takes precedence over old graph state.
                 saved = self.store.load(s.run_id, s.scope_id)
+                s.guidance = saved.guidance
+                s.guidance_constraints = saved.guidance_constraints
                 for metric in ('model_calls', 'browser_actions', 'patches', 'subtasks', 'tokens', 'cost_usd'):
                     setattr(s.budget, metric, max(getattr(s.budget, metric), getattr(saved.budget, metric)))
                 try:
                     return await getattr(self, node)(s, data.get('next_node', 'prepare'))
                 except UnknownOperation as e:
+                    if s.execution_mode == 'batch':
+                        s = self.finish_error(self.store.load(s.run_id, s.scope_id), e, details={
+                            'status': 'UNKNOWN_OPERATION', 'category': 'missing_receipt',
+                            'requires_manual_review': True})
+                        self.event(s, 'run.error', {'error': s.error,
+                            'status': s.run_status, 'error_details': s.error_details})
+                        return self.output(s, 'finalize')
                     # 节点可能已经提交过变更，终止写入以持久化的最新版本为基准。
                     s = self.changed(self.store.load(s.run_id, s.scope_id),
                                      run_status=RunStatus.PAUSED, error='UNKNOWN_OPERATION（未知操作）：'+str(e),
@@ -576,12 +824,44 @@ class Engine:
                 except Exception as e:
                     if node == 'finalize':
                         raise
+                    if isinstance(e, ContextWindowError) or getattr(e, 'status', None) == 'UNKNOWN_OPERATION':
+                        if s.execution_mode == 'batch':
+                            s = self.finish_error(s, e, details={
+                                **getattr(e, 'details', {}),
+                                'status': getattr(e, 'status', 'PAUSED'),
+                                'category': getattr(e, 'category', 'runtime')})
+                            self.event(s, 'run.error', {'error': s.error,
+                                'status': s.run_status, 'error_details': s.error_details})
+                            return self.output(s, 'finalize')
+                        error_details = {**getattr(e, 'details', {}), 'status': getattr(e, 'status', 'PAUSED'),
+                                         'category': getattr(e, 'category', 'runtime')}
+                        if isinstance(e, (MCPConnectionError, MCPActionUnknown)):
+                            error_details.setdefault('source', 'browser')
+                        elif isinstance(e, ModelError):
+                            error_details.setdefault('source', 'model')
+                        s = self.changed(self.store.load(s.run_id, s.scope_id),
+                            run_status=RunStatus.PAUSED, error=sanitize(error_message(e)),
+                            error_details={**error_details, 'requires_manual_review': True})
+                        self.event(s, 'run.error', {'error': s.error, 'error_details': s.error_details})
+                        return self.output(s, 'paused')
+                    if s.execution_mode == 'batch' and getattr(e, 'tracefix_operation_id', None):
+                        s = self.finish_error(s, e, details={
+                            'status': 'UNKNOWN_OPERATION', 'category': 'missing_receipt',
+                            'operation_id': e.tracefix_operation_id,
+                            'requires_manual_review': True})
+                        self.event(s, 'run.error', {'error': s.error,
+                            'status': s.run_status, 'error_details': s.error_details})
+                        return self.output(s, 'finalize')
                     current = self.store.load(s.run_id, s.scope_id)
                     signature = self._error_signature(e)
                     s = self.changed(current, last_error_signature=signature,
                                      loop_error_signatures=current.loop_error_signatures + [signature])
                     _, _, loop_signals = self._loop_assessment(s)
-                    if (loop_signals and not (isinstance(e, (ModelError, MCPConnectionError, MCPActionUnknown))
+                    diagnostic_feedback = (s.phase in {Phase.DIAGNOSE, Phase.PATCH}
+                        and (isinstance(e, (ModelOutputError, BudgetExceeded))
+                             or s.execution_mode == 'batch' and isinstance(e, ValueError)))
+                    if (loop_signals and not diagnostic_feedback
+                            and not (isinstance(e, (ModelError, MCPConnectionError, MCPActionUnknown))
                             and e.status in {'UNKNOWN_OPERATION', 'WAITING_NETWORK'})):
                         s = self._mark_loop(s, self._loop_state_fingerprint(s), [], loop_signals)
                         return self.output(s, 'finalize')
@@ -591,6 +871,12 @@ class Engine:
                             'category': e.category, 'type': type(e).__name__,
                             'source': 'model' if isinstance(e, ModelError) else 'browser'})
                         if e.status in {'UNKNOWN_OPERATION', 'WAITING_NETWORK'}:
+                            if s.execution_mode == 'batch':
+                                s = self.finish_error(self.store.load(s.run_id, s.scope_id), e,
+                                    details=error_details)
+                                self.event(s, 'run.error', {'error': s.error,
+                                    'status': s.run_status, 'error_details': s.error_details})
+                                return self.output(s, 'finalize')
                             safe_unsent_model_retry = (
                                 isinstance(e, ModelError) and e.status == 'WAITING_NETWORK'
                                 and e.details.get('request_status') == 'not_sent'
@@ -604,29 +890,80 @@ class Engine:
                             self.event(s, 'run.error', {'error': s.error,
                                 'status': s.run_status, 'error_details': error_details})
                             return self.output(s, 'paused')
+                        if s.execution_mode == 'batch' and not isinstance(e, ModelOutputError):
+                            s = self.finish_error(self.store.load(s.run_id, s.scope_id), e,
+                                details=error_details)
+                            self.event(s, 'run.error', {'error': s.error,
+                                'status': s.run_status, 'error_details': s.error_details})
+                            return self.output(s, 'finalize')
                     if isinstance(e, ReplayUnbound):
                         target = Phase.EXPLORE if s.phase == Phase.REPRODUCE else Phase.DIAGNOSE
                         s = self.changed(s, phase=target, replay_plan_ref=None,
+                                         exploration_plan_ref=None, reproduction_plan_frozen=False,
                                          replay_index=0, pending_action=None,
                                          error=sanitize(f'{type(e).__name__}: {error_message(e)}')[:1500])
                         self.event(s, 'run.error', {'error': s.error, 'error_details': error_details,
                                                     'action': '重新录制重放计划'})
                         return self.output(s, 'prelude')
-                    if isinstance(e, (ModelOutputError, BudgetExceeded)):
-                        s = self.changed(s, error=sanitize(f'{type(e).__name__}: {error_message(e)}')[:1500],
-                                         error_details={'feedback': '输出未通过校验，请依据错误重新输出'},
-                                         pending_action=None)
+                    if (isinstance(e, (ModelOutputError, BudgetExceeded))
+                            or s.execution_mode == 'batch' and isinstance(e, ValueError)):
+                        current = self.store.load(s.run_id, s.scope_id)
+                        retryable_phase = current.phase in {Phase.DIAGNOSE, Phase.PATCH}
+                        retry_count = current.diagnosis_retry_count + (1 if retryable_phase else 0)
+                        feedback_ref = None
+                        if retryable_phase:
+                            feedback_ref, feedback = self._diagnosis_feedback(current, e)
+                            feedback_text = ('输出未通过校验。请重新读取相关文件和失败证据，'
+                                              '提出有实际差异的最小补丁；本次反馈：'
+                                              + feedback['message'])
+                            details = {'feedback': feedback_text,
+                                       'retry_count': retry_count,
+                                       'feedback_ref': feedback_ref,
+                                       'additional_context': ['diagnosis_feedback_refs',
+                                                              'current_workspace_diff',
+                                                              'latest_failure_evidence']}
+                            if s.execution_mode == 'batch' and retry_count >= self.DIAGNOSIS_RETRY_LIMIT:
+                                s = self.changed(current, phase=Phase.FINALIZE,
+                                    run_status=RunStatus.RUNNING,
+                                    outcome=Outcome.REPAIR_EXHAUSTED,
+                                    diagnosis_retry_count=retry_count,
+                                    diagnosis_feedback_refs=current.diagnosis_feedback_refs + [feedback_ref],
+                                    error=sanitize(f'{type(e).__name__}: {error_message(e)}')[:1500],
+                                    error_details={**details, 'terminal_reason': 'diagnosis_retry_limit'},
+                                    pending_action=None)
+                                self.event(s, 'run.error', {'error': s.error,
+                                    'error_details': s.error_details,
+                                    'action': '诊断重试次数耗尽，输出最终报告'})
+                                return self.output(s, 'finalize')
+                        else:
+                            details = {'feedback': '输出未通过校验，请依据错误重新输出'}
+                        delta = {'error': sanitize(f'{type(e).__name__}: {error_message(e)}')[:1500],
+                                 'error_details': details, 'pending_action': None}
+                        if retryable_phase:
+                            delta.update(diagnosis_retry_count=retry_count,
+                                         diagnosis_feedback_refs=current.diagnosis_feedback_refs + [feedback_ref])
+                            if current.phase == Phase.PATCH:
+                                delta.update(phase=Phase.DIAGNOSE, patch_ref=None)
+                        s = self.changed(current, **delta)
                         self.event(s, 'run.error', {'error': s.error, 'error_details': s.error_details,
                                                     'action': '反馈给模型并重试'})
                         return self.output(s, 'prelude')
                     if isinstance(e, PermissionError):
                         s = self.changed(s, error=sanitize(f'{type(e).__name__}: {error_message(e)}')[:1500],
-                                         error_details={'feedback': '该动作被策略拒绝，请根据原因重新决策'},
-                                         pending_action=None)
+                                         error_details={'feedback': '该动作被策略拒绝，请根据原因重新决策',
+                                                        **(e.details if isinstance(e, GuidanceRejected) else {})},
+                                         pending_action=None,
+                                         **({'phase': Phase.DIAGNOSE, 'patch_ref': None}
+                                            if isinstance(e, GuidanceRejected) and s.phase == Phase.PATCH else {}))
                         self.event(s, 'run.error', {'error': s.error, 'error_details': s.error_details,
                                                     'action': '反馈给模型'})
                         return self.output(s, 'prelude')
                     current = self.store.load(s.run_id, s.scope_id)
+                    if s.execution_mode == 'batch':
+                        s = self.finish_error(current, e)
+                        self.event(s, 'run.error', {'error': s.error,
+                            'status': s.run_status, 'error_details': s.error_details})
+                        return self.output(s, 'finalize')
                     s = self.changed(current, run_status=RunStatus.PAUSED,
                                      error=sanitize(f'{type(e).__name__}: {error_message(e)}')[:1500],
                                      error_details=error_details or {'requires_manual_review': True},
@@ -641,6 +978,25 @@ class Engine:
     def output(self, s, next_node):
         return {'data': s.model_dump(mode='json'), 'next_node': next_node}
 
+    def finish_error(self, s, error, *, outcome=Outcome.INFRA_FAILURE, details=None):
+        """Return a FINALIZE state without replaying an uncertain operation."""
+        s = self.store.load(s.run_id, s.scope_id)
+        message = sanitize(f'{type(error).__name__}: {error_message(error)}')[:1500]
+        details = redact(details or getattr(error, 'details', {}) or {})
+        details.setdefault('requires_manual_review', True)
+        details.setdefault('terminal_reason', 'batch_runtime_error')
+        return self.changed(s, phase=Phase.FINALIZE, run_status=RunStatus.RUNNING,
+                            outcome=outcome, error=message, error_details=details,
+                            pending_action=None)
+
+    def _diagnosis_feedback(self, s, error):
+        """Persist rich feedback so the next patch proposal has new context."""
+        detail = {'type': type(error).__name__, 'message': sanitize(error_message(error)),
+                  'phase': str(s.phase), 'attempt': s.diagnosis_retry_count + 1,
+                  'error_details': redact(getattr(error, 'details', {}) or {})}
+        ref = self.put(s, detail, name='诊断重试反馈')
+        return ref, detail
+
     def route(self, s):
         return {Phase.PREPARE: 'prepare', Phase.EXPLORE: 'decide', Phase.REPRODUCE: 'reproduce',
                 Phase.DIAGNOSE: 'diagnose', Phase.PATCH: 'patch', Phase.VERIFY: 'verify',
@@ -648,12 +1004,25 @@ class Engine:
 
     async def prelude(self, s, _):
         self.scopes.assert_current(self.context)
-        s = self.ensure_rule_snapshot(s)
         if self.control == 'cancel':
+            self.cancel_subagents(s)
             self.control = None
             s = self.changed(s, phase=Phase.FINALIZE, error='用户已取消', outcome=Outcome.INCONCLUSIVE)
             return self.output(s, 'finalize')
+        s = self.ensure_rule_snapshot(s)
+        retarget = self.sync_guidance(s)
+        if retarget:
+            # 已确认的 L3 在阶段边界派生子 Run；父 Run 先收尾，再移交继承证据。
+            self.retarget_child = retarget_state(s, retarget)
+            retarget.status, retarget.child_run_id = 'superseded', self.retarget_child.run_id
+            self.guidance_ledger.save(retarget)
+            s = self.changed(s, phase=Phase.FINALIZE, superseded_by_run_id=self.retarget_child.run_id,
+                             outcome=Outcome.INCONCLUSIVE, pending_action=None)
+            self.event(s, 'run.retargeted', {'guidance_id': retarget.id, 'child_run_id': retarget.child_run_id,
+                       'goal': self.retarget_child.goal, 'inherited_evidence_refs': s.evidence_refs})
+            return self.output(s, 'finalize')
         if self.control == 'pause':
+            self.cancel_subagents(s)
             self.control = None
             s = self.changed(s, run_status=RunStatus.PAUSED)
             return self.output(s, 'paused')
@@ -663,11 +1032,117 @@ class Engine:
                 return self.output(s, 'finalize')
         if self.notes:
             for note in self.notes:
-                self.event(s, 'input.applied', {'text': note, 'effect': '已记录澄清；冻结的 TestSpec 未改变'})
+                self.submit_guidance(s, note, level='hint')
             self.notes.clear()
+            self.sync_guidance(s)
+        if getattr(self, 'compact_requested', False):
+            self.compact_requested = False
+            self.compact_context(s, reason='manual')
         return self.output(s, self.route(s))
 
+    def cancel_subagents(self, s):
+        # 父 Run 暂停或取消时同步终止子任务，避免后台任务继续消耗资源。
+        runtime = getattr(self, 'subagent_runtime', None)
+        if runtime:
+            runtime.cancel(s.run_id)
+
+    def compact_context(self, s, *, reason='manual'):
+        # 手动 compact 生成确定性摘要，不修改冻结的 TestSpec、权限或原始证据。
+        # 摘要保留近期动作和失败事件，完整历史仍可从事件与 artifact 回放。
+        from tracefix.knowledge.assembler import TokenCounter, compact_steps
+        plan = self.get(s, s.replay_plan_ref) if s.replay_plan_ref else []
+        steps = [{'step': index + 1, 'action': action} for index, action in enumerate(plan)]
+        summary = compact_steps(steps)
+        failure_events = [event for event in self.store.trace(s.run_id, s.scope_id)
+            if event['type'] in {'tool.error', 'tool.rejected', 'model.error.persisted', 'run.error'}
+            or event['type'] == 'gate.decided' and event.get('payload', {}).get('passed') is False]
+        summary['failure_events'] = failure_events
+        summary['phase'] = str(s.phase)
+        summary['source_manifest'] = s.source_manifest
+        ref = self.put(s, summary, name='上下文压缩摘要')
+        if hasattr(s, 'compaction_refs'):
+            s.compaction_refs.append(ref)
+        if hasattr(s, 'working_memory_ref'):
+            s.working_memory_ref = ref
+        self.store.save(s)
+        if getattr(self, 'memory', None):
+            # 同步写入 L1 progress，使下次模型调用能读取压缩摘要。
+            self.memory.note(s.scope_id, s.run_id,
+                {'id': 'runtime_compaction', 'kind': 'progress',
+                 'text': json.dumps(summary, ensure_ascii=False)[:4000], 'evidence_refs': []},
+                source_manifest=s.source_manifest)
+        counter = TokenCounter()
+        self.event(s, 'context.compacted', {'reason': reason, 'summary_ref': ref,
+            'step_range': [1, summary['merged_steps']], 'tokens_before': counter.count(steps),
+            'tokens_after': counter.count(summary)})
+        return ref
+
+    def compact(self, s, *, reason='manual'):
+        return self.compact_context(s, reason=reason)
+
+    def agents(self, s):
+        # 合并已持久化事件和运行中的层级 trace，供 CLI 查询同一份子任务视图。
+        records = {}
+        for event in self.store.trace(s.run_id, s.scope_id):
+            if not event['type'].startswith('subtask.'):
+                continue
+            payload = event.get('payload') or {}
+            key = payload.get('child_run_id') or payload.get('task_id') or payload.get('role')
+            if key:
+                records[key] = {**records.get(key, {}), **payload, 'event': event['type']}
+        runtime = getattr(self, 'subagent_runtime', None)
+        if runtime:
+            for record in runtime.trace.children(s.run_id):
+                key = record.get('child_run_id') or record.get('task_id')
+                if key:
+                    records[key] = {**records.get(key, {}), **record}
+        return list(records.values())
+
+    async def discover(self, s):
+        from tracefix.workers import HierarchyTrace, IsolatedGuiScout, SubAgentRuntime, WorkerTask
+        # GUI scout 仅由父 Run 派发；已完成记录和深度检查阻止重复或递归探索。
+        if os.getenv('TRACEFIX_BROWSER_WORKERS', '0') != '1' or getattr(self, 'subagent_depth', 0):
+            return
+        if any(event['type'] == 'subtask.discover.finished' for event in self.store.trace(s.run_id, s.scope_id)):
+            return
+        step_id = f'{s.run_id}:{s.revision}'
+        runtime = SubAgentRuntime(profile=self.profile, workspace=self.workspace,
+            browser_concurrency=max(1, int(os.getenv('TRACEFIX_BROWSER_WORKER_CONCURRENCY', '1'))),
+            trace=HierarchyTrace(lambda record: self.event(s, record['type'],
+                {key: value for key, value in record.items() if key != 'type'})))
+        self.subagent_runtime = runtime
+        task = WorkerTask(run_id=s.run_id, phase='DISCOVER', role='gui-scout',
+            goal='在独立应用和浏览器中探索冻结测试目标并返回真实页面与失败证据。',
+            prompt='依据冻结 TestSpec 从授权 URL 开始探索。只执行已授权浏览器动作，记录观察、页面地图及规则命中；成功必须由确定性断言判定。',
+            tools=['browser'], source_revision=s.revision,
+            metadata={'source_manifest': s.source_manifest, 'parent_step_id': step_id, 'url': s.url})
+        s.budget = s.budget.charge('subtasks')
+        self.store.save(s)
+        try:
+            result = await runtime.dispatch(task, parent_run_id=s.run_id, parent_step_id=step_id,
+                                            generation=s.revision, runner=IsolatedGuiScout(self, s))
+            usage = result.data.get('usage', {})
+            totals = s.budget.model_dump()
+            for metric in ('model_calls', 'browser_actions', 'tokens', 'cost_usd'):
+                totals[metric] += usage.get(metric, 0)
+            s.budget = type(s.budget)(**totals)
+            ref = self.put(s, result.model_dump(mode='json'), name='独立GUI探索结果')
+            s.subtask_refs.append(ref)
+            self.store.save(s)
+            self.event(s, 'subtask.discover.finished', {'artifact_ref': ref, **result.data})
+            if self.memory and getattr(s, 'job_id', None):
+                self.memory.save_job_memory(s.scope_id, s.job_id, result.data.get('page_map', {}),
+                    source_run_id=s.run_id, source_manifest=s.source_manifest)
+        except asyncio.CancelledError:
+            runtime.cancel(s.run_id)
+            raise
+        except Exception as error:
+            self.event(s, 'subtask.discover.finished', {'status': 'failed', 'error': sanitize(str(error))})
+        finally:
+            runtime.close()
+
     async def prepare(self, s, _):
+        self.warn_retrieval_degraded(s)
         if s.step == 0:
             async def prepare_env():
                 if s.continuation_count:
@@ -721,6 +1196,8 @@ class Engine:
             s = self.changed(s, test_spec_ref=ref, test_spec_hash=digest(spec))
             return self.output(s, 'prelude')
         phase = Phase.VERIFY if s.continuation_count and s.patch_hash and s.reproduced and s.replay_plan_ref else Phase.EXPLORE
+        if phase == Phase.EXPLORE:
+            await self.discover(s)
         s = self.changed(s, phase=phase, step=0)
         return self.output(s, 'prelude')
 
@@ -796,6 +1273,8 @@ class Engine:
         return await self.operation(s, 'scenario.reset', {'trial': s.trial, 'validation': s.validation_index}, reset_env)
 
     async def reproduce(self, s, _):
+        if not s.reproduction_plan_frozen:
+            s = await self.freeze_reproduction_plan(s)
         plan = [BrowserAction(**a) for a in self.get(s, s.replay_plan_ref)]
         if s.replay_index == 0:
             r = await self.reset(s)
@@ -809,8 +1288,8 @@ class Engine:
             trials = s.trial + 1
             s = self.changed(s, trial=trials, replay_index=0, evidence_refs=s.evidence_refs+[ref], failure_signatures=signatures)
             if trials == 3:
-                matching = sum(x == signatures[0] for x in signatures[1:])
-                stable = matching >= 2
+                failures = Counter(value for value in signatures[-3:] if value != 'PASS')
+                stable = max(failures.values(), default=0) >= 2
                 if stable and s.mode == 'repair':
                     s = self.changed(s, phase=Phase.DIAGNOSE, reproduced=True)
                 else:
@@ -819,15 +1298,64 @@ class Engine:
                                      error='已验证缺陷报告（仅测试模式）' if stable else '故障无法在三次试验中的至少两次复现')
         return self.output(s, 'prelude')
 
+    def phase_observations(self, s, phase):
+        started = {}
+        observations = []
+        for event in self.store.trace(s.run_id, s.scope_id):
+            if event['phase'] != str(phase):
+                continue
+            payload = event['payload']
+            if event['type'] == 'tool.started':
+                operation_id = payload.get('operation_id')
+                if operation_id:
+                    started[operation_id] = payload.get('intent', {})
+            elif event['type'] == 'tool.completed':
+                ref = payload.get('receipt', {}).get('observation_ref')
+                if ref:
+                    operation_id = payload.get('operation_id')
+                    observations.append({'action': started.get(operation_id, {}),
+                                         'observation_ref': ref, 'observation': self.get(s, ref)})
+        return observations
+
+    async def freeze_reproduction_plan(self, s):
+        if s.patch_hash:
+            raise ValueError('修补后不能重新选择复现计划')
+        if s.reproduction_plan_frozen:
+            return s
+        plan = self.get(s, s.replay_plan_ref) if s.replay_plan_ref else []
+        if not plan:
+            return self.changed(s, exploration_plan_ref=s.replay_plan_ref, reproduction_plan_frozen=True)
+        selection = await self.model_call(s, ReproductionPlan, {
+            'test_spec': self.spec(s).model_dump(), 'goal': s.goal,
+            'exploration_actions': plan,
+            'exploration_observations': self.phase_observations(s, Phase.EXPLORE),
+            'instruction': '只选择已有动作的递增索引，保留交互及随后刷新，排除无关重试。'})
+        indices = selection.action_indices
+        if indices != sorted(set(indices)) or any(index < 0 or index >= len(plan) for index in indices):
+            raise ModelOutputError('复现计划索引必须唯一、递增且在探索记录范围内')
+        selected = [plan[index] for index in indices]
+        interactions = [index for index, action in enumerate(selected) if action['kind'] in {'click', 'type', 'select', 'press'}]
+        original_interactions = [index for index, action in enumerate(plan) if action['kind'] in {'click', 'type', 'select', 'press'}]
+        needs_reload = bool(original_interactions) and any(
+            action['kind'] == 'navigate' for action in plan[original_interactions[0] + 1:])
+        if (original_interactions and not interactions) or (needs_reload and not any(
+                action['kind'] == 'navigate' for action in selected[interactions[-1] + 1:])):
+            raise ModelOutputError('复现计划必须包含交互及随后刷新验证')
+        ref = self.put(s, selected, name='冻结复现计划')
+        return self.changed(s, exploration_plan_ref=s.replay_plan_ref, replay_plan_ref=ref,
+                            reproduction_plan_frozen=True)
+
     async def diagnose(self, s, _):
+        self.warn_retrieval_degraded(s)
         self.workspace.check_frozen(self.source)
         overlay = s.source_manifest + (':' + s.patch_hash if s.patch_hash else '')
         await self.retriever.index(self.workspace, overlay)
         code = await self.retriever.retrieve(s.goal, overlay, 'M1', 10)
         recipes = await self.retriever.retrieve(s.goal, s.source_manifest, 'M3', 3)
-        # Authorized current file reads validate retrieved cards and provide before_hash.
+        # 直接读取当前授权文件以核验检索卡片，并提供补丁校验所需的 before_hash。
         preferred = [json.loads(card['content']).get('path') for card in code if card.get('content', '').startswith('{')]
-        cards = self.workspace.cards(preferred_paths=preferred)
+        cards = self.workspace.cards(limit_chars=60_000 * (s.diagnosis_retry_count + 1),
+                                     preferred_paths=preferred)
         if self.rule_library and self.rule_resolver:
             files = []
             for path in self.workspace.files():
@@ -840,32 +1368,105 @@ class Engine:
                     saved = self.rule_library.save_finding(finding)
                     self.event(s, 'finding.created', {'finding_id': saved.id, 'rule_id': saved.rule_id,
                                                      'rule_version': saved.rule_version, 'source': 'static'})
-        context = build_context(s, self.spec(s).model_dump(), cards=cards,
+        observation = self.get(s, s.observation_ref) if s.observation_ref else None
+        if s.observation_ref and s.observation_ref not in s.evidence_refs:
+            s = self.changed(s, evidence_refs=s.evidence_refs + [s.observation_ref])
+        context = build_context(s, self.spec(s).model_dump(), observation=observation, cards=cards,
                                 rules=self.active_rules(s, str(Phase.DIAGNOSE)))
         context['reference_documents'] = await select_documents(self, s)
+        validations = []
+        validation_observations = []
+        for validation_ref in s.validation_refs:
+            validation = self.get(s, validation_ref)
+            if validation.get('patch_hash') != s.patch_hash:
+                continue
+            result = self.get(s, validation['artifact_ref'])
+            validations.append({**validation, 'result': result})
+            observation_ref = result.get('observation_ref')
+            if observation_ref:
+                validation_observations.append({'observation_ref': observation_ref,
+                                               'observation': self.get(s, observation_ref)})
+                if observation_ref not in s.evidence_refs:
+                    s.evidence_refs.append(observation_ref)
+        context['available_evidence_refs'] = list(dict.fromkeys(context['available_evidence_refs'] + s.evidence_refs))
         context.update(instruction='请诊断并返回最小化的完整文件替换内容。只能编辑当前允许的文件。引用已有证据；每个 before_hash 必须匹配已提供的文件。',
                        allowed_files=self.workspace.allowed_files, repair_memory=recipes, retrieval_ids=[x['id'] for x in code],
-                       failures=[self.get(s, r) for r in s.evidence_refs[-4:]],
-                       previous_validation=[self.get(s, r) for r in s.validation_refs])
-        if os.getenv('TRACEFIX_WORKER') == '1':
+                       failures=[self.get(s, r) for r in s.evidence_refs[-4 * (s.diagnosis_retry_count + 1):]],
+                       previous_validation=validations, validation_observations=validation_observations,
+                       replay_plan=self.get(s, s.replay_plan_ref) if s.replay_plan_ref else [],
+                       current_workspace_diff=self.workspace.diff(),
+                       diagnosis_retry_count=s.diagnosis_retry_count,
+                       diagnosis_feedback=[self.get(s, r) for r in s.diagnosis_feedback_refs[-self.DIAGNOSIS_RETRY_LIMIT:]])
+        if s.diagnosis_retry_count:
+            context['instruction'] += (' 上一次未形成有效补丁。重新核对完整复现步骤、当前页面、失败断言与源码调用链；'
+                                       '当前已补充更多源码和失败证据。只包含实际有改动的文件，'
+                                       '不要为了满足输出要求编造无意义改动。')
+        worker_enabled = (os.getenv('TRACEFIX_WORKER', '1') != '0'
+            and getattr(self, 'subagent_enabled', True)
+            and not getattr(self, 'subagent_depth', 0))
+        if worker_enabled:
             from tracefix.runtime.worker import ReadOnlyWorker, SubtaskSpec
-            spec = SubtaskSpec(s.goal, 'code_investigator', s.revision,
-                tuple(c['path'] for c in cards[:3]), tuple(s.evidence_refs[-2:]))
-            result = await ReadOnlyWorker(self).run(s, spec)
-            worker_ref = self.put(s, result.model_dump(), name='子任务调查结果')
-            s.subtask_refs.append(worker_ref)
-            context['read_only_investigation'] = result.model_dump()
-            self.event(s, 'subtask.completed', {'artifact_ref': worker_ref})
+            specs = [SubtaskSpec(s.goal, 'code-explorer', s.revision,
+                tuple(card['path'] for card in cards[:3]), tuple(s.evidence_refs[-2:])),
+                SubtaskSpec(s.goal, 'evidence-reviewer', s.revision, (), tuple(s.evidence_refs[-4:]))]
+            results = await ReadOnlyWorker(self).group(s, specs)
+            accepted = []
+            for result in results:
+                worker_ref = self.put(s, result.model_dump(), name='子任务调查结果')
+                s.subtask_refs.append(worker_ref)
+                if not result.unresolved or result.evidence_refs or result.files:
+                    accepted.append(result.model_dump())
+            context['read_only_investigations'] = accepted
+            self.store.save(s)
         patch = await self.model_call(s, PatchProposal, context)
         self.validate_rule_refs(s, patch.rule_refs)
         if not set(patch.evidence_refs) <= set(s.evidence_refs):
-            raise ValueError('补丁引用了不存在的证据')
+            invalid = sorted(set(patch.evidence_refs) - set(s.evidence_refs))
+            raise ModelOutputError(
+                '补丁引用了不存在的证据：' + '、'.join(invalid),
+                category='output_validation',
+                details={'invalid_evidence_refs': invalid})
+        self.validate_patch_candidate(patch)
         ref = self.put(s, patch.model_dump(), name='补丁方案')
-        s = self.changed(s, phase=Phase.PATCH, patch_ref=ref, hypothesis_refs=s.hypothesis_refs+[ref])
+        s = self.changed(s, phase=Phase.PATCH, patch_ref=ref, hypothesis_refs=s.hypothesis_refs+[ref],
+                         diagnosis_retry_count=0, error=None, error_details=None,
+                         last_error_signature=None)
         return self.output(s, 'prelude')
+
+    def validate_patch_candidate(self, patch):
+        paths = [edit.path for edit in patch.edits]
+        if len(paths) != len(set(paths)):
+            raise ModelOutputError('补丁包含重复的编辑路径', category='output_validation')
+        for edit in patch.edits:
+            try:
+                path = self.workspace.path(edit.path, write=True)
+            except (PermissionError, ValueError, FileNotFoundError) as error:
+                raise ModelOutputError('补丁路径未通过授权校验：' + edit.path,
+                    category='output_validation',
+                    details={'path': edit.path, 'reason': sanitize(error_message(error))}) from error
+            current = path.read_bytes()
+            if digest(current) != edit.before_hash:
+                raise ModelOutputError(
+                    '补丁基准哈希不匹配：' + edit.path,
+                    category='output_validation',
+                    details={'path': edit.path, 'expected_before_hash': edit.before_hash,
+                             'actual_before_hash': digest(current)})
+            if not edit.content.strip() or current == edit.content.encode('utf-8'):
+                raise ModelOutputError(
+                    '补丁包含无实际改动的文件：' + edit.path,
+                    category='output_validation',
+                    details={'path': edit.path, 'reason': 'no_effective_change',
+                             'proposal_summary': patch.summary,
+                             'proposed_paths': paths})
+        try:
+            self.workspace.validate_guidance_patch(patch)
+        except PermissionError as error:
+            raise ModelOutputError('补丁不符合当前编辑约束：' + sanitize(error_message(error)),
+                category='output_validation', details=getattr(error, 'details', {})) from error
 
     async def patch(self, s, _):
         self.scopes.assert_current(self.context)
+        self.sync_guidance(s)
         if not all(self.bundle_exists(s,r) for r in s.evidence_refs):
             raise ValueError('所需的复现证据缺失或已损坏')
         proposal = PatchProposal(**self.get(s, s.patch_ref))
@@ -926,6 +1527,11 @@ class Engine:
             self.event(s, 'run.error', {'error': s.error, 'error_details': s.error_details,
                                         'action': '从第一项重新验证'})
             return self.output(s, 'prelude')
+        if s.execution_mode == 'batch':
+            s = self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.FIX_VERIFIED,
+                             run_status=RunStatus.RUNNING, approval_ref=None,
+                             error=None, error_details=None)
+            return self.output(s, 'finalize')
         approval = self.store.approval(s, {'action': 'local_commit', 'branch': 'tracefix/'+s.run_id})
         s = self.changed(s, phase=Phase.REVIEW, outcome=Outcome.FIX_VERIFIED,
                          approval_ref=approval, run_status=RunStatus.WAITING_APPROVAL)
@@ -950,8 +1556,14 @@ class Engine:
         return self.output(s, 'finalize')
 
     async def paused(self, s, _):
+        if s.execution_mode == 'batch' and s.error:
+            s = self.finish_error(s, RuntimeError(s.error), details=s.error_details)
+            return self.output(s, 'finalize')
         answer = interrupt({'run_id': s.run_id, 'status': 'PAUSED', 'reason': s.error,
                             'error_details': s.error_details})
+        if answer == 'retarget' and self.sync_guidance(s):
+            s = self.changed(s, run_status=RunStatus.RUNNING)
+            return self.output(s, 'prelude')
         if answer == 'cancel':
             s = self.changed(s, phase=Phase.FINALIZE, run_status=RunStatus.RUNNING,
                              outcome=Outcome.INCONCLUSIVE, error='用户已取消', error_details=None)
@@ -972,32 +1584,85 @@ class Engine:
         return self.output(s, 'prelude')
 
     async def finalize(self, s, _):
+        if s.outcome is None:
+            s = self.changed(s, outcome=Outcome.INCONCLUSIVE,
+                             error=s.error or '未形成确定性验收结论')
+        diff_error = None
+        try:
+            diff_text = self.workspace.diff()
+        except Exception as e:
+            diff_text = ''
+            diff_error = sanitize(error_message(e))[:300]
+        diff_ref = self.put(s, diff_text, 'diff', name='最终候选补丁差异')
+        patch_available = bool(diff_text.strip())
+        verified = False
+        if s.outcome == Outcome.FIX_VERIFIED:
+            try:
+                validations = [Validation(**self.get(s, ref)) for ref in s.validation_refs]
+                verified = (patch_available and digest(diff_text.encode()) == s.patch_hash
+                            and verification_gate(s, validations, lambda ref: self.bundle_exists(s, ref)))
+            except (OSError, ValueError, KeyError):
+                verified = False
+            if not verified:
+                s = self.changed(s, outcome=Outcome.INFRA_FAILURE,
+                    error='最终补丁或验证证据已失效，无法输出已验证修复',
+                    error_details={'terminal_reason': 'final_verification_invalid',
+                                   'patch_export_error': diff_error})
+        patch_verification = ('verified' if verified else 'unverified' if patch_available else 'none')
+        summaries = {
+            Outcome.FIX_VERIFIED: '修复补丁通过全部确定性验证，可供后续流程消费。',
+            Outcome.NO_BUG_FOUND: '本次测试规范未发现缺陷，未生成修复补丁。',
+            Outcome.BUG_CONFIRMED: '缺陷已稳定复现；仅测试模式未执行修复。',
+            Outcome.REPAIR_EXHAUSTED: '补充上下文并多次追问后仍未形成有效修复，已输出最终结果。',
+            Outcome.LOOP_DETECTED: '检测到重复状态或操作循环，已终止并输出最终结果。',
+            Outcome.INFRA_FAILURE: '模型调用、浏览器或运行环境发生重大异常，已输出失败结果。',
+            Outcome.POLICY_BLOCKED: '运行被执行策略阻止，已输出最终结果。',
+            Outcome.INCONCLUSIVE: '现有证据不足以得出确定性验收结论，已输出最终结果。',
+        }
+        result_summary = summaries.get(s.outcome, str(s.outcome))
+        if patch_available and patch_verification != 'verified':
+            result_summary += ' 已导出候选补丁，但该补丁尚未通过全部验证。'
+        if s.error:
+            result_summary += ' 原因：' + s.error
         cleanup = []
         for name, fn in [('browser', self.browser.close), ('sandbox', self.runner.close)]:
             try:
                 await fn()
             except Exception as e:
                 cleanup.append(label(name) + '：' + sanitize(error_message(e))[:300])
-        status = (RunStatus.CANCELLED if s.error == '用户已取消' else
+        status = (RunStatus.SUPERSEDED if s.superseded_by_run_id else
+                  RunStatus.CANCELLED if s.error == '用户已取消' else
                   RunStatus.ABNORMAL if s.outcome == Outcome.LOOP_DETECTED else
                   RunStatus.FAILED if s.outcome in {Outcome.INFRA_FAILURE, Outcome.POLICY_BLOCKED, Outcome.REPAIR_EXHAUSTED}
                   or isinstance(s.error, str) and s.error.startswith('ModelOutputError:') else RunStatus.COMPLETED)
         report = {'schema_version': s.schema_version, 'run_id': s.run_id, 'scope_id': s.scope_id,
-                  'run_status': status, 'mode': s.mode,
+                  'run_status': status, 'mode': s.mode, 'execution_mode': s.execution_mode,
                   'goal': s.goal, 'parent_run_id': s.parent_run_id,
                   'continuation_instruction': s.continuation_instruction,
                   'continuation_count': s.continuation_count,
                   'abnormal_termination': s.abnormal_termination,
                   'continuation_markers': s.continuation_markers,
+                  'guidance': [entry.model_dump(mode='json') for entry in s.guidance],
+                  'guidance_constraints': [entry.model_dump(mode='json') for entry in s.guidance_constraints],
+                  'superseded_by_run_id': s.superseded_by_run_id,
+                  'inherited_evidence_refs': s.inherited_evidence_refs,
                   'remote_config': s.remote_config,
                   'outcome': s.outcome, 'reproduced': s.reproduced,
                   'patch_hash': s.patch_hash, 'branch': s.local_branch, 'merged': False,
+                  'patch_diff_ref': diff_ref, 'patch_available': patch_available,
+                  'patch_verification': patch_verification, 'patch_export_error': diff_error,
+                  'result_summary': result_summary,
+                  'diagnosis_retry_count': s.diagnosis_retry_count,
+                  'diagnosis_feedback_refs': s.diagnosis_feedback_refs,
                   'budget': s.budget.model_dump(), 'evidence_refs': s.evidence_refs,
                   'execution_backend': type(self.runner).__name__, 'source_manifest': s.source_manifest,
                   'environment_digest': s.environment_digest, 'baseline_validation_refs': s.baseline_validation_refs,
                    'validation_refs': s.validation_refs, 'error': s.error,
                    'error_details': s.error_details, 'cleanup_errors': cleanup,
                    'model_exchange_refs': s.model_exchange_refs,
+                   'reasoning_refs': s.reasoning_refs,
+                   'context_manifest_refs': s.context_manifest_refs,
+                   'compaction_refs': s.compaction_refs,
                   'agent_instructions_ref': s.agent_instructions_ref,
                   'agent_instructions_hash': s.agent_instructions_hash,
                   'agent_instructions_path': s.agent_instructions_path,
@@ -1005,18 +1670,26 @@ class Engine:
         ref = self.put(s, report, name='修复报告数据')
         page = report_page(report)
         for evidence in s.evidence_refs:
-            item = self.get(s, evidence)
-            obs_ref = item.get('observation_ref')
-            if obs_ref:
-                obs = self.get(s, obs_ref)
-                page += f'<h2>证据：{html.escape(evidence)}</h2><img alt="页面证据截图" style="max-width:100%" src="{html.escape(obs["screenshot_ref"], quote=True)}">'
-        patches = [e for e in self.store.trace(s.run_id,s.scope_id) if e['type']=='patch.applied']
-        if patches:
-            diff_text = self.artifacts.read(s.scope_id,s.run_id,patches[-1]['payload']['diff_ref']).decode()
+            try:
+                item = self.get(s, evidence)
+                obs_ref = item.get('observation_ref')
+                if obs_ref:
+                    obs = self.get(s, obs_ref)
+                    page += f'<h2>证据：{html.escape(evidence)}</h2><img alt="页面证据截图" style="max-width:100%" src="{html.escape(obs["screenshot_ref"], quote=True)}">'
+            except (OSError, ValueError, KeyError) as error:
+                page += '<p>证据附件无法读取：' + html.escape(evidence) + '</p>'
+                self.event(s, 'run.warning', {'source': 'report_evidence', 'evidence_ref': evidence,
+                                            'error': sanitize(error_message(error))[:300]})
+        if patch_available:
             page += '<h2>候选补丁差异</h2><pre>'+html.escape(diff_text)+'</pre>'
         html_ref = self.put(s, page+'</html>', 'html', name='修复报告')
         if s.reproduced:
-            self.retriever.candidate(s, json.dumps(report, ensure_ascii=False), 'success_recipe' if s.outcome == Outcome.FIX_VERIFIED else 'failure_recipe')
+            try:
+                self.warn_retrieval_degraded(s)
+                self.retriever.candidate(s, json.dumps(report, ensure_ascii=False), 'success_recipe' if s.outcome == Outcome.FIX_VERIFIED else 'failure_recipe')
+            except Exception as error:
+                self.event(s, 'run.warning', {'source': 'report_memory',
+                                            'error': sanitize(error_message(error))[:300]})
         s = self.changed(s, report_ref=ref, run_status=status, pending_action=None)
         self.event(s, 'run.finished', {'report_ref': ref, 'html_ref': html_ref, 'outcome': s.outcome})
         events = self.store.trace(s.run_id, s.scope_id)
@@ -1040,5 +1713,29 @@ class Engine:
                     })
                 else:
                     self.event(state, 'run.started', {'manifest_ref': state.repo_snapshot_ref})
-                return await self.graph.ainvoke(self.output(state, 'prepare'), config)
-            return await self.graph.ainvoke(Command(resume=resume), config)
+                invocation = self.output(state, 'prepare')
+            else:
+                invocation = Command(resume=resume)
+            try:
+                return await self.graph.ainvoke(invocation, config)
+            except GraphInterrupt:
+                raise
+            except Exception as e:
+                scope_id = state.scope_id if state else self.context.active_scope
+                current = self.store.load(run_id, scope_id)
+                if current.execution_mode != 'batch':
+                    raise
+                if current.run_status in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL,
+                                          RunStatus.FAILED, RunStatus.SUPERSEDED}:
+                    raise
+                if isinstance(e, GraphRecursionError):
+                    current = self.changed(current, phase=Phase.FINALIZE,
+                        outcome=Outcome.LOOP_DETECTED, run_status=RunStatus.RUNNING,
+                        abnormal_termination=True, pending_action=None,
+                        error='图执行次数达到上限，检测到流程未能收敛',
+                        error_details={'terminal_reason': 'graph_recursion_limit'})
+                else:
+                    current = self.finish_error(current, e)
+                self.event(current, 'run.error', {'error': current.error,
+                    'error_details': current.error_details})
+                return await self.finalize(current, 'finalize')
