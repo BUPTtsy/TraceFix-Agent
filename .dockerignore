@@ -1,0 +1,11 @@
+.env
+.env.*
+.venv
+.tracefix
+**/node_modules
+**/.git
+**/__pycache__
+artifacts
+upload
+*.zip
+vendor

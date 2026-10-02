@@ -45,7 +45,7 @@ async def check_native_protocol(gateway):
 
     response = await gateway.generate(
         BrowserAction,
-        {"instruction": "Call browser_snapshot exactly once with {}, then return JSON kind=finish. "
+        {"instruction": "Call BrowserSnapshot exactly once with {}, then return JSON kind=finish. "
          "This is a protocol diagnostic with a synthetic observation and no real browser."},
         tool_executor=diagnostic_snapshot,
         on_attempt=lambda model, request, attempt: requests.append(request),
