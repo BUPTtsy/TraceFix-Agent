@@ -10,6 +10,7 @@ from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
 
 from tracefix.cli.registry import COMMANDS, parse
+from tracefix.cli.control import close_watcher, watch_stop_requests
 from tracefix.cli.render import Renderer
 from tracefix.cli.workspace import WorkspaceCommands, command_parser
 from tracefix.console import project_catalog
@@ -21,11 +22,12 @@ from tracefix.execution.workspace import Workspace
 from tracefix.knowledge.context import SkillCatalog
 from tracefix.knowledge.documents import DocumentLibrary, timestamp
 from tracefix.knowledge.retrieval import EmbeddingAdapter, Retriever
+from tracefix.knowledge.memory import MemoryLibrary
 from tracefix.knowledge.scope import ScopeResolver
 from tracefix.model.gateway import BrowserPolicyRouter, Gateway
 from tracefix.model.chat import stream_chat
 from tracefix.messages import ChineseArgumentParser, error_message
-from tracefix.runtime.contracts import Phase, RunState, RunStatus, TestSpec, digest, new_id
+from tracefix.runtime.contracts import Outcome, Phase, RunState, RunStatus, TestSpec, digest, new_id
 from tracefix.runtime.engine import Engine
 from tracefix.runtime.continuation import continuation_state
 from tracefix.rules import RuleLibrary, RuleResolver
@@ -46,7 +48,11 @@ class Session:
         self.render.artifacts = self.artifacts
         self.render.scope = self.scope
         self.engine, self.task, self.run_id = None, None, None
+        self.stop_requested = False
         self.goal, self.mode = args.goal or '', args.mode
+        requested_execution_mode = getattr(args, 'execution_mode', None)
+        self.execution_mode = requested_execution_mode or (
+            'batch' if getattr(args, 'run', False) or getattr(args, 'continue_run', None) else 'interactive')
         self.history_generation = 0
         self.console_run_id = os.getenv('TRACEFIX_CONSOLE_RUN_ID')
         self.web_console_run_id = self.console_run_id
@@ -141,6 +147,7 @@ class Session:
         self.console_run_id = new_id('console')
         fields = {'projectId': self.scope, 'goal': state.goal if state else self.goal,
                   'mode': state.mode if state else self.mode, 'status': str(state.run_status).lower() if state else 'running',
+                  'executionMode': state.execution_mode if state else self.execution_mode,
                   'phase': str(state.phase) if state else 'STARTING', 'origin': 'cli', 'pid': os.getpid(),
                   'dataRoot': str(Path(self.args.data).resolve()), 'finishedAt': None,
                   'profile': self.args.profile, 'registry': str(Path(self.args.projects).resolve())}
@@ -160,19 +167,21 @@ class Session:
             return
         state = self.state()
         changes = {'agentRunId': state.run_id, 'goal': state.goal, 'status': str(state.run_status).lower(),
+                   'executionMode': state.execution_mode,
                    'phase': str(state.phase), 'outcome': state.outcome, 'reportRef': state.report_ref,
                    'branch': state.local_branch, 'error': error or state.error}
         changes.update({'continuationCount': state.continuation_count,
                         'abnormalTermination': state.abnormal_termination,
                         'continuationMarkers': state.continuation_markers,
                         'continuationInstruction': state.continuation_instruction})
-        if state.run_status in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL, RunStatus.FAILED} or error:
+        if state.run_status in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL, RunStatus.FAILED, RunStatus.SUPERSEDED} or error:
             changes['finishedAt'] = timestamp()
         else:
             changes['finishedAt'] = None
         if error:
             changes['status'] = str(state.run_status).lower()
-        changes['pid'] = os.getpid() if state.run_status == RunStatus.RUNNING and not error else None
+        changes['pid'] = os.getpid() if state.run_status in {
+            RunStatus.RUNNING, RunStatus.PAUSED, RunStatus.WAITING_INPUT, RunStatus.WAITING_APPROVAL} and not error else None
         knowledge = event.get('payload') if event and event['type'] == 'knowledge.selected' else None
         if event:
             record = self.documents.run(self.console_run_id)
@@ -182,6 +191,37 @@ class Session:
                     entry += ' · ' + ', '.join(f"{document['title']} v{document['version']}" for document in knowledge['documents'])
                 changes['logs'] = [*record.get('logs', []), sanitize(entry) + '\n'][-120:]
         self.documents.update_run(self.console_run_id, redact(changes), knowledge=knowledge)
+
+    def transfer_console_run(self, previous, child):
+        """Keep Web process ownership attached to a derived Run."""
+        if not self.console_run_id:
+            self.begin_console_run(child)
+            return
+        # update_run 会在旧记录仍有 stopRequestedAt 时强制状态为 stopping；先清理旧请求。
+        self.documents.update_run(self.console_run_id, {
+            'stopRequestedAt': None, 'stopPreviousStatus': None, 'stopError': None,
+        })
+        self.documents.update_run(self.console_run_id, redact({
+            'agentRunId': child.run_id,
+            'goal': child.goal,
+            'status': str(child.run_status).lower(),
+            'executionMode': child.execution_mode,
+            'phase': str(child.phase),
+            'outcome': None,
+            'reportRef': None,
+            'branch': child.local_branch,
+            'error': None,
+            'finishedAt': None,
+            'pid': os.getpid(),
+            'stopRequestedAt': None,
+            'stopPreviousStatus': None,
+            'stopError': None,
+            'parentRunId': child.parent_run_id or previous.run_id,
+            'continuationInstruction': child.continuation_instruction,
+            'continuationCount': child.continuation_count,
+            'continuationMarkers': child.continuation_markers,
+            'abnormalTermination': child.abnormal_termination,
+        }))
 
     def evidence_damaged(self, report):
         """旧证据副本损坏不能静默跳过：写入事件流留痕，并当场告知用户。"""
@@ -203,7 +243,7 @@ class Session:
         if self.task and not self.task.done():
             return True
         if self.run_id:
-            return self.store.load(self.run_id, self.scope).run_status not in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL, RunStatus.FAILED}
+            return self.store.load(self.run_id, self.scope).run_status not in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL, RunStatus.FAILED, RunStatus.SUPERSEDED}
         return False
 
     def state(self):
@@ -221,6 +261,7 @@ class Session:
             return
         self.begin_console_run()
         self.run_id, self.engine, self.task = None, None, None
+        self.stop_requested = False
         try:
             await self.create_agent()
             self.continuation_parent = None
@@ -239,7 +280,7 @@ class Session:
         record = self.workspace_commands.run(run_id)
         claim = os.getenv('TRACEFIX_CONTINUATION_ID')
         if claim and self.web_console_run_id == record['id']:
-            if record.get('continuationId') != claim or record['status'] != 'running':
+            if record.get('continuationId') != claim or record['status'] not in {'running', 'stopping'}:
                 raise ValueError('Web 续执行请求已失效')
             instruction = record['continuationInstruction']
         else:
@@ -248,6 +289,7 @@ class Session:
         self.console_run_id = record['id']
         self.web_console_run_id = None
         self.run_id, self.engine, self.task = None, None, None
+        self.stop_requested = False
         self.goal, self.mode = record['goal'], record['mode']
         self.args.data = record.get('dataRoot') or self.args.data
         self.args.profile = record.get('profile') or self.args.profile
@@ -257,6 +299,14 @@ class Session:
             self.render.reset()
             await self.ensure_runtime()
             previous = self.store.load(record['agentRunId'], self.scope) if record.get('agentRunId') else None
+            requested_execution_mode = getattr(self.args, 'execution_mode', None)
+            if requested_execution_mode:
+                self.execution_mode = requested_execution_mode
+            elif getattr(self.args, 'continue_run', None):
+                self.execution_mode = 'batch'
+            else:
+                self.execution_mode = record.get('executionMode') or (
+                    previous.execution_mode if previous else self.execution_mode)
             continued = None
             if previous:
                 markers = record['continuationMarkers']
@@ -267,6 +317,7 @@ class Session:
                 self.documents.update_run(record['id'], {'continuationMarkers': markers})
                 continued = continuation_state(previous, instruction, markers,
                     process_ended=markers[-1]['previous_status'] in {'failed', 'cancelled'})
+                continued.execution_mode = self.execution_mode
             await self.create_agent(state=continued, reuse_workspace=previous is not None)
         except Exception as error:
             self.documents.update_run(record['id'], redact({'status': 'failed', 'phase': 'FINALIZE',
@@ -290,6 +341,7 @@ class Session:
         Policy(profile.allowed_origins).url(url)
         if state is None:
             state = RunState(scope_id=self.scope, goal=self.goal, url=url, mode=self.mode,
+                             execution_mode=self.execution_mode,
                              parent_run_id=self.continuation_parent or self.parent_run_id,
                              continuation_instruction=self.continuation_instruction,
                              remote_config=remote, additional_rule_ids=self.additional_rule_ids)
@@ -312,6 +364,8 @@ class Session:
                 raise PermissionError('原任务补丁已变化，请核对工作区后继续')
         else:
             workspace, source = Workspace.export(self.scopes, self.ctx, profile.source_commit, workspace_path)
+            if state.inherited_evidence_refs and state.source_manifest and digest(source) != state.source_manifest:
+                raise PermissionError('派生任务源码与父任务冻结清单不一致，不能复用父任务证据')
             state.source_manifest = digest(source)
             state.repo_snapshot_ref = self.artifacts.put(self.scope, state.run_id, source, label='源码快照')
             state.memory_snapshot_ref = self.artifacts.put(self.scope, state.run_id, dataclasses.asdict(self.ctx), label='上下文快照')
@@ -345,7 +399,8 @@ class Session:
         embedding = None
         if os.getenv('TRACEFIX_EMBEDDING_URL'):
             embedding = EmbeddingAdapter(os.environ['TRACEFIX_EMBEDDING_URL'], os.environ['TRACEFIX_EMBEDDING_REVISION'])
-        retriever = Retriever(self.store, self.scopes, self.ctx, embedding)
+        memory = MemoryLibrary(Path(self.args.data) / 'memory.sqlite3')
+        retriever = Retriever(self.store, self.scopes, self.ctx, embedding, fallback=memory)
         rule_library = RuleLibrary(self.documents.path)
         rule_resolver = RuleResolver(rule_library)
         student = None
@@ -355,18 +410,70 @@ class Session:
         self.engine = Engine(self.store, self.artifacts, self.scopes, self.ctx, profile, workspace,
             runner, browser, BrowserPolicyRouter(Gateway(), student), retriever, source, self.saver, self.notify,
             rule_resolver=rule_resolver, rule_library=rule_library)
+        self.engine.memory = memory
         self.engine.documents = self.documents
         self.engine.current_run = state.run_id
         self.run_id = state.run_id
+
+    async def finish_cancelled(self):
+        state = self.state()
+        if state.run_status in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL,
+                                RunStatus.FAILED, RunStatus.SUPERSEDED}:
+            return
+        self.engine.cancel_subagents(state)
+        self.engine.control = None
+        with self.store.writer(state.run_id):
+            state = self.engine.changed(state, phase=Phase.FINALIZE, run_status=RunStatus.RUNNING,
+                                        outcome=Outcome.INCONCLUSIVE, error='用户已取消', pending_action=None)
+            await self.engine.finalize(state, None)
+        self.publish_console()
+        self.render.status(self.state())
+
+    async def stop(self, *, grace=5):
+        self.stop_requested = True
+        state = self.state()
+        self.engine.control = 'cancel'
+        self.engine.cancel_subagents(state)
+        task = self.task
+        if task and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), grace)
+            except asyncio.TimeoutError:
+                task.cancel()
+                await task
+        else:
+            await self.finish_cancelled()
 
     async def drive(self, state=None, resume=None):
         try:
             await self.engine.run(state, resume)
             self.publish_console()
             self.render.status(self.state())
+            child = self.engine.retarget_child
+            if child:
+                # L3 在运行时确认父 Run 已被替换后交回子状态；复制父证据并建立独立控制台记录。
+                previous = self.state()
+                self.engine.copy_retarget_evidence(previous, child)
+                self.engine.retarget_child = None
+                self.transfer_console_run(previous, child)
+                self.goal, self.mode = child.goal, child.mode
+                await self.create_agent(state=child)
+        except asyncio.CancelledError:
+            if not self.stop_requested:
+                raise
+            await self.finish_cancelled()
         except Exception as e:
             latest = self.state()
-            if latest.run_status not in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL, RunStatus.FAILED}:
+            terminal = latest.run_status in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL,
+                                            RunStatus.FAILED, RunStatus.SUPERSEDED}
+            if latest.execution_mode == 'batch':
+                if not terminal:
+                    latest = self.engine.finish_error(latest, e)
+                    await self.engine.finalize(latest, None)
+                self.publish_console(error=error_message(e))
+                self.render.status(self.state())
+                return
+            if not terminal:
                 latest.run_status = RunStatus.PAUSED
                 latest.error = sanitize(error_message(e))
                 latest.error_details = {'requires_manual_review': True, 'source': 'runtime'}
@@ -406,6 +513,7 @@ class Session:
             self.task = asyncio.create_task(self.drive(resume='resume'))
 
     async def chat(self, message, use_knowledge=True):
+        # Chat 服务负责落库 reasoning；终端这里只流式展示正文，历史也只保留正文供下一轮使用。
         history = self.chat_history.setdefault(self.scope, [])
         answer, sources = '', []
         try:
@@ -427,23 +535,92 @@ class Session:
         if command is None:
             if getattr(self, 'mode', '') == 'chat':
                 await self.chat(text)
+            elif self.run_id and self.state().run_status == RunStatus.PAUSED and (self.task is None or self.task.done()):
+                # 暂停后的普通输入作为运行中引导提交；有效 L1/L2 可恢复，L3 必须等待二次确认。
+                if hasattr(self.engine, 'submit_guidance'):
+                    entry = self.engine.submit_guidance(self.state(), text)
+                    self.show_guidance(entry)
+                    if entry.status != 'rejected' and entry.level != 'retarget':
+                        self.task = asyncio.create_task(self.drive(resume='resume'))
+                else:
+                    self.engine.notes.append(text)
+                    self.engine.event(self.state(), 'interrupt.prompt', {'text': text, 'effect': 'recorded_only', 'applied_to_model': False, 'resumes_original_plan': True})
+                    self.render.input(text)
+                    self.task = asyncio.create_task(self.drive(resume='resume'))
+                    self.render.text('已记录，但不会影响当前 Run 的模型输入；正在按原计划从安全边界继续。若需补充指令，请先取消或等待非成功结束后使用 /continue RUN_ID INSTRUCTION。')
             elif self.active():
-                self.engine.notes.append(text)
-                self.engine.event(self.state(), 'interrupt.prompt', {'text': text, 'correction': True})
-                self.render.input(text)
-                self.render.text('已排队；更改冻结测试目标需新建 Run。')
-            elif self.run_id and self.state().run_status == RunStatus.PAUSED:
-                self.engine.notes.append(text)
-                self.engine.event(self.state(), 'interrupt.prompt', {'text': text, 'effect': 'resume after correction'})
-                self.render.input(text)
-                self.task = asyncio.create_task(self.drive(resume='resume'))
-                self.render.text('已记录纠正提示，正在从安全边界继续。')
+                if hasattr(self.engine, 'submit_guidance'):
+                    self.show_guidance(self.engine.submit_guidance(self.state(), text))
+                else:
+                    self.engine.notes.append(text)
+                    self.engine.event(self.state(), 'interrupt.prompt', {'text': text, 'effect': 'recorded_only', 'applied_to_model': False})
+                    self.render.input(text)
+                    self.render.text('已记录，但不会影响当前 Run 的模型输入。若需补充指令，请先取消或等待非成功结束后使用 /continue RUN_ID INSTRUCTION；更改冻结测试目标需新建 Run。')
             else:
                 self.goal = text
                 self.render.text('目标已记录。输入 /run 开始。')
             return
         if command == 'help':
             self.render.help(COMMANDS)
+        elif command == 'guidance':
+            self.render.panel('用户引导', json.dumps([entry.model_dump(mode='json')
+                for entry in self.engine.guidance_status(self.state())], ensure_ascii=False, indent=2))
+        elif command == 'compact':
+            # 活跃 Run 只排队压缩请求，执行层在安全边界压缩，避免与模型调用同时改写上下文。
+            if args:
+                raise ValueError('用法：/compact')
+            state = self.state()
+            if self.active():
+                self.engine.compact_requested = True
+                self.render.text('已请求在下一安全边界压缩上下文。')
+            else:
+                ref = self.engine.compact(state, reason='manual')
+                self.render.text('上下文摘要已保存：' + ref)
+        elif command == 'agents':
+            # 优先按任务 ID 取消调度任务；隔离子 Run 由 runtime 的父运行取消入口向下传播。
+            state = self.state()
+            records = self.engine.agents(state)
+            if not args:
+                self.render.panel('子 Agent', json.dumps(records, ensure_ascii=False, indent=2))
+            elif len(args) == 2 and args[0] == 'show':
+                record = next((item for item in records if args[1] in
+                    {item.get('child_run_id'), item.get('task_id')}), None)
+                if record is None:
+                    raise ValueError('当前 Run 未找到该子 Agent')
+                self.render.panel('子 Agent 结果', json.dumps(record, ensure_ascii=False, indent=2))
+            elif len(args) == 2 and args[0] == 'cancel':
+                runtime = getattr(self.engine, 'subagent_runtime', None)
+                if runtime and runtime.scheduler and any(snapshot.task_id == args[1]
+                                                          for snapshot in runtime.scheduler.snapshots()):
+                    runtime.scheduler.cancel(args[1])
+                else:
+                    record = next((item for item in records if args[1] in
+                        {item.get('child_run_id'), item.get('task_id')}), None)
+                    if record is None:
+                        raise ValueError('当前 Run 未找到该子 Agent')
+                    if not runtime or record.get('event') == 'subtask.completed':
+                        raise ValueError('该子 Agent 已结束')
+                    runtime.cancel(state.run_id)
+                self.render.text('已请求取消子 Agent：' + args[1])
+            else:
+                raise ValueError('用法：/agents [show ID|cancel ID]')
+        elif command in {'hint', 'constrain', 'retarget'}:
+            if not args:
+                raise ValueError(f'用法：/{command} TEXT')
+            state = self.state()
+            if command == 'retarget' and args[0] == 'confirm':
+                # CLI 的确认入口绑定引导 ID、Run ID 和项目，确认结果写入审计后才触发改目标。
+                if len(args) != 2:
+                    raise ValueError('用法：/retarget confirm ID')
+                entry = self.engine.guidance_ledger.confirm(args[1], state.run_id, state.scope_id)
+                self.engine.event(state, 'guidance.confirmed', entry.model_dump(mode='json'))
+                self.render.text('已确认改目标，将在安全边界结束父 Run 并派生子 Run。')
+                if state.run_status == RunStatus.PAUSED and (self.task is None or self.task.done()):
+                    self.task = asyncio.create_task(self.drive(resume='retarget'))
+            else:
+                entry = self.engine.submit_guidance(state, text.split(maxsplit=1)[1],
+                    level={'hint': 'hint', 'constrain': 'constraint', 'retarget': 'retarget'}[command])
+                self.show_guidance(entry)
         elif command == 'projects':
             self.workspace_commands.project(args)
         elif command == 'remote':
@@ -477,7 +654,7 @@ class Session:
             if not self.active():
                 raise ValueError('当前没有运行中的 Run')
             self.engine.control = 'pause'
-            self.render.text('已打断，等待纠正')
+            self.render.text('已请求暂停，将在安全边界停止。')
         elif command == 'mode':
             if len(args)!=1 or args[0] not in {'test','repair','chat'}:
                 raise ValueError('用法：/mode test|repair|chat')
@@ -605,19 +782,53 @@ class Session:
                 except Exception as e:
                     self.render.panel('输入', error_message(e))
 
+    def show_guidance(self, entry):
+        if entry.status == 'rejected':
+            self.render.text('引导被拒绝：' + entry.rejection_reason)
+        elif entry.level == 'retarget':
+            self.render.text(f'识别为改目标 L3：{entry.text}。输入 /retarget confirm {entry.id} 二次确认。')
+        else:
+            self.render.text(f'识别为 {"提示 L1" if entry.level == "hint" else "约束 L2"}：{entry.text}；'
+                             f'{"将在下一次模型请求注入" if entry.level == "hint" else "将在执行前强制校验"}。')
+
 
 async def application(args):
     async with AsyncExitStack() as resources:
         session = Session(args, None, None)
         session.runtime_stack = resources
+        process_control_id = os.getenv('TRACEFIX_PROCESS_CONTROL_ID')
+        console_run_id = os.getenv('TRACEFIX_CONSOLE_RUN_ID')
+        if process_control_id and console_run_id:
+            watcher = asyncio.create_task(watch_stop_requests(session, console_run_id, process_control_id))
+            resources.push_async_callback(close_watcher, watcher)
+        async def wait_for_run():
+            while session.task:
+                task = session.task
+                await task
+                if session.task is not task:
+                    continue
+                if not os.getenv('TRACEFIX_CONSOLE_RUN_ID') or session.state().run_status != RunStatus.PAUSED:
+                    break
+                handled = {entry.id for entry in session.state().guidance}
+                while session.state().run_status == RunStatus.PAUSED:
+                    if session.task is not task:
+                        break
+                    entries = session.engine.guidance_status(session.state())
+                    pending = [entry for entry in entries if entry.status == 'queued' and
+                        (entry.level == 'retarget' and entry.confirmed_at or entry.level != 'retarget' and entry.id not in handled)]
+                    if pending:
+                        handled.update(entry.id for entry in pending)
+                        session.task = asyncio.create_task(session.drive(resume='retarget' if any(entry.level == 'retarget' for entry in pending) else 'resume'))
+                        break
+                    await asyncio.sleep(0.3)
         if getattr(args, 'continue_run', None):
             await session.continue_task(args.continue_run, args.instruction)
             if session.task:
-                await session.task
+                await wait_for_run()
         elif args.run:
             await session.create()
             if session.task:
-                await session.task
+                await wait_for_run()
                 if session.state().run_status == RunStatus.WAITING_APPROVAL:
                     session.render.text('非交互模式已暂停，未自动批准。用 /resume RUN_ID 进入审批。')
         elif args.command:
@@ -630,6 +841,20 @@ async def application(args):
                     await session.task
         else:
             await session.interact()
+        if session.run_id:
+            state = session.state()
+            if state.execution_mode == 'batch':
+                report = session.artifacts.json(state.scope_id, state.run_id, state.report_ref) if state.report_ref else {}
+                result = {'run_id': state.run_id, 'run_status': str(state.run_status),
+                          'outcome': str(state.outcome) if state.outcome else None,
+                          'report_ref': state.report_ref,
+                          'patch_diff_ref': report.get('patch_diff_ref'),
+                          'patch_available': report.get('patch_available', False),
+                          'patch_verification': report.get('patch_verification', 'none'),
+                          'result_summary': report.get('result_summary'), 'error': state.error}
+                print('BATCH_RESULT: ' + json.dumps(result, ensure_ascii=False))
+                return 0 if state.run_status == RunStatus.COMPLETED else 1
+        return 0
 
 
 def main():
@@ -647,10 +872,12 @@ def main():
     parser.add_argument('--url')
     parser.add_argument('--goal')
     parser.add_argument('--mode',choices=['test','repair','chat'],default='test')
+    parser.add_argument('--execution-mode', choices=['interactive', 'batch'], default=None,
+                        help='运行策略；--run 默认 batch，interactive 保留人工暂停/审批')
     parser.add_argument('--spec')
     parser.add_argument('--plain',action='store_true')
     execution = parser.add_mutually_exclusive_group()
-    execution.add_argument('--run',action='store_true',help='执行一次非交互式运行；遇到审批会暂停')
+    execution.add_argument('--run',action='store_true',help='执行一次批处理运行并输出最终报告与补丁；不创建提交')
     execution.add_argument('--command',action='append',help='执行斜杠命令后退出；可重复指定，知识管理无需启动后端')
     execution.add_argument('--continue-run', help='继续原任务，保留任务 ID 和完整轨迹')
     parser.add_argument('--instruction', default='', help='本次继续执行的指令')
@@ -675,7 +902,7 @@ def main():
         asyncio.run(smoke(Path(args.data)/'smoke', plain=args.plain))
         return
     try:
-        asyncio.run(application(args))
+        raise SystemExit(asyncio.run(application(args)))
     except (ValueError,RuntimeError,PermissionError,OSError) as e:
         Renderer(args.plain).panel('启动失败', error_message(e))
         raise SystemExit(2)

@@ -16,6 +16,7 @@ from tracefix.rules.models import Rule
 from tracefix.rules.resolver import render_rule_context
 from tracefix.remote import RemoteConfigStore
 from tracefix.runtime.continuation import can_continue
+from tracefix.runtime.guidance import GuidanceLedger
 from tracefix.messages import error_message
 
 
@@ -150,6 +151,32 @@ def dispatch(operation, fields, *, library=None, projects_path=None, data_root=N
                         library.append_event(record['id'], event)
                     break
         return library.run_events(record['id'], int(fields.get('after', 0)))
+    if operation in {'run.guidance', 'run.guidance.submit', 'run.guidance.confirm'}:
+        # 控制台记录与 Agent Run ID 分开存储；引导账本必须绑定真实运行 ID 和项目作用域。
+        record = library.run(fields['id'])
+        run_id = record.get('agentRunId')
+        if not run_id:
+            raise ValueError('Agent 尚未建立 Run，暂时不能接收引导')
+        ledger = GuidanceLedger(Path(record.get('dataRoot') or data_root) / 'guidance.sqlite3')
+        if operation == 'run.guidance':
+            return [entry.model_dump(mode='json') for entry in ledger.list(run_id, record['projectId'])]
+        if record['status'] not in {'running', 'paused', 'waiting_input'}:
+            raise ValueError('只有运行中或已暂停的 Run 可以接收引导')
+        if operation == 'run.guidance.confirm':
+            # 确认只更新账本，父 Run 的终结和子 Run 的派生交由运行时在安全边界处理。
+            entry = ledger.confirm(fields.get('guidanceId'), run_id, record['projectId'])
+        else:
+            if not isinstance(fields.get('text'), str):
+                raise ValueError('引导必须为文本')
+            entry = ledger.submit(run_id, record['projectId'], fields['text'], level=fields.get('level'),
+                author='web', phase=record.get('phase') if record.get('phase') not in {'STARTING', None} else None,
+                expires=fields.get('expires', 'run'), constraints=fields.get('constraints'))
+        # 同步写入控制台审计轨迹，让 Web 的状态展示能区分排队、拒绝和人工确认。
+        library.append_event(record['id'], {'type': 'guidance.confirmed' if operation.endswith('confirm')
+            else 'guidance.rejected' if entry.status == 'rejected' else 'guidance.queued',
+            'phase': record.get('phase', 'PREPARE'), 'at': entry.created_at,
+            'payload': entry.model_dump(mode='json'), 'seq': -int(entry.created_at * 1_000_000)})
+        return entry.model_dump(mode='json')
     if operation == 'run.continue':
         previous = library.run(fields['id'])
         project = next((item for item in catalog() if item['id'] == previous['projectId']), None)

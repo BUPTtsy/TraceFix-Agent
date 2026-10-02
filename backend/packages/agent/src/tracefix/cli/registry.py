@@ -9,6 +9,14 @@ class CommandSpec:
     help: str
 
 COMMANDS = [
+    # 三类引导共用运行时账本；retarget 的确认步骤独立于提交目标文本。
+    CommandSpec('hint','/hint TEXT','将提示注入当前 Run 的下一次模型请求'),
+    CommandSpec('constrain','/constrain TEXT|JSON','收窄当前 Run 的路径、补丁大小或动作权限'),
+    CommandSpec('retarget','/retarget TEXT | /retarget confirm ID','请求改目标；二次确认后结束父 Run 并派生子 Run'),
+    CommandSpec('guidance','/guidance','查看当前 Run 引导的注入、采纳与拒绝状态'),
+    CommandSpec('agents','/agents [show ID|cancel ID]','查看子 Agent 层级、结果与取消状态'),
+    # compact 只请求运行时压缩历史，冻结目标、断言和权限继续完整保留。
+    CommandSpec('compact','/compact','将旧步骤压缩为工作记忆并保留失败证据'),
     CommandSpec('remote','/remote [show|set|clear]','配置当前项目的远程仓库和拉取分支'),
     CommandSpec('continue','/continue RUN_ID INSTRUCTION','继续原任务并追加非成功结束标记和轨迹'),
     CommandSpec('run','/run','启动已输入目标'), CommandSpec('mode','/mode test|repair|chat','选择测试、修复或流式对话'),

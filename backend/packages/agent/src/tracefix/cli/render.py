@@ -224,14 +224,17 @@ class Renderer:
             if kind in {'run.error', 'run.finished'}:
                 if kind == 'run.error':
                     self.run_status = str(payload.get('status', 'FAILED'))
-                elif self.run_status not in {'CANCELLED', 'FAILED', 'ABNORMAL', 'COMPLETED'}:
+                elif self.run_status not in {'CANCELLED', 'FAILED', 'ABNORMAL', 'COMPLETED', 'SUPERSEDED'}:
                     self.run_status = 'COMPLETED'
                 self.finished_at = time.monotonic()
             elif kind == 'run.started':
                 self.run_status = 'RUNNING'
-        # Normal runtime output is intentionally minimal. Detailed event
-        # payloads remain available through explicit diagnostic commands.
+        # 普通输出保留状态和必要告警，完整事件内容通过诊断命令查看。
         if not replay:
+            # 后端降级会影响检索能力，普通输出也需提示，详细记录仍可通过 trace 查询。
+            if kind in {'retrieval.degraded', 'memory.degraded'}:
+                self.text(f"[警告] {payload['message']}")
+                return
             if kind == 'state.changed':
                 status = str(payload.get('status', self.run_status))
                 status_changed = status != self._last_status
