@@ -90,6 +90,8 @@ class WorkerContext:
             raise PermissionError(f"worker tool is not authorized: {tool}")
 
     def authorize_file(self, path: str, *, write: bool = False) -> None:
+        if write and not self.task.write_enabled:
+            raise PermissionError('Supervisor must explicitly enable worker writes')
         normalized = path.replace("\\", "/")
         if normalized not in self.task.allowed_files:
             raise PermissionError(f"worker file is not authorized: {path}")
@@ -99,8 +101,12 @@ class WorkerContext:
     def authorize_shell(self, *, write: bool = False) -> None:
         if not ({"shell", "shell.readonly", "shell.patch"} & set(self.task.tools)):
             raise PermissionError("worker shell tool is not authorized")
-        if write and not self.task.shell_writes_allowed:
-            raise PermissionError("shell writes are allowed only for a PATCH task")
+        if write:
+            if not self.task.write_enabled:
+                raise PermissionError('Supervisor must explicitly enable worker writes')
+            self.require_tool("shell.patch")
+            if not self.task.shell_writes_allowed:
+                raise PermissionError("shell writes are allowed only for a PATCH task")
 
     def authorize_shell_command(self, command: str) -> None:
         self.authorize_shell(write=_shell_command_writes(command))
@@ -112,12 +118,14 @@ class WorkerContext:
         return self.workspace.read(path)
 
     def write_file(self, path: str, content: str | bytes) -> Any:
+        self.require_tool("file.write")
         self.authorize_file(path, write=True)
         if self.workspace is None:
             raise RuntimeError("worker workspace is unavailable")
         return self.workspace.write(path, content)
 
     def apply_patch(self, proposal: Any) -> Any:
+        self.require_tool("code.write")
         if self.workspace is None:
             raise RuntimeError("worker workspace is unavailable")
         edits = getattr(proposal, "edits", ())

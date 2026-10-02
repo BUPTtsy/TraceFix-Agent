@@ -31,6 +31,7 @@ def new_worker_id(prefix: str = "worker") -> str:
 
 
 def _safe_relative_path(value: str) -> str:
+    # 委派路径只允许项目内相对路径；具体文件授权仍由子 Agent 运行时校验。
     if not isinstance(value, str) or not value.strip():
         raise ValueError("worker path must be a non-empty string")
     normalized = value.replace("\\", "/")
@@ -70,6 +71,13 @@ class WorkerEventType(StrEnum):
 
 
 class WorkerTool(StrEnum):
+    BASH = "Bash"
+    READ = "Read"
+    WRITE = "Write"
+    EDIT = "Edit"
+    GLOB = "Glob"
+    GREP = "Grep"
+    NOTEBOOK_EDIT = "NotebookEdit"
     FILE_READ = "file.read"
     FILE_WRITE = "file.write"
     CODE_READ = "code.read"
@@ -118,6 +126,7 @@ class WorkerTask(WorkerContract):
         validation_alias=AliasChoices("tools", "allowed_tools"),
     )
     writable_files: list[str] = Field(default_factory=list, max_length=2_000)
+    write_enabled: bool = False
     depends_on: list[str] = Field(default_factory=list, max_length=2_000)
     shell_mode: Literal["disabled", "readonly", "patch"] = "disabled"
     retry_limit: int = Field(default=3, ge=0, le=3)
@@ -160,22 +169,29 @@ class WorkerTask(WorkerContract):
 
     @model_validator(mode="after")
     def validate_authorization(self) -> WorkerTask:
+        # 可写范围必须包含于可读范围，shell 写入能力还需绑定 PATCH 阶段。
         if self.role_label is None:
             object.__setattr__(self, "role_label", self.role)
         if not set(self.writable_files) <= set(self.allowed_files):
             raise ValueError("writable_files must be a subset of allowed_files")
         if self.shell_mode == "patch" and self.phase.upper() != "PATCH":
             raise ValueError("shell write mode is only available in the PATCH phase")
-        if self.shell_mode == "disabled" and {
+        shell_tools = {
+            WorkerTool.BASH.value,
             WorkerTool.SHELL.value,
             WorkerTool.SHELL_READONLY.value,
             WorkerTool.SHELL_PATCH.value,
-        } & set(self.tools):
+        }
+        if self.shell_mode == "disabled" and shell_tools & set(self.tools):
             raise ValueError("shell tools require shell_mode=readonly or shell_mode=patch")
-        if self.shell_mode == "readonly" and WorkerTool.SHELL_PATCH.value in self.tools:
-            raise ValueError("shell.patch requires shell_mode=patch")
+        if self.shell_mode == "readonly":
+            if WorkerTool.SHELL_PATCH.value in self.tools:
+                raise ValueError("shell.patch requires shell_mode=patch")
+            if self.write_enabled:
+                raise ValueError("readonly shell mode cannot grant file write access")
         if self.shell_mode == "patch" and not (
-            {WorkerTool.SHELL.value, WorkerTool.SHELL_PATCH.value} & set(self.tools)
+            {WorkerTool.BASH.value, WorkerTool.SHELL.value, WorkerTool.SHELL_PATCH.value}
+            & set(self.tools)
         ):
             raise ValueError("shell_mode=patch requires a shell tool")
         return self
@@ -215,6 +231,7 @@ class WorkerTask(WorkerContract):
         data["run_id"] = run_id
         data["parent_task_id"] = parent_task_id
         if source_revision is not None:
+            # 版本由父运行注入，防止模型自行指定过期或伪造的 generation。
             data["source_revision"] = source_revision
         else:
             data.pop("source_revision", None)
@@ -236,11 +253,11 @@ class WorkerTask(WorkerContract):
         constraints = data.get("constraints", [])
         prompt = str(data.get("prompt", "")).strip()
         if data.get("expected_output"):
-            prompt += f"\n\nExpected output:\n{data['expected_output']}"
+            prompt += f"\n\n预期输出：\n{data['expected_output']}"
         if criteria:
-            prompt += "\n\nCompletion criteria:\n- " + "\n- ".join(map(str, criteria))
+            prompt += "\n\n完成标准：\n- " + "\n- ".join(map(str, criteria))
         if constraints:
-            prompt += "\n\nAdditional constraints:\n- " + "\n- ".join(map(str, constraints))
+            prompt += "\n\n补充约束：\n- " + "\n- ".join(map(str, constraints))
         data["prompt"] = prompt
         data.pop("objective", None)
         data.pop("allowed_tools", None)

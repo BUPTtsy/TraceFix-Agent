@@ -19,7 +19,23 @@
 
 ## Shell、网络与浏览器
 
-Worker 可以按任务契约使用网络和浏览器。普通 Shell 只允许运行只读命令键（`worker.run_shell_readonly`）；运行时会拒绝重定向、`tee`、创建/删除/移动文件、原地编辑、Git 修改和包安装等写操作。只有 `phase=PATCH` 且任务明确声明 `shell_mode=patch` 和补丁文件时，才允许通过补丁 API 或 `worker.run_shell_patch` 写入。
+### 通用工具集
+
+模型接口名称统一使用 PascalCase：Bash、Read、Write、Edit、Glob、Grep、NotebookEdit、BrowserNavigate、BrowserClick、BrowserType、BrowserSelect、BrowserPress、BrowserSnapshot、RulesApplicable、RulesGet、MemorySearch、MemoryNote、AgentDelegate、SubmitTestSpec、FinishExploration、ProposePatch、ReportFindings。
+内部工具 ID 和操作回执保持不变；旧 snake_case 历史在恢复时转换为新名称，不重复执行已完成调用。
+重复的 code.read/code.search 模型入口由 Read/Grep 替代；BrowserSnapshot 已返回截图证据，不再单独暴露 BrowserTakeScreenshot。底层 MCP 的工具名称保持原协议。
+
+主 Agent 与子 Agent 通过 `runtime/local_tools.py` 共用 Bash、Read、Write、Edit、Glob、Grep、NotebookEdit。
+子 Agent 默认只读；Supervisor 通过 `agent.delegate` 的 `write_enabled=true` 与 `writable_files` 显式授权写入。
+角色名不授予写权限，文件路径仍受项目白名单及委派集合约束，子 Agent 不能继续委派。
+文件工具接收授权工作区内的绝对路径。Read 默认读 2000 行，可分页；图片通过 vision 模型分析，PDF 提取指定页文本（不提供 OCR），Notebook 返回 cell。
+Edit 要求唯一匹配，批量替换必须显式指定 replace_all。Glob 按修改时间降序；Grep 支持正则、类型过滤、多行匹配及三种输出模式。
+NotebookEdit 使用零起始 cell_number，支持 replace/insert/delete；修改 code cell 后清空陈旧输出。
+Bash 在配置镜像的 `/bin/bash` 中运行，工作目录为 `/workspace`，仅复制授权文件，禁止访问宿主环境和网络。
+只读子 Agent 的副本只读挂载。显式授权的写任务只有通过路径及并发 hash 校验后才回写文件；不回写删除及越权修改。
+Shell 需要 Docker Linux 引擎和提供 Bash 的镜像；失败不会退回宿主 shell。所有写工具经操作回执串行执行，文件编辑使用共享工作区锁。
+
+Worker 可以按任务契约使用网络和浏览器。Supervisor 自行决定是否授予写权限，必须显式设置 `write_enabled=true` 并列出 `writable_files`。通用文件工具的写入由这两个字段控制；底层 `WorkerContext` API 还检查 `file.write`、`code.write` 或 `shell.patch` 工具声明。旧的 shell.patch API 仍要求 `phase=PATCH` 和 `shell_mode=patch`；通用 Bash 使用上文的独立副本与回写校验。角色及自然语言提示词不能替代结构化授权。
 
 Worker 补丁写入的是共享工作区中的候选修改，并在结果中返回 `patch_hash`；Supervisor 必须先 `agent.join`、核对证据并让主 Run 的补丁与验证流程重新确认，Worker 结果不会自动提升为主 Run 的 `patch_ref` 或 `patch_hash`。
 
