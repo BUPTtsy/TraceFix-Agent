@@ -8,7 +8,7 @@ from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
 from tracefix.runtime.contracts import BrowserAction, Decision, PatchProposal
 
 
-def tool_call(call_id='call-1', name='browser_snapshot', arguments='{}'):
+def tool_call(call_id='call-1', name='BrowserSnapshot', arguments='{}'):
     return {'id': call_id, 'type': 'function',
             'function': {'name': name, 'arguments': arguments}}
 
@@ -58,7 +58,7 @@ async def test_native_preserves_reasoning_and_pairs_results(monkeypatch):
     assert 'response_format' not in requests[0]
     assert requests[0]['parallel_tool_calls'] is False
     assert requests[0]['tool_choice'] == 'auto'
-    assert len(requests[0]['tools']) == 7
+    assert len(requests[0]['tools']) == 6
     assert isinstance(requests[0]['messages'][1]['content'], str)
     assert '只返回一个符合' not in requests[0]['messages'][0]['content']
     assistant, tool = requests[1]['messages'][-2:]
@@ -71,7 +71,7 @@ async def test_native_preserves_reasoning_and_pairs_results(monkeypatch):
 
 
 async def test_native_multiple_rounds_use_new_observation_and_deduplicate_ids(monkeypatch):
-    click = tool_call('click-1', 'browser_click', json.dumps({
+    click = tool_call('click-1', 'BrowserClick', json.dumps({
         'observation_id': 'fresh', 'element_ref': 'e1', 'locator': {'role': 'button', 'name': 'Save'}}))
     requests = mock_completions(monkeypatch, [completion([tool_call()]),
         completion([click]), completion([click]), completion()])
@@ -79,7 +79,7 @@ async def test_native_multiple_rounds_use_new_observation_and_deduplicate_ids(mo
 
     async def execute(name, arguments, call_id):
         executed.append(call_id)
-        return {'observation': {'id': 'fresh' if name == 'browser_snapshot' else 'after-click'}}
+        return {'observation': {'id': 'fresh' if name == 'BrowserSnapshot' else 'after-click'}}
 
     await Gateway(key='ci').generate(BrowserAction, {}, tool_executor=execute,
         on_tool_result=lambda exchange, record: records.append(record))
@@ -89,16 +89,16 @@ async def test_native_multiple_rounds_use_new_observation_and_deduplicate_ids(mo
 
 
 @pytest.mark.parametrize('bad_call', [
-    {'id': 'call-bad', 'type': 'not-function', 'function': {'name': 'browser_snapshot', 'arguments': '{}'}},
-    tool_call('', 'browser_snapshot'),
+    {'id': 'call-bad', 'type': 'not-function', 'function': {'name': 'BrowserSnapshot', 'arguments': '{}'}},
+    tool_call('', 'BrowserSnapshot'),
     tool_call('call-bad', 'browser_evaluate'),
-    tool_call('call-bad', 'browser_snapshot', {}),
-    tool_call('call-bad', 'browser_snapshot', 'null'),
-    tool_call('call-bad', 'browser_snapshot', '[]'),
-    tool_call('call-bad', 'browser_snapshot', '{broken'),
-    tool_call('call-bad', 'browser_snapshot', '{"extra":1}'),
-    tool_call('call-bad', 'browser_navigate', '{"value":1}'),
-    tool_call('call-bad', 'browser_click', '{"observation_id":"fresh","element_ref":"e1","locator":{"role":"button","name":1}}'),
+    tool_call('call-bad', 'BrowserSnapshot', {}),
+    tool_call('call-bad', 'BrowserSnapshot', 'null'),
+    tool_call('call-bad', 'BrowserSnapshot', '[]'),
+    tool_call('call-bad', 'BrowserSnapshot', '{broken'),
+    tool_call('call-bad', 'BrowserSnapshot', '{"extra":1}'),
+    tool_call('call-bad', 'BrowserNavigate', '{"value":1}'),
+    tool_call('call-bad', 'BrowserClick', '{"observation_id":"fresh","element_ref":"e1","locator":{"role":"button","name":1}}'),
     tool_call(),
 ])
 async def test_entire_batch_is_validated_before_any_execution(monkeypatch, bad_call):
@@ -119,7 +119,7 @@ async def test_entire_batch_is_validated_before_any_execution(monkeypatch, bad_c
 
 async def test_reused_id_with_different_arguments_never_executes(monkeypatch):
     mock_completions(monkeypatch, [completion([tool_call()]),
-        completion([tool_call(name='browser_take_screenshot')])])
+        completion([tool_call(name='BrowserPress', arguments=json.dumps({'observation_id': 'obs', 'value': 'Enter'}))])])
     executed = []
 
     async def execute(name, arguments, call_id):
@@ -210,7 +210,7 @@ async def test_complete_history_reuses_recorded_tool_result(monkeypatch):
     requests = mock_completions(monkeypatch, [completion([tool_call()]), completion()])
     history = [{'role': 'assistant', 'content': None, 'reasoning_content': 'retained',
                 'tool_calls': [tool_call()]},
-               {'role': 'tool', 'tool_call_id': 'call-1', 'name': 'browser_snapshot',
+               {'role': 'tool', 'tool_call_id': 'call-1', 'name': 'BrowserSnapshot',
                 'content': '{"observation":{"id":"saved"}}'}]
 
     async def execute(*args):

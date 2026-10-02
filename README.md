@@ -4,7 +4,7 @@ TraceFix 是面向受控 React/TypeScript 项目的 GUI 检测与修复工具。
 
 当前版本为 **v0.1.1**，采用前台、后台与独立演示目标分离的 monorepo 结构：React Web 与 TypeScript CLI 提供交互入口，Node 提供 HTTP 和共享数据服务，Python 3.12、LangGraph、PostgreSQL/pgvector 与 Playwright MCP 负责 Agent 执行。
 
-结构重构已完成，业务逻辑保持原样。最近一次验证为 **2026-09-27**：Node 测试 8 项通过，Python 测试 346 项通过、1 项跳过、3 项原有失败；构建、类型检查、HTTP 集成、离线 Smoke 和规则/续执行浏览器验收通过。失败项及证据见 [重构验证记录](RESTRUCTURE_VALIDATION.md)。历史 API/MCP 验收见 [验收记录](docs/验收记录.md)，不代表当前环境已验证；此次未运行真实模型、Docker 浏览器修复或真实 PostgreSQL 集成检查，也未产出 GPU 训练权重或真实修复成功率。
+结构重构已完成。**2026-09-27 的重构验证快照**为：Node 测试 8 项通过，Python 测试 346 项通过、1 项跳过、3 项原有失败；构建、类型检查、HTTP 集成、离线 Smoke 和规则/续执行浏览器验收通过。失败项及证据见 [重构验证记录](RESTRUCTURE_VALIDATION.md)。**2026-09-28 的 M0 增量验证**合并回归 92 passed、降级警告 SSR 3 passed、Web typecheck 通过；真实 PostgreSQL 与 retrieval 相关测试另有通过记录。各批次范围、既有失败与命令见 [完成度评估](docs/产品说明手册/00-项目进度/完成度评估.md) 和 [验收记录](docs/验收记录.md)。2026-10-01 的 AgentTeam B01 真实批处理运行已输出 `COMPLETED / FIX_VERIFIED`，但补丁审查发现模型停用了取消完成功能，以满足包含两次点击的冻结计划，因此不接受该结果作为 B01/M0 产品验收通过。原始自动报告保留于 `artifacts/real-e2e/m0-b01-agentteam-batch-evidence.json`，审查结论见 `artifacts/real-e2e/m0-b01-agentteam-batch-review.json`；仍需有效修复、至少 3 个真实成功用例和夜间 CI 证据。
 
 ## 1. 项目结构与软件包
 
@@ -173,6 +173,8 @@ npm run dev
 
 打开 `http://127.0.0.1:5173`。`npm run dev` 同时启动 Vite 和后台 HTTP 服务，Vite 将 API 请求转发到 `http://127.0.0.1:3000`。浏览和管理本地项目、知识、规则及运行记录不要求模型 API 或 Docker；Chat 需要模型配置，Test / Repair 需要完整 Agent 环境。
 
+Web Chat 在选择项目后，会随每次请求附带服务端解析的已注册项目信息；关闭知识检索不影响项目上下文。模型可通过 `project.list_files`、`project.read_file`、`project.search` 按需列出、读取和搜索项目文件，回答继续使用 SSE 流式输出。Chat 工具只读，不执行命令或修改、删除文件；项目外路径、符号链接及敏感文件会被服务端拒绝。未选择项目时仍可进行普通对话，但不提供项目文件工具。模型接口需要支持 Chat Completions 的 `tools` / `tool_calls`；真实修复请使用 Repair 模式。
+
 检查并预览构建后的控制台：
 
 ```bash
@@ -241,7 +243,15 @@ docker build -f bugboard/docker/Dockerfile -t tracefix-bugboard:1.0 bugboard/tar
 | `/help`、`/quit` | 帮助、退出 |
 
 TypeScript CLI 使用 Enter 提交命令，输入目标后通过 `/run` 执行；活动 Agent 可通过 `/pause`、`/cancel` 等命令控制。Python 兼容入口使用 `tools/bootstrap/launch.py`，其交互终端支持 Alt+Enter 换行与 Tab 补全，`--plain` 禁用颜色及动态终端控制。Python 的 `/skills` 读取 `backend/skills`；两种入口的完整命令以各自 `/help` 为准。
-非交互运行可使用 `--run --goal "..."`；需要审批时保存检查点并暂停，不自动批准。
+非交互运行可使用 `--run --goal "..." --mode repair`，默认采用 `batch` 策略；非交互 `--continue-run RUN_ID` 也默认采用 `batch`，显式 `--execution-mode interactive` 才恢复人工暂停/审批。普通输出或补丁校验失败继续反馈模型并补充当前源码、失败断言、复现步骤和验证历史；连续三轮仍无有效补丁时以 `REPAIR_EXHAUSTED` 输出最终结果。重大模型错误、未知操作结果和死循环也会生成终态报告，不停留在等待人工恢复的状态。验证成功后直接输出结果与补丁，不创建提交。交互终端默认仍为 `interactive`。
+
+批处理结束时 stdout 包含 `BATCH_RESULT: {...}` JSON，提供 `run_status`、`outcome`、`report_ref`、`patch_diff_ref`、`patch_available`、`patch_verification`、`result_summary` 和错误原因；正常完成退出码为 0，失败、异常或取消为 1。最终报告总会导出一个 diff 文件；没有有效改动时为空，并明确标记 `patch_available=false`、`patch_verification=none`，不把空补丁当作修复成功。已有有效补丁在后续失败时仍会导出，并标记 `unverified`。
+
+运行时按阶段、当前页面适用规则和工作区文件选择 `backend/skills` 中的 Skill，并记录正文版本、哈希及每次请求实际注入的集合。已选择的正文完整保留；受保护上下文超过窗口时暂停，不静默删除指导。未发送的模型请求恢复时保留原消息和已完成工具结果，下一次工具执行后刷新规则与 Skill。DeepSeek 默认发送 `thinking=enabled`；其他兼容端点仅在参数或 `TRACEFIX_THINKING` 显式配置时发送。
+
+复现阶段在修改源码前从探索记录中选择递增且唯一的动作索引，保留必要交互和刷新，冻结后用于独立复现与原问题重测。三次独立试验中至少两次出现相同失败签名才确认缺陷，成功试验不计为失败。诊断只读取当前补丁的验证结果及关联页面证据；无法重放时回到探索阶段重新记录。
+
+授权源码导出与验证后本地候选提交使用 `TRACEFIX_GIT_AUTHOR_NAME` / `TRACEFIX_GIT_AUTHOR_EMAIL` 配置作者和提交者，默认 `TraceFix <tracefix@localhost>`。这两个配置只注入 Git 提交子进程，不修改用户或仓库的 Git 配置。
 
 CLI 支持 `/knowledge import`、`new`、`edit`、`search`、`enable` / `disable`、`export`，以及 `/runs remember` 归档经验。使用 `--command "/knowledge list"` 可执行后退出，管理命令不要求启动 Web 或 Agent 基础设施。命令示例与共享数据说明见 [命令行工作区](docs/命令行工作区.md)。
 
@@ -264,9 +274,12 @@ CLI 支持 `/knowledge import`、`new`、`edit`、`search`、`enable` / `disable
 | [命令行工作区](docs/命令行工作区.md) | CLI 项目、知识、运行管理与续执行 |
 | [Web 工作台与知识库](docs/Web工作台与知识库.md) | 页面、共享数据及浏览器验收说明 |
 | `tools/checks/check_backend.py` | 本地 HTTP 集成检查 |
+| `tools/checks/verify_real_e2e.py` | 真实模型 + Docker + Playwright MCP 的 B01 修复验收；夜间 workflow 使用 `--required`，缺少前置条件直接失败 |
 | `tools/checks/verify_rules_ui.mjs` | 规则管理、刷新持久化与派生运行浏览器验收 |
 | `tools/checks/verify_continuation_ui.mjs` | 续执行、进程回写与移动端浏览器验收 |
 
 浏览器验收需要 Playwright 和 Chromium，可用 `TRACEFIX_PLAYWRIGHT_MODULE` 指定已安装模块。这些脚本使用隔离数据及预期配置失败的 Agent 启动路径，不验证真实模型修复。
+
+真实修复验收使用 `tools/checks/verify_real_e2e.py --required --case B01`，需要配置真实模型并确保检查器子进程能访问 Docker Linux 引擎。最新报告 `artifacts/real-e2e/m0-rerun.json` 为 `failed`，Python 退出码 2，仍在 named pipe 权限检查处停止，未进入模型/MCP；直接 `docker info` 返回 29.4.0（linux），本轮唯一授权重跑因审批服务 503 未执行。此前 `m0-current.json` 保留为历史。详细命令和边界见 [完成度评估](docs/产品说明手册/00-项目进度/完成度评估.md)。夜间 workflow 文件存在不代表 CI 已通过。
 
 指定的历史 pytest 工作区已归档至 `artifacts/test-runs/native-20260925-gateway`；迁移前快照、文件映射、哈希与测试日志位于 `artifacts/restructure`。历史产物中的路径和结论属于对应运行，不代表当前环境状态。

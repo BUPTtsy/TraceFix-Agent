@@ -3,7 +3,13 @@
   "preconditions":["Fresh seeded BugBoard sandbox; no credentials or personal data"],
   "authorized_actions":["navigate","click","type","select","press","observe","finish"],
   "assertions":[{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"checked"}],
-  "regression_plan":[],
-  "regression_assertions":[{"locator":{"role":"heading","name":"Task board"},"condition":"visible"},{"locator":{"role":"button","name":"Add task"},"condition":"enabled"}],
+  "regression_plan":[
+    {"kind":"click","locator":{"role":"checkbox","name":"Complete Write project brief"}},
+    {"kind":"navigate","value":"http://app:3000/"},
+    {"kind":"click","locator":{"role":"checkbox","name":"Complete Write project brief"}},
+    {"kind":"navigate","value":"http://app:3000/"},
+    {"kind":"click","locator":{"role":"button","name":"Todo"}}
+  ],
+  "regression_assertions":[{"locator":{"role":"heading","name":"Task board"},"condition":"visible"},{"locator":{"role":"button","name":"Add task"},"condition":"enabled"},{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"visible"}],
   "max_steps":12
 }

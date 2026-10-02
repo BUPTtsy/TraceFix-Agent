@@ -5,7 +5,8 @@ import httpx
 import pytest
 
 from tracefix.model.gateway import BrowserPolicyRouter, Gateway, ModelError, ModelOutputError, ModelResult
-from tracefix.runtime.contracts import BrowserAction, Decision, RunStatus, digest
+from tracefix.runtime.contracts import (BrowserAction, Decision, FileEdit, Outcome,
+    PatchProposal, RunStatus, digest)
 from tracefix.runtime.smoke import make_engine
 
 
@@ -20,7 +21,7 @@ def completion(*, calls=None, content='{"kind":"finish"}', usage=1, status=200):
     })
 
 
-def tool_call(call_id='call-first', name='browser_snapshot', arguments=None):
+def tool_call(call_id='call-first', name='BrowserSnapshot', arguments=None):
     return {'id': call_id, 'type': 'function', 'function': {
         'name': name, 'arguments': json.dumps(arguments or {})}}
 
@@ -350,3 +351,177 @@ async def test_unknown_result_pauses_before_loop_termination(tmp_path, status):
     assert paused.outcome is None
     assert paused.error_details['status'] == status
     assert paused.error_details['requires_manual_review'] is True
+
+
+@pytest.mark.parametrize('invalid_kind', ['unchanged', 'blank', 'stale_hash', 'duplicate', 'evidence'])
+async def test_invalid_patch_is_corrected_before_workspace_operation(tmp_path, invalid_kind):
+    engine, state = make_engine(tmp_path)
+    original = engine.workspace.read('src/value.ts')
+    stable_content = b'export const unchanged = 1;\n'
+    stable_path = engine.workspace.root / 'src/stable.ts'
+    stable_path.write_bytes(stable_content)
+    engine.source['files']['src/stable.ts'] = digest(stable_content)
+    state.source_manifest = digest(engine.source)
+    state.repo_snapshot_ref = engine.put(state, engine.source)
+    engine.runner.source = state.source_manifest
+    inner = engine.model
+    contexts = []
+
+    class InvalidPatchOnce:
+        async def generate(self, schema, context, **kwargs):
+            if schema is not PatchProposal:
+                return await inner.generate(schema, context, **kwargs)
+            contexts.append(context)
+            assert engine.workspace.read('src/value.ts') == original
+            assert stable_path.read_bytes() == stable_content
+            if len(contexts) > 1:
+                return await inner.generate(schema, context, **kwargs)
+            proposal = PatchProposal(summary='invalid candidate',
+                evidence_refs=context['evidence_refs'][:1], edits=[FileEdit(
+                    path='src/value.ts', before_hash=digest(original.encode()),
+                    content='export const persisted = true;\n')])
+            if invalid_kind == 'unchanged':
+                proposal.edits.append(FileEdit(path='src/stable.ts',
+                    before_hash=digest(stable_content), content=stable_content.decode()))
+            elif invalid_kind == 'blank':
+                proposal.edits[0].content = ' \n'
+            elif invalid_kind == 'stale_hash':
+                proposal.edits[0].before_hash = '0' * 64
+            elif invalid_kind == 'duplicate':
+                proposal.edits.append(proposal.edits[0].model_copy())
+            else:
+                proposal.evidence_refs = ['invented.json']
+            exchange = kwargs['on_attempt']('FAKE-CI', {'json': {}}, 1)
+            usage = {'total_tokens': 1}
+            kwargs['on_usage'](usage)
+            kwargs['on_response'](exchange, {'http_status': 200, 'body': {
+                'usage': usage, 'choices': [{'finish_reason': 'stop',
+                    'message': {'content': proposal.model_dump_json()}}]}})
+            return ModelResult(proposal, usage, 'FAKE-CI', 'stop')
+
+    engine.model = InvalidPatchOnce()
+    await engine.run(state)
+    saved = engine.store.load(state.run_id, state.scope_id)
+    events = engine.store.trace(state.run_id, state.scope_id)
+    operations = [event for event in events if event['type'] == 'tool.started'
+                  and ':workspace.patch:' in event['payload'].get('operation_id', '')]
+
+    assert len(contexts) == 2
+    assert contexts[1]['runtime_feedback'].startswith('ModelOutputError:')
+    assert saved.run_status == RunStatus.WAITING_APPROVAL, saved.error
+    assert saved.outcome == Outcome.FIX_VERIFIED
+    assert saved.budget.patches == 1
+    assert len(operations) == 1
+    assert not any(event['type'] == 'run.error'
+                   and event['payload'].get('status') == RunStatus.PAUSED for event in events)
+
+
+async def test_batch_noop_patch_followups_enrich_context_and_eventually_verify(tmp_path):
+    engine, state = make_engine(tmp_path)
+    state.execution_mode = 'batch'
+    original = engine.workspace.read('src/value.ts')
+    inner = engine.model
+    contexts, card_limits = [], []
+    original_cards = engine.workspace.cards
+
+    def record_cards(limit_chars=60_000, preferred_paths=()):
+        card_limits.append(limit_chars)
+        return original_cards(limit_chars=limit_chars, preferred_paths=preferred_paths)
+
+    class NoopTwice:
+        async def generate(self, schema, context, **kwargs):
+            if schema is not PatchProposal:
+                return await inner.generate(schema, context, **kwargs)
+            contexts.append(copy.deepcopy(context))
+            result = await inner.generate(schema, context, **kwargs)
+            if len(contexts) <= 2:
+                result.value.edits[0].content = original
+                result.value.summary = 'No code change is needed'
+            return result
+
+    engine.workspace.cards = record_cards
+    engine.model = NoopTwice()
+    await engine.run(state)
+
+    finished = engine.store.load(state.run_id, state.scope_id)
+    assert finished.run_status == RunStatus.COMPLETED, finished.error
+    assert finished.outcome == Outcome.FIX_VERIFIED
+    assert len(contexts) == 3
+    assert card_limits == [60_000, 120_000, 180_000]
+    assert [context['diagnosis_retry_count'] for context in contexts] == [0, 1, 2]
+    assert len(contexts[1]['diagnosis_feedback']) == 1
+    assert len(contexts[2]['diagnosis_feedback']) == 2
+    assert 'No code change is needed' in json.dumps(contexts[2]['diagnosis_feedback'])
+    assert contexts[1]['observation']['snapshot']
+    assert 'replay_plan' in contexts[1]
+    assert 'current_workspace_diff' in contexts[1]
+    assert contexts[1]['runtime_feedback'].startswith('ModelOutputError:')
+    assert len(finished.diagnosis_feedback_refs) == 2
+    assert finished.diagnosis_retry_count == 0
+    report = engine.get(finished, finished.report_ref)
+    assert report['patch_available'] is True
+    assert report['patch_verification'] == 'verified'
+
+
+async def test_batch_repeated_noop_patch_emits_exhausted_report_and_empty_diff(tmp_path):
+    engine, state = make_engine(tmp_path)
+    state.execution_mode = 'batch'
+    original = engine.workspace.read('src/value.ts')
+    inner = engine.model
+    contexts = []
+
+    class NoopForever:
+        async def generate(self, schema, context, **kwargs):
+            result = await inner.generate(schema, context, **kwargs)
+            if schema is PatchProposal:
+                contexts.append(copy.deepcopy(context))
+                result.value.edits[0].content = original
+            return result
+
+    engine.model = NoopForever()
+    await engine.run(state)
+
+    finished = engine.store.load(state.run_id, state.scope_id)
+    assert len(contexts) == engine.DIAGNOSIS_RETRY_LIMIT
+    assert finished.run_status == RunStatus.FAILED
+    assert finished.outcome == Outcome.REPAIR_EXHAUSTED
+    assert finished.diagnosis_retry_count == engine.DIAGNOSIS_RETRY_LIMIT
+    assert len(finished.diagnosis_feedback_refs) == engine.DIAGNOSIS_RETRY_LIMIT
+    assert finished.budget.patches == 0
+    assert engine.workspace.read('src/value.ts') == original
+    report = engine.get(finished, finished.report_ref)
+    assert report['patch_available'] is False
+    assert report['patch_verification'] == 'none'
+    assert engine.artifacts.read(state.scope_id, state.run_id, report['patch_diff_ref']) == b''
+    assert report['error_details']['terminal_reason'] == 'diagnosis_retry_limit'
+    assert report['result_summary']
+    assert not any(event['type'] == 'state.changed'
+                   and event['payload']['status'] == RunStatus.PAUSED for event in
+                   engine.store.trace(state.run_id, state.scope_id))
+
+
+async def test_batch_patch_failure_with_unknown_receipt_is_never_replayed(tmp_path):
+    engine, state = make_engine(tmp_path)
+    state.execution_mode = 'batch'
+    original_apply = engine.workspace.apply
+    attempts = []
+
+    def write_then_fail(proposal):
+        attempts.append(proposal)
+        original_apply(proposal)
+        raise ValueError('Patch was written but the receipt was lost')
+
+    engine.workspace.apply = write_then_fail
+    await engine.run(state)
+
+    finished = engine.store.load(state.run_id, state.scope_id)
+    assert len(attempts) == 1
+    assert finished.run_status == RunStatus.FAILED
+    assert finished.outcome == Outcome.INFRA_FAILURE
+    assert finished.error_details['status'] == 'UNKNOWN_OPERATION'
+    assert finished.error_details['operation_id']
+    report = engine.get(finished, finished.report_ref)
+    assert report['patch_available'] is True
+    assert report['patch_verification'] == 'unverified'
+    assert 'persisted = true' in engine.artifacts.read(
+        state.scope_id, state.run_id, report['patch_diff_ref']).decode()

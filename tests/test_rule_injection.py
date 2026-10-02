@@ -102,14 +102,14 @@ async def test_native_navigation_refreshes_rules_before_next_model_request(tmp_p
             context = json.loads(request['messages'][-1]['content'])['context']
             assert 'checkout_rule' not in context['detection_rules']['rule_ids']
             message = {'content': None, 'tool_calls': [{'id': 'checkout', 'type': 'function', 'function': {
-                'name': 'browser_navigate', 'arguments': json.dumps({'value': 'http://app:3000/checkout'})}}]}
+                'name': 'BrowserNavigate', 'arguments': json.dumps({'value': 'http://app:3000/checkout'})}}]}
             reason = 'tool_calls'
         elif len(requests) == 2:
             context = json.loads(request['messages'][1]['content'])['context']
             assert 'checkout_rule' in context['detection_rules']['rule_ids']
             assert '不得自行忽略' in context['detection_rules']['prompt']
             message = {'content': None, 'tool_calls': [{'id': 'home', 'type': 'function', 'function': {
-                'name': 'browser_navigate', 'arguments': json.dumps({'value': 'http://app:3000/home'})}}]}
+                'name': 'BrowserNavigate', 'arguments': json.dumps({'value': 'http://app:3000/home'})}}]}
             reason = 'tool_calls'
         else:
             context = json.loads(request['messages'][1]['content'])['context']

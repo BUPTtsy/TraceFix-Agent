@@ -12,6 +12,7 @@ dependencies = [
   "psycopg[binary,pool]==3.3.3", "mcp==1.26.0", "rich==14.3.3",
   "prompt_toolkit==3.0.52", "httpx[socks]==0.28.1", "PyYAML==6.0.3",
   "tree-sitter==0.25.2", "tree-sitter-typescript==0.23.2",
+  "pypdf==6.1.1",
 ]
 [project.scripts]
 tracefix = "tracefix.cli.main:main"

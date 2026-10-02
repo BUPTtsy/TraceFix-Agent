@@ -23,7 +23,7 @@ async def prepare_engine(root):
     return engine, state
 
 
-def completion(call_id=None, name='browser_snapshot', arguments=None):
+def completion(call_id=None, name='BrowserSnapshot', arguments=None):
     message = {'content': '{"action":{"kind":"finish"}}'}
     if call_id is not None:
         message = {'content': None, 'reasoning_content': 'audit-reasoning', 'tool_calls': [{
@@ -45,7 +45,7 @@ async def test_native_actions_update_observations_receipts_replay_and_audit(tmp_
         if len(requests) == 2:
             observed = json.loads(request['messages'][-1]['content'])['observation']
             assert observed == engine.get(state, state.observation_ref)
-            return completion('click-fresh', 'browser_click', {
+            return completion('click-fresh', 'BrowserClick', {
                 'observation_id': observed['id'], 'element_ref': 'e2',
                 'locator': {'role': 'checkbox', 'name': 'Complete task'}})
         return completion()
@@ -76,7 +76,7 @@ async def test_policy_rejects_tools_before_browser_side_effects(tmp_path, monkey
     observation = engine.get(state, state.observation_ref)
     arguments = {'observation_id': 'stale' if violation == 'stale' else observation['id'],
         'element_ref': 'e2', 'locator': {'role': 'checkbox', 'name': 'Complete task'}}
-    name = 'browser_click'
+    name = 'BrowserClick'
     if violation == 'missing-locator':
         arguments['locator']['name'] = 'No such checkbox'
     if violation == 'unauthorized':
@@ -84,7 +84,7 @@ async def test_policy_rejects_tools_before_browser_side_effects(tmp_path, monkey
         spec.authorized_actions.remove('click')
         state.test_spec_ref = engine.put(state, spec.model_dump())
     if violation == 'origin':
-        name, arguments = 'browser_navigate', {'value': 'https://unauthorized.test'}
+        name, arguments = 'BrowserNavigate', {'value': 'https://unauthorized.test'}
     requests = []
 
     async def post(client, url, **kwargs):
@@ -180,7 +180,7 @@ async def test_stale_native_press_is_rejected_before_operation_and_mcp(tmp_path,
     async def post(client, url, **kwargs):
         requests.append(copy.deepcopy(kwargs['json']))
         if len(requests) == 1:
-            return completion('stale-press', 'browser_press', {
+            return completion('stale-press', 'BrowserPress', {
                 'observation_id': 'previous-observation', 'value': 'Enter'})
         return completion()
 
