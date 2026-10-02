@@ -143,7 +143,8 @@ class Rule(Contract):
         check = self.detection.model_dump(mode="json")
         return {
             "id": self.id, "version": self.version, "severity": self.severity,
-            "name": self.name, "check": check, "fix_guidance": self.fix_guidance,
+            "name": self.name, "category": self.category,
+            "check": check, "fix_guidance": self.fix_guidance,
         }
 
 

@@ -1,4 +1,4 @@
-"""Incremental chat completion events and their final response envelope."""
+"""解析模型流式增量事件，并组装包含正文、reasoning 与工具调用的完整响应。"""
 import copy
 import json
 
@@ -8,6 +8,7 @@ class StreamProtocolError(ValueError):
 
 
 class CompletionStream:
+    # 将 SSE 增量合并为完整响应，正文与 reasoning 分通道转发。
     def __init__(self, on_delta=None):
         self.on_delta = on_delta
         self.message = {'role': 'assistant', 'content': None}
@@ -34,6 +35,7 @@ class CompletionStream:
         if not isinstance(value, str):
             raise StreamProtocolError(field + ' 增量必须为字符串')
         target[field] = (target.get(field) or '') + value
+        # reasoning 与正文使用不同 channel，调用方可分别展示或持久化。
         if value and channel and self.on_delta:
             self.on_delta({'channel': channel, 'delta': value})
 
@@ -91,7 +93,9 @@ class CompletionStream:
                 raise StreamProtocolError('流事件缺少 delta 对象')
             if self.finish_reason is not None and any(value for value in delta.values()):
                 raise StreamProtocolError('finish_reason 后出现新的输出增量')
+            # 不同供应商可能使用两个字段，二者都合并进最终消息并记录。
             self._text(self.message, 'reasoning_content', delta.get('reasoning_content'), 'reasoning')
+            self._text(self.message, 'reasoning', delta.get('reasoning'), 'reasoning')
             self._text(self.message, 'content', delta.get('content'), 'content')
             self._text(self.message, 'refusal', delta.get('refusal'))
             self._tools(delta.get('tool_calls'))
@@ -104,6 +108,7 @@ class CompletionStream:
                 self.finish_reason = finish_reason
 
     async def read(self, response):
+        # 缺少 [DONE] 的流不能当作完整响应，由 Gateway 按结果未知处理。
         if 'text/event-stream' not in response.headers.get('content-type', '').lower():
             raise StreamProtocolError('流响应的 Content-Type 必须为 text/event-stream')
         data_lines = []

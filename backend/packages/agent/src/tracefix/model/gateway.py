@@ -1,11 +1,13 @@
-"""OpenAI wire protocol, explicit JSON validation, retry backoff and real usage."""
+"""适配 Chat Completions 协议，校验结构化输出并记录重试与真实用量。"""
 import asyncio
 import base64
 import json
 import os
 import copy
 import math
+import re
 import uuid
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -13,14 +15,17 @@ from email.utils import parsedate_to_datetime
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from tracefix.knowledge.context import POLICY
-from tracefix.model.prompts import output_instructions
+from tracefix.model.prompts import serialize_request, system_instructions
 from tracefix.messages import error_message, validation_details
 from tracefix.storage.artifacts import sanitize
+from tracefix.model.chat_completions import ChatCompletionsAdapter, IncompleteCompletion
+from tracefix.runtime.contracts import Phase, digest
+from tracefix.runtime.tools import ToolRegistry, ToolSpec, model_tool_name
 
 
 @dataclass
 class ModelResult:
+    # 一次逻辑模型调用的结构化结果；重试和工具轮次沿用同一外层契约。
     value: BaseModel
     usage: dict
     model_revision: str
@@ -64,17 +69,39 @@ def _retry_after_seconds(headers, *, now=None):
 
 
 class Gateway:
+    # 处理传输、工具协议和上下文窗口；运行时通过回调保存请求与 reasoning 审计。
     supports_tool_executor = True
+    supports_streaming = True
+    supports_context_assembler = True
 
     def __init__(self, base_url=None, key=None, text_model=None, vision_model=None,
-                 max_output_tokens=4096, timeout=90, max_attempts=None,
+                 max_output_tokens=20480, timeout=None, max_attempts=None,
                  max_retry_delay=60, tool_mode=None, tool_executor=None,
-                 max_tool_rounds=8):
+                 max_tool_rounds=40, thinking=None, stream=None, additional_tools=None):
         self.base_url = (base_url or os.getenv('TRACEFIX_BASE_URL', 'https://api.deepseek.com')).rstrip('/')
         self.key = key or os.getenv('TRACEFIX_API_KEY', '')
         self.text_model = text_model or os.getenv('TRACEFIX_TEXT_MODEL', 'deepseek-chat')
         self.vision_model = (vision_model if vision_model is not None else os.getenv('TRACEFIX_VISION_MODEL', '')).strip()
-        self.max_output_tokens, self.timeout = max_output_tokens, timeout
+        self.max_output_tokens = max_output_tokens
+        try:
+            self.timeout = float(timeout if timeout is not None else os.getenv('TRACEFIX_MODEL_TIMEOUT', '240'))
+        except (ValueError, TypeError) as error:
+            raise ValueError('timeout must be a positive finite number') from error
+        if not math.isfinite(self.timeout) or self.timeout <= 0:
+            raise ValueError('timeout must be a positive finite number')
+        configured_stream = os.getenv('TRACEFIX_STREAM', 'true') if stream is None else stream
+        if isinstance(configured_stream, str) and configured_stream.lower() in {'true', 'false'}:
+            configured_stream = configured_stream.lower() == 'true'
+        if type(configured_stream) is not bool:
+            raise ValueError('stream must be true or false')
+        self.stream = configured_stream
+        # thinking 默认开启；只有显式传入 disabled 或配置环境变量才关闭。
+        default_thinking = 'enabled' if urlsplit(self.base_url).hostname == 'api.deepseek.com' else None
+        self.thinking = thinking if thinking is not None else os.getenv('TRACEFIX_THINKING', default_thinking)
+        if self.thinking is not None and self.thinking not in {'enabled', 'disabled'}:
+            raise ValueError('thinking must be enabled or disabled')
+        self.additional_tools = list(additional_tools or [])
+        self.adapter = ChatCompletionsAdapter()
         self.tool_mode = (tool_mode or os.getenv('TRACEFIX_TOOL_MODE', 'native')).strip().lower()
         if self.tool_mode not in {'native', 'json'}:
             raise ValueError("tool_mode must be 'native' or 'json'")
@@ -104,6 +131,7 @@ class Gateway:
 
     @staticmethod
     def _native_tools(schema):
+        # 工具 schema 只声明动作格式；实际执行仍受运行时策略控制。
         from tracefix.runtime.contracts import BrowserAction, Decision
         if schema not in {BrowserAction, Decision}:
             return []
@@ -116,7 +144,6 @@ class Gateway:
             'browser_select': ['observation_id', 'element_ref', 'locator', 'value'],
             'browser_press': ['observation_id', 'value'],
             'browser_snapshot': [],
-            'browser_take_screenshot': [],
         }.items():
             properties = {field: copy.deepcopy(action_schema['properties'][field]) for field in fields}
             for property_schema in properties.values():
@@ -124,7 +151,7 @@ class Gateway:
                 if 'anyOf' in property_schema:
                     property_schema.update(property_schema.pop('anyOf')[0])
             tools.append({'type': 'function', 'function': {
-                'name': name,
+                'name': model_tool_name(name),
                 'description': 'Execute through TraceFix policy and MCP. Returns a fresh observation and screenshot evidence reference. value is the URL, text, selected value, or key for the named action.',
                 'parameters': {'type': 'object', 'properties': properties,
                     'required': fields, 'additionalProperties': False, '$defs': action_schema.get('$defs', {})},
@@ -137,19 +164,21 @@ class Gateway:
         from tracefix.runtime.contracts import BrowserAction
         definitions = {tool['function']['name']: tool['function']['parameters']
                        for tool in cls._native_tools(BrowserAction)}
+        name = model_tool_name(name) if isinstance(name, str) else name
         if not isinstance(name, str) or name not in definitions:
             raise ValueError('未知或未授权的浏览器工具：' + str(name))
         try:
             jsonschema.validate(arguments, definitions[name])
         except jsonschema.ValidationError as error:
             raise ValueError('工具参数校验失败：' + error.message) from error
-        kind = {'browser_navigate': 'navigate', 'browser_click': 'click',
-                'browser_type': 'type', 'browser_select': 'select', 'browser_press': 'press',
-                'browser_snapshot': 'observe', 'browser_take_screenshot': 'observe'}[name]
+        kind = {'BrowserNavigate': 'navigate', 'BrowserClick': 'click',
+                'BrowserType': 'type', 'BrowserSelect': 'select', 'BrowserPress': 'press',
+                'BrowserSnapshot': 'observe'}[name]
         return BrowserAction(kind=kind, **arguments)
 
     @classmethod
     def _validated_calls(cls, calls, native_tools, completed_calls):
+        # 整批校验通过后才允许执行，避免前半批已执行而后半批存在非法调用。
         if not native_tools:
             raise ValueError('当前模型输出类型或 tool_mode 不允许调用浏览器工具')
         if not isinstance(calls, list) or not calls:
@@ -170,7 +199,16 @@ class Gateway:
             if not isinstance(raw_arguments, str):
                 raise ValueError('function.arguments 必须是 JSON 字符串')
             arguments = json.loads(raw_arguments)
-            cls.browser_action(name, arguments)
+            definitions = {tool['function']['name']: tool['function']['parameters'] for tool in native_tools}
+            if name not in definitions:
+                raise ValueError('未知或未授权的工具：' + str(name))
+            import jsonschema
+            try:
+                jsonschema.validate(arguments, definitions[name])
+            except jsonschema.ValidationError as error:
+                raise ValueError('工具参数校验失败：' + error.message) from error
+            if name.startswith('Browser'):
+                cls.browser_action(name, arguments)
             identity = (name, json.dumps(arguments, sort_keys=True))
             if call_id in completed_calls and completed_calls[call_id][0] != identity:
                 raise ValueError('tool_call_id 不可复用于不同参数')
@@ -211,6 +249,26 @@ class Gateway:
         return completed
 
     @staticmethod
+    def _wire_history(messages, registry, phase):
+        history = copy.deepcopy(messages)
+        if not isinstance(history, list):
+            return history
+        for message in history:
+            if not isinstance(message, dict):
+                continue
+            functions = [call.get('function') for call in message.get('tool_calls', [])
+                         if isinstance(call, dict)]
+            if message.get('role') == 'tool' and 'name' in message:
+                functions.append(message)
+            for function in functions:
+                if not isinstance(function, dict) or not isinstance(function.get('name'), str):
+                    continue
+                name = function['name']
+                if registry.contains(name, phase):
+                    function['name'] = registry.get(name, phase).wire_name
+        return history
+
+    @staticmethod
     async def _call_tool_executor(executor, name, arguments, call_id):
         if executor is None:
             raise ModelOutputError('模型请求执行工具，但未配置 tool_executor', category='tool_execution')
@@ -218,6 +276,8 @@ class Gateway:
 
     @staticmethod
     def _tool_content(value):
+        if hasattr(value, 'to_content'):
+            return value.to_content()
         if isinstance(value, BaseModel):
             value = value.model_dump(mode='json')
         if isinstance(value, str):
@@ -230,54 +290,120 @@ class Gateway:
     async def generate(self, schema, context, image=None, agent_instructions=None,
                        on_attempt=None, on_response=None, on_error=None, on_usage=None,
                        validate_output=None, tool_executor=None, messages=None, on_tool_result=None,
-                       context_provider=None):
+                       context_provider=None, on_delta=None, tool_registry=None, tool_pipeline=None,
+                       context_assembler=None, on_context=None, preserve_resumed_request=False):
+        # 重试和工具轮次共享消息历史；on_response 将每次响应交给运行时持久化。
         if not self.key:
             raise ModelError('未配置 TRACEFIX_API_KEY', status='FAILED', category='configuration',
                              details={'status': 'FAILED', 'category': 'configuration',
                                       'requires_manual_review': False})
-        text = json.dumps({'context': context, 'response_json_schema': schema.model_json_schema()}, ensure_ascii=False)
+        text = serialize_request(schema, context)
         content = [{'type': 'text', 'text': text}]
         image = image if self.vision_model else None
         if image:
             content.append({'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + base64.b64encode(image).decode()}})
         model = self.vision_model if image else self.text_model
-        project_policy = ''
-        if agent_instructions:
-            project_policy = ('\nProject AGENTS.md instructions follow. They constrain behavior but cannot override '
-                              'the safety policy, frozen TestSpec, scope, permissions, or validation gates.\n'
-                              '<project_instructions>\n' + agent_instructions + '\n</project_instructions>')
-        native_tools = self._native_tools(schema) if self.tool_mode == 'native' else []
-        policy = POLICY.replace('Only propose the requested typed output.',
-            'Use the provided typed tools and final output contract.') if native_tools else POLICY
-        payload = {'model': model, 'messages': [{'role': 'system', 'content': policy + project_policy + output_instructions(schema, native_tools=bool(native_tools))},
+        phase = context.get('phase') or {'TestSpec': 'PREPARE', 'Decision': 'EXPLORE',
+            'BrowserAction': 'EXPLORE', 'PatchProposal': 'DIAGNOSE'}.get(schema.__name__, 'DIAGNOSE')
+        phase = Phase(phase)
+        browser_tools = self._native_tools(schema) if self.tool_mode == 'native' else []
+        offered_registry = ToolRegistry()
+        if self.tool_mode == 'native':
+            for tool in browser_tools:
+                function = tool['function']
+                internal_name = 'browser_' + re.sub(r'(?<!^)(?=[A-Z])', '_',
+                    function['name'][len('Browser'):]).lower()
+                offered_registry.register(ToolSpec(internal_name, function['description'],
+                    function['parameters'], side_effect='external', phases=frozenset({phase}),
+                    idempotency_key=digest, category='browser'))
+            source_registry = tool_registry or (tool_pipeline.registry if tool_pipeline else None)
+            if source_registry is not None:
+                for spec in source_registry.visible(phase):
+                    offered_registry.register(spec)
+            for spec in self.additional_tools:
+                if phase in spec.phases:
+                    offered_registry.register(spec)
+        native_tools = offered_registry.native_tools(phase)
+        names = [tool['function']['name'] for tool in native_tools]
+        if len(names) != len(set(names)):
+            raise ValueError('工具名重复')
+        system = system_instructions(schema, context, agent_instructions=agent_instructions,
+                                     native_tools=bool(native_tools))
+        delegation_policy = ''
+        if any(spec.name.startswith('agent.') for spec in offered_registry.visible(phase)):
+            from tracefix.workers.prompt_policy import SUPERVISOR_DELEGATION_POLICY
+            delegation_policy = SUPERVISOR_DELEGATION_POLICY
+            for spec in offered_registry.visible(phase):
+                delegation_policy = delegation_policy.replace(spec.name, spec.wire_name)
+            system += '\n<supervisor_tool_protocol>\n' + delegation_policy + '\n</supervisor_tool_protocol>'
+        payload = {'model': model, 'messages': [{'role': 'system', 'content': system},
                     {'role': 'user', 'content': content if image else text}],
-                   'max_tokens': self.max_output_tokens, 'stream': False}
+                   'max_tokens': self.max_output_tokens, 'stream': self.stream}
+        if self.stream:
+            payload['stream_options'] = {'include_usage': True}
         if not native_tools:
             payload['response_format'] = {'type': 'json_object'}
         if native_tools:
             payload['tools'] = native_tools
             payload['tool_choice'] = 'auto'
-            payload['parallel_tool_calls'] = False
-        if 'api.deepseek.com' in self.base_url:
-            payload['thinking'] = {'type': 'disabled'}
+            payload['parallel_tool_calls'] = not bool(browser_tools)
+        # reasoning 是否返回取决于供应商；返回的字段经 adapter 保留，再进入运行时审计。
+        if self.thinking is not None:
+            payload['thinking'] = {'type': self.thinking}
         if messages is not None:
             payload['messages'] = copy.deepcopy(messages)
         logical_exchange_id = uuid.uuid4().hex
         tool_rounds = 0
         attempt = 0
         try:
+            payload['messages'] = self._wire_history(payload['messages'], offered_registry, phase)
             completed_calls = self._completed_history(payload['messages'], native_tools)
+            for history_message in payload['messages']:
+                if history_message.get('tool_calls') is not None:
+                    offered_registry.validate_batch(history_message['tool_calls'], phase,
+                                                    wire_names=True)
         except (ValueError, TypeError) as exc:
             raise ModelOutputError('工具历史无效：' + str(exc), category='tool_protocol') from exc
         tool_rounds = sum(message.get('role') == 'assistant' and bool(message.get('tool_calls'))
                           for message in payload['messages'])
+        resumed_tool_round = tool_rounds
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
             while attempt < self.max_attempts:
                 attempt += 1
-                if context_provider:
-                    current_context = context_provider()
-                    current_text = json.dumps({'context': current_context,
-                        'response_json_schema': schema.model_json_schema()}, ensure_ascii=False)
+                # 每次请求重新组装上下文；配置 provider 时同步最新引导、观测和记忆。
+                if (context_provider or messages is not None or context_assembler is not None) and not (preserve_resumed_request and messages is not None and tool_rounds == resumed_tool_round):
+                    current_context = context_provider() if context_provider else context
+                    current_system = system_instructions(schema, current_context,
+                        agent_instructions=agent_instructions, native_tools=bool(native_tools))
+                    if delegation_policy:
+                        current_system += '\n<supervisor_tool_protocol>\n' + delegation_policy + '\n</supervisor_tool_protocol>'
+                    for system_message in payload['messages']:
+                        if system_message.get('role') == 'system':
+                            system_message['content'] = current_system
+                            break
+                    if context_assembler is not None:
+                        overhead = copy.deepcopy(payload)
+                        context_removed = False
+                        image_count = 0
+                        for overhead_message in overhead['messages']:
+                            is_context = overhead_message.get('role') == 'user' and not context_removed
+                            if is_context:
+                                context_removed = True
+                            message_content = overhead_message.get('content')
+                            if isinstance(message_content, list):
+                                for part in message_content:
+                                    if part.get('type') == 'image_url':
+                                        image_count += 1
+                                        part['image_url'] = {'url': '[IMAGE]'}
+                                    elif is_context and part.get('type') == 'text':
+                                        part['text'] = ''
+                            elif is_context:
+                                overhead_message['content'] = ''
+                        overhead['response_json_schema'] = schema.model_json_schema()
+                        extra_tokens = context_assembler.counter.count(overhead) + image_count * 4096
+                        assembly = context_assembler.assemble(current_context, extra_tokens=extra_tokens)
+                        current_context = assembly.context
+                    current_text = serialize_request(schema, current_context)
                     for context_message in payload['messages']:
                         if context_message.get('role') != 'user':
                             continue
@@ -290,6 +416,23 @@ class Gateway:
                         else:
                             context_message['content'] = current_text
                         break
+                    if context_assembler is not None:
+                        bounded_payload = copy.deepcopy(payload)
+                        for bounded_message in bounded_payload['messages']:
+                            bounded_content = bounded_message.get('content')
+                            if isinstance(bounded_content, list):
+                                for part in bounded_content:
+                                    if part.get('type') == 'image_url':
+                                        part['image_url'] = {'url': '[IMAGE]'}
+                        required_tokens = context_assembler.counter.count(bounded_payload) + image_count * 4096
+                        manifest = {**assembly.manifest, 'request_tokens': required_tokens,
+                                    'protocol_tokens': extra_tokens, 'image_tokens_reserved': image_count * 4096}
+                        if on_context:
+                            on_context(manifest, assembly.compacted)
+                        if required_tokens > context_assembler.available:
+                            from tracefix.knowledge.assembler import ContextWindowError
+                            raise ContextWindowError(required_tokens, context_assembler.available,
+                                                     ['system', 'schema', 'tools', 'tool_history'])
                 can_retry = attempt < self.max_attempts
                 retry_delay = min(self.max_retry_delay, 2 ** min(attempt - 1, 30)) if can_retry else None
                 request_record = {'url': self.base_url + '/chat/completions',
@@ -301,8 +444,31 @@ class Gateway:
                 if on_attempt:
                     exchange = on_attempt(model, request_record, attempt)
                 try:
-                    response = await client.post(self.base_url + '/chat/completions',
-                        headers={'Authorization': 'Bearer ' + self.key}, json=payload)
+                    response, raw = await self.adapter.request(client, self.base_url + '/chat/completions',
+                        {'Authorization': 'Bearer ' + self.key}, payload,
+                        on_delta=(lambda delta: on_delta(exchange, delta)) if on_delta else None)
+                except IncompleteCompletion as failure:
+                    usage = failure.body.get('usage')
+                    if on_response:
+                        on_response(exchange, {'http_status': failure.response.status_code,
+                            'headers': dict(failure.response.headers), 'body': failure.body,
+                            'stream_incomplete': True, 'logical_exchange_id': logical_exchange_id,
+                            'tool_round': tool_rounds, 'attempt': attempt,
+                            'messages': copy.deepcopy(payload['messages'])})
+                    valid_usage = (isinstance(usage, dict) and type(usage.get('total_tokens')) is int
+                                   and usage['total_tokens'] >= 0)
+                    if valid_usage and on_usage:
+                        on_usage(usage)
+                    details = {'type': type(failure.cause).__name__, 'category': 'stream_incomplete',
+                        'status': 'UNKNOWN_OPERATION', 'operation_status': 'UNKNOWN_OPERATION',
+                        'request_status': 'response_received', 'billing_status': 'known' if valid_usage else 'unknown',
+                        'requires_manual_review': True, 'retryable': False, 'will_retry': False,
+                        'logical_exchange_id': logical_exchange_id, 'tool_round': tool_rounds, 'attempt': attempt,
+                        'message': sanitize(str(failure.cause))}
+                    if on_error:
+                        on_error(exchange, details)
+                    raise ModelError('模型流未完整结束，执行结果需要核查', status='UNKNOWN_OPERATION',
+                                     category='stream_incomplete', details=details) from failure
                 except httpx.RequestError as e:
                     request_sent = not isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout,
                                                      httpx.PoolTimeout))
@@ -332,10 +498,6 @@ class Gateway:
                                      '模型连接失败；请求尚未发送，等待网络恢复',
                                      status=request_status, category=category,
                                      details=request_error) from e
-                try:
-                    raw = response.json()
-                except (ValueError, TypeError):
-                    raw = {'raw_text': response.content.decode(errors='replace')}
                 if on_response:
                     on_response(exchange, {'http_status': response.status_code,
                         'headers': dict(response.headers), 'body': raw,
@@ -428,10 +590,13 @@ class Gateway:
                                 or message.get('refusal')):
                             raise ValueError('tool_calls 与 finish_reason/refusal 不一致')
                         calls = self._validated_calls(tool_calls, native_tools, completed_calls)
+                        validated_tools = offered_registry.validate_batch(tool_calls, phase,
+                                                                         wire_names=True)
                         if tool_rounds >= self.max_tool_rounds:
                             raise ValueError('模型工具调用轮次超过上限')
                         executor = tool_executor if tool_executor is not None else self.tool_executor
-                        if executor is None:
+                        if executor is None and any(tool_pipeline is None or
+                                not tool_pipeline.registry.contains(call.spec.name, phase) for call in validated_tools):
                             raise ValueError('模型请求执行工具，但未配置 tool_executor')
                     except (ValueError, TypeError) as exc:
                         error = {'type': 'ModelOutputError', 'category': 'tool_protocol',
@@ -445,15 +610,24 @@ class Gateway:
                             on_error(exchange, error)
                         raise ModelOutputError('模型工具协议校验失败：' + error['message'],
                                                category='tool_protocol', details=error) from exc
-                    assistant_message = {'role': 'assistant', 'content': message.get('content'),
-                                         'tool_calls': copy.deepcopy(tool_calls)}
-                    if 'reasoning_content' in message:
-                        assistant_message['reasoning_content'] = copy.deepcopy(message['reasoning_content'])
+                    assistant_message = self.adapter.assistant_message(message, tool_calls=True)
                     payload['messages'].append(assistant_message)
-                    for call_id, name, arguments, identity in calls:
+                    batch_results = [None] * len(calls)
+                    batch_images = {}
+
+                    async def execute_call(index):
+                        # 已完成的 call 只复用原结果，避免网络重试造成重复副作用。
+                        call_id, wire_name, arguments, identity = calls[index]
+                        name = validated_tools[index].spec.name
+                        reused = call_id in completed_calls
                         try:
-                            if call_id in completed_calls:
+                            if reused:
                                 result_content = completed_calls[call_id][1]
+                            elif tool_pipeline is not None and tool_pipeline.registry.contains(name, phase):
+                                result = await tool_pipeline.execute(name, arguments, call_id)
+                                result_content = result.to_content()
+                                if result.images:
+                                    batch_images[index] = result.images
                             else:
                                 result = await self._call_tool_executor(executor, name, arguments, call_id)
                                 result_content = self._tool_content(result)
@@ -473,8 +647,39 @@ class Gateway:
                                 raise
                             raise ModelError('工具执行结果未知：' + error['message'],
                                 status='UNKNOWN_OPERATION', category='tool_execution', details=error) from exc
-                        reused = call_id in completed_calls
                         completed_calls[call_id] = (identity, result_content)
+                        batch_results[index] = (result_content, reused)
+
+                    position = 0
+                    while position < len(calls):
+                        spec = validated_tools[position].spec
+                        if spec.parallel_safe and spec.side_effect in {'none', 'read'}:
+                            end = position
+                            while end < len(calls) and validated_tools[end].spec.parallel_safe and \
+                                    validated_tools[end].spec.side_effect in {'none', 'read'}:
+                                end += 1
+                            try:
+                                async with asyncio.TaskGroup() as group:
+                                    for index in range(position, end):
+                                        group.create_task(execute_call(index))
+                            except ExceptionGroup as errors:
+                                pending_errors = list(errors.exceptions)
+                                flattened = []
+                                while pending_errors:
+                                    error = pending_errors.pop(0)
+                                    if isinstance(error, ExceptionGroup):
+                                        pending_errors.extend(error.exceptions)
+                                    else:
+                                        flattened.append(error)
+                                selected = next((error for error in flattened if hasattr(error, 'status')),
+                                                flattened[0])
+                                raise selected from errors
+                            position = end
+                        else:
+                            await execute_call(position)
+                            position += 1
+                    for index, (call_id, name, arguments, identity) in enumerate(calls):
+                        result_content, reused = batch_results[index]
                         tool_message = {'role': 'tool', 'tool_call_id': call_id,
                                         'name': name, 'content': result_content}
                         payload['messages'].append(tool_message)
@@ -482,7 +687,47 @@ class Gateway:
                             on_tool_result(exchange, {'logical_exchange_id': logical_exchange_id,
                                 'tool_round': tool_rounds, 'attempt': attempt,
                                 'message': copy.deepcopy(tool_message), 'reused': reused})
+                    for images in batch_images.values():
+                        if self.vision_model:
+                            payload['model'] = self.vision_model
+                            payload['messages'].append({'role': 'user', 'content': images})
+                        else:
+                            payload['messages'].append({'role': 'user', 'content':
+                                'Read 返回了图片，但当前未配置 vision_model，无法分析图像内容。'})
+                    if context.get('execution_mode') == 'batch':
+                        for index, call in enumerate(validated_tools):
+                            if not call.spec.submission:
+                                continue
+                            try:
+                                rejected = json.loads(batch_results[index][0])
+                            except (ValueError, TypeError):
+                                continue
+                            if (not isinstance(rejected, dict)
+                                    or rejected.get('isError', rejected.get('is_error')) is not True
+                                    or rejected.get('executed') is not False):
+                                continue
+                            rejection = rejected.get('error') or {}
+                            detail = sanitize(str(rejection.get('message') or '阶段提交被运行时拒绝'))[:2000]
+                            error = {'type': 'ModelOutputError', 'category': 'output_validation',
+                                'message': detail, 'retryable': True, 'will_retry': True,
+                                'retry_delay_seconds': None, 'status': 'FAILED',
+                                'operation_status': 'FAILED', 'billing_status': 'known',
+                                'request_status': 'response_received', 'requires_manual_review': False,
+                                'executed': False, 'submission_rejected': True,
+                                'tool_name': call.name, 'tool_call_id': call.call_id,
+                                'logical_exchange_id': logical_exchange_id,
+                                'tool_round': tool_rounds, 'attempt': attempt,
+                                'rejected_submission': call.arguments}
+                            if on_error:
+                                on_error(exchange, error)
+                            raise ModelOutputError('阶段提交未通过校验；需补充诊断上下文后重试：' + detail,
+                                                   category='output_validation', details=error)
                     tool_rounds += 1
+                    if tool_pipeline is not None and tool_pipeline.submission_value is not None:
+                        value = schema.model_validate(tool_pipeline.submission_value.model_dump(mode='json'))
+                        if validate_output:
+                            validate_output(value)
+                        return ModelResult(value, usage, raw.get('model', model), 'tool_calls')
                     attempt = 0
                     continue
                 refusal = isinstance(message, dict) and bool(message.get('refusal'))
@@ -509,7 +754,7 @@ class Gateway:
                     continue
                 try:
                     value = schema.model_validate_json(choice['message']['content'])
-                    if native_tools:
+                    if browser_tools:
                         action = getattr(value, 'action', value)
                         if action.kind != 'finish':
                             raise ValueError('native 模式必须通过 tools 执行动作；最终 JSON 只能使用 finish')
@@ -536,9 +781,7 @@ class Gateway:
                         raise ModelOutputError(f'模型输出规范校验失败，{self.max_attempts} 次尝试已耗尽；未执行无效输出：'+detail,
                                                category='output_validation', details=error) from e
                     if isinstance(message, dict) and isinstance(message.get('content'), str):
-                        rejected_message = {'role': 'assistant', 'content': message['content']}
-                        if 'reasoning_content' in message:
-                            rejected_message['reasoning_content'] = copy.deepcopy(message['reasoning_content'])
+                        rejected_message = self.adapter.assistant_message(message)
                         payload['messages'].append(rejected_message)
                     payload['messages'].append({'role': 'user', 'content':
                         '上一次最终 JSON 未通过校验，其中的动作未被执行。已有工具结果仍然有效，不得重复执行。'
@@ -547,6 +790,11 @@ class Gateway:
                     await asyncio.sleep(retry_delay)
                     continue
                 return ModelResult(value, usage, raw.get('model', model), choice['finish_reason'])
+
+    @staticmethod
+    def delegation_tools():
+        from tracefix.workers.tools import supervisor_tools
+        return supervisor_tools()
 
 
 class BrowserPolicyRouter:
@@ -559,8 +807,16 @@ class BrowserPolicyRouter:
         return getattr(self.teacher, 'supports_tool_executor', False)
 
     @property
+    def supports_context_assembler(self):
+        return getattr(self.teacher, 'supports_context_assembler', False)
+
+    @property
     def vision_model(self):
         return getattr(self.teacher, 'vision_model', None)
+
+    @property
+    def supports_streaming(self):
+        return any(getattr(model, 'supports_streaming', False) for model in (self.teacher, self.student))
 
     async def generate(self, schema, context, **kwargs):
         from tracefix.runtime.contracts import Decision, BrowserAction
@@ -586,4 +842,6 @@ class BrowserPolicyRouter:
                     raise
                 # Let the host log the externally checkable reason, never confidence.
                 context = {**context, 'student_fallback_reason': str(error)}
+        if not getattr(self.teacher, 'supports_streaming', False):
+            kwargs.pop('on_delta', None)
         return await self.teacher.generate(schema, context, **kwargs)
