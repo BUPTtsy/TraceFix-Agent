@@ -7,7 +7,6 @@ import pytest
 from tracefix.cli import main as cli
 from tracefix.runtime.contracts import Outcome, RunState, RunStatus
 from tracefix.storage.store import MemoryStore
-from test_cli_workspace import session
 
 
 @pytest.mark.parametrize('status,outcome,expected_code', [
@@ -81,12 +80,12 @@ async def test_batch_drive_does_not_display_pause_for_terminal_error():
     (False, 'interactive', 'batch', 'batch', 'interactive'),
 ])
 async def test_continuation_uses_requested_or_entrypoint_execution_mode(
-        session, monkeypatch, noninteractive, requested_mode, record_mode,
+        cli_session, monkeypatch, noninteractive, requested_mode, record_mode,
         previous_mode, expected_mode):
     monkeypatch.delenv('TRACEFIX_CONTINUATION_ID', raising=False)
-    session.args.execution_mode = requested_mode
-    session.args.continue_run = 'previous_task' if noninteractive else None
-    continued_session = cli.Session(session.args, MemoryStore(), None)
+    cli_session.args.execution_mode = requested_mode
+    cli_session.args.continue_run = 'previous_task' if noninteractive else None
+    continued_session = cli.Session(cli_session.args, MemoryStore(), None)
     previous = RunState(scope_id=continued_session.scope, goal='继续验证状态持久化',
                         url='http://app:3000', mode='repair', execution_mode=previous_mode,
                         run_status=RunStatus.FAILED, outcome=Outcome.INFRA_FAILURE)

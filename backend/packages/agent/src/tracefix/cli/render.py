@@ -12,6 +12,7 @@ from rich.text import Text
 
 from tracefix.storage.artifacts import redact, sanitize
 from tracefix.storage.presentation import label, readable
+from tracefix.storage.reporting import report_text
 
 
 ACCENT = '#da7756'
@@ -268,6 +269,12 @@ class Renderer:
                 self.text('\n'.join(lines))
                 return
             if kind in {'run.started', 'run.finished', 'run.error'}:
+                if kind == 'run.finished' and self.artifacts and payload.get('report_ref'):
+                    try:
+                        report = self.artifacts.json(event['scope_id'], event['run_id'], payload['report_ref'])
+                        self.panel('问题报告', report_text(report))
+                    except (OSError, ValueError, KeyError) as error:
+                        self.text('问题报告读取失败：' + str(error))
                 status = ('RUNNING' if kind == 'run.started' else
                           str(payload.get('status', 'FAILED')) if kind == 'run.error' else 'COMPLETED')
                 if status != self._last_status:

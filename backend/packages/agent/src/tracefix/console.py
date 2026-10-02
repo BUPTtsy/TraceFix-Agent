@@ -131,13 +131,19 @@ def dispatch(operation, fields, *, library=None, projects_path=None, data_root=N
         record = library.run(fields['id'])
         record['canContinue'] = can_continue(record['status'], record.get('outcome'))
         record['artifacts'] = []
+        record['issueReport'] = None
         if record.get('agentRunId'):
             artifacts = Artifacts(Path(record.get('dataRoot') or data_root) / 'artifacts')
             index = artifacts._index(record['projectId'], record['agentRunId'])
+            report_ref = record.get('reportRef')
+            if report_ref in index:
+                record['issueReport'] = artifacts.json(record['projectId'], record['agentRunId'], report_ref)
+            issue_refs = {ref for issue in (record['issueReport'] or {}).get('issues', [])
+                          for ref in issue.get('evidence_refs', [])}
             knowledge_refs = {entry['artifact_ref'] for entry in record.get('knowledge', [])}
             record['artifacts'] = [{'ref': ref, 'label': entry['用途'], 'bytes': entry['字节数']} for ref, entry in index.items()
-                                   if ref.endswith(('.diff', '.html')) or ref == record.get('reportRef') or ref in knowledge_refs
-                                   or any(name in entry['用途'] for name in ('修复报告数据', '完整事件数据', '继续执行前状态'))]
+                                   if ref.endswith(('.diff', '.html')) or ref == report_ref or ref in knowledge_refs or ref in issue_refs
+                                   or any(name in entry['用途'] for name in ('修复报告数据', '完整事件数据', '继续执行前状态', '_阶段轨迹'))]
         return record
     if operation == 'run.trace':
         record = library.run(fields['id'])

@@ -131,6 +131,46 @@ class Artifacts:
                         json.dumps(index, ensure_ascii=False, indent=2).encode('utf-8'))
             return ref
 
+    def trace_position(self, scope, run):
+        with self._lock:
+            index = self._index(scope, run)
+            segments = [ref for ref, entry in index.items() if entry['用途'].endswith('_阶段轨迹')]
+            return self.json(scope, run, segments[-1])['end_seq'] if segments else 0
+
+    def append_trace(self, event):
+        from tracefix.storage.presentation import label
+
+        event = redact(event)
+        scope, run, sequence = event['scope_id'], event['run_id'], event['seq']
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+            raise ValueError('阶段轨迹事件序号无效')
+        with self._lock:
+            index = self._index(scope, run)
+            references = [ref for ref, entry in index.items() if entry['用途'].endswith('_阶段轨迹')]
+            reference = references[-1] if references else None
+            segment = self.json(scope, run, reference) if reference else None
+            position = segment['end_seq'] if segment else 0
+            if sequence <= position:
+                for previous_ref in reversed(references):
+                    previous = self.json(scope, run, previous_ref)
+                    if previous['start_seq'] <= sequence <= previous['end_seq']:
+                        if previous['events'][sequence - previous['start_seq']] == event:
+                            return previous_ref
+                        raise ValueError('阶段轨迹事件内容冲突')
+                raise ValueError('阶段轨迹事件序号冲突')
+            if sequence != position + 1:
+                raise ValueError('阶段轨迹事件序号不连续')
+            if segment is None or segment['phase'] != event['phase']:
+                return self.put(scope, run, {'phase': event['phase'], 'start_seq': sequence,
+                    'end_seq': sequence, 'events': [event]}, label=label(event['phase']) + '_阶段轨迹')
+            segment['events'].append(event)
+            segment['end_seq'] = sequence
+            raw = json.dumps(segment, ensure_ascii=False, indent=2, default=str).encode('utf-8')
+            self._write(self._path(scope, run, reference), raw)
+            index[reference].update(SHA256=digest(raw), **{'字节数': len(raw)})
+            self._write(self._index_path(scope, run), json.dumps(index, ensure_ascii=False, indent=2).encode('utf-8'))
+            return reference
+
     def read(self, scope: str, run: str, ref: str) -> bytes:
         raw = self._path(scope, run, ref).read_bytes()
         expected = ref.split('.')[0] if re.fullmatch(r'[a-f0-9]{64}\.[a-z]+', ref) else self._index(scope, run).get(ref, {}).get('SHA256')

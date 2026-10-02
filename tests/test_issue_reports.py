@@ -132,6 +132,50 @@ async def test_model_gui_issues_survive_final_report_as_suspected_with_real_evid
     assert all(engine.artifacts.exists(state.scope_id, state.run_id, ref) for ref in issue['evidence_refs'])
 
 
+@pytest.mark.parametrize('reference_kind', ['artifact', 'observation_id', 'screenshot', 'unrelated', 'foreign', 'unknown'])
+async def test_model_gui_issue_references_are_bound_to_current_observation(tmp_path, reference_kind):
+    engine, state = make_engine(tmp_path, bugfree=True)
+    engine.store.save(state)
+    reference = await engine.capture(state, await engine.browser.action(BrowserAction(kind='observe')))
+    state.observation_ref = reference
+    engine.store.save(state)
+    observation = engine.get(state, reference)
+    unrelated = engine.put(state, {'snapshot': 'unrelated'}, name='其他数据')
+    foreign = engine.artifacts.put(state.scope_id, 'foreign_run', {'snapshot': 'foreign'})
+    references = {'artifact': reference, 'observation_id': observation['id'],
+        'screenshot': observation['screenshot_ref'], 'unrelated': unrelated,
+        'foreign': foreign, 'unknown': 'invented.json'}
+    decision = Decision(action=BrowserAction(kind='finish'), issues=[GUIIssue(title='页面缺少反馈',
+        expected='显示结果提示', actual='当前快照未显示提示', evidence_refs=[references[reference_kind]])])
+    engine.record_gui_issues(state, decision, observation)
+    findings = [event['payload']['finding'] for event in engine.store.trace(state.run_id, state.scope_id)
+                if event['type'] == 'finding.created']
+    if reference_kind in {'artifact', 'observation_id', 'screenshot'}:
+        assert len(findings) == 1
+        assert findings[0]['evidence_refs'] == [reference]
+        assert findings[0]['status'] == 'suspected'
+    else:
+        assert findings == []
+
+
+async def test_model_gui_findings_are_not_deduplicated_across_runs(tmp_path):
+    engine, first = make_engine(tmp_path, bugfree=True)
+    engine.rule_library = RuleLibrary(tmp_path / 'rules.sqlite3')
+    second = RunState(scope_id=first.scope_id, goal=first.goal, url=first.url)
+    for state in (first, second):
+        engine.store.save(state)
+        reference = await engine.capture(state, await engine.browser.action(BrowserAction(kind='observe')))
+        state.observation_ref = reference
+        engine.store.save(state)
+        decision = Decision(action=BrowserAction(kind='finish'), issues=[GUIIssue(title='页面缺少反馈',
+            expected='显示结果提示', actual='当前快照未显示提示', evidence_refs=[reference])])
+        engine.record_gui_issues(state, decision, engine.get(state, reference))
+        findings = engine.rule_library.findings(run_id=state.run_id)
+        assert len(findings) == 1
+        assert findings[0].run_id == state.run_id
+        assert findings[0].evidence_refs == [reference]
+
+
 def test_single_failure_and_runtime_errors_are_not_confirmed_gui_bugs():
     state = RunState(scope_id='demo', goal='检查前端页面', url='http://app:3000')
     records = {'check.json': {'observation_ref': 'observation.json', 'assertions': [
@@ -191,6 +235,19 @@ def test_phase_trace_appends_and_reentry_creates_new_segment_after_restart(tmp_p
         artifacts.append_trace({**event, 'seq': 8})
     with pytest.raises(ValueError, match='冲突'):
         artifacts.append_trace({**event, 'payload': {'changed': True}})
+
+
+def test_phase_trace_replay_checks_previous_segments(tmp_path):
+    artifacts = Artifacts(tmp_path)
+    first = {'scope_id': 'demo', 'run_id': 'run_1', 'phase': 'EXPLORE', 'seq': 1,
+             'type': 'tool.completed', 'payload': {'password': 'private'}}
+    reference = artifacts.append_trace(first)
+    artifacts.append_trace({**first, 'phase': 'REPRODUCE', 'seq': 2})
+    artifacts = Artifacts(tmp_path)
+    assert artifacts.append_trace(first) == reference
+    assert artifacts.trace_position('demo', 'run_1') == 2
+    with pytest.raises(ValueError, match='冲突'):
+        artifacts.append_trace({**first, 'payload': {'changed': True}})
 
 
 async def test_engine_recovery_collects_unnotified_events_in_order(tmp_path):

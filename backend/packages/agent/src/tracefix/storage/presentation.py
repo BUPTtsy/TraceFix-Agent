@@ -121,6 +121,8 @@ def readable(value):
 
 
 def report_page(report):
+    from tracefix.storage.reporting import ISSUE_STATUSES
+
     def render(value, key=''):
         if isinstance(value, list) and key.endswith('_refs'):
             return '<ul>'+''.join('<li>'+render(ref, 'artifact_ref')+'</li>' for ref in value)+'</ul>'
@@ -132,15 +134,28 @@ def report_page(report):
                       'environment_digest', 'agent_instructions_hash'}
     summary, technical = [], []
     for key, value in report.items():
+        if key == 'issues':
+            continue
         row = f'<tr><th>{html.escape(label(key))}</th><td>{render(value, key)}</td></tr>'
         (technical if key in technical_keys else summary).append(row)
+    issue_sections = []
+    for index, issue in enumerate(report.get('issues', []), 1):
+        status = ISSUE_STATUSES.get(issue['status'], issue['status'])
+        details = ''.join(f'<dt>{heading}</dt><dd>{html.escape(str(issue.get(key, "")))}</dd>'
+            for key, heading in [('location', '位置'), ('expected', '预期'), ('actual', '实际'), ('verification', '验证')])
+        steps = ''.join('<li>' + html.escape(step) + '</li>' for step in issue.get('steps', []))
+        evidence = ''.join('<li>' + render(ref, 'artifact_ref') + '</li>' for ref in issue.get('evidence_refs', []))
+        issue_sections.append(f'<article><h3>{index}. [{html.escape(status)}] {html.escape(issue["title"])}</h3>'
+            f'<dl>{details}</dl><h4>复现步骤</h4><ol>{steps}</ol><h4>证据</h4><ul>{evidence}</ul></article>')
+    title = '测试报告' if report.get('mode') == 'test' else '修复报告'
+    issues = '<section><h2>问题清单</h2>' + (''.join(issue_sections) or '<p>未形成有证据的问题记录。</p>') + '</section>'
     return ('<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
             '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
             'style-src \'unsafe-inline\'; img-src \'self\'">'
-            '<title>TraceFix 修复报告</title><style>body{font:16px system-ui;max-width:1050px;'
+            f'<title>TraceFix {title}</title><style>body{{font:16px system-ui;max-width:1050px;'
             'margin:40px auto;padding:20px}table{border-collapse:collapse;width:100%}'
             'td,th{border:1px solid #ddd;padding:12px;text-align:left;vertical-align:top}'
             'pre{white-space:pre-wrap;overflow-wrap:anywhere}summary{cursor:pointer;margin:20px 0}'
-            'a{overflow-wrap:anywhere}</style><h1>TraceFix 修复报告</h1><table>'
+            'a{overflow-wrap:anywhere}</style>' + f'<h1>TraceFix {title}</h1>' + issues + '<table>'
             +''.join(summary)+'</table><details><summary>技术详情与完整校验值</summary><table>'
             +''.join(technical)+'</table></details>')

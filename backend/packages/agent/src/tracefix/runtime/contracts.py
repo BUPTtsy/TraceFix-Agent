@@ -212,6 +212,13 @@ class Guidance(Contract):
     child_run_id: str | None = None
 
 
+class GUIIssue(Contract):
+    title: str = Field(min_length=1, max_length=240)
+    expected: str = Field(min_length=1, max_length=1200)
+    actual: str = Field(min_length=1, max_length=1200)
+    evidence_refs: list[str] = Field(min_length=1, max_length=20)
+
+
 class Decision(Contract):
     action: BrowserAction
     evidence_refs: list[str] = Field(default_factory=list)
@@ -219,6 +226,7 @@ class Decision(Contract):
     expected_observation: str = ""
     summary: str = Field(default="", max_length=1200)
     guidance_ack: list[GuidanceAck] = Field(default_factory=list)
+    issues: list[GUIIssue] = Field(default_factory=list, max_length=20)
 
 
 class ReproductionPlan(Contract):

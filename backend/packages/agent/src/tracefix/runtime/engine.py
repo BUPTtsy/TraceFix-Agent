@@ -21,7 +21,7 @@ from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
 from tracefix.model.chat_completions import reasoning_records
 from tracefix.knowledge.context import SkillCatalog, build_context
 from tracefix.knowledge.selection import select_documents
-from tracefix.rules import RuleResolver, RuleSnapshot, evaluate_oracle, evaluate_static
+from tracefix.rules import Finding, RuleResolver, RuleSnapshot, evaluate_oracle, evaluate_static
 from tracefix.rules.resolver import render_rule_context, rule_applies
 from tracefix.runtime.contracts import (BudgetExceeded, BrowserAction, Decision, Outcome,
     PatchProposal, Phase, ReplayUnbound, ReproductionPlan, RunState, RunStatus, TestSpec, Validation, digest, new_id,
@@ -32,6 +32,7 @@ from tracefix.runtime.tool_handlers import build_runtime_tools
 from tracefix.knowledge.assembler import ContextAssembler, ContextWindowError
 from tracefix.storage.artifacts import redact, sanitize
 from tracefix.storage.presentation import label, readable, report_page
+from tracefix.storage.reporting import collect_issues
 from tracefix.storage.store import UnknownOperation
 from tracefix.messages import error_message
 
@@ -103,6 +104,7 @@ class Engine:
         self.retarget_child = None
         self.documents = None
         self.document_context = {}
+        self._trace_sequences = {}
         self.skills = SkillCatalog(Path(__file__).resolve().parents[5] / 'skills')
         self.graph = self._graph(checkpointer)
 
@@ -332,6 +334,13 @@ class Engine:
             self.event(s, 'memory.degraded', degradation)
 
     def _notify(self, event):
+        scope, run = event['scope_id'], event['run_id']
+        key = (scope, run)
+        if key not in self._trace_sequences:
+            self._trace_sequences[key] = self.artifacts.trace_position(scope, run)
+        for entry in self.store.trace(run, scope, after=self._trace_sequences[key]):
+            self.artifacts.append_trace(entry)
+            self._trace_sequences[key] = entry['seq']
         if self.notify:
             try:
                 self.notify(event)
@@ -757,7 +766,9 @@ class Engine:
                     saved = self.rule_library.save_finding(finding)
                     self.event(s, 'finding.created', {'finding_id': saved.id, 'rule_id': saved.rule_id,
                                                      'rule_version': saved.rule_version,
-                                                     'status': saved.status, 'evidence_ref': observation_ref})
+                                                     'status': saved.status, 'evidence_ref': observation_ref,
+                                                     'finding': saved.model_dump(mode='json'),
+                                                     'expectation': rule.name})
         return observation_ref
 
     async def act(self, s, action, *, frozen=False, tool_call_id=None):
@@ -1201,6 +1212,23 @@ class Engine:
         s = self.changed(s, phase=phase, step=0)
         return self.output(s, 'prelude')
 
+    def record_gui_issues(self, s, decision, observation):
+        for issue in decision.issues:
+            references = normalize_decision_evidence_refs(
+                issue.evidence_refs, [], s.observation_ref, observation)
+            if not references:
+                continue
+            location = {'url': observation.get('url') or s.url}
+            finding = Finding(job_id=s.job_id or s.run_id, run_id=s.run_id, source='guided', severity='minor',
+                title=issue.title, location=location, evidence_refs=references,
+                fingerprint=digest([s.run_id, issue.title, issue.expected, issue.actual, location]),
+                details={'expected': issue.expected, 'actual': issue.actual})
+            if self.rule_library:
+                finding = self.rule_library.save_finding(finding)
+            self.event(s, 'finding.created', {'finding_id': finding.id, 'source': finding.source,
+                'status': finding.status, 'finding': finding.model_dump(mode='json'),
+                'expectation': issue.expected})
+
     async def decide(self, s, _):
         spec = self.spec(s)
         obs = self.get(s, s.observation_ref)
@@ -1217,6 +1245,7 @@ class Engine:
         decision.evidence_refs = normalize_decision_evidence_refs(
             decision.evidence_refs, s.evidence_refs, s.observation_ref, obs)
         self.browser.policy.browser(s, decision.action, spec, obs)
+        self.record_gui_issues(s, decision, obs)
         canonical = decision.action.model_copy(update={'observation_id': None, 'element_ref': None})
         fingerprint = digest([canonical.model_dump(), stable_snapshot(obs['snapshot'])])
         s = self.changed(s, pending_action=decision.action.model_dump(),
@@ -1367,7 +1396,9 @@ class Engine:
                 for finding in evaluate_static(rule, files, job_id=s.run_id, run_id=s.run_id):
                     saved = self.rule_library.save_finding(finding)
                     self.event(s, 'finding.created', {'finding_id': saved.id, 'rule_id': saved.rule_id,
-                                                     'rule_version': saved.rule_version, 'source': 'static'})
+                                                     'rule_version': saved.rule_version, 'source': 'static',
+                                                     'finding': saved.model_dump(mode='json'),
+                                                     'expectation': rule.name})
         observation = self.get(s, s.observation_ref) if s.observation_ref else None
         if s.observation_ref and s.observation_ref not in s.evidence_refs:
             s = self.changed(s, evidence_refs=s.evidence_refs + [s.observation_ref])
@@ -1667,6 +1698,7 @@ class Engine:
                   'agent_instructions_hash': s.agent_instructions_hash,
                   'agent_instructions_path': s.agent_instructions_path,
                   'limits': '未发现问题仅适用于本次测试规范覆盖的范围。修复通过仅代表本地验证通过，不代表已合并或发布。'}
+        report.update(collect_issues(s, self.store.trace(s.run_id, s.scope_id), lambda reference: self.get(s, reference)))
         ref = self.put(s, report, name='修复报告数据')
         page = report_page(report)
         for evidence in s.evidence_refs:
