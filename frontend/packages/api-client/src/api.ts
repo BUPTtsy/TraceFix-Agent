@@ -5,7 +5,9 @@ export interface Project {id: string; repoId: string; root: string; profile: str
 export interface Source {id: string; title: string; version: number}
 export interface KnowledgeUse {phase: string; queries: string[]; documents: Source[]; artifact_ref: string}
 export interface Run {id: string; projectId: string; agentRunId?: string; goal: string; mode: Service | 'unknown'; status: string; phase: string; outcome?: string; startedAt: string; finishedAt?: string; timeSource?: string; exitCode?: number; error?: string; branch?: string; continuationCount?: number; abnormalTermination?: boolean; continuationMarkers?: {instruction: string; previous_status: string; previous_error?: string; at: string}[]; knowledge: KnowledgeUse[]; logs?: string[]; artifacts?: {ref: string; label: string; bytes: number}[]}
-export interface AgentStatus extends Partial<Run> {running: boolean}
+export interface AgentStatus extends Partial<Run> {running: boolean; canStop?: boolean; stopUnavailableReason?: string; stopError?: string | null}
+// 引导状态来自持久化账本；retarget 排队后仍需 confirmed_at 才能在运行时替换目标。
+export interface Guidance {id: string; run_id: string; level: 'hint' | 'constraint' | 'retarget'; text: string; status: 'queued' | 'applied' | 'acknowledged' | 'rejected' | 'superseded'; created_at: number; applied_step?: number; how_applied?: string; rejection_reason?: string; confirmed_at?: number; child_run_id?: string}
 export interface TraceEvent {seq: number; agentSeq?: number; type: string; phase: string; at: number; payload: Record<string, unknown>}
 export type WorkerStatus = 'CREATED' | 'QUEUED' | 'RUNNING' | 'RETRYING' | 'SUCCEEDED' | 'PARTIAL' | 'FAILED' | 'CANCELLED' | 'EXPIRED' | string;
 export interface WorkerSnapshot {
@@ -61,6 +63,7 @@ const numberValue = (payload: Record<string, unknown>, fallback: number, ...keys
 };
 
 /** Fold append-only worker lifecycle events into the latest UI snapshots. */
+// 只从追加的生命周期事件还原子 Agent 快照，页面刷新或重新轮询时可得到一致的最终状态。
 export function aggregateWorkers(events: TraceEvent[]): WorkerAggregate {
   const snapshots = new Map<string, WorkerSnapshot>();
   let maxConcurrency = 4;
@@ -74,6 +77,7 @@ export function aggregateWorkers(events: TraceEvent[]): WorkerAggregate {
     if (!workerId || suffix === 'joined') continue;
     const previous = snapshots.get(workerId);
     const rawStatus = stringValue(payload, 'status').toUpperCase();
+    // 兼容 worker/subtask 两套事件字段；显式状态优先，缺失时保留前一个快照中的信息。
     const status = workerStatusAliases[rawStatus] || rawStatus || workerEventStatus[suffix] || previous?.status || 'UNKNOWN';
     const taskId = stringValue(payload, 'task_id', 'taskId') || previous?.taskId || workerId;
     const role = stringValue(payload, 'role') || previous?.role || 'worker';
@@ -141,6 +145,10 @@ export const loadServices = () => request<{id: Service; label: string}[]>('/api/
 export const loadRuns = () => request<Run[]>('/api/runs');
 export const loadRun = (id: string) => request<Run>(`/api/runs/${encodeURIComponent(id)}`);
 export const loadRunTrace = (id: string, after = 0) => request<TraceEvent[]>(`/api/runs/${encodeURIComponent(id)}/trace?after=${after}`);
+// 提交引导和确认改目标是两个独立请求，避免一次误操作直接结束正在执行的父 Run。
+export const loadGuidance = (id: string) => request<Guidance[]>(`/api/runs/${encodeURIComponent(id)}/guidance`);
+export const submitGuidance = (id: string, text: string, level: Guidance['level']) => request<Guidance>(`/api/runs/${encodeURIComponent(id)}/guidance`, {method: 'POST', body: JSON.stringify({text, level})});
+export const confirmGuidance = (id: string, guidanceId: string) => request<Guidance>(`/api/runs/${encodeURIComponent(id)}/guidance/${encodeURIComponent(guidanceId)}/confirm`, {method: 'POST', body: '{}'});
 export const loadAgentStatus = () => request<AgentStatus>('/api/agent/status');
 export const startAgent = (goal: string, mode: Service, projectId: string) => request<AgentStatus>('/api/agent/start', {method: 'POST', body: JSON.stringify({goal, mode, projectId})});
 export const stopAgent = () => request<AgentStatus>('/api/agent/stop', {method: 'POST'});
@@ -162,6 +170,7 @@ export const loadRulePreview = (id: string) => request<{prompt: string; items: A
 export const artifactUrl = (id: string, ref: string) => `/api/runs/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(ref)}`;
 
 export async function streamChat(message: string, history: ChatMessage[], projectId: string, useKnowledge: boolean, onDelta: (delta: string) => void, onSources: (sources: Source[]) => void, onReasoning?: (delta: string) => void) {
+  // 历史只发送角色与正文；reasoning 用专用回调展示，由服务端保存为审计记录，不重复注入历史。
   const response = await fetchResponse('/api/chat', {method: 'POST', headers: {'Content-Type': 'application/json', Accept: 'text/event-stream'}, body: JSON.stringify({message, history: history.map(({role, content}) => ({role, content})), projectId, useKnowledge})});
   if (!response.ok) {const data = await responseJson(response); throw new Error(`对话请求失败（HTTP ${response.status}）${data?.error ? '：' + data.error : ''}`);}
   if (response.headers.get('content-type')?.includes('application/json')) {
@@ -179,6 +188,7 @@ export async function streamChat(message: string, history: ChatMessage[], projec
     while (true) {
       const {value, done} = await reader.read();
       buffer += decoder.decode(value || new Uint8Array(), {stream: !done});
+      // 网络块可能切断 SSE 事件或 UTF-8 字符，缓冲至完整事件边界后再分别转发正文和 reasoning。
       const events = buffer.split(/\r?\n\r?\n/); buffer = events.pop() || '';
       for (const event of events) for (const line of event.split(/\r?\n/)) if (line.startsWith('data:')) {
         const payload = JSON.parse(line.slice(5));

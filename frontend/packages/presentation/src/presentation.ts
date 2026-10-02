@@ -16,6 +16,7 @@ const events: Record<string, string> = {
   'model.response.persisted': '模型输出已保存', 'model.error.persisted': '模型错误已保存',
   'state.changed': '状态切换', 'tool.started': '工具开始', 'tool.completed': '工具完成',
   'tool.error': '工具执行失败', 'knowledge.selected': '知识来源已选择', 'evidence.damaged': '证据损坏',
+  'retrieval.degraded': '代码检索与修复记忆未启用',
   'gate.decided': '验证门禁结论', 'patch.applied': '补丁已应用', 'validation.failed': '验证失败',
   'loop.suspected': '疑似死循环', 'loop.detected': '检测到死循环',
   'input.applied': '补充输入已记录', 'subtask.completed': '子任务已完成',

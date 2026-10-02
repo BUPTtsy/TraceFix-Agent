@@ -1,9 +1,10 @@
 import {useEffect, useMemo, useState} from 'react';
-import {aggregateWorkers, artifactUrl, continueRun, deriveRun, DetectionRule, loadRun, loadRules, loadRunTrace, Run, TraceEvent, WorkerSnapshot} from '@tracefix/api-client';
+import {aggregateWorkers, artifactUrl, continueRun, deriveRun, DetectionRule, loadRun, loadRules, loadRunTrace, Run, TraceEvent, WorkerSnapshot, Guidance, loadGuidance, submitGuidance, confirmGuidance} from '@tracefix/api-client';
 import {eventLabel, outcomeLabel, phaseLabel, serviceLabel, workerRoleLabel, workerStatusLabel} from '@tracefix/presentation';
 
-const statuses: Record<string, string> = {idle: '空闲', running: '运行中', completed: '已结束', abnormal: '异常结束', failed: '失败', cancelled: '已停止', paused: '已暂停', waiting_input: '等待输入', waiting_approval: '等待审批', stopping: '停止中'};
+const statuses: Record<string, string> = {idle: '空闲', running: '运行中', completed: '已结束', abnormal: '异常结束', failed: '失败', cancelled: '已停止', superseded: '目标已替换', paused: '已暂停', waiting_input: '等待输入', waiting_approval: '等待审批', stopping: '停止中'};
 const issueStatuses: Record<string, string> = {suspected: '待确认', confirmed: '已确认', reproduced: '已确认', fixed: '已验证修复', not_reproducible: '未稳定复现', wont_fix: '暂不修复', false_positive: '已判定误报'};
+const guidanceStatus = (entry: Guidance) => entry.level === 'retarget' && entry.status === 'queued' && !entry.confirmed_at ? '等待确认' : {queued: '排队中', applied: '已注入', acknowledged: '已采纳', rejected: '被拒绝', superseded: '已改目标'}[entry.status];
 export const statusLabel = (status: string) => statuses[status.toLowerCase()] || status;
 export const timeLabel = (value?: string) => value ? new Date(value).toLocaleString('zh-CN', {hour12: false}) : '—';
 export function RunList({runs, onSelect, selectedId}: {runs: Run[]; onSelect: (run: Run) => void; selectedId?: string}) {
@@ -32,6 +33,7 @@ function WorkerCard({worker}: {worker: WorkerSnapshot}) {
   </article>;
 }
 function WorkerPanel({events}: {events: TraceEvent[]}) {
+  // 子 Agent 面板以审计事件聚合状态；运行、排队与历史结果分别展示，便于观察并发占用和失败隔离。
   const aggregate = useMemo(() => aggregateWorkers(events), [events]);
   if (!aggregate.workers.length) return null;
   const activeWorkers = aggregate.workers.filter(worker => ['RUNNING', 'RETRYING'].includes(worker.status.toUpperCase()));
@@ -45,22 +47,33 @@ function WorkerPanel({events}: {events: TraceEvent[]}) {
   </section>;
 }
 interface Props {runs: Run[]; selectedId: string; onSelect: (id: string) => void; onDocument: (id: string) => void; onCapture: (run: Run) => void; report: (error: unknown) => void}
+export function RetrievalWarning({events}: {events: TraceEvent[]}) {
+  const degradation = events.find(event => event.type === 'retrieval.degraded');
+  if (!degradation) return null;
+  const message = degradation.payload?.message;
+  return <div className="notice warning" role="status">{typeof message === 'string' && message.trim() ? message : '代码检索与修复记忆未启用：当前运行未连接 PostgreSQL。项目文档检索仍可用。配置 PostgreSQL 后重新运行以恢复这些能力。'}</div>;
+}
 export function RunsPage({runs, selectedId, onSelect, onDocument, onCapture, report}: Props) {
   const [query, setQuery] = useState(''), [status, setStatus] = useState(''), [detail, setDetail] = useState<Run | null>(null);
   const [loading, setLoading] = useState(false), [continuing, setContinuing] = useState(false), [deriving, setDeriving] = useState(false);
   const [instruction, setInstruction] = useState(''), [trace, setTrace] = useState<TraceEvent[]>([]);
   const [ruleOptions, setRuleOptions] = useState<DetectionRule[]>([]), [additionalRuleIds, setAdditionalRuleIds] = useState<string[]>([]), [deriveGoal, setDeriveGoal] = useState('');
+  const [guidance, setGuidance] = useState<Guidance[]>([]), [guidanceText, setGuidanceText] = useState(''), [guidanceLevel, setGuidanceLevel] = useState<Guidance['level']>('hint'), [guidanceBusy, setGuidanceBusy] = useState(false);
   useEffect(() => {
     if (!selectedId) {setDetail(null); setTrace([]); return;}
     let active = true, timer: number;
     let loadedRules = false;
     setDetail(null); setLoading(true); setInstruction(''); setTrace([]); setRuleOptions([]); setAdditionalRuleIds([]); setDeriveGoal('');
+    setGuidance([]); setGuidanceText('');
     let lastSequence = 0;
     async function poll() {
+      // 轨迹按 seq 增量追加，Worker/工具生命周期由同一事件流驱动；引导账本则刷新完整状态。
       try {
         const [record, events] = await Promise.all([loadRun(selectedId), loadRunTrace(selectedId, lastSequence)]);
         if (active) {
           setDetail(record); setTrace(previous => [...previous, ...events]);
+          // 引导通过实际 Agent Run 关联查询；只有收到新账本状态才显示“已注入/已采纳”等执行结果。
+          if (record.agentRunId) loadGuidance(record.id).then(items => {if (active) setGuidance(items);}).catch(error => {if (active) report(error);});
           if (!loadedRules) {
             loadedRules = true;
             loadRules(record.projectId).then(items => {
@@ -76,9 +89,14 @@ export function RunsPage({runs, selectedId, onSelect, onDocument, onCapture, rep
     poll(); return () => {active = false; window.clearTimeout(timer);};
   }, [selectedId, report]);
   const filtered = runs.filter(run => (!status || run.status === status) && (run.goal + run.id + (run.agentRunId || '')).toLowerCase().includes(query.toLowerCase()));
+  // 改目标条目先显示独立确认操作；trace 保留 tool.started/tool.completed 的原始 payload 供检查回执。
   return <><section className="card"><div className="section-heading"><div><h2>Agent Runs <span className="count">{runs.length}</span></h2><p>按项目持久化，页面刷新后仍可追溯</p></div></div><div className="toolbar"><input aria-label="搜索运行记录" placeholder="搜索目标或 Run ID…" value={query} onChange={event => setQuery(event.target.value)}/><select aria-label="运行状态" value={status} onChange={event => setStatus(event.target.value)}><option value="">全部状态</option>{Object.entries(statuses).map(([key, label]) => <option value={key} key={key}>{label}</option>)}</select></div>{runs.length > 0 && !filtered.length ? <div className="empty-state"><span aria-hidden="true">⌕</span><h3>没有匹配的运行记录</h3><p>调整关键词或状态筛选，再看看其他运行。</p></div> : <RunList runs={filtered} onSelect={run => onSelect(run.id)} selectedId={selectedId}/>}</section>
     {loading && <div className="notice" role="status">正在加载运行详情…</div>}
     {detail && <section className="card detail-block continuation-detail">
+      <RetrievalWarning events={trace}/>
+      <h3>对话与干预</h3>
+      {guidance.map(entry => <article className="knowledge-use" key={entry.id}><span className="badge">{guidanceStatus(entry)}</span><p>{entry.text}</p>{entry.how_applied && <p>{entry.how_applied}</p>}{entry.rejection_reason && <p className="notice failure">{entry.rejection_reason}</p>}{entry.level === 'retarget' && entry.status === 'queued' && !entry.confirmed_at && <button type="button" disabled={guidanceBusy} onClick={async () => {setGuidanceBusy(true); try {await confirmGuidance(detail.id, entry.id); setGuidance(await loadGuidance(detail.id));} catch (error) {report(error);} finally {setGuidanceBusy(false);}}}>确认结束当前目标并派生新任务</button>}{entry.child_run_id && <p>子 Run：{entry.child_run_id}</p>}</article>)}
+      {detail.agentRunId && ['running', 'paused', 'waiting_input'].includes(detail.status) && <form onSubmit={async event => {event.preventDefault(); setGuidanceBusy(true); try {await submitGuidance(detail.id, guidanceText, guidanceLevel); setGuidance(await loadGuidance(detail.id)); setGuidanceText('');} catch (error) {report(error);} finally {setGuidanceBusy(false);}}}><label htmlFor="guidance-level">引导类型</label><select id="guidance-level" value={guidanceLevel} onChange={event => setGuidanceLevel(event.target.value as Guidance['level'])}><option value="hint">提示 L1</option><option value="constraint">约束 L2</option><option value="retarget">改目标 L3</option></select><label htmlFor="guidance-text">补充引导</label><textarea id="guidance-text" value={guidanceText} onChange={event => setGuidanceText(event.target.value)} maxLength={2000} required placeholder={guidanceLevel === 'constraint' ? '不要改 src/legacy；补丁不超过 50 行，或输入约束 JSON' : '描述需要调整的行为…'}/><button className="primary" disabled={guidanceBusy || !guidanceText.trim()}>{guidanceBusy ? '发送中…' : '发送引导'}</button></form>}
       <h3>问题清单</h3>
       {detail.reportError && <div className="notice failure">{detail.reportError}</div>}
       {detail.issueReport ? <>
