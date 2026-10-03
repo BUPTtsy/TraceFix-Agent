@@ -6,6 +6,7 @@ import pytest
 
 from tracefix.model.gateway import BrowserPolicyRouter, Gateway, ModelError, ModelResult
 from tracefix.runtime.contracts import BrowserAction, Decision
+from tracefix.model.chat import _chat_events
 
 
 class EventBytes(httpx.AsyncByteStream):
@@ -69,6 +70,34 @@ def use_transport(monkeypatch, responses):
 def gateway_defaults(monkeypatch):
     for name in ('TRACEFIX_STREAM', 'TRACEFIX_THINKING', 'TRACEFIX_MODEL_TIMEOUT'):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.parametrize('fragments', [
+    [event({'content': 'partial'})],
+    [event(finish='stop')],
+    [b'data: [DONE]\n\n'],
+    [event(finish='length'), b'data: [DONE]\n\n'],
+    [b'data: invalid\n\n', event(finish='stop'), b'data: [DONE]\n\n'],
+    [b'data: {"error":{"message":"failed"}}\n\n'],
+])
+async def test_chat_rejects_incomplete_or_invalid_response(fragments):
+    audit = {'reasoning': {}, 'content': '', 'complete': False}
+    response = stream_response(fragments)
+    with pytest.raises(ValueError, match='响应未完成'):
+        async for item in _chat_events(response, [], audit):
+            pass
+    assert audit['complete'] is False
+    await response.aclose()
+
+
+async def test_chat_requires_successful_finish_and_done():
+    audit = {'reasoning': {}, 'content': '', 'complete': False}
+    response = final_stream(content='complete')
+    events = [item async for item in _chat_events(response, [], audit)]
+    assert {'delta': 'complete'} in events
+    assert audit['complete'] is True and audit['content'] == 'complete'
+    assert audit['usage'] == {'total_tokens': 3}
+    await response.aclose()
 
 
 async def test_default_thinking_streams_before_completion_and_preserves_usage(monkeypatch):

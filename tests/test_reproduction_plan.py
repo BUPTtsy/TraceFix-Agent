@@ -4,7 +4,7 @@ from tracefix.execution.browser import resolve_locator
 from tracefix.model.gateway import Gateway, ModelOutputError, ModelResult
 from tracefix.runtime.contracts import (BrowserAction, Decision, FileEdit, Locator, Outcome,
     PatchProposal, Phase, ReproductionPlan, RunState, RunStatus, Validation, digest)
-from tracefix.runtime.smoke import FakeBrowser, make_engine
+from tracefix.runtime.smoke import PNG, FakeBrowser, make_engine
 
 
 def exploration_actions():
@@ -198,17 +198,24 @@ async def test_diagnose_reads_current_validation_and_checks_its_observation_refs
     engine, state = make_engine(tmp_path)
     state.phase = Phase.DIAGNOSE
     state.reproduced = state.source_aligned = True
+    state.environment_digest = await engine.runner.inspect_images()
+    plan = [BrowserAction(kind='observe').model_dump()]
+    state.replay_plan_ref = engine.put(state, plan)
+    state.reproduction_plan_frozen = True
     state.patch_hash = 'current-patch'
-    stale = Validation(kind='original', passed=False, source_manifest=state.source_manifest,
-        patch_hash='old-patch', environment_digest='', test_spec_hash=state.test_spec_hash, artifact_ref='missing-old-result.json')
+    stale = Validation(kind='original', passed=False, scope_id=state.scope_id, run_id=state.run_id,
+        source_manifest=state.source_manifest, replay_plan_hash=digest(plan),
+        patch_hash='old-patch', environment_digest=state.environment_digest,
+        test_spec_hash=state.test_spec_hash, artifact_ref='missing-old-result.json')
     state.validation_refs = [engine.put(state, stale.model_dump())]
     engine.store.save(state)
     engine.event(state, 'patch.applied', {'patch_hash': state.patch_hash})
-    observation = {'id': 'latest', 'url': state.url, 'snapshot': '- checkbox "Complete task" [checked]',
+    observation = {'id': 'latest', 'url': state.url, 'snapshot': '- checkbox "Complete task" [ref=e1]',
                    'network': 'PATCH /api/tasks/1 => [200] OK', 'console': ''}
-    state.observation_ref = engine.put(state, observation)
-    result_ref = engine.put(state, {'passed': False, 'observation_ref': state.observation_ref,
-                                   'assertions': [{'passed': False, 'matches': 1}]})
+    state.observation_ref = await engine.capture(state, {**observation, 'png': PNG})
+    observation = engine.get(state, state.observation_ref)
+    result, result_ref = engine.check(state, engine.spec(state).assertions)
+    assert not result['passed']
     current = stale.model_copy(update={'patch_hash': state.patch_hash, 'artifact_ref': result_ref})
     state.validation_refs.append(engine.put(state, current.model_dump()))
     state.phase = Phase.VERIFY
@@ -222,7 +229,7 @@ async def test_diagnose_reads_current_validation_and_checks_its_observation_refs
         assert schema is PatchProposal
         assert context['observation'] == observation
         assert len(context['previous_validation']) == 1
-        assert context['previous_validation'][0]['result']['assertions'] == [{'passed': False, 'matches': 1}]
+        assert context['previous_validation'][0]['result']['assertions'] == result['assertions']
         assert context['validation_observations'][0]['observation']['network'] == observation['network']
         assert state.observation_ref in context['available_evidence_refs']
         value = PatchProposal(summary='根据最新验证证据诊断',

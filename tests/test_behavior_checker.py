@@ -7,8 +7,10 @@ import tempfile
 
 import pytest
 
-from tracefix.runtime.contracts import RunState, Validation, digest
+from tracefix.runtime.contracts import BrowserAction, RunState, Validation, digest, verification_gate
 from tracefix.execution.browser import assertions
+from tracefix.runtime.smoke import PNG
+from tracefix.runtime.verification import verification_binding
 from tracefix.storage.artifacts import Artifacts
 
 
@@ -147,40 +149,58 @@ def verified_run(workspace, specification):
                      environment_digest="environment-current", test_spec_hash=digest(spec))
     artifacts = Artifacts(workspace / "artifacts")
 
-    def put(value):
-        return artifacts.put(state.scope_id, state.run_id, value)
+    def put(value, ext="json"):
+        return artifacts.put(state.scope_id, state.run_id, value, ext)
 
     state.test_spec_ref = put(spec.model_dump(mode="json"))
-    plan = [{"kind": "click", "locator": {"role": "checkbox", "name": "Complete Write project brief"}},
-            {"kind": "navigate", "value": "http://app:3000/"}]
+    plan = [BrowserAction.model_validate(action).model_dump(mode="json") for action in [
+        {"kind": "click", "locator": {"role": "checkbox", "name": "Complete Write project brief"}},
+        {"kind": "navigate", "value": "http://app:3000/"}]]
     state.replay_plan_ref = put(plan)
     state.evidence_refs = [put({"reproduced": True})]
-    shared = {"source_manifest": state.source_manifest, "patch_hash": state.patch_hash,
-              "environment_digest": state.environment_digest, "test_spec_hash": state.test_spec_hash}
+    binding = verification_binding(state, digest(plan))
+    shared = {key: value for key, value in binding.items() if key != "plan_hash"}
+
+    def gui_result(checks):
+        elements = {}
+        for assertion in checks:
+            if assertion.condition != "absent":
+                attributes = elements.setdefault((assertion.locator.role, assertion.locator.name), set())
+                if assertion.condition in {"checked", "disabled"}:
+                    attributes.add(f"[{assertion.condition}]")
+        snapshot = "\n".join(f'- {role} "{name}" [ref=element-{index}] ' + " ".join(sorted(attributes))
+                             for index, ((role, name), attributes) in enumerate(elements.items()))
+        observation = {**binding, "type": "gui_observation", "snapshot": snapshot,
+                       "screenshot_ref": put(PNG, "png"), "screenshot_hash": digest(PNG)}
+        evaluated = assertions(snapshot, checks)
+        assert evaluated["passed"]
+        return {**evaluated, "observation_ref": put(observation), "observation_hash": digest(observation)}
+
     for kind in sorted(checker.REQUIRED_VALIDATIONS):
+        result = {**binding, "type": "validation_result", "kind": kind, "passed": True}
+        if kind in {"original", "regression"}:
+            result.update(gui_result(spec.assertions if kind == "original" else spec.regression_assertions),
+                          execution_plan_hash=digest(plan) if kind == "original" else digest(
+                              [action.model_dump(mode="json") for action in spec.regression_plan]))
+        else:
+            result.update(exit_code=0, output=f"CI fixture simulated {kind} completed")
         validation = Validation(kind=kind, passed=True, **shared,
-                                replay_plan_hash=digest(plan), artifact_ref=put({"passed": True, "kind": kind}))
+                                replay_plan_hash=digest(plan), artifact_ref=put(result))
         state.validation_refs.append(put(validation.model_dump()))
     for scenario in spec.behavior_scenarios:
-        binding = {**shared, "scenario_id": scenario.id, "scenario_hash": digest(scenario), "plan_hash": digest(plan)}
+        scenario_binding = {**binding, "scenario_id": scenario.id, "scenario_hash": digest(scenario)}
+        execution_hash = digest([step.action.model_dump(mode="json") for step in scenario.steps])
         checkpoints = []
         for step_index, step in enumerate(scenario.steps, 1):
             if step.assertions:
-                elements = {}
-                for assertion in step.assertions:
-                    if assertion.condition != "absent":
-                        attributes = elements.setdefault((assertion.locator.role, assertion.locator.name), set())
-                        if assertion.condition in {"checked", "disabled"}:
-                            attributes.add(f"[{assertion.condition}]")
-                snapshot = "\n".join(f'- {role} "{name}" [ref=element-{index}] ' + " ".join(sorted(attributes))
-                                     for index, ((role, name), attributes) in enumerate(elements.items()))
-                observation = {"snapshot": snapshot, "screenshot_ref": put("unit-test-screenshot")}
-                evaluated = assertions(snapshot, step.assertions)
-                assert evaluated["passed"]
-                checkpoints.append(put({**binding, "scenario_step": step_index, "passed": True,
-                                        "observation_ref": put(observation), "observation_hash": digest(observation),
-                                        "action_hash": digest(step.action), "assertions": evaluated["assertions"]}))
-        result_ref = put({**binding, "passed": True, "checkpoint_refs": checkpoints})
+                checkpoint = {**scenario_binding, **gui_result(step.assertions), "type": "assertion_checkpoint",
+                              "kind": "behavior", "scenario_step": step_index,
+                              "action_hash": digest(step.action), "execution_plan_hash": execution_hash}
+                checkpoints.append(put(checkpoint))
+        result_ref = put({**scenario_binding, "type": "validation_result", "kind": "behavior",
+                          "passed": True, "checkpoint_refs": checkpoints, "execution_plan_hash": execution_hash,
+                          "observation_ref": checkpoint["observation_ref"],
+                          "observation_hash": checkpoint["observation_hash"]})
         validation = Validation(kind="behavior", passed=True, **shared,
                                 replay_plan_hash=digest(plan), scenario_id=scenario.id,
                                 scenario_hash=digest(scenario), artifact_ref=result_ref)
@@ -188,8 +208,18 @@ def verified_run(workspace, specification):
     return state, artifacts, frozen
 
 
+def gate(state, artifacts):
+    validations = [Validation.model_validate(artifacts.json(state.scope_id, state.run_id, ref))
+                   for ref in state.validation_refs]
+    return verification_gate(state, validations,
+        lambda ref: artifacts.exists(state.scope_id, state.run_id, ref),
+        artifact_read=lambda ref: artifacts.json(state.scope_id, state.run_id, ref),
+        artifact_read_bytes=lambda ref: artifacts.read(state.scope_id, state.run_id, ref))
+
+
 def test_checker_accepts_fully_bound_checkpoint_evidence(verified_run):
     state, artifacts, frozen = verified_run
+    assert gate(state, artifacts)
     assert checker.verify_evidence(state, artifacts, frozen, case="B01") == checker.REQUIRED_VALIDATIONS | {"behavior"}
 
 
@@ -242,6 +272,7 @@ def test_checker_rejects_false_success_with_invalid_evidence(verified_run, fault
             result["checkpoint_refs"][3] = put(checkpoint)
         validation["artifact_ref"] = put(result)
         state.validation_refs[-1] = put(validation)
+    assert not gate(state, artifacts)
     with pytest.raises(RuntimeError, match="独立验证门禁拒绝"):
         checker.verify_evidence(state, artifacts, frozen, case="B01")
 

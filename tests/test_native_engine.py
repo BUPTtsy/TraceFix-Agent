@@ -8,7 +8,7 @@ import pytest
 
 from tracefix.execution.browser import MCPActionUnknown, MCPBrowser
 from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
-from tracefix.runtime.contracts import BrowserAction, Decision, Phase
+from tracefix.runtime.contracts import BrowserAction, Decision, Phase, digest
 from tracefix.runtime.smoke import PNG, make_engine
 
 
@@ -66,10 +66,19 @@ async def test_native_actions_update_observations_receipts_replay_and_audit(tmp_
     assert engine.artifacts.exists(state.scope_id, state.run_id, observation['screenshot_ref'])
     trace = engine.store.trace(state.run_id, state.scope_id)
     started = [event['payload'] for event in trace if event['type'] == 'tool.started']
-    assert [event['intent']['tool_call_id'] for event in started] == ['observe-first', 'click-fresh']
-    assert len([event for event in trace if event['type'] == 'tool.completed']) == 2
+    called = [event['payload'] for event in trace
+              if event['type'] == 'operation.called' and event['payload']['name'] == 'browser']
+    call_ids = ['observe-first', 'click-fresh']
+    assert [event['tool_call_id'] for event in called] == call_ids
+    assert [event['execution'] for event in called] == [event['intent']['execution'] for event in started]
+    assert all('tool_call_id' not in event['intent'] and 'call_id' not in event['intent'] for event in started)
+    completed = [event['payload'] for event in trace if event['type'] == 'tool.completed']
+    assert [event['operation_id'] for event in completed] == [event['operation_id'] for event in started]
     records = [engine.get(state, ref) for ref in state.model_exchange_refs]
-    assert len([record for record in records if 'tool_result' in record]) == 2
+    audits = [event['payload'] for event in trace if event['type'] == 'model.tool.result.persisted']
+    assert [event['tool_call_id'] for event in audits] == call_ids
+    assert [engine.get(state, event['result_ref'])['tool_result']['message']['tool_call_id']
+            for event in audits] == call_ids
     assert [record['tool_round'] for record in records if 'request' in record] == [0, 1, 2]
 
 
@@ -86,6 +95,7 @@ async def test_policy_rejects_tools_before_browser_side_effects(tmp_path, monkey
         spec = engine.spec(state)
         spec.authorized_actions.remove('click')
         state.test_spec_ref = engine.put(state, spec.model_dump())
+        state.test_spec_hash = digest(spec)
     if violation == 'origin':
         name, arguments = 'BrowserNavigate', {'value': 'https://unauthorized.test'}
     requests = []

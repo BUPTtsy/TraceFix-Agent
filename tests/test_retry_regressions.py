@@ -7,6 +7,7 @@ import pytest
 from tracefix.model.gateway import BrowserPolicyRouter, Gateway, ModelError, ModelOutputError, ModelResult
 from tracefix.runtime.contracts import (BrowserAction, Decision, FileEdit, Outcome,
     PatchProposal, RunStatus, digest)
+from tracefix.runtime import smoke
 from tracefix.runtime.smoke import make_engine
 
 
@@ -357,16 +358,21 @@ async def test_unknown_result_pauses_before_loop_termination(tmp_path, status):
 
 
 @pytest.mark.parametrize('invalid_kind', ['unchanged', 'blank', 'stale_hash', 'duplicate', 'evidence'])
-async def test_invalid_patch_is_corrected_before_workspace_operation(tmp_path, invalid_kind):
+async def test_invalid_patch_is_corrected_before_workspace_operation(tmp_path, invalid_kind, monkeypatch):
+    stable_content = b'export const unchanged = 1;\n'
+    original_index = smoke.safe_index_files
+
+    def initialize_stable_source(root, paths):
+        (root / 'src/stable.ts').write_bytes(stable_content)
+        return original_index(root, [*paths, 'src/stable.ts'])
+
+    monkeypatch.setattr(smoke, 'safe_index_files', initialize_stable_source)
     engine, state = make_engine(tmp_path)
     original = engine.workspace.read('src/value.ts')
-    stable_content = b'export const unchanged = 1;\n'
     stable_path = engine.workspace.root / 'src/stable.ts'
-    stable_path.write_bytes(stable_content)
-    engine.source['files']['src/stable.ts'] = digest(stable_content)
-    state.source_manifest = digest(engine.source)
-    state.repo_snapshot_ref = engine.put(state, engine.source)
-    engine.runner.source = state.source_manifest
+    assert engine.source['files']['src/stable.ts'] == digest(stable_content)
+    assert engine.source['entries']['src/stable.ts']['tracked'] is True
+    engine.workspace.check_frozen(engine.source)
     inner = engine.model
     contexts = []
 
@@ -509,9 +515,9 @@ async def test_batch_patch_failure_with_unknown_receipt_is_never_replayed(tmp_pa
     original_apply = engine.workspace.apply
     attempts = []
 
-    def write_then_fail(proposal):
+    def write_then_fail(proposal, base='HEAD'):
         attempts.append(proposal)
-        original_apply(proposal)
+        original_apply(proposal, base=base)
         raise ValueError('Patch was written but the receipt was lost')
 
     engine.workspace.apply = write_then_fail

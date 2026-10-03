@@ -49,6 +49,7 @@ class BehaviorBrowser(FakeBrowser):
 
 def verification_engine(tmp_path, failure=None):
     engine, state = make_engine(tmp_path)
+    state.environment_digest = 'fake-ci-environment'
     spec = engine.spec(state).model_copy(update={'behavior_scenarios': [scenario()]})
     state.test_spec_ref = engine.put(state, spec.model_dump())
     state.test_spec_hash = digest(spec)
@@ -91,7 +92,8 @@ def gate(engine, state, *, missing=None, transform=None, validations=None):
     if validations is None:
         validations = [Validation(**engine.get(state, ref)) for ref in state.validation_refs]
     return verification_gate(state, validations,
-        lambda ref: ref != missing and engine.bundle_exists(state, ref), artifact_read=read)
+        lambda ref: ref != missing and engine.bundle_exists(state, ref), artifact_read=read,
+        artifact_read_bytes=lambda ref: engine.artifacts.read(state.scope_id, state.run_id, ref))
 
 
 @pytest.mark.parametrize('snapshot,passed', [

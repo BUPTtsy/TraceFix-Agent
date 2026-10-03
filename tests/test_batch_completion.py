@@ -9,8 +9,56 @@ from tracefix.execution.browser import MCPActionUnknown, MCPConnectionError
 from tracefix.knowledge.assembler import ContextWindowError
 from tracefix.model.gateway import ModelError
 from tracefix.runtime.contracts import (Outcome, Phase, RunState, RunStatus,
-                                       TestSpec as Spec, Validation, digest)
+                                       TestSpec as Spec, Validation, digest, reduce_state)
 from tracefix.runtime.smoke import FakeBrowser, make_engine
+from tracefix.runtime.verification import verification_binding
+
+
+@pytest.mark.parametrize('late_change', [False, True])
+async def test_interactive_commit_preserves_verified_patch_and_rejects_late_changes(tmp_path, late_change):
+    engine, state = make_engine(tmp_path)
+    baseline = engine.workspace.head()
+    await engine.run(state)
+    pending = engine.store.load(state.run_id, state.scope_id)
+    assert pending.run_status == RunStatus.WAITING_APPROVAL
+    with pytest.raises(ValueError, match='基线'):
+        reduce_state(pending, pending.revision, patch_base_commit='a' * 40)
+    if late_change:
+        original_branch = engine.workspace.branch
+
+        def commit_then_change(name):
+            result = original_branch(name)
+            (engine.workspace.root / 'src/value.ts').write_bytes(b'export const persisted = false;\n')
+            return result
+
+        engine.workspace.branch = commit_then_change
+    engine.store.decide_approval(pending.approval_ref, pending, 'approve')
+    await engine.run(resume='approve')
+    finished = engine.store.load(state.run_id, state.scope_id)
+    if late_change:
+        assert finished.outcome == Outcome.INFRA_FAILURE
+        assert finished.error_details['terminal_reason'] == 'final_verification_invalid'
+        return
+    assert finished.outcome == Outcome.FIX_VERIFIED, finished.error
+    assert finished.patch_base_commit == baseline
+    assert engine.workspace.head() != baseline and engine.workspace.diff() == ''
+    assert digest(engine.workspace.diff(baseline).encode()) == finished.patch_hash
+    report = engine.get(finished, finished.report_ref)
+    assert report['patch_base_commit'] == baseline
+    assert report['patch_verification'] == 'verified' and report['patch_available']
+    assert engine.artifacts.read(state.scope_id, state.run_id, report['patch_diff_ref'])
+
+
+def test_existing_candidate_branch_does_not_return_stale_commit(tmp_path):
+    engine, state = make_engine(tmp_path)
+    candidate = 'tracefix/' + state.run_id
+    target = engine.workspace.root / 'src/value.ts'
+    target.write_bytes(b'export const persisted = true;\n')
+    engine.workspace.branch(candidate)
+    previous_commit = engine.workspace.head()
+    target.write_bytes(b'export const persisted = 1;\n')
+    assert engine.workspace.branch(candidate) == candidate
+    assert engine.workspace.head() != previous_commit and engine.workspace.diff() == ''
 
 
 async def test_batch_fix_finishes_without_interactive_approval(tmp_path):
@@ -94,7 +142,7 @@ async def test_batch_browser_unknown_operation_preserves_unreceipted_intent(tmp_
     assert finished.error_details["status"] == "UNKNOWN_OPERATION"
     events = engine.store.trace(state.run_id, state.scope_id)
     failed = next(event for event in events if event["type"] == "tool.error")
-    assert engine.store.operations[failed["payload"]["operation_id"]]["status"] == "STARTED"
+    assert engine.store.operations[failed["payload"]["operation_id"]]["status"] == "UNKNOWN"
     report = engine.get(finished, finished.report_ref)
     assert report["patch_available"] is False
     assert report["patch_verification"] == "none"
@@ -160,9 +208,10 @@ async def test_batch_context_window_error_finishes_with_consumable_output(tmp_pa
     assert report["result_summary"]
 
 
-async def test_batch_graph_recursion_limit_finishes_with_loop_report(tmp_path):
+@pytest.mark.parametrize('execution_mode', ['batch', 'interactive'])
+async def test_graph_recursion_limit_finishes_with_loop_report(tmp_path, execution_mode):
     engine, state = make_engine(tmp_path)
-    state.execution_mode = "batch"
+    state.execution_mode = execution_mode
 
     class ExhaustedGraph:
         async def ainvoke(self, invocation, config):
@@ -302,7 +351,7 @@ async def test_batch_final_report_rechecks_patch_and_validation_evidence(tmp_pat
                 return original_get(saved, reference)
             engine.get = missing_validation
         else:
-            def broken_export():
+            def broken_export(base='HEAD'):
                 raise OSError('无法读取工作区 diff')
             engine.workspace.diff = broken_export
         return await original_finalize(current, next_node)
@@ -385,12 +434,15 @@ async def test_persistence_profile_rejects_loss_of_uncomplete_behavior(tmp_path,
                 if not complete_only or self.task_status != 'Done':
                     self.task_status = 'Done' if self.task_status == 'Todo' else 'Todo'
                     self.saved_status = self.task_status
-            elif action.kind == 'click' and action.locator.name == 'Todo':
-                self.filter = 'Todo'
+            elif action.kind == 'click' and action.locator.name in {'Todo', 'Done'}:
+                self.filter = action.locator.name
             snapshot = ('- heading "Task board" [ref=e1]\n'
                         '- button "Add task" [ref=e2]\n'
-                        '- button "Todo" [ref=e3]\n')
-            if self.filter != 'Todo' or self.task_status == 'Todo':
+                        '- button "Todo" [ref=e3]\n'
+                        '- button "Done" [ref=e5]\n')
+            if self.filter == 'Done':
+                snapshot += '- checkbox "Complete Prepare release checklist" [ref=e6]'
+            elif self.filter != 'Todo' or self.task_status == 'Todo':
                 snapshot += '- checkbox "Complete Write project brief" [ref=e4]'
                 if self.task_status == 'Done':
                     snapshot += ' [checked]'
@@ -413,20 +465,32 @@ async def test_persistence_profile_rejects_loss_of_uncomplete_behavior(tmp_path,
     state.execution_mode = 'batch'
     state.phase, state.validation_index = Phase.VERIFY, 4
     state.reproduced = state.source_aligned = True
+    state.reproduction_plan_frozen = True
     state.environment_digest = 'profile-regression-environment'
     state.patch_hash = digest(engine.workspace.diff().encode())
     state.test_spec_ref = engine.put(state, spec.model_dump())
     state.test_spec_hash = digest(spec)
-    state.replay_plan_ref = engine.put(state, [action.model_dump() for action in spec.regression_plan[:2]])
+    replay_plan = [action.model_dump() for action in spec.regression_plan[:2]]
+    state.replay_plan_ref = engine.put(state, replay_plan)
+    replay_plan_hash = digest(replay_plan)
+    binding = verification_binding(state, replay_plan_hash)
     for kind in ('static', 'unit', 'build', 'health'):
-        artifact_ref = engine.put(state, {'kind': kind, 'passed': True})
-        validation = Validation(kind=kind, passed=True, source_manifest=state.source_manifest,
+        command = await engine.runner.health() if kind == 'health' else await engine.runner.command(kind)
+        artifact_ref = engine.put(state, {**command, **binding, 'type': 'validation_result', 'kind': kind})
+        validation = Validation(kind=kind, passed=command['passed'], scope_id=state.scope_id,
+            run_id=state.run_id, source_manifest=state.source_manifest,
             patch_hash=state.patch_hash, environment_digest=state.environment_digest,
-            test_spec_hash=state.test_spec_hash, artifact_ref=artifact_ref)
+            test_spec_hash=state.test_spec_hash, replay_plan_hash=replay_plan_hash,
+            artifact_ref=artifact_ref)
         state.validation_refs.append(engine.put(state, validation.model_dump()))
     engine.store.save(state)
 
-    for step in range(len(spec.regression_plan) + 7):
+    original_verification_steps = 1 + len(replay_plan) + 1
+    regression_verification_steps = 1 + len(spec.regression_plan) + 1
+    behavior_verification_steps = sum(1 + len(scenario.steps) for scenario in spec.behavior_scenarios)
+    verification_steps = (original_verification_steps + regression_verification_steps +
+                          behavior_verification_steps)
+    for step in range(verification_steps):
         if state.phase != Phase.VERIFY:
             break
         output = await engine.verify(state, None)
@@ -439,8 +503,10 @@ async def test_persistence_profile_rejects_loss_of_uncomplete_behavior(tmp_path,
     assert regression['passed'] is (not complete_only)
     assert state.phase == (Phase.DIAGNOSE if complete_only else Phase.FINALIZE)
     regression_result = engine.get(state, regression['artifact_ref'])
-    assert [check['passed'] for check in regression_result['assertions']] == [True, True, not complete_only]
-    assert engine.browser.frames[-6:] == [
+    assert [check['passed'] for check in regression_result['assertions']] == [
+        True, True, not complete_only, not complete_only]
+    regression_frame_start = 1 + len(replay_plan)
+    assert engine.browser.frames[regression_frame_start:regression_frame_start + 1 + len(spec.regression_plan)] == [
         ('navigate', 'Todo', 'All'), ('click', 'Done', 'All'), ('navigate', 'Done', 'All'),
         ('click', 'Done' if complete_only else 'Todo', 'All'),
         ('navigate', 'Done' if complete_only else 'Todo', 'All'),
