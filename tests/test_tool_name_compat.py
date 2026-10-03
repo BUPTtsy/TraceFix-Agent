@@ -264,6 +264,8 @@ async def test_batch_finish_exploration_accepts_current_observation_evidence(
     engine, state = make_engine(tmp_path)
     state.phase = Phase.EXPLORE
     state.execution_mode = 'batch'
+    # 副作用 operation 的审计通知必须读取已登记的 RunState；生产路径由创建 Run 时完成登记。
+    engine.store.save(state)
     screenshot = engine.put(state, b'fixture', 'png')
     observation = {'id': 'current-observation', 'snapshot': '', 'screenshot_ref': screenshot}
     state.observation_ref = engine.put(state, observation)
