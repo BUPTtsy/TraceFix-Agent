@@ -167,7 +167,8 @@ class IsolatedGuiScout:
                                                                      text, 'txt', label='项目约束')
             child.agent_instructions_hash = parent.agent_instructions_hash
             child.agent_instructions_path = parent.agent_instructions_path
-        model = self.engine.model
+        # GUI workers use the isolated Gateway when configured; otherwise retain supervisor behavior.
+        model = getattr(self.engine, 'worker_model', None) or self.engine.model
         if hasattr(model, 'student') and model.student:
             model = type(model)(model.teacher, model.student)
         worker = Engine(self.engine.store, self.engine.artifacts, self.engine.scopes,
@@ -175,10 +176,13 @@ class IsolatedGuiScout:
                         sandbox.runner, sandbox.browser, model, self.engine.retriever,
                         self.engine.source, self.engine.graph.checkpointer,
                         rule_resolver=self.engine.rule_resolver, rule_library=self.engine.rule_library)
+        worker.worker_model = getattr(self.engine, 'worker_model', None)
         worker.documents = self.engine.documents
         worker.subagent_role = 'gui-scout'
         worker.subagent_depth = 1
         worker.worker_write_enabled = task.write_enabled
+        worker.worker_allowed_tools = list(task.tools)
+        worker.worker_shell_mode = task.shell_mode
         worker.worker_allowed_files = list(task.allowed_files)
         worker.worker_writable_files = list(task.writable_files)
         worker.subagent_parent_step_id = task.metadata.get('parent_step_id')

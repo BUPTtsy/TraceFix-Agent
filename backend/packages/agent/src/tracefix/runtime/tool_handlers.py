@@ -59,18 +59,14 @@ def _value(value):
 
 
 def build_runtime_tools(engine, state, schema, context=None, validate_output=None):
-    context = context or {}
-    if getattr(engine, 'subagent_depth', 0) == 1:
-        context = {**context, 'worker_depth': 1,
-                   'worker_write_enabled': getattr(engine, 'worker_write_enabled', False),
-                   'worker_allowed_files': getattr(engine, 'worker_allowed_files', []),
-                   'worker_writable_files': getattr(engine, 'worker_writable_files', [])}
+    from tracefix.runtime.local_tools import local_tool_context, register_local_tools
+    context = local_tool_context(engine, context)
     # 子 Agent 默认只读，写权限及路径由 Supervisor 契约显式声明。
     worker_mode = context.get('worker_depth') == 1
     worker_allowed_files = {
         str(path).replace('\\', '/') for path in context.get('worker_allowed_files', [])
     }
-    worker_allowed_tools = set(context.get('allowed_tools') or context.get('worker_allowed_tools') or [])
+    worker_allowed_tools = set(context.get('worker_allowed_tools', []))
     worker_shell_mode = context.get('worker_shell_mode', 'disabled')
     registry, handlers, submissions = ToolRegistry(), {}, {}
     phase = Phase(state.phase)
@@ -78,16 +74,7 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
     def worker_tool_allowed(name, side_effect):
         if not worker_mode:
             return True
-        aliases = {
-            'Read': {'Read', 'file.read', 'code.read'},
-            'Glob': {'Glob', 'file.read', 'code.read'},
-            'Grep': {'Grep', 'file.read', 'code.read'},
-            'Write': {'Write', 'file.write', 'code.write'},
-            'Edit': {'Edit', 'file.write', 'code.write'},
-            'NotebookEdit': {'NotebookEdit', 'file.write', 'code.write'},
-            'Bash': {'Bash', 'shell', 'shell.readonly', 'shell.patch'},
-        }
-        if not worker_allowed_tools or not (worker_allowed_tools & aliases.get(name, {name})):
+        if name not in worker_allowed_tools:
             return False
         if name == 'Bash':
             return worker_shell_mode in {'readonly', 'patch'}
@@ -108,7 +95,6 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
             category=name.split('.')[0]))
         handlers[name] = handler
 
-    from tracefix.runtime.local_tools import register_local_tools
     register_local_tools(engine, state, context, bind)
 
     if not worker_mode:

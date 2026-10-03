@@ -128,7 +128,9 @@ def make_operation_executor(store, state, *, notify=None):
             receipt = store.begin(execution_state, op_id, intent, owner=owner, ancestors=ancestors, notify=notify)
         except Exception as error:
             if getattr(error, 'status', None) == 'UNKNOWN_OPERATION' and reconcile is not None:
-                error.details['recovery'] = 'store.reconcile with reviewer, identity, evidence and result'
+                # 自动回调无法证明执行已停止；解除 fence 必须走带证据的显式人工核对。
+                error.details['recovery'] = ('store.reconcile with reviewer, identity, resources, '
+                                             'execution_stopped, evidence and result')
             raise
         if receipt is not None:
             return receipt
@@ -142,6 +144,7 @@ def make_operation_executor(store, state, *, notify=None):
             error.tracefix_operation_id = op_id
             if isinstance(getattr(error, 'details', None), dict):
                 error.details['operation_id'] = op_id
+            # perform/finish 失败或取消都不能证明副作用未发生，所有模式均保留跨 epoch fence。
             try:
                 store.mark_unknown(execution_state, op_id, owner=owner, reason=type(error).__name__, notify=notify)
             except Exception as ledger_error:

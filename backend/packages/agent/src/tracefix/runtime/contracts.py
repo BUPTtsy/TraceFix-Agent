@@ -153,6 +153,7 @@ class BehaviorScenario(Contract):
 
     @model_validator(mode="after")
     def validate_checkpoints(self):
+        # 中间检查点保留状态转移证据，避免只看最终状态而漏掉被补丁破坏的正向或逆向能力。
         if not self.steps[-1].assertions:
             raise ValueError('业务场景最后一步必须包含断言')
         if len(self.steps) > 1 and not any(step.assertions for step in self.steps[:-1]):
@@ -432,4 +433,6 @@ def verification_gate(state: RunState, validations: list[Validation], artifact_e
                       artifact_read=None, artifact_read_bytes=None) -> bool:
     from tracefix.runtime.verification import verify_artifacts
 
+    # passed 是生产者声明，不是证明；门禁须核验类型、当前运行绑定与原始证据，并从快照重算 GUI 断言。
+    # 只有引用存在还不够，缺少 JSON 或截图字节读取器时必须拒绝放行。
     return verify_artifacts(state, validations, artifact_exists, artifact_read, artifact_read_bytes)

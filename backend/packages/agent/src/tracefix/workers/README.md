@@ -2,6 +2,20 @@
 
 `tracefix.workers` 提供 Supervisor 动态派发 Worker 所需的任务契约、线程调度、提示词约束和工作区锁。角色名称和任务提示词由 Supervisor 每次派发时生成，不预先枚举固定角色；运行时仍会独立校验工具、文件、Artifact、Shell 模式和版本边界。
 
+## 动态 Worker 的权限上界
+
+动态角色不是能力声明。Worker 的有效权限是父 Run、项目作用域、阶段策略、任务契约和运行时策略的交集；子任务只能收窄，不能扩大父任务权限。`allowed_tools`、`allowed_files`、`allowed_artifacts`、网络/浏览器能力和 `source_revision` 都必须进入结构化契约并在派发、执行和回写时复核，角色名、自然语言提示词或 Skill 名称不能替代授权。
+
+- Worker 默认只读。写入必须同时具备 Supervisor 显式的 `write_enabled=true`、属于 `allowed_files` 的 `writable_files`、适用的写工具声明和工作区锁；不能借 Bash、底层 API、路径别名或符号链接绕过白名单，也不能把写权限扩展到删除、越权文件或未授权 Artifact。
+- Worker 不能递归派发或加入其他 Worker，不能自行提升为 Supervisor，不能把自己的 `patch_hash`、`passed` 标签或建议直接提升为父 Run 的补丁和成功结论。源码 revision、父 Run/step、作用域和证据引用变化时，Supervisor 必须重新校验。
+- 子任务可见的 Artifact 必须是父 Run 已授权的证据集合；浏览器、Shell、网络和模型配置仍受同一 Run 的预算、作用域、审批与审计链约束。取消是协作式的，不代表已经撤销不可中断的外部副作用。
+
+## Skill 与权限审计的关系
+
+Skill 是指导文本，不是权限令牌。它可以描述检查步骤、输出格式和收敛策略，但不能新增工具、文件、网络、模型或写入范围。实际请求应记录所用 Skill 的正文版本、哈希及引用内容，并与最终任务契约、策略版本、审批绑定和拒绝原因一起审计；缺少这些证据时，不能把“使用了某 Skill”写成已完成的安全验证。
+
+阶段一只依赖上述结构化授权、证据绑定和父级复核来验证行为闭环，不宣称后续权限审计或 Skill 冻结已经完成。阶段二需要继续覆盖恢复、取消和未知副作用；阶段三再冻结每个 Run 实际使用的 Skill 正文与 references，审查最终参数、作用域、撤回和经验晋升；阶段四的真实评分仍必须独立于 Worker 的过程反馈。无论后续阶段如何扩展，动态 Worker 的权限上界都不能超过父 Run 的确定性授权。
+
 ## 运行约定
 
 - 每个 Worker 使用 `ThreadPoolExecutor` 中的一个线程运行；本机同时运行的 Worker 默认最多 4 个，可通过 `TRACEFIX_WORKER_CONCURRENCY` 配置为 1 到 4。
@@ -41,9 +55,15 @@ Worker 补丁写入的是共享工作区中的候选修改，并在结果中返�
 
 线程无法安全地硬杀正在执行的同步外部 Runner。取消会设置协作式取消事件并阻止后续工具调用；已经阻塞在不可中断的同步系统调用中的线程会继续运行，调度器会等待其自然返回并通过状态和事件报告结果。不要把线程取消当成进程级强制终止。
 
+副作用 ledger 的恢复安全契约是 `UNKNOWN` + resource fence + 显式人工 reconcile：结果不明时保留资源围栏，不允许盲重试或由 callback 自行解锁。线程返回、终态报告或 Worker 结果回写都不能替代人工核对。2026-10-03 最近一次全量记录包含 UNKNOWN 安全边界 7 项失败；随后主 Agent 对 architecture operation、guidance、engine 使用 `-k 'operation or guidance or cancel'` 的安全回归为 **98 passed、21 deselected，76.09s**。原失败与后续定向通过分列，新全量结果尚未提供；旧测试应迁移到该安全契约，不能削弱断言以迁就不安全恢复，也不据此宣称阶段二恢复已验收。
+
 ## 模型配置
 
-Supervisor 与 Worker 默认复用同一个 `Gateway`。设置任意 `TRACEFIX_WORKER_*` 覆盖项后，CLI 会创建独立 Worker Gateway；未设置的字段继承 Supervisor 的环境配置：
+Supervisor 与 Worker 默认复用同一个 `Gateway`。CLI 的 `configured_worker_model()` 在存在实际 `TRACEFIX_WORKER_*` 覆盖时创建独立 Worker Gateway，未覆盖字段继承 Supervisor 的环境配置；全部省略或为空时返回 `None`，继续使用父 Gateway。2026-10-03 配置与实际路由定向记录为 **11 passed**，本次文档更新未重跑这些测试。
+
+`Engine.model_call()` 在 Worker 调用中局部选择 `selected_model`，不替换共享的 `engine.model`；GUI scout 子 Engine 同样优先使用 Worker Gateway，未配置时使用父 Gateway。该记录支持配置继承、覆盖与实际路由行为，不代表所有模型、推理配置及运行时实际使用值已经有完整审计，也不等于阶段三验收。
+
+本轮开发编排中的子 Agent 在 spawn 时省略 `model` / `reasoning`，继承主 Agent 配置，不自动升级或指定其他模型；这是开发编排记录，不能与 TraceFix 产品的 `TRACEFIX_WORKER_*` 配置机制混为一谈。产品中的 Gateway 覆盖须由父级明确记录并授权，仍不能扩大工具、文件、网络、Skill 或验证权限；实际使用值及推理配置仍需补足审计证据。
 
 ```text
 TRACEFIX_WORKER_BASE_URL
@@ -52,7 +72,7 @@ TRACEFIX_WORKER_TEXT_MODEL
 TRACEFIX_WORKER_VISION_MODEL
 ```
 
-其中 `TRACEFIX_WORKER_VISION_MODEL` 为空表示 Worker 不发送图片；省略该变量时可继承 `TRACEFIX_VISION_MODEL`。Worker 的模型调用仍通过同一 Run 的预算、作用域和审计链路。
+在已创建独立 Worker Gateway 时，`TRACEFIX_WORKER_VISION_MODEL` 显式为空表示 Worker 不发送图片，省略该变量则继承 `TRACEFIX_VISION_MODEL`。仅设置空值不会创建独立 Gateway；因此关闭 Worker 图片时还须有其他非空覆盖项。Worker 的模型调用仍受同一 Run 的用量记录、作用域和审计要求约束，不因独立 Gateway 获得额外权限。
 
 ## 观测与展示
 

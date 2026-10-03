@@ -82,6 +82,7 @@ observation_id 和 element_ref 必须来自本次观测，不得编造、截断�
 当目标要求“标记完成后刷新并验证”时，先操作，再 navigate 重新加载，观察加载后状态，最后 finish。
 """
 
+# 业务场景在修补前冻结，防止用禁用交互或破坏逆向操作来换取原问题断言通过。
 SPEC = """
 TestSpec 输出规范：你正在根据用户目标和首次只读页面观测编译测试规范，尚未冻结。
 authorized_actions 是动作名称数组，只能选择 navigate、click、type、select、press、observe、finish；

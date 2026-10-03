@@ -71,6 +71,7 @@ def assertions(snapshot, checks):
         elif passed and a.condition == 'enabled':
             passed = '[disabled]' not in found[0]['attrs']
         elif passed and a.condition == 'unchecked':
+            # 仅可勾选角色能证明取消勾选；普通元素缺少 checked 或控件为 mixed 都不能冒充 unchecked。
             passed = (found[0]['role'] in {'checkbox', 'radio', 'switch', 'menuitemcheckbox', 'menuitemradio'}
                       and re.search(r'\[checked(?:[=\s][^\]]*)?\]', found[0]['attrs']) is None)
         results.append({'assertion': a.model_dump(), 'passed': passed, 'matches': len(found)})

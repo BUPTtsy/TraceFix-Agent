@@ -95,6 +95,7 @@ class Engine:
         self.store, self.artifacts, self.scopes, self.context = store, artifacts, scopes, context
         self.profile, self.workspace, self.runner = profile, workspace, runner
         self.browser, self.model, self.retriever, self.source = browser, model, retriever, source
+        self.worker_model = None
         self.notify = notify
         self.rule_resolver = rule_resolver
         self.rule_library = rule_library
@@ -232,13 +233,30 @@ class Engine:
 
     def record_guidance_ack(self, s, candidate):
         acknowledgements = {entry.id: entry.how_applied for entry in getattr(candidate, 'guidance_ack', [])}
+        changed = False
         for entry in s.guidance:
             if entry.id not in acknowledgements:
                 continue
-            entry.status, entry.how_applied = 'acknowledged', acknowledgements[entry.id]
+            how_applied = acknowledgements[entry.id]
+            # 仅允许 applied -> acknowledged；拒绝把未应用或已失效的引导恢复为已确认。
+            if entry.status not in {'applied', 'acknowledged'}:
+                raise ModelOutputError('guidance_ack 只能确认已应用的引导')
+            if entry.status == 'acknowledged':
+                # 相同确认是幂等空操作；新说明须单独审计，不能重发首次确认事件或覆盖旧证据。
+                if entry.how_applied == how_applied:
+                    continue
+                previous_how_applied = entry.how_applied
+                entry.how_applied = how_applied
+                event_type = 'guidance.acknowledgement.updated'
+                payload = {**entry.model_dump(mode='json'), 'previous_how_applied': previous_how_applied}
+            else:
+                entry.status, entry.how_applied = 'acknowledged', how_applied
+                event_type = 'guidance.acknowledged'
+                payload = entry.model_dump(mode='json')
             self.guidance_ledger.save(entry)
-            self.event(s, 'guidance.acknowledged', entry.model_dump(mode='json'))
-        if acknowledgements:
+            self.event(s, event_type, payload)
+            changed = True
+        if changed:
             self.store.save(s)
 
     def active_rules(self, s, phase=None, observation=None, paths=None):
@@ -542,6 +560,9 @@ class Engine:
 
     async def model_call(self, s, schema, ctx, image=None, validate_output=None):
         ctx = {**ctx, 'phase': str(s.phase), 'execution_mode': s.execution_mode}
+        # Worker calls select locally; never replace the shared supervisor model.
+        selected_model = (self.worker_model if ctx.get('worker_depth') == 1
+                          and self.worker_model is not None else self.model)
         logical_call = s.budget.model_calls + 1
         ctx = self.guidance_context(s, ctx, logical_call)
         if self.rule_resolver:
@@ -689,12 +710,12 @@ class Engine:
                 'reused': raw['reused']})
 
         validation = {'validate_output': validate_output} if (original_validation or ctx['guidance_ack_required'] or
-            (self.rule_resolver and getattr(self.model, 'supports_tool_executor', False))) else {}
+            (self.rule_resolver and getattr(selected_model, 'supports_tool_executor', False))) else {}
         recovery = s.error_details or {}
         recovering_model_request = (recovery.get('status') == 'WAITING_NETWORK'
             and recovery.get('request_status') == 'not_sent'
             and not recovery.get('requires_manual_review') and not recovery.get('requires_new_run'))
-        if getattr(self.model, 'supports_tool_executor', False):
+        if getattr(selected_model, 'supports_tool_executor', False):
             def current_context():
                 nonlocal ctx
                 ctx = self.guidance_context(s, ctx, logical_call)
@@ -778,16 +799,16 @@ class Engine:
                 self.event(s, 'context.compacted', {'manifest_ref': manifest_ref,
                     'tokens_before': manifest['tokens_before'], 'tokens_after': manifest['tokens_after']})
         generation_kwargs = dict(validation)
-        if getattr(self.model, 'supports_tool_executor', False) and runtime_tools.registry.visible(s.phase):
+        if getattr(selected_model, 'supports_tool_executor', False) and runtime_tools.registry.visible(s.phase):
             generation_kwargs.update(tool_registry=runtime_tools.registry, tool_pipeline=tool_pipeline)
-        if getattr(self.model, 'supports_context_assembler', False):
+        if getattr(selected_model, 'supports_context_assembler', False):
             # Gateway 支持时由其在每个 attempt 内重新组装，覆盖重试和工具多轮的新上下文。
             generation_kwargs.update(context_assembler=self.assembler, on_context=context_record)
         else:
             assembly = self.assembler.assemble(ctx)
             ctx = assembly.context
             context_record(assembly.manifest, assembly.compacted)
-        result = await self.model.generate(schema, ctx, image=image,
+        result = await selected_model.generate(schema, ctx, image=image,
             agent_instructions=self.agent_instructions(s), on_attempt=attempt,
             on_response=response, on_error=error, on_usage=usage, **generation_kwargs)
         if tool_pipeline.submission_value is not None:
@@ -1616,6 +1637,7 @@ class Engine:
         scenario = spec.behavior_scenarios[s.validation_index - 6] if kind == 'behavior' else None
         if scenario is not None:
             if s.replay_index == 0:
+                # 每个场景须自行建立前置状态，隔离探索/上一场景的浏览器与服务端状态，并清空旧检查点。
                 result = await self.reset(s)
                 return self.output(self.changed(s, observation_ref=result['observation_ref'],
                                                replay_index=1, behavior_check_refs=[]), 'prelude')
@@ -1626,6 +1648,7 @@ class Engine:
                 s = self.changed(s, observation_ref=ref, replay_index=step_index + 1)
                 result = None
                 if step.assertions:
+                    # 在下一动作覆盖页面状态前取证，才能区分每次转移与刷新后的持久化结果。
                     result, ref = self.check(s, step.assertions, scenario=scenario, scenario_step=step_index)
                     s = self.changed(s, behavior_check_refs=s.behavior_check_refs + [ref])
                 if (result is None or result['passed']) and step_index < len(scenario.steps):
@@ -1633,6 +1656,7 @@ class Engine:
             checkpoints = [self.get(s, ref) for ref in s.behavior_check_refs]
             expected_steps = [index for index, step in enumerate(scenario.steps, 1) if step.assertions]
             last_checkpoint = checkpoints[-1] if checkpoints else {}
+            # 检查点必须按冻结步骤完整覆盖；提前失败或只执行终态断言都不能汇总为通过。
             result = {'passed': ([item['scenario_step'] for item in checkpoints] == expected_steps
                                  and all(item['passed'] for item in checkpoints)),
                       'scenario_id': scenario.id, 'scenario_hash': digest(scenario),

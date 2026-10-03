@@ -7,7 +7,6 @@ import csv
 import io
 import json
 import mimetypes
-import os
 import shutil
 import subprocess
 import tempfile
@@ -18,7 +17,7 @@ from pydantic import Field
 
 from tracefix.execution.platforms import container_user, is_link
 from tracefix.execution.runner import process
-from tracefix.runtime.contracts import Contract, Phase, digest, new_id
+from tracefix.runtime.contracts import Contract, Phase, RunState, digest, new_id
 from tracefix.runtime.tools import ToolRejected
 from tracefix.runtime.effects import apply_effect_receipt, run_effect
 from tracefix.workers.locks import WorkspaceMutex
@@ -73,27 +72,94 @@ class BashInput(Contract):
     description: str = Field(min_length=1, max_length=1000)
 
 
+LOCAL_TOOL_ALIASES = {
+    'Read': {'Read', 'file.read', 'code.read'},
+    'Glob': {'Glob', 'file.read', 'code.read'},
+    'Grep': {'Grep', 'file.read', 'code.read'},
+    'Write': {'Write', 'file.write', 'code.write'},
+    'Edit': {'Edit', 'file.write', 'code.write'},
+    'NotebookEdit': {'NotebookEdit', 'file.write', 'code.write'},
+    'Bash': {'Bash', 'shell', 'shell.readonly', 'shell.patch'},
+}
+
+
+def local_tool_context(engine, context):
+    """归一化委派权限；显式空工具集合拒绝全部，GUI 权限以父引擎授权为准。"""
+    context = dict(context or {})
+    if getattr(engine, 'subagent_depth', 0) == 1:
+        context.update(worker_depth=1,
+            worker_write_enabled=getattr(engine, 'worker_write_enabled', False),
+            worker_allowed_files=getattr(engine, 'worker_allowed_files', []),
+            worker_writable_files=getattr(engine, 'worker_writable_files', []),
+            worker_allowed_tools=getattr(engine, 'worker_allowed_tools', []),
+            worker_shell_mode=getattr(engine, 'worker_shell_mode', 'disabled'))
+    if context.get('worker_depth') == 1:
+        grants = [set(context[name]) for name in ('allowed_tools', 'worker_allowed_tools')
+                  if name in context]
+        tools = [name for name, aliases in LOCAL_TOOL_ALIASES.items()
+                 if grants and all(grant & aliases for grant in grants)]
+        shell_mode = context.get('worker_shell_mode', 'disabled')
+        if shell_mode not in {'readonly', 'patch'} or 'Bash' not in tools:
+            shell_mode = 'disabled'
+            tools = [name for name in tools if name != 'Bash']
+        elif any('shell.readonly' in grant for grant in grants):
+            # 只读授权是能力上限，不能在别名归一化时升级成 patch。
+            shell_mode = 'readonly'
+        context['worker_allowed_tools'] = tools
+        context['worker_shell_mode'] = shell_mode
+    return context
+
+
 class LocalTools:
     def __init__(self, engine, context, state=None):
+        context = local_tool_context(engine, context)
         self.engine = engine
         self.workspace = engine.workspace
         self.root = self.workspace.root.resolve()
         self.state = state
         self.worker = context.get('worker_depth') == 1
-        self.allowed = set(context.get('worker_allowed_files', []))
-        self.writable = set(context.get('worker_writable_files', [])) if self.worker else None
-        self.worker_allowed_tools = (set(context['worker_allowed_tools'])
-                                     if self.worker and 'worker_allowed_tools' in context else None)
+        self.allowed = {str(path).replace('\\', '/') for path in context.get('worker_allowed_files', [])}
+        self.writable = ({str(path).replace('\\', '/') for path in context.get('worker_writable_files', [])}
+                         if self.worker else None)
+        self.worker_allowed_tools = set(context.get('worker_allowed_tools', [])) if self.worker else None
         self.worker_shell_mode = context.get('worker_shell_mode', 'disabled') if self.worker else 'disabled'
-        phase = Phase(getattr(state, 'phase', context.get('phase', Phase.PREPARE)))
-        mode = getattr(state, 'mode', context.get('mode', 'test'))
-        self.write_enabled = (mode == 'repair' and phase in {Phase.DIAGNOSE, Phase.PATCH}
+        self.write_enabled = (isinstance(state, RunState) and state.mode == 'repair'
+                              and state.phase in {Phase.DIAGNOSE, Phase.PATCH}
                               and (not self.worker or context.get('worker_write_enabled') is True))
+        self.shell_write_enabled = (self.write_enabled
+                                    and (not self.worker or self.worker_shell_mode == 'patch'))
         if self.worker and self.writable - self.allowed:
             raise ToolRejected('子 Agent 可写路径必须属于允许文件集合')
         if not hasattr(self.workspace, '_local_tool_mutex'):
             self.workspace._local_tool_mutex = WorkspaceMutex(self.root)
         self.mutex = self.workspace._local_tool_mutex
+
+    def staged_content(self, relative):
+        return self.workspace.staged_content(relative)
+
+    def require_tool(self, name):
+        if self.worker and name not in self.worker_allowed_tools:
+            raise ToolRejected('Supervisor 未授予该工具权限')
+
+    def require_managed(self):
+        store = getattr(self.engine, 'store', None)
+        if (not isinstance(self.state, RunState) or store is None
+                or any(not callable(getattr(store, name, None))
+                       for name in ('begin', 'finish', 'mark_unknown', 'operation_guard'))
+                or any(not callable(getattr(self.workspace, name, None))
+                       for name in ('staged_content', 'stage', 'stage_many', 'require_repository_snapshot'))):
+            raise ToolRejected('本地副作用工具需要有效 RunState、store 和受管 overlay')
+        snapshot = self.workspace.require_repository_snapshot()
+        if snapshot['scope_id'] != self.state.scope_id:
+            raise ToolRejected('工作区快照与 Run scope 不一致')
+
+    def store_content(self, path, content):
+        """仅在受管资源 fence 内暂存候选补丁，禁止直接改写磁盘。"""
+        self.require_managed()
+        if not path.is_file():
+            raise ToolRejected('本地编辑工具不支持创建新文件')
+        with apply_effect_receipt():
+            return self.workspace.stage(path.relative_to(self.root).as_posix(), content)
 
     def path(self, value, *, write=False):
         candidate = Path(value)
@@ -107,6 +173,10 @@ class LocalTools:
             raise ToolRejected('文件不在 Supervisor 委派范围内')
         if write and (not self.write_enabled or self.worker and relative not in self.writable):
             raise ToolRejected('Supervisor 未授予该文件写权限')
+        if write:
+            self.require_managed()
+            if self.state.mode != 'repair' or self.state.phase not in {Phase.DIAGNOSE, Phase.PATCH}:
+                raise ToolRejected('当前 Run 模式或阶段不允许本地写入')
         return self.workspace.path(relative, write=True) if write else self.workspace.path(relative)
 
     def files(self, directory=None):
@@ -124,10 +194,12 @@ class LocalTools:
                     continue
 
     def read(self, arguments):
+        self.require_tool('Read')
         path = self.path(arguments.file_path)
         with self.mutex.read_lock(path):
-            staged = self.workspace.staged_content(path.relative_to(self.root).as_posix())
-            data = staged if staged is not None else path.read_bytes()
+            staged = self.staged_content(path.relative_to(self.root).as_posix())
+            baseline = path.read_bytes()
+            data = staged if staged is not None else baseline
         if path.suffix.lower() in {'.png', '.jpg', '.jpeg', '.gif', '.webp'}:
             return {'path': str(path), 'type': 'image', 'mime_type': mimetypes.guess_type(path)[0],
                     'base64': base64.b64encode(data).decode('ascii')}
@@ -147,40 +219,32 @@ class LocalTools:
             return {'type': 'notebook', 'total_cells': len(cells),
                     'cells': cells[arguments.offset - 1:arguments.offset - 1 + arguments.limit]}
         lines = text.splitlines()
-        baseline = path.read_bytes()
         return {'path': str(path), 'total_lines': len(lines), 'before_hash': digest(baseline),
                 'offset': arguments.offset,
                 'content': '\n'.join(f'{index + 1}\t{line}' for index, line in enumerate(lines)
                                      if arguments.offset <= index + 1 < arguments.offset + arguments.limit)}
 
-    def save(self, path, content):
-        data = content.encode('utf-8')
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix='.tracefix-edit-')
-        try:
-            with os.fdopen(descriptor, 'wb') as stream:
-                stream.write(data)
-            os.replace(temporary, path)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
-        return {'path': str(path), 'after_hash': digest(data)}
-
     def write(self, arguments):
+        self.require_tool('Write')
         path = self.path(arguments.file_path, write=True)
         with self.mutex.write_lock(path):
-            if not path.exists():
-                raise ToolRejected('本地编辑工具不支持创建新文件')
-            return self.workspace.stage(path.relative_to(self.root).as_posix(), arguments.content)
+            return self.store_content(path, arguments.content)
 
     async def write_effect(self, arguments, tool_name):
+        if tool_name not in {'Write', 'Edit', 'NotebookEdit'}:
+            raise ToolRejected('未知的本地写请求')
+        self.require_tool(tool_name)
         path_value = arguments.file_path if tool_name != 'NotebookEdit' else arguments.notebook_path
         path = self.path(path_value, write=True)
         relative = path.relative_to(self.root).as_posix()
         with self.mutex.write_lock(path):
-            staged = self.workspace.staged_content(relative)
+            staged = self.staged_content(relative)
+            if not path.is_file():
+                raise ToolRejected('本地编辑工具不支持创建新文件')
             baseline = path.read_bytes()
             content = staged if staged is not None else baseline
+            with apply_effect_receipt():
+                pass
             prepared = await run_effect('local.prepare', {
                 'tool': tool_name,
                 'content': content.decode('utf-8'),
@@ -189,24 +253,28 @@ class LocalTools:
             if digest(content) != prepared['before_hash']:
                 raise ToolRejected('本地写入基线在执行期间变化，拒绝回写')
             with apply_effect_receipt():
-                current = self.workspace.staged_content(relative)
-                if current != staged or path.read_bytes() != baseline:
+                current = self.staged_content(relative)
+                path = self.path(path_value, write=True)
+                disk = path.read_bytes() if path.exists() else None
+                if current != staged or disk != baseline:
                     raise ToolRejected('本地写入基线在执行期间变化，拒绝回写')
                 return self.workspace.stage(relative, prepared['content'])
 
     def edit(self, arguments):
+        self.require_tool('Edit')
         path = self.path(arguments.file_path, write=True)
         with self.mutex.write_lock(path):
             relative = path.relative_to(self.root).as_posix()
-            staged = self.workspace.staged_content(relative)
+            staged = self.staged_content(relative)
             text = (staged if staged is not None else path.read_bytes()).decode('utf-8')
             count = text.count(arguments.old_string)
             if not count or count != 1 and not arguments.replace_all:
                 raise ToolRejected('old_string 必须存在且唯一；多处替换需指定 replace_all')
-            return self.workspace.stage(relative, text.replace(arguments.old_string, arguments.new_string,
-                                                               -1 if arguments.replace_all else 1))
+            return self.store_content(path, text.replace(arguments.old_string, arguments.new_string,
+                                                        -1 if arguments.replace_all else 1))
 
     def glob(self, arguments):
+        self.require_tool('Glob')
         base = Path(arguments.path) if arguments.path else self.root
         paths = [path for path in self.files(str(base))
                  if path.relative_to(base).match(arguments.pattern)
@@ -215,6 +283,7 @@ class LocalTools:
         return {'files': [str(path) for path in paths]}
 
     def grep(self, arguments):
+        self.require_tool('Grep')
         extensions = {'ts': {'.ts', '.tsx'}, 'js': {'.js', '.jsx', '.mjs'},
                       'py': {'.py'}, 'json': {'.json', '.ipynb'}}
         executable = shutil.which('rg')
@@ -262,9 +331,11 @@ class LocalTools:
         return {'matches': results[:arguments.head_limit], 'truncated': len(results) > arguments.head_limit}
 
     def notebook_edit(self, arguments):
+        self.require_tool('NotebookEdit')
         path = self.path(arguments.notebook_path, write=True)
         with self.mutex.write_lock(path):
-            notebook = json.loads(path.read_bytes())
+            staged = self.staged_content(path.relative_to(self.root).as_posix())
+            notebook = json.loads(staged if staged is not None else path.read_bytes())
             cells = notebook['cells']
             index = arguments.cell_number
             if index > len(cells) or index == len(cells) and arguments.edit_mode != 'insert':
@@ -284,36 +355,43 @@ class LocalTools:
                     if 'id' in cells[index]:
                         cell['id'] = cells[index]['id']
                     cells[index] = cell
-            return self.workspace.stage(path.relative_to(self.root).as_posix(),
-                                       json.dumps(notebook, ensure_ascii=False, indent=1) + '\n')
+            return self.store_content(path, json.dumps(notebook, ensure_ascii=False, indent=1) + '\n')
 
     async def bash(self, arguments, call_id=None):
+        self.require_tool('Bash')
+        if self.worker and self.worker_shell_mode == 'disabled':
+            raise ToolRejected('Supervisor 未授予 Bash 权限')
+        self.require_managed()
+        with apply_effect_receipt():
+            pass
         profile = getattr(self.engine, 'profile', None)
         if profile is None:
             raise ToolRejected('Bash 需要配置 Docker sandbox 镜像')
         name = new_id('tf-shell')
         with tempfile.TemporaryDirectory(prefix='tracefix-shell-') as folder:
             staging = Path(folder)
-            staging.chmod(0o777 if self.write_enabled else 0o755)
+            staging.chmod(0o777 if self.shell_write_enabled else 0o755)
             originals = {}
             baselines = {}
+            overlays = {}
             with self.mutex.workspace_read():
                 for source in self.files():
                     relative = source.relative_to(self.root).as_posix()
-                    staged = self.workspace.staged_content(relative)
+                    staged = self.staged_content(relative)
+                    overlays[relative] = staged
                     originals[relative] = staged if staged is not None else source.read_bytes()
                     baselines[relative] = source.read_bytes()
                     target = staging / relative
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(originals[relative])
                     target.chmod(0o666)
-            if self.write_enabled and (not self.worker or self.worker_shell_mode == 'patch'):
+            if self.shell_write_enabled:
                 for directory in staging.rglob('*'):
                     if directory.is_dir():
                         directory.chmod(0o777)
             mount = io.StringIO()
             fields = ['type=bind', 'src=' + str(staging), 'dst=/workspace']
-            if not self.write_enabled or (self.worker and self.worker_shell_mode != 'patch'):
+            if not self.shell_write_enabled:
                 fields.append('readonly')
             csv.writer(mount, lineterminator='').writerow(fields)
             command = ['docker', 'run', '--rm', '--name', name, '--network=none',
@@ -340,22 +418,25 @@ class LocalTools:
             if not result['passed']:
                 return {**result, 'files_changed': [], 'discarded_changes': list(changes),
                         'cwd': '/workspace'}
-            if not self.write_enabled or (self.worker and self.worker_shell_mode != 'patch'):
+            if not self.shell_write_enabled:
                 return {**result, 'files_changed': [], 'discarded_changes': list(changes),
                         'cwd': '/workspace'}
             targets = {relative: self.path(str(self.root / relative), write=True) for relative in changes}
             with self.mutex.workspace_write():
                 for relative, target in targets.items():
                     current = target.read_bytes() if target.exists() else None
-                    if current != baselines.get(relative):
+                    if (current != baselines.get(relative)
+                            or self.staged_content(relative) != overlays.get(relative)):
                         raise ToolRejected('Bash 执行期间文件已变化，拒绝覆盖并发修改')
                     changes[relative].decode('utf-8')
                 for target in targets.values():
                     if not target.exists():
                         raise ToolRejected('Bash 不支持创建新文件')
-                with apply_effect_receipt():
-                    self.workspace.stage_many({relative: data.decode('utf-8')
-                                               for relative, data in changes.items()})
+                if changes:
+                    with apply_effect_receipt():
+                        self.require_managed()
+                        self.workspace.stage_many({relative: data.decode('utf-8')
+                                                   for relative, data in changes.items()})
             return {**result, 'files_changed': list(changes), 'cwd': '/workspace', 'staged': True}
 
 
@@ -366,7 +447,7 @@ def register_local_tools(engine, state, context, bind):
          '读取当前授权工作区内的绝对路径。文本默认最多 2000 行，可用 offset/limit 分页；支持图片、PDF 页文本、Jupyter cell。倾向并行读取多个文件。'),
         ('Glob', GlobInput, tools.glob, False, '按文件名 glob（如 **/*.ts）列出授权文件，按修改时间降序排序；path 为绝对目录。'),
         ('Grep', GrepInput, tools.grep, False, '正则内容搜索；支持 glob/type 过滤、multiline 和 content/files_with_matches/count 三种输出。'),
-        ('Write', WriteInput, tools.write, True, '写入或覆盖绝对路径文件；已有文件优先 Edit。用户没有要求时不要创建 Markdown 或 README。'),
+        ('Write', WriteInput, tools.write, True, '覆盖授权绝对路径的已有文件，仅暂存到 overlay；禁止新建文件，精确替换优先 Edit。'),
         ('Edit', EditInput, tools.edit, True, '精确字符串替换；old_string 必须存在且唯一，replace_all=true 可替换全部匹配。'),
         ('NotebookEdit', NotebookEditInput, tools.notebook_edit, True, '按零起始 cell_number 替换、插入或删除 Jupyter cell；保留 notebook 元数据，代码修改清空旧输出。'),
     ]
@@ -382,6 +463,8 @@ def register_local_tools(engine, state, context, bind):
         bind(name, description, model, handler, phases=set(Phase),
              side_effect='write' if writing else 'read', parallel_safe=not writing)
     if tools.worker and tools.worker_allowed_tools is not None and not ({'Bash', 'shell', 'shell.readonly', 'shell.patch'} & tools.worker_allowed_tools):
+        return
+    if tools.worker and tools.worker_shell_mode == 'disabled':
         return
     bind('Bash', '在独立 Docker Linux sandbox 执行 Bash，工作目录 /workspace；只复制授权文件，禁网、禁宿主访问。'
          '提供 command/description，timeout 为秒（最多 120）。优先用 Read/Glob/Grep/Edit 操作文件。'

@@ -250,8 +250,9 @@ class Renderer:
                         self.text(output)
                 return
             if kind == 'tool.started':
-                operation_id = str(payload.get('operation_id', ''))
-                if operation_id.rsplit(':', 1)[-1] == 'sandbox.start':
+                operation_name = self.operation_name(payload)
+                if operation_name == 'sandbox.start':
+                    operation_id = str(payload.get('operation_id', ''))
                     self.text(f'启动沙箱：{operation_id}')
                 return
             if kind == 'gate.decided':
@@ -328,9 +329,25 @@ class Renderer:
         return clean(value)
 
     @staticmethod
-    def tool_name(payload):
-        name = str(payload.get('tool') or payload.get('operation_id', '工具').rsplit(':', 1)[-1])
-        return label(name)
+    def operation_name(payload):
+        """优先读取事件操作名；仅在旧事件中兼容沙箱操作 ID。"""
+        intent = payload.get('intent')
+        name = payload.get('tool')
+        if not name and isinstance(intent, dict):
+            name = intent.get('name')
+        name = name or payload.get('operation')
+        if name:
+            return str(name)
+        operation_id = str(payload.get('operation_id', ''))
+        identity = operation_id.split(':', 3)
+        # 兼容 scope:run:name:logical_key；限制切分次数，保留含冒号的逻辑键。
+        if len(identity) == 4 and identity[2] == 'sandbox.start':
+            return 'sandbox.start'
+        return operation_id.rsplit(':', 1)[-1]
+
+    @classmethod
+    def tool_name(cls, payload):
+        return label(cls.operation_name(payload) or '工具')
 
     def diff(self, text):
         if self.plain or not self.console.is_terminal:

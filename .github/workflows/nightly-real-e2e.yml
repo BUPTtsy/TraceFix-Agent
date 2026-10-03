@@ -20,11 +20,11 @@ jobs:
       PYTHONUTF8: '1'
       PYTHONIOENCODING: utf-8
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
       - name: Install locked Python dependencies
@@ -35,7 +35,7 @@ jobs:
         run: python tools/checks/verify_real_e2e.py --required --case B01 --output artifacts/real-e2e/report.json
       - name: Upload E2E report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: real-e2e-report
           path: artifacts/real-e2e/report.json

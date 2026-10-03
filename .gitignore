@@ -22,6 +22,7 @@ vendor/
 tests/*
 !tests/conftest.py
 !tests/test_gateway_streaming.py
+!tests/test_architecture_repairs.py
 !tests/test_web_startup.py
 !tests/test_issue_reports.py
 !tests/test_reproduction_plan.py
@@ -32,7 +33,15 @@ tests/*
 !tests/test_batch_cli.py
 !tests/test_batch_checker.py
 !tests/test_batch_completion.py
+!tests/test_architecture_operation_repairs.py
+!tests/test_architecture_validation_repairs.py
+!tests/test_architecture_repository_repairs.py
+!tests/test_architecture_engine_repairs.py
+!tests/test_architecture_worker_repairs.py
+!tests/test_local_tools.py
 !tests/test_tool_name_compat.py
+!tests/test_worker_configuration.py
+!tests/test_worker_model_binding.py
 !backend/apps/console-api/tests/
 !backend/apps/console-api/tests/**
 .gitignore/
@@ -41,3 +50,4 @@ tests/*
 pytest*/
 pytest_*.txt
 .pytest-tmp-browser/
+.test*/

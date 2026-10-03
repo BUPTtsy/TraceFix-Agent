@@ -13,12 +13,12 @@ jobs:
       PYTHONUTF8: '1'
       PYTHONIOENCODING: utf-8
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           architecture: x64
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
       - name: Bootstrap with native PowerShell (explicit fake model)
@@ -30,7 +30,7 @@ jobs:
           ./.venv/Scripts/python.exe -m pytest -q --junitxml=artifacts/pytest-results.xml
       - name: Upload Python JUnit results
         if: ${{ always() && hashFiles('artifacts/pytest-results.xml') != '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: windows-python-junit
           path: artifacts/pytest-results.xml

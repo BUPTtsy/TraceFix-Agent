@@ -358,8 +358,10 @@ class ToolPipeline:
                 key = call.spec.idempotency_key(call.input)
                 if not isinstance(key, str) or not key.strip():
                     raise ToolProtocolError('工具幂等键必须为非空字符串')
+                # 阶段提交按当前调用验收；真实写入仍使用稳定工具身份，避免跨调用重放副作用。
+                prefix = call.call_id if call.spec.submission else call.name
                 receipt = await self.operation(call.name, intent, perform,
-                                               idempotency_key=call.name + ':' + key)
+                                               idempotency_key=prefix + ':' + key)
             else:
                 receipt = await perform()
             result = ToolResult.model_validate(receipt).model_copy(
