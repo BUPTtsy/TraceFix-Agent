@@ -29,7 +29,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./.venv/Scripts/python.exe -m pytest -q --junitxml=artifacts/pytest-results.xml
       - name: Upload Python JUnit results
-        if: always()
+        if: ${{ always() && hashFiles('artifacts/pytest-results.xml') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: windows-python-junit

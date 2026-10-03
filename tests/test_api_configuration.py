@@ -150,6 +150,7 @@ async def test_stream_chat_uses_same_default_text_model(monkeypatch):
             return None
 
         async def aiter_lines(self):
+            yield 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}'
             yield 'data: [DONE]'
 
     def stream(client, method, url, **kwargs):

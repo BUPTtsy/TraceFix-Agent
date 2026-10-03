@@ -27,4 +27,4 @@ Windows 在项目根目录运行：
 
 缺少前置条件时，可选模式记录 `skipped`，`--required` 记录 `failed` 并以 Python 退出码 2 结束，均不回退 Fake。历史报告 `artifacts/real-e2e/m0-rerun.json` 记录了 Python 子进程访问 Docker Linux 引擎 named pipe 被拒绝；后续 AgentTeam 重跑已进入真实模型、Docker 应用与 Playwright MCP。第一轮 `artifacts/real-e2e/m0-b01-agentteam-batch.json` 记录了 `FAILED / REPAIR_EXHAUSTED`、退出码 1、最终报告和空 diff；该轮暴露的当前观察证据引用不一致已修复。随后重跑 `artifacts/real-e2e/m0-b01-agentteam-batch-evidence.json` 自动输出 `COMPLETED / FIX_VERIFIED`，但最终补丁把双向 checkbox 改成仅能完成，无法取消完成。审查结论 `artifacts/real-e2e/m0-b01-agentteam-batch-review.json` 明确拒绝把该 Run 计作 B01/M0 验收通过，保留原始报告和 diff。自动验证只说明当时冻结规范中的断言通过，还需核对补丁是否保留既有业务行为；后续新 Run 的回归规范必须保护取消完成功能。`.github/workflows/nightly-real-e2e.yml` 使用必需模式，仍需有效修复、其余缺陷和夜间 CI 证据；关键命令和边界同时记录于 `docs/产品说明手册/00-项目进度/差距清单.md`。
 
-Windows CI 通过 `--junitxml=artifacts/pytest-results.xml` 生成本轮 Python 结果并上传 `windows-python-junit`。该路径在本地被忽略；旧 XML 仅是历史文件，不代表当前工作区测试结果。
+Windows CI 通过 `--junitxml=artifacts/pytest-results.xml` 生成本轮 Python 结果并上传 `windows-python-junit`。只在 XML 已生成时执行上传；pytest 失败但生成结果时仍会上传，Bootstrap 或依赖安装失败导致测试未执行时跳过上传。该路径在本地被忽略；旧 XML 仅是历史文件，不代表当前工作区测试结果。

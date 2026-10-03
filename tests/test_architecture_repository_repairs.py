@@ -3,8 +3,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from test_cli_workspace import session, web
-from test_continuation import engine_session
 from tracefix.config import Project
 from tracefix.cli.main import Session
 from tracefix.execution.repository import run_git, safe_commit, safe_index_files
@@ -13,6 +11,7 @@ from tracefix.execution.workspace import Workspace
 from tracefix.knowledge.scope import ScopeResolver
 from tracefix.remote import prepare_checkout
 from tracefix.runtime.contracts import digest
+from tracefix.runtime.smoke import make_engine
 
 
 def repository(root, origin=True):
@@ -33,6 +32,63 @@ def exported(tmp_path):
     ctx = scopes.context('app')
     workspace, snapshot = Workspace.export(scopes, ctx, 'HEAD', tmp_path / 'workspace')
     return root, scopes, ctx, workspace, snapshot
+
+
+@pytest.mark.parametrize('entry', ['config.worktree', 'commondir', 'objects/info/alternates'])
+def test_nested_smoke_initializes_without_using_parent_metadata(tmp_path, entry):
+    parent = repository(tmp_path / 'parent')
+    target = parent / '.git' / entry
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text('untrusted parent metadata\n')
+    before = {path.relative_to(parent): path.read_bytes()
+              for path in (parent / '.git').rglob('*') if path.is_file()}
+
+    engine, state = make_engine(parent / 'smoke')
+
+    assert engine.workspace.root.joinpath('.git').is_dir()
+    assert state.source_manifest
+    assert Path(run_git(parent / 'smoke/code', 'rev-parse', '--show-toplevel').decode().strip()).resolve() == (
+        parent / 'smoke/code').resolve()
+    assert before == {path.relative_to(parent): path.read_bytes()
+                      for path in (parent / '.git').rglob('*') if path.is_file()}
+    with pytest.raises(PermissionError, match='外部对象目录'):
+        run_git(parent, 'status', '--porcelain')
+
+
+@pytest.mark.parametrize('key,value', [('include.path', 'missing-config'),
+                                      ('core.worktree', 'other'), ('core.bare', 'true')])
+def test_nested_git_init_does_not_read_parent_config(tmp_path, key, value):
+    parent = repository(tmp_path / 'parent')
+    if key == 'core.worktree':
+        other = tmp_path / 'other'
+        other.mkdir()
+        value = str(other)
+    run_git(parent, 'config', key, value)
+    before = (parent / '.git/config').read_bytes()
+
+    child = repository(parent / 'child', origin=False)
+
+    assert Path(run_git(child, 'rev-parse', '--show-toplevel').decode().strip()).resolve() == child.resolve()
+    assert (parent / '.git/config').read_bytes() == before
+    assert run_git(child, 'config', '--get', key, check=False) == (b'false\n' if key == 'core.bare' else b'')
+    with pytest.raises(PermissionError):
+        run_git(parent, 'status', '--porcelain')
+    with pytest.raises(PermissionError):
+        run_git(parent, 'init', '-q')
+
+
+@pytest.mark.parametrize('entry', ['config.worktree', 'commondir', 'objects/info/alternates'])
+def test_git_init_rejects_existing_unsafe_metadata(tmp_path, entry):
+    root = repository(tmp_path / 'source')
+    target = root / '.git' / entry
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text('untrusted metadata\n')
+    before = (root / '.git/config').read_bytes()
+
+    with pytest.raises(PermissionError, match='外部对象目录'):
+        run_git(root, 'init', '-q')
+
+    assert (root / '.git/config').read_bytes() == before
 
 
 @pytest.mark.parametrize('change', ['origin', 'head', 'branch', 'dirty', 'root', 'source'])
@@ -295,17 +351,18 @@ def test_executable_export_is_explicitly_unsupported(tmp_path):
 
 async def test_missing_workspace_rejects_before_continuation_marker(engine_session):
     session, engine, state = engine_session
+    web = session.workspace_commands.call
     engine.store.save(state)
     session.publish_console()
-    web(session, 'run.ended', {'id': session.console_run_id, 'exitCode': 1})
-    before = web(session, 'run', {'id': session.console_run_id})
+    web('run.ended', {'id': session.console_run_id, 'exitCode': 1})
+    before = web('run', {'id': session.console_run_id})
     session.run_id = None
     engine.workspace.root.rename(engine.workspace.root.with_name('saved-workspace'))
 
     with pytest.raises(PermissionError, match='工作区根目录或 .git 入口不可信'):
         await session.continue_task(session.console_run_id, '缺失工作区不得继续')
 
-    after = web(session, 'run', {'id': session.console_run_id})
+    after = web('run', {'id': session.console_run_id})
     assert after['continuationCount'] == 0
     assert after.get('continuationMarkers', []) == before.get('continuationMarkers', [])
     assert after['agentRunId'] == before['agentRunId'] == state.run_id

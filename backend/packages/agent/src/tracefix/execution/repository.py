@@ -43,9 +43,13 @@ def _git_prefix() -> list[str]:
 def run_git(root: Path | None, *args: str, input_data: bytes | None = None,
             timeout: int = 30, check: bool = True, identity: tuple[str, str] | None = None) -> bytes:
     command = _git_prefix()
+    environment = safe_git_environment()
+    initializing = bool(args) and args[0] == 'init'
     if root is not None:
         root = plain_root(root)
-        for parent in (root, *root.parents):
+        if initializing:
+            environment['GIT_CEILING_DIRECTORIES'] = str(root.parent)
+        for parent in ((root,) if initializing else (root, *root.parents)):
             metadata = parent / '.git'
             if linked(metadata):
                 raise PermissionError('Git 元数据入口不能是链接')
@@ -59,7 +63,7 @@ def run_git(root: Path | None, *args: str, input_data: bytes | None = None,
                 break
         command.extend(['-C', str(root)])
         configuration = subprocess.run(command + ['config', '--local', '--no-includes', '--list', '-z'],
-                                       capture_output=True, timeout=30, env=safe_git_environment())
+                                       capture_output=True, timeout=30, env=environment)
         for record in configuration.stdout.decode(errors='replace').split('\0'):
             key, _, value = record.partition('\n')
             if key.lower() == 'core.worktree' or (key.lower() == 'core.bare' and value.lower() not in {'false', 'no', 'off', '0'}):
@@ -78,7 +82,6 @@ def run_git(root: Path | None, *args: str, input_data: bytes | None = None,
             arguments[position:position] = ['--no-ext-diff', '--no-textconv']
             break
     command.extend(arguments)
-    environment = safe_git_environment()
     if identity:
         environment.update(GIT_AUTHOR_NAME=identity[0], GIT_AUTHOR_EMAIL=identity[1],
                            GIT_COMMITTER_NAME=identity[0], GIT_COMMITTER_EMAIL=identity[1])
