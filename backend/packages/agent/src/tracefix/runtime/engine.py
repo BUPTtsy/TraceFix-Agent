@@ -305,14 +305,40 @@ class Engine:
         plan = self.get(s, s.replay_plan_ref) if s.replay_plan_ref else []
         return verification_binding(s, digest(plan))
 
-    def verification_passed(self, s):
+    def verification_passed(self, s, *, sampled_environment_digest=None):
+        """只验证工作区及已采样摘要；最终执行门禁必须调用异步 live helper。"""
         try:
+            # 纯证据检查仍须重读冻结工作区、完整补丁差异和已采样环境摘要。
+            self.workspace.check_frozen(self.source)
+            current_patch_hash = digest(
+                self.workspace.diff(s.patch_base_commit or 'HEAD').encode()
+            )
+            current_environment_digest = (sampled_environment_digest
+                                          if sampled_environment_digest is not None
+                                          else getattr(self.runner, 'actual_digest', ''))
+            if (not s.patch_hash or current_patch_hash != s.patch_hash
+                    or not current_environment_digest
+                    or current_environment_digest != s.environment_digest):
+                return False
             validations = [Validation(**self.get(s, ref)) for ref in s.validation_refs]
             return verification_gate(s, validations, lambda ref: self.bundle_exists(s, ref),
                 artifact_read=lambda ref: self.get(s, ref),
                 artifact_read_bytes=lambda ref: self.artifacts.read(s.scope_id, s.run_id, ref))
         except Exception:
             return False
+
+    async def runtime_verification_passed(self, s):
+        """在最终成功边界重新采样运行容器；采样失败或漂移必须 fail-closed。"""
+        try:
+            live_environment_digest = await self.runner.inspect_images(runtime=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+        if (type(live_environment_digest) is not str or not live_environment_digest
+                or live_environment_digest != s.environment_digest):
+            return False
+        return self.verification_passed(s, sampled_environment_digest=live_environment_digest)
 
     def agent_instructions(self, s):
         if not s.agent_instructions_ref:
@@ -1651,13 +1677,14 @@ class Engine:
             return self.output(self.changed(s, phase=Phase.DIAGNOSE), 'prelude')
         if s.validation_index < len(kinds)-1:
             return self.output(self.changed(s, validation_index=s.validation_index+1), 'prelude')
-        if not self.verification_passed(s):
-            s = self.changed(s, phase=Phase.VERIFY, validation_index=0, replay_index=0,
-                             validation_refs=[], error='确定性验证门禁拒绝了该证据',
-                             error_details={'feedback': '验证证据已失效，从第一项重新验证'})
+        if not await self.runtime_verification_passed(s):
+            s = self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.INFRA_FAILURE,
+                             run_status=RunStatus.RUNNING,
+                             error='最终运行环境采样失败、发生漂移或验证证据失效，拒绝输出已验证修复',
+                             error_details={'terminal_reason': 'runtime_environment_gate_failed'})
             self.event(s, 'run.error', {'error': s.error, 'error_details': s.error_details,
-                                        'action': '从第一项重新验证'})
-            return self.output(s, 'prelude')
+                                        'action': '保留未验证补丁并清理运行环境'})
+            return self.output(s, 'finalize')
         if s.execution_mode == 'batch':
             s = self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.FIX_VERIFIED,
                              run_status=RunStatus.RUNNING, approval_ref=None,
@@ -1684,7 +1711,7 @@ class Engine:
             'source_manifest', 'environment_digest', 'test_spec_ref', 'test_spec_hash',
             'replay_plan_ref', 'reproduction_plan_frozen', 'reproduced', 'source_aligned')
         if (any(getattr(persisted, field) != getattr(s, field) for field in approval_fields)
-                or not self.verification_passed(persisted)):
+                or not await self.runtime_verification_passed(persisted)):
             s = self.changed(persisted, phase=Phase.FINALIZE, run_status=RunStatus.RUNNING,
                 outcome=Outcome.INFRA_FAILURE, error='审批对应的验证证据已失效',
                 error_details={'terminal_reason': 'approval_verification_invalid'})
@@ -1743,12 +1770,12 @@ class Engine:
         if s.outcome == Outcome.FIX_VERIFIED:
             try:
                 verified = (patch_available and digest(diff_text.encode()) == s.patch_hash
-                            and self.verification_passed(s))
+                            and await self.runtime_verification_passed(s))
             except (OSError, ValueError, KeyError):
                 verified = False
             if not verified:
                 s = self.changed(s, outcome=Outcome.INFRA_FAILURE,
-                    error='最终补丁或验证证据已失效，无法输出已验证修复',
+                    error='最终运行环境、补丁或验证证据已失效，无法输出已验证修复',
                     error_details={'terminal_reason': 'final_verification_invalid',
                                    'patch_export_error': diff_error})
         patch_verification = ('verified' if verified else 'unverified' if patch_available else 'none')

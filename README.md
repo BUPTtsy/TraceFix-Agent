@@ -1,10 +1,83 @@
 # TraceFix Agent
 
+## CI 源码与测试对齐（2026-10-04）
+
+当前核验 HEAD 为 `62afe19`。用户提供的 GitHub 流水线部分结果为 **65 failed、959 passed、24 skipped，1601.25s**，不是本地完整基线结果；日志未提供 checkout SHA。提交 `589e67d` 只更新了六个测试文件，配套的 `Engine.runtime_verification_passed`、`FakeRunner.started`/运行期采样协议和 Docker 不可变镜像启动仍只存在于本地未提交改动中。HEAD 本身已能确认“新测试 + 旧实现”的版本错配，不应删除这些有效安全测试来消除错误。
+
+本地覆盖日志失败模块的五文件定向回归为 **228 passed，1364.02s**，包含日志列出的全部 65 个失败用例；补充 live-gate 回归为 **34 passed，100.93s**。这两批使用当前工作树，结果不证明未提交增量之外的独立提交树或远端 CI 已通过。先前被中断的本地完整基线没有最终 JUnit 统计，不计为通过或完成。本次不重新运行完整基线，也不把 FakeRunner/Docker CLI mock 的结果称为真实 Docker/MCP E2E。
+
+配套提交应一起包含 Engine 的 live-gate 相关 hunk、FakeRunner 协议、DockerRunner 镜像绑定/运行期检查，以及 `tests/test_runtime_environment_gate.py`。该回归文件受 `tests/*` 忽略规则影响，需显式 `git add -f`；不要为本次修复混入 Worker 路由、guidance、前端或其他既有 dirty。GitHub 必须 checkout 包含修复的新提交；只重跑旧 Run 会继续使用旧 SHA。本地 commit 本身不会更新 GitHub，本次不 push。
+
+下述较早日期的验证与审批服务失败保留为历史记录；当前状态以本节和 [四阶段台账](docs/agentteam-four-stage.md) 的最新记录为准，不把旧的权限故障当作当前已核验的阻塞原因。
+
 TraceFix 是面向受控 React/TypeScript 项目的 GUI 检测与修复工具。它通过浏览器复现问题、收集证据、生成补丁并验证结果，在需要提交修改时等待明确审批。
 
 当前版本为 **v0.1.1**，采用前台、后台与独立演示目标分离的 monorepo 结构：React Web 与 TypeScript CLI 提供交互入口，Node 提供 HTTP 和共享数据服务，Python 3.12、LangGraph、PostgreSQL/pgvector 与 Playwright MCP 负责 Agent 执行。
 
 结构重构已完成。**2026-09-27 的重构验证快照**为：Node 测试 8 项通过，Python 测试 346 项通过、1 项跳过、3 项原有失败；构建、类型检查、HTTP 集成、离线 Smoke 和规则/续执行浏览器验收通过。失败项及证据见 [重构验证记录](RESTRUCTURE_VALIDATION.md)。**2026-09-28 的 M0 增量验证**合并回归 92 passed、降级警告 SSR 3 passed、Web typecheck 通过；真实 PostgreSQL 与 retrieval 相关测试另有通过记录。各批次范围、既有失败与命令见 [完成度评估](docs/产品说明手册/00-项目进度/完成度评估.md) 和 [验收记录](docs/验收记录.md)。2026-10-01 的 AgentTeam B01 真实批处理运行已输出 `COMPLETED / FIX_VERIFIED`，但补丁审查发现模型停用了取消完成功能，以满足包含两次点击的冻结计划，因此不接受该结果作为 B01/M0 产品验收通过。原始自动报告保留于 `artifacts/real-e2e/m0-b01-agentteam-batch-evidence.json`，审查结论见 `artifacts/real-e2e/m0-b01-agentteam-batch-review.json`；仍需有效修复、至少 3 个真实成功用例和夜间 CI 证据。
+
+**2026-10-03 阶段一最新已知快照**：HEAD `70a7d06` 是外部依赖提交，不计阶段验收。主 Agent 独立执行 S1 九文件回归得到 **173 passed，486.36s**；最近一次 Python 全量为 **12 failed、1372 passed、2 skipped，1612.44s（总计 1386）**，失败分为 UNKNOWN 安全边界 7 项、guidance 幂等 1 项、Postgres fixture 4 项。随后主 Agent 安全回归为 **98 passed、21 deselected，76.09s**，Postgres 定向为 **11 passed、1 skipped，0.09s**；严格 snapshot 已恢复到 HEAD、完全无 diff，新 18 项测试通过。本轮 `npm test` 为 **10 passed**，`npm run typecheck`、`npm run build` 均 exit 0；Worker 配置与实际路由定向为 **11 passed**，不代表所有模型/推理配置已有完整审计。这些结果由用户提供，本次文档更新未运行测试；原全量失败与后续定向结果分别保留，没有新的全量结果，不能提前宣称全绿。
+
+阶段一验收 commit **环境阻塞**：主 Agent 精确暂存的 default 尝试因 `index.lock PermissionDenied` 失败；`require_escalated` 请求遇审批 reviewer 503（`gpt5.6luna` 不可用），获批操作未执行，无 index 变化、无 commit。已告知用户修复审批服务，不绕过；阶段 2—4 未开始、无新 worktree，不能进入阶段二。详见 [四阶段修改与验收台账](docs/agentteam-four-stage.md)。
+
+## TraceFix Agent：证据驱动修复闭环
+
+TraceFix 不把模型输出或单个 `passed` 标签当作修复结论。一个可审查的修复 Run 依次完成：冻结项目作用域、源码版本和 `TestSpec`；从浏览器探索中提取并冻结可重放的复现序列；在授权文件范围内提出候选补丁；重新运行原问题、业务回归和工程检查；由 Run 的 typed gate 汇总内部验证证据并生成内部报告。独立 Oracle 属于评测侧的最终评分器，与修复过程和 Run 内部 gate 分离；它不是 Agent 运行时自动执行的终点，也不会因为内部报告生成就自动运行或把结果提升为发布结论。补丁可供人工审批，但运行时不会因为验证成功而自动提交或发布。
+
+### 业务不变量与双向行为回归
+
+阶段一以 persistence/B01 场景说明“修复什么”和“不能牺牲什么”。正常路径必须支持“未完成 → 完成 → 刷新后仍完成”；逆向路径必须支持“完成 → 取消完成 → 刷新后回到未完成”。Todo/Done 筛选等相邻能力也必须保持正确。只实现单向完成、删除取消完成处理器或停用原能力的候选补丁，即使原问题断言通过，也不能成为 `FIX_VERIFIED`。
+
+业务场景的每一步可以带有浏览器 observation 和断言 checkpoint。回归门不仅比较最终页面，还要求中间状态、刷新后的持久化状态和双向动作顺序均可由证据重放。Run 内部 gate 与评测侧 Oracle 分离，避免把同一题的调试反馈或经验写回最终评分。
+
+### Typed verification gate
+
+验证结果通过严格的 typed contract 进入 gate，保留 `static`、`unit`、`build`、`health`、`original`、`regression` 六类检查，并为每个冻结业务场景增加 `behavior` 结果。每条结果都要绑定当前 `scope_id`、`run_id`、源码清单、补丁哈希、环境摘要、TestSpec 哈希和 replay-plan 哈希；GUI 结果还必须提供可读取的 observation、PNG 字节哈希、重算后的断言和按顺序绑定的行为 checkpoint。
+
+Gate 会重新读取并校验 artifact、作用域、schema、哈希、退出码、断言和场景动作，不信任孤立的 `passed` 字段。缺失、过期、错误环境、错误顺序、无法读取的截图或未授权动作都会阻断成功结论。该 gate 是本地源码和测试的确定性证据边界，不等同于已经完成付费模型、Docker 或 MCP 的完整真实 E2E。
+
+strict frozen manifest 从 mutable workspace 补缺项的增量已撤销，严格 snapshot 已恢复到 HEAD、完全无 diff，新 18 项测试通过；冻结输入缺项不能靠当前可变源码补齐。live 环境 gate 仍需真正实时读取环境，缓存的 `actual_digest` 不能包装成实时检查，不能把上述目标边界写成已全部验收。副作用 ledger 恢复须保留 `UNKNOWN` 与 resource fence，只有显式人工 reconcile 才能解除；callback 不能自行解锁。旧测试应迁移到安全契约，不删除、排除失败或削弱断言来制造通过。
+
+### 外部设计借鉴边界
+
+外部项目只作为待验证设计启发的参考对象，不是 TraceFix 的依赖或实现来源。2026-10-03 对官方 Pi / OpenCode / Claude / Hermes 的 HTTP 及浏览器核验均失败，原因包括网络 socket 权限和审批 reviewer 503；下列链接仅是参考入口，不是本轮在线核验事实：
+
+- [Pi / pi-mono 官方仓库](https://github.com/badlogic/pi-mono)：拟借鉴“薄 harness”方向——让模型通过少量明确工具和事件循环完成工作，把权限、证据和业务 gate 留在宿主控制面；不复制其内部代码、默认工具或运行策略。
+- [OpenCode 官方仓库](https://github.com/anomalyco/opencode) 与 [官方文档](https://opencode.ai/docs/)：拟借鉴 client/server 分离，以及 build/plan 等阶段化工作流对能力收窄的启发；TraceFix 仍以自己的项目作用域、文件/工具白名单、审批和 typed gate 为准，不声称兼容 OpenCode 协议或权限模型。
+- [Claude Code 官方文档](https://code.claude.com/docs/en/overview)、[hooks](https://code.claude.com/docs/en/hooks) 与 [memory/project instructions](https://code.claude.com/docs/en/memory)：拟借鉴 hooks、项目指令和隔离子任务作为可审计扩展点的设计方向。Claude Code 不是这里所称的完全开源 harness；不声称存在可直接移植的内部代码、协议或未核验的权限语义。
+- [Hermes Agent 官方仓库](https://github.com/NousResearch/hermes-agent)：拟借鉴经验/记忆与 Skill 组织的可追溯方向；只有在 TraceFix 自己的 Skill 正文、references、作用域和证据冻结机制中才有运行时意义，不把外部实现或能力直接带入。
+
+以上映射只描述待验证的设计启发，不宣称本轮成功读取公开页面，也不宣称外部项目的完整内部实现、模型能力、权限语义或评测成绩。TraceFix 的项目作用域、白名单、审批、审计、typed verification gate 和评测侧独立 Oracle 始终是权威边界；相似界面或工作流不能替代这些证据。
+
+### 阶段一 checker 的开发者入口
+
+下面三类命令用途不同，不能互相替代：
+
+```powershell
+$testRun = Join-Path $env:TEMP ("tracefix-tests-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $testRun | Out-Null
+
+# 1. 阶段一九文件定向回归（主 Agent 最新独立记录：173 passed，486.36s）
+.\.venv\Scripts\python.exe -m pytest -q `
+  tests/test_batch_checker.py tests/test_batch_completion.py `
+  tests/test_behavior_checker.py tests/test_behavior_invariants.py `
+  tests/test_contracts.py tests/test_engine.py tests/test_native_engine.py `
+  tests/test_real_e2e_cleanup.py tests/test_reproduction_plan.py `
+  --basetemp "$testRun/pytest" --junitxml "$testRun/junit.xml"
+Write-Output "pytest exit code: $LASTEXITCODE"
+
+# 2. 本地源码浏览器正负例：clean 应通过，completion_only 应在取消完成处被拒绝
+node tools/checks/verify_b01_behavior_ui.mjs
+
+# 3. 完整真实 E2E checker（需要真实模型、Docker Linux、Compose 和 MCP）
+.\.venv\Scripts\python.exe tools/checks/verify_real_e2e.py `
+  --case B01 --spec profiles/persistence.spec.json `
+  --output "$testRun/real-e2e-b01.json"
+```
+
+这是后续执行示例，不是已知成绩的原始执行命令。每次 pytest 都在系统 `TEMP` 下生成新 GUID 目录，不复用 `$testRun` 或 `--basetemp`；pytest 会清理指定的 basetemp，不能指向仓库、系统 `TEMP` 根目录或已有证据目录。JUnit 放在 basetemp 之外，建议连同精确命令、退出码、stdout/stderr、源码 HEAD 与增量标识一起保存，失败重跑保留旧证据。历史 173 passed / 139.77s 与 fixture 2 passed 见台账，不能覆盖为本次独立结果。
+
+第 2 项复制本地源码并使用 Playwright 与评测侧独立 Oracle 验证正例和历史无效补丁负例；它不是模型驱动的完整真实 E2E，Oracle 也不是 Agent Run 的自动终点。第 3 项不会用 Fake 替代缺失前置条件：本地缺少真实环境时默认报告 `SKIPPED`，CI 可加 `--required` 使缺失前置条件失败。脚本存在、源码浏览器正负例通过或 fixture 通过，都不能单独宣称付费模型 + Docker + MCP 的真实修复已完成。
 
 ## 1. 项目结构与软件包
 
@@ -134,7 +207,11 @@ npm.cmd run build
 npm.cmd run typecheck
 npm.cmd test
 node frontend/apps/cli/dist/cli.mjs --doctor
-.\.venv\Scripts\python.exe -m pytest -q
+$testRun = Join-Path $env:TEMP ("tracefix-tests-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $testRun | Out-Null
+.\.venv\Scripts\python.exe -m pytest -q `
+  --basetemp "$testRun/pytest" --junitxml "$testRun/junit.xml"
+Write-Output "pytest exit code: $LASTEXITCODE"
 .\.venv\Scripts\python.exe tools/bootstrap/launch.py --smoke --plain
 ```
 
@@ -149,13 +226,17 @@ npm run build
 npm run typecheck
 npm test
 node frontend/apps/cli/dist/cli.mjs --doctor
-.venv/bin/python -m pytest -q
+test_run="$(mktemp -d "${TMPDIR:-/tmp}/tracefix-tests.XXXXXXXX")"
+.venv/bin/python -m pytest -q \
+  --basetemp "$test_run/pytest" --junitxml "$test_run/junit.xml"
+pytest_exit_code=$?
+printf 'pytest exit code: %s\n' "$pytest_exit_code"
 .venv/bin/tracefix --smoke
 ```
 
 从旧目录结构迁移后，已有虚拟环境也应执行一次 `python -m pip install --no-deps -e .`，刷新 editable install 的源码位置。已安装环境无需重新创建 `.venv`。`--doctor` 输出本地配置状态，不发送模型请求。
 
-`npm test` 包含 Node 数据服务、API 单元测试及 Python 数据互操作；`pytest` 覆盖 Python 测试。已知 3 个 Python 失败见 [重构验证记录](RESTRUCTURE_VALIDATION.md)，不能将当前全量测试描述为全部通过。若 Windows 默认临时目录无访问权限，可为 pytest 指定新的仓库内目录，例如 `--basetemp=artifacts/test-runs/local-check-01`。
+`npm test` 包含 Node 数据服务、API 单元测试及 Python 数据互操作；`pytest` 覆盖 Python 测试。本轮 Node 为 10 passed，typecheck/build 均 exit 0；最近一次 Python 全量为 12 failed、1372 passed、2 skipped（总计 1386）。后续安全回归 98 passed / 21 deselected、Postgres 定向 11 passed / 1 skipped 与新 18 项测试通过分别记录，不能据此把原全量改写为全绿；新全量结果尚未提供。[重构验证记录](RESTRUCTURE_VALIDATION.md) 中的 3 个失败仅是 2026-09-27 历史快照。上述 pytest 示例统一使用系统临时根目录下的新目录，并输出独立 JUnit；每次重跑重新生成目录，不能复用旧 basetemp 或覆盖原失败证据。
 
 `--smoke` 明确使用 Fake 模型、工具和内存数据库；用于验证图、证据门、审批和报告，**不是实际浏览器修复演示**。正式运行不会因服务不可用而自动切换到 Fake。
 设置 `TRACEFIX_TEST_DATABASE_URL` 后，pytest 还会执行真实 PostgreSQL 事务和访问范围集成测试。
@@ -221,6 +302,8 @@ docker build -f bugboard/docker/Dockerfile -t tracefix-bugboard:1.0 bugboard/tar
 
 配置面向 DeepSeek 及兼容的 Chat Completions API。`.env.example` 的地址为 `https://api.deepseek.com`、文本模型为 `deepseek-chat`；建议显式设置 `TRACEFIX_TEXT_MODEL`，使 CLI Chat、Web Chat 与 Python Agent 使用同一模型。`TRACEFIX_BASE_URL` 填写接口根地址，不附加 `/chat/completions`。
 
+Worker Gateway 路由已实现：无实际 `TRACEFIX_WORKER_*` 覆盖时复用 Supervisor Gateway；有覆盖时由 CLI 创建独立 Gateway，未覆盖字段继承 Supervisor 环境配置。Worker 调用局部选择 model，不替换共享 `engine.model`；GUI scout 也选择 Worker Gateway，未配置时回退父 Gateway。配置与实际路由定向记录为 11 passed，只支持该局部行为，不证明所有模型/推理配置已有完整审计；详见 [Worker 模型配置](backend/packages/agent/src/tracefix/workers/README.md#模型配置)。
+
 这个命令会发送真实 API 请求。默认检查文本 JSON，再检查一次 `browser_snapshot` 原生工具调用及结果回传，正常共三次模型请求；工具返回明确标记的本地合成观测，不启动浏览器，也不验证 MCP 执行。`TRACEFIX_TOOL_MODE=json` 时仅检查文本 JSON，不探测原生工具。只有配置 `TRACEFIX_VISION_MODEL` 时才追加红色测试图片请求，否则输出跳过原因。诊断请求不自动重试，native 检查的用量列出每次实际响应。
 
 `artifacts/connectivity.json` 和 `artifacts/gateway-connectivity.json` 是历史实测记录，不代表当前配置已通过上述检查。Token 用量来自实际响应；正式 Run 会把供应商返回的 `reasoning_content` 保存到受作用域保护的审计 artifact，但不会保存 API key、Authorization 或 Cookie。
@@ -275,11 +358,12 @@ CLI 支持 `/knowledge import`、`new`、`edit`、`search`、`enable` / `disable
 | [Web 工作台与知识库](docs/Web工作台与知识库.md) | 页面、共享数据及浏览器验收说明 |
 | `tools/checks/check_backend.py` | 本地 HTTP 集成检查 |
 | `tools/checks/verify_real_e2e.py` | 真实模型 + Docker + Playwright MCP 的 B01 修复验收；夜间 workflow 使用 `--required`，缺少前置条件直接失败 |
+| `tools/checks/verify_b01_behavior_ui.mjs` | 本地源码浏览器正负例与独立 B01 Oracle；不代表完整真实 E2E |
 | `tools/checks/verify_rules_ui.mjs` | 规则管理、刷新持久化与派生运行浏览器验收 |
 | `tools/checks/verify_continuation_ui.mjs` | 续执行、进程回写与移动端浏览器验收 |
 
 浏览器验收需要 Playwright 和 Chromium，可用 `TRACEFIX_PLAYWRIGHT_MODULE` 指定已安装模块。这些脚本使用隔离数据及预期配置失败的 Agent 启动路径，不验证真实模型修复。
 
-真实修复验收使用 `tools/checks/verify_real_e2e.py --required --case B01`，需要配置真实模型并确保检查器子进程能访问 Docker Linux 引擎。最新报告 `artifacts/real-e2e/m0-rerun.json` 为 `failed`，Python 退出码 2，仍在 named pipe 权限检查处停止，未进入模型/MCP；直接 `docker info` 返回 29.4.0（linux），本轮唯一授权重跑因审批服务 503 未执行。此前 `m0-current.json` 保留为历史。详细命令和边界见 [完成度评估](docs/产品说明手册/00-项目进度/完成度评估.md)。夜间 workflow 文件存在不代表 CI 已通过。
+真实修复验收使用 `tools/checks/verify_real_e2e.py --required --case B01`，需要配置真实模型并确保检查器子进程能访问 Docker Linux 引擎。该命令只有生成 `status=passed` 且所有 typed gate 与独立业务证据可回查时，才可作为完整真实 E2E 证据；`SKIPPED`、基础设施失败、脚本存在或本地源码浏览器结果均不算完成。前次真实 E2E 失败产物 `artifacts/real-e2e/m0-rerun.json` 保留为失败证据：Python 退出码 2，停在 named pipe 权限检查，未进入模型/MCP；`artifacts/real-e2e/m0-current.json` 仍是历史记录。当前阶段一台账记录本地源码正负例、定向回归、fixture 与最新全量失败事实，不宣称付费模型/Docker/MCP 真实 E2E 已完成。详细命令和边界见 [完成度评估](docs/产品说明手册/00-项目进度/完成度评估.md)。夜间 workflow 文件存在不代表 CI 已通过。
 
 指定的历史 pytest 工作区已归档至 `artifacts/test-runs/native-20260925-gateway`；迁移前快照、文件映射、哈希与测试日志位于 `artifacts/restructure`。历史产物中的路径和结论属于对应运行，不代表当前环境状态。

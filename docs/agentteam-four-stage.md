@@ -1,26 +1,54 @@
 # AgentTeam 四阶段修改与验收台账
 
-阶段0基线执行已结束并报告失败；**阶段1已报告实施，当前定向回归173 passed / 0 failed且两个独立persistence fixture为2 passed，但提交门禁仍未通过**。旧172/2fail保留为历史失败；contracts.py、engine.py、test_batch_completion.py含外来或混合hunk，workspace.py无可安全暂存hunk，当前未形成稳定可提交快照。线程goal仍active；阶段2—4未开始。
+## 2026-10-04 CI 配套提交复核
 
-基线采样时间：2026-10-03 11:12:35（Asia/Shanghai）。基线HEAD：`373d74fcad6b580117a673f4abfaa98c4e8b6e52`；分支：`main`。采样时暂存区无改动。机器可读基线见 `artifacts/agentteam-four-stage/baseline-manifest.json`。
+核验时 HEAD：`62afe19de1caf0245af1907f1f0123424d966fcf`。`589e67d` 只提交了六个升级后的测试；`ea957cd` 已包含前一轮 tool-name compatibility fixture 修复。当前三个实现文件的配套修复尚未提交，HEAD 的 Engine 没有 `runtime_verification_passed`，FakeRunner 没有 `started` 等采样/生命周期字段，DockerRunner 的启动参数仍使用可变 tag。因此本次 GitHub 日志与源码/测试提交不配套一致，不是 npm 安装失败，也不应通过删除有效测试或放宽 gate 修复。
 
-本Worker仍只创建/维护这两个指定文件，不改生产或测试代码，不运行测试，不暂存或提交，不再派生Agent。具体实现、独立审查及测试安排由主Agent调度；commit由主Agent完成。初次基线读取限于Git元数据、18个既有路径的hash与差异范围，以及7个文件的定向差异正文；本次另只读指定JUnit/浏览器产物与源码hash/关键标记，没有全文审计源码。
+用户提供的流水线部分统计为 **65 failed、959 passed、24 skipped，1601.25s**：architecture engine 10 项、repository 1 项、batch completion 2 项、behavior invariants 36 项、reproduction plan 16 项。日志没有提供 checkout SHA，不能补造远端 Run 的提交身份。先前中断的本地全量没有最终 JUnit，不能把这份 GitHub 统计当成本地测试完成结果。
 
-## 基线复核门禁
+本地五个日志相关文件定向结果为 **228 passed，1364.02s**，包含日志列出的全部 65 个失败用例；补充 live-gate 定向为 **34 passed，100.93s**，其结果存于 `.tracefix/live-gate-ci-alignment.xml`。这些结果来自当前工作树，不证明独立暂存树或远端 CI 已通过。当前阶段一整体验收未完成，不运行新的完整基线、不进入 S2—S4，也不新建 worktree。
 
-**当前基线状态：待协调复核，不能据此启动无审查的整文件暂存。** 两轮只读扫描之间以下路径的SHA256变化：
+Epicurus 继承主 Agent 的模型与推理配置，只读复核三个实现文件与新增回归的依赖，未运行 pytest、改文件、提交或 push。复核确认三者必须配套提交；`tests/test_runtime_environment_gate.py` 受 `tests/*` 忽略，需显式 force-add。编排记录保存在 `.tracefix/ci-alignment-notes.md`。
+
+窄范围 Engine 补丁保存在 `.tracefix/ci-live-gate.patch`，只含同步证据检查、异步 live helper 和 VERIFY/REVIEW/FINALIZE 三个调用边界共五个 hunk；`git apply --check --cached` 已通过且未修改暂存区。Worker 路由、guidance、`.gitignore`、前端、其他既有 dirty 和临时产物不纳入本次 CI 对齐提交。结果仅支持当前工作树的定向测试，不宣称整个阶段或真实 Docker Oracle 已验收。
+
+GitHub 验证必须使用包含修复的新 SHA；本地提交不等于远端已同步，重跑旧 Run 也不会读取本地未提交修复。本次不 push；最后给出精确的本地提交命令，由提交执行者核对暂存 diff。
+
+## 2026-10-03 历史快照
+
+本节以下的旧 HEAD、文档 Worker 范围、测试结果及审批服务故障保留为历史记录，不描述 2026-10-04 的当前状态。
+
+阶段0基线执行已结束并报告失败；**当前工作仅处于 S1 收敛：主 Agent 独立执行九文件回归为 173 passed，486.36s；最近一次全量为 12 failed、1372 passed、2 skipped，1612.44s（总计 1386）**。后续主 Agent 安全回归为 **98 passed、21 deselected，76.09s**，Postgres 定向为 **11 passed、1 skipped，0.09s**；严格 snapshot 已恢复 HEAD、完全无 diff，新 18 项测试通过。没有新的全量结果，不改写原失败；**阶段一验收 commit 环境阻塞**。旧九文件 173 passed / 139.77s、fixture 2 passed 与旧172/2 failed分别保留为历史批次。S2—S4未开始、无新 worktree，不能进入阶段二，也不能用已有历史 commit 代替本轮阶段验收。
+
+历史基线采样时间：2026-10-03 11:12:35（Asia/Shanghai）。历史基线HEAD：`373d74fcad6b580117a673f4abfaa98c4e8b6e52`；分支：`main`。采样时暂存区无改动。机器可读历史基线见 `artifacts/agentteam-four-stage/baseline-manifest.json`，其hash不代表当前源码。
+
+本次文档更新只使用 apply_patch 修改 `README.md`、`backend/packages/agent/src/tracefix/workers/README.md` 与本台账；不改源码、测试、profiles或artifact manifest，不运行测试、不暂存、不提交、不 push、不删除、不派 Agent。当前源码和提交历史由用户统一接管；最新测试及编排信息由用户提供，旧 Worker 的采样及产物核对记录保留为历史，不冒称本次文档更新独立复验。
+
+## 历史HEAD、授权与提交门禁
+
+本次只读核验 HEAD 为 `70a7d06099398f3075bba1538ca3cccd2cf0b2d2`；`70a7d06` 是补齐 pypdf 离线依赖及 Windows wheel 完整性检查的外部依赖提交，不算阶段验收。旧 `373d74f` 之后已有 `b2ebbb6`、`0557565`、`19109cd`、`52cb8c4`、`e86aabd`、`70a7d06` 提交；阶段一部分实现、外来 hunk 及 Windows 依赖变更已进入 Git 历史，不能再按旧 dirty 清单重新暂存或回滚，也不能把这些历史 commit 登记为本轮阶段验收 commit。
+
+用户已确认既有失败修复授权并统一接管当前源码。此前“授权待答复”“混合hunk待协调”“workspace.py无安全暂存hunk”等结论只描述旧采样时刻，不再作为当前阻塞原因。最近一次全量已报告失败，后续安全与 Postgres 定向已有通过记录，但新全量、live gate 实时检查和独立阶段复核仍待补足；阶段验收 commit 环境阻塞。本次文档任务明确不提交，阶段提交规则仅供后续获授权的主 Agent 执行。任何后续增量仍须以当前 HEAD 为基准精确审查，不重放旧暂存方案。
+
+用户补充的精确暂存尝试：default 模式因 `index.lock PermissionDenied` 失败；`require_escalated` 请求遇审批 reviewer 503（`gpt5.6luna` 不可用），请求的暂存操作未执行，无 index 变化、无 commit。已告知用户修复审批服务，不绕过该限制。此记录属于主 Agent 的既有尝试，本次文档更新未执行暂存或提权重试；阶段一 commit 未完成，不能进入阶段二。
+
+此前文档批次开始时只记录了 `.gitignore` 与 `frontend/packages/runs/src/RunsPage.tsx` 的 tracked dirty，该记录不代表当前完整清单。本次只读检查可见多处源码、测试及文档既有改动，均不因此获得新的修改或提交授权；仅维护三份指定文档。最新全量未通过，不把九文件或 fixture 通过扩展为全量通过；本次没有新建 worktree 或派发 Agent。此前开发编排的继承记录见下节，不宣称全部模型/推理配置已完成审计。
+
+## 历史基线复核门禁
+
+**初次采样时的基线状态为待协调复核。** 下列两轮只读扫描及SHA256变化保留为历史证据，不代表当前HEAD仍存在这些未提交变化：
 
 - `backend/packages/agent/src/tracefix/runtime/tools.py`：`cca030867582b8633ebf539f057bef8a6bd6cd4927d2234165ace4f3f62c5a27` → `b8ea13b9b682107a4ca13d61670b3bddd2f9964f885cb8a48fe492cac37e570e`。
 - `ARCHITECTURE_REVIEW_SUMMARY.md`：`d276eb3374a97b58e5c4890ab53cf3c4d79c75fb496e90021d4bf1aeb0094c6f` → `994e75f298db9131bb2ba7a413bc721aae566def929e74ea01592496b7363bc6`。
 - `tests/test_architecture_repairs.py`：`220ba0605d8151c6c53621c92d04756eb462ac9206b0c9b084b941228d1ee734` → `d329fca894a4eb77ee459f918f967183f1844be12e83df891a7e726d0e83ee5c`。
 
-来源未核实，不能推断这些变化属于四阶段任务。manifest保存后一轮的采样值，同时保留初次hash。采样不是事务快照；主Agent应先确认这些变动的归属，并在派发首阶段前重新核对HEAD、索引和各路径。不能静默覆盖旧基线来消除漂移记录。
+当时来源未核实，未据此推断变化属于四阶段任务。manifest保存后一轮的历史采样值，同时保留初次hash；本轮不修改manifest、不覆盖历史记录。采样不是事务快照，当前暂存与验收应以新HEAD及实际增量重新核对，不能复用旧hunk坐标。
 
 临时pytest目录全部排除；对这些目录的权限警告没有通过清理或越权访问处理。`.env`及密钥不纳入记录。`engine.py`有混合LF/CRLF；SHA256针对原始文件字节，hunk针对Git当前归一化差异，两个口径不可混淆。
 
-## 既有未提交改动
+## 历史基线中的未提交改动
 
-共 **18** 个路径：**11 tracked + 7 untracked**。全部默认属于本任务开始前的既有工作，不能整批提交。精确hunk范围、字节数和Git对象ID保存在manifest；下表摘要并不代替代码审查。
+初次采样共 **18** 个路径：**11 tracked + 7 untracked**，当时全部默认属于任务开始前的既有工作。下表仅保留历史状态、hash与hunk摘要，不是当前dirty清单或可暂存集合；部分变化已进入后续Git历史，不能据此回滚。精确历史范围保存在manifest，摘要不代替当前源码审查。
 
 | 路径 | Git状态 | SHA256 | 既有hunk摘要 |
 | --- | --- | --- | --- |
@@ -51,11 +79,11 @@ manifest中的Git对象ID来自索引；采样时暂存差异为空，因此与H
 2. 禁止用 `git add .`、`git add -A`、`git commit -am` 把共享工作树整批纳入提交。既有未跟踪文件不可当作本阶段新文件。
 3. 已脏文件必须按本阶段增量分离并审查 `git diff --cached`；同一hunk重叠、依赖原有改动或不能解释的换行变化均阻止提交。hash与摘要不能还原旧版本，不足以自动分离；需主Agent先取得可逆基线或等价的可审查增量方案，本Worker不自行创建额外快照文件。
 4. 必须确认拟提交树本身可通过适用检查；含旧未提交依赖的共享工作树测试通过，不能证明独立阶段commit有效。阶段增量若不能从旧工作中分离，应报告依赖并调整实施方案，不能偷带旧改动。
-5. 两个台账产物被现有 `.gitignore` 的 `docs/*` 与 `artifacts/` 忽略。主Agent决定纳入提交时，只精确处理这两个明确路径；本Worker不修改忽略规则、不执行 `git add`。
+5. 初次采样时两个台账产物被 `.gitignore` 的 `docs/*` 与 `artifacts/` 忽略；该说明仅属历史。当前仅审查本轮授权路径及其实际增量，本Worker不改忽略规则、不改manifest、不执行 `git add`。
 6. 验证通过后由主Agent本地commit并登记SHA，再启动下一阶段。commit前可登记本次验证证据；拿到SHA后补记台账，后续提交可携带该记录，不能为了在同一文件引用自身最终SHA而反复改写提交。
 7. 不push，不创建新branch，不清理或回退他人工作；保留现有无Run硬总量上限设计。
 
-## 已报告的真实基线结果
+## 历史已报告的真实基线结果
 
 阶段0基线执行已经结束，**结果并非全绿**。以下为主Agent通过本次Worker消息提供的执行结果；本Worker未执行测试，尚未收到原始日志、精确Python命令、执行目录或产物hash，因此不能声称独立复验。不得将基线成绩记为阶段1验收成绩。
 
@@ -84,52 +112,66 @@ manifest中的Git对象ID来自索引；采样时暂存差异为空，因此与H
 - `tests/test_local_tools.py::test_bash_rejects_unsafe_writeback[conflict]`
 - `tests/test_tool_engine.py::test_gateway_executes_registered_code_tool_and_returns_typed_submission`
 
-主Agent已询问用户是否授权修复既有失败以保证每阶段全量通过，**当前未收到答复**。收到明确授权前，不修改这些既有生产/测试问题；不能删除测试、弱化断言或继续排除失败来制造全绿。阶段1可在已授权的新需求scope内实施，但仍不得宣告通过、提交或启动阶段2。
+此前曾等待既有失败修复授权；**用户已确认授权并统一接管**，不再记录为“未收到答复”。授权本身不证明旧收集问题或14个失败已全部解决；这些旧结果保留为历史，当前以最新全量 12 failed、1372 passed、2 skipped 为准。旧测试须迁移到安全契约，不能删除测试、弱化断言或排除失败来制造全绿；阶段一最终验收与本阶段 commit 完成前，不启动阶段二。
 
-基线测试结束不代表并发文件漂移已厘清：原采样hash和漂移记录保持不变，提交前仍须协调复核。特别保护用户原有 `runtime/engine.py` 的 `@@ -1758 +1758 @@` GraphRecursionError修复，该hunk不得混入阶段提交。
+历史采样hash、漂移记录及用户旧GraphRecursionError修复保护记录保持不变。当前已进入Git历史的变更不回滚、不重复算成本轮增量；提交前以当前HEAD复核实际diff，而不是旧 `@@ -1758 +1758 @@` 等坐标。
 
-## 阶段1当前派工
+## 阶段1实施分工记录
 
 | Worker | 用户分配scope | 台账需求映射 | 当前状态 |
 | --- | --- | --- | --- |
-| runtimeWorker | contracts / engine / browser / prompts / 新tests_behavior_invariants | S1-01、S1-02、S1-03、S1-07 | 实施已报告；本组源码写入停止，验收未通过 |
-| checkerWorker | profile / evals/oracle / verify_real_e2e / 新verify_b01_behavior_ui / 新tests_behavior_checker | S1-04、S1-05、S1-06 | 实施已报告；本组源码写入停止，验收未通过 |
+| runtimeWorker | contracts / engine / browser / prompts / 新tests_behavior_invariants | S1-01、S1-02、S1-03、S1-07 | 已报告实施、九文件定向通过；后续安全回归通过，新全量未提供，阶段 commit 环境阻塞 |
+| checkerWorker | profile / evals/oracle / verify_real_e2e / 新verify_b01_behavior_ui / 新tests_behavior_checker | S1-04、S1-05、S1-06 | 已报告实施、九文件定向通过；新全量及阶段复核待完成，阶段 commit 环境阻塞 |
 
-scope沿用主Agent授权。需求映射用于追踪联合覆盖，不代表Worker独立完成或允许跨scope修改。实际模型/推理等级及每个hunk归属待复核；实施路径、测试产物、review限制和并发漂移详见后文。其他阶段仍未开始。
+此表保留实施时的scope和分工，需求映射不代表允许跨scope修改。当前源码已由用户统一接管，新增子Agent继承父模型/推理配置且不递归派生。历史实际模型记录仍待补，不能凭配置要求推断实际执行；阶段2—4仍未开始。
 
-## 阶段1实施与实际测试记录（未通过提交门禁）
+### 本轮开发编排简短记录（用户提供，非本次派发）
 
-主Agent报告两Worker已实施schema、业务证据gate、冻结spec checker、profile、独立Oracle和browser harness。本Worker只读确认下列路径存在，并核对指定JUnit与浏览器报告；没有执行测试或源码审查，路径存在不等于独立验收通过，以下清单也不是可直接整体暂存的文件集合。
+将已知中间结论记入本台账，满足编排记录落盘要求；不新增临时笔记文件或 Agent。本轮既有分工为：Socrates（ledger）、Hubble（guidance）、Helmholtz（Postgres）、Herschel（snapshot）、Boyle（gate review）、Parfit（research）。这些 spawn 均省略 `model` / `reasoning`，继承主 Agent 的模型与推理配置；未提供具体配置值，不补造独立审计结论。
 
-| 已报告实施路径 | Worker/授权 | 内容与归属边界 |
+当前汇总：ledger / guidance / engine 安全回归 98 passed、21 deselected（76.09s），Postgres 定向 11 passed、1 skipped（0.09s）；strict frozen manifest 的 mutable workspace 补缺增量已撤销，严格 snapshot 恢复 HEAD、完全无 diff，新 18 项测试通过。live 环境 gate 尚需真正实时读取；外部研究在线核验失败。新全量结果未提供，阶段 commit 因 index 权限和审批服务故障环境阻塞；阶段 2—4 仍未开始，无新 worktree。此汇总只更新已提供事实，不将各项宣称为完整验收完成。
+
+## 阶段1实施与实际测试记录（S1收敛中）
+
+两Worker此前已报告实施schema、业务证据gate、冻结spec checker、profile、独立Oracle和browser harness。本轮仅做文档更新与当前状态核对，没有执行测试或全面源码审查；路径存在不等于独立验收通过、完整真实E2E或本阶段commit完成。
+
+| 已报告实施路径 | Worker/授权 | 实施内容与当前边界 |
 | --- | --- | --- |
-| `backend/packages/agent/src/tracefix/runtime/contracts.py` | runtimeWorker | schema及业务证据gate；外来patch_base_commit字段及校验与本组scope重叠，待hunk归属协调 |
-| `backend/packages/agent/src/tracefix/runtime/engine.py` | runtimeWorker | 业务证据gate、checkpoint observation断言复核；保留用户旧GraphRecursionError修复；外来patch_base_commit/diff(base)与本组scope重叠 |
-| `backend/packages/agent/src/tracefix/execution/browser.py` | runtimeWorker | 浏览器observation及行为证据支持；具体hunk与稳定源码验收仍待主Agent复核 |
-| `backend/packages/agent/src/tracefix/model/prompts.py` | runtimeWorker | 冻结spec与业务约束提示；具体hunk与稳定源码验收仍待主Agent复核 |
-| `tests/test_behavior_invariants.py` | runtimeWorker | 新业务不变量及证据gate测试；具体hunk与稳定源码验收仍待主Agent复核 |
-| `profiles/persistence.spec.json` | checkerWorker | 业务场景及冻结spec profile；具体hunk与稳定源码验收仍待主Agent复核 |
-| `evals/oracle.mjs` | checkerWorker | 独立最终业务Oracle；具体hunk与稳定源码验收仍待主Agent复核 |
-| `tools/checks/verify_real_e2e.py` | checkerWorker | 冻结spec checker及typed gate完整验证；具体hunk与稳定源码验收仍待主Agent复核 |
-| `tools/checks/verify_b01_behavior_ui.mjs` | checkerWorker | 本地真实浏览器B01源码正负例harness；具体hunk与稳定源码验收仍待主Agent复核 |
-| `tests/test_behavior_checker.py` | checkerWorker | 新行为checker测试；具体hunk与稳定源码验收仍待主Agent复核 |
+| `backend/packages/agent/src/tracefix/runtime/contracts.py` | runtimeWorker | typed schema及业务证据gate；部分实现已在历史commit中，当前需按HEAD复核 |
+| `backend/packages/agent/src/tracefix/runtime/engine.py` | runtimeWorker | 业务证据gate、checkpoint observation断言复核；历史GraphRecursionError与patch_base_commit变更不重算为本轮验收 |
+| `backend/packages/agent/src/tracefix/execution/browser.py` | runtimeWorker | 浏览器observation及行为证据支持；当前仍需新全量验证 |
+| `backend/packages/agent/src/tracefix/model/prompts.py` | runtimeWorker | 冻结spec与业务约束提示；当前仍需新全量验证 |
+| `tests/test_behavior_invariants.py` | runtimeWorker | 新业务不变量及证据gate测试；当前结果只按定向回归记录 |
+| `profiles/persistence.spec.json` | checkerWorker | 业务场景及冻结spec profile；不因本地正负例通过而宣称真实模型E2E |
+| `evals/oracle.mjs` | checkerWorker | 评测侧独立最终业务Oracle；不是Agent Run自动执行的运行时终点 |
+| `tools/checks/verify_real_e2e.py` | checkerWorker | 真实E2E checker及typed gate验证；真实模型/Docker/MCP结果仍需单独产物 |
+| `tools/checks/verify_b01_behavior_ui.mjs` | checkerWorker | 本地源码浏览器B01正负例harness；不等同完整真实E2E |
+| `tests/test_behavior_checker.py` | checkerWorker | 新行为checker测试；当前结果只按定向回归记录 |
 | `tests/test_batch_checker.py` | 另一已授权Worker | 本次args.spec新契约fixture适配；仅本次新契约适配，不包含既有14fail修复 |
 | `tests/test_real_e2e_cleanup.py` | 另一已授权Worker | 本次args.spec新契约fixture适配；仅本次新契约适配，不包含既有14fail修复 |
 
-`tests/test_batch_checker.py`与`tests/test_real_e2e_cleanup.py`的额外授权仅用于本次`args.spec`新契约fixture适配，不能扩大为修复既有14fail。`tests/test_batch_completion.py`同时承载父级失败回归与外来interactive_commit/patch_base_commit变动，另列在源码漂移记录中，不能将整文件归本任务。
+`tests/test_batch_checker.py`与`tests/test_real_e2e_cleanup.py`最初的额外授权仅用于本次`args.spec`新契约fixture适配；既有失败修复授权现已获，不再记录为待用户答复。`tests/test_batch_completion.py`的历史混合变动保留归属说明，不能把历史commit或整文件变化冒称本轮阶段验收。
 
-主Agent的审查要求仍作为验收门禁保留：checkpoint必须读取observation复核断言，不可信任`passed`标签；checker必须完整验证typed gate的结构与语义，不只检查六种kind集合。实现已报告，稳定源码上的独立验收仍未通过。
+审查要求仍作为验收门禁保留：checkpoint必须读取observation复核断言，不可信任`passed`标签；checker必须完整验证typed gate的结构与语义，不只检查六种kind集合。九文件及后续安全、Postgres 定向已有通过记录；最近一次全量失败保留，新全量结果未提供，live gate 实时检查、独立阶段复核仍待完成，本阶段 commit 环境阻塞。
 
 | 执行/证据 | 实际结果 | 来源与限制 |
 | --- | --- | --- |
 | 父级首次targeted | 69 passed / 6 failed | 主Agent报告旧checker fixture与新强语义验证不匹配，后续Worker已修；保留首轮失败，不写成全绿 |
 | runtimeWorker定向 | 95 passed | 主Agent转述Worker结果；精确命令、失败数、退出码和原始产物未提供，不推断父级全量通过 |
 | checkerWorker定向 | 38 passed | 主Agent转述Worker结果；精确命令、失败数、退出码和原始产物未提供 |
-| 阶段一当前定向9文件回归 | **173 passed / 0 failed** | 精确命令由主Agent掌握；本Worker未执行；当前混合工作树未形成稳定可提交快照 |
-| 两个独立persistence fixture | **2 passed / 0 failed** | 精确命令由主Agent掌握；本Worker未执行；不能替代稳定源码快照与提交门禁 |
-| 历史最终9文件suite | **170 passed / 2 failed，146.02s** | 旧失败记录保留：JUnit为172 tests、2 failures、0 errors/skipped，suite time=145.973s；仅作历史失败证据 |
+| 主 Agent 最新独立 S1 九文件回归 | **173 passed，486.36s** | 用户提供的主 Agent 独立执行结果；本次文档更新未执行，不补造原始命令、日志 hash 或退出码；不等于全量通过 |
+| 最近一次 Python 全量 | **12 failed、1372 passed、2 skipped，1612.44s；总计 1386** | 用户提供；失败组为 UNKNOWN 安全边界 7 项、guidance 幂等 1 项、Postgres fixture 4 项；后续定向结果分列，新全量未提供，不补造失败名或日志 |
+| 主 Agent 后续安全回归 | **98 passed、21 deselected，76.09s** | 用户提供；architecture operation + guidance + engine，筛选参数为 `-k 'operation or guidance or cancel'`；完整命令、退出码及日志未提供，不把 deselected 计为通过 |
+| 主 Agent 后续 Postgres 定向 | **11 passed、1 skipped，0.09s** | 用户提供；完整命令、退出码、跳过原因及日志未提供，不把 skipped 计为通过，不替代新全量 |
+| 严格 snapshot 恢复与新测试 | **已恢复 HEAD、完全无 diff；新 18 项测试通过** | 用户提供；不扩大到整个共享工作树无 diff；新测试的精确命令、耗时、退出码及日志未提供，不补造 |
+| 本轮 `npm test` | **10 passed** | 用户提供；退出码及原始日志未提供，不冒称本次文档更新执行 |
+| 本轮 `npm run typecheck` / `npm run build` | **均 exit 0** | 用户提供；原始命令环境及产物待补，不能替代 Python 全量与阶段验收 |
+| Worker 配置与实际路由定向 | **11 passed** | 用户提供；支持局部选择 model、不改共享 model、GUI scout 选择 Worker Gateway，不代表全部模型/推理配置已有审计 |
+| 历史9-file recheck | **173 passed / 0 failed，139.77s** | 用户/父级此前报告；本 Worker 未执行，与 486.36s 的最新独立批次分列保留 |
+| 历史fixture定向 | **2 passed / 0 failed** | 用户/父级此前报告；本 Worker 未执行；不能替代最新全量、阶段最终验收与本阶段 commit |
+| 历史最终9文件suite（旧172/2 failed） | **170 passed / 2 failed，146.02s** | JUnit总计172 tests、2 failures、0 errors/skipped，suite time=145.973s；172不是passed数，仅作历史失败证据 |
 | 父级本地浏览器harness | `node tools/checks/verify_b01_behavior_ui.mjs` exit 0 | clean 7步骤通过；completion_only前3步通过，第4步cancel_completion被拒绝，负例子过程expected exit 1 |
-| 父级全量collect-only | **699 collected / 1 error，exit 2** | `configured_worker_model`缺失；仅收集，没有执行699项测试，不是全量成功 |
+| 历史父级全量collect-only | **699 collected / 1 error，exit 2** | 当时`configured_worker_model`缺失；仅收集，没有执行699项测试；不据此推断当前仍缺失或已全量成功 |
 
 历史最终9文件suite产物（保留为历史失败证据）：`.tracefix/agentteam-stage1-final-20261003.xml`，33457字节，SHA256：`77a3ff2233187818e372a242c7bb4ad9a25c5498908164f2889e4bf2ad26b6d0`。本Worker只读解析历史计数和失败名，覆盖模块为test_batch_checker、test_batch_completion、test_behavior_checker、test_behavior_invariants、test_contracts、test_engine、test_native_engine、test_real_e2e_cleanup、test_reproduction_plan`；不能把历史结果扩展为当前全量通过。
 
@@ -138,13 +180,25 @@ scope沿用主Agent授权。需求映射用于追踪联合覆盖，不代表Work
 - `tests/test_batch_completion.py::test_persistence_profile_rejects_loss_of_uncomplete_behavior[False]`：XML显示Phase.VERIFY与预期Phase.FINALIZE不一致。
 - `tests/test_batch_completion.py::test_persistence_profile_rejects_loss_of_uncomplete_behavior[True]`：XML显示实际`[True, True, False, False]`与预期`[True, True, False]`不一致。
 
-主Agent归因为旧profile fixture未适配新behavior场景/断言数；该文件在测试期间又被本组外修改，源码与输出行号漂移，因此现有结果不能证明当前混合树稳定。此处登记诊断来源，不凭症状替代稳定版本上的复验。
+历史诊断归因为旧profile fixture未适配新behavior场景/断言数；当时还发生源码与输出行号漂移。旧失败及诊断来源保留，不代表当前定向回归仍失败；当前结果仍不能替代新全量验证。
 
-浏览器独立产物：`.tracefix/b01-behavior-0lEsnt/report.json`，1897字节，SHA256：`1accfe6b476ddad9cf349a678dabf343e7ad43d4bd5608f73eb17ec3806cc4ec`。报告标记independent-playwright-v2、final_scoring_only=true。clean通过initial_unchecked、complete、reload_completed、cancel_completion、reload_uncompleted、todo_filter、done_filter；completion_only在cancel_completion未发出预期状态更新，waitForResponse超时后按预期拒绝。**这是本地真实浏览器源码正负例，未证明付费模型+Docker+MCP闭环，也未证明漂移后的混合树稳定。** 该部分证据支持S1-04的局部行为检查，不能单独宣告阶段1或完整FIX_VERIFIED门禁完成。
+### 当前失败记录、修复回归与安全边界
 
-## 新增源码漂移及两项待决策
+- 最近一次全量的 12 项失败按 UNKNOWN 安全边界 7 项、guidance 幂等 1 项、Postgres fixture 4 项分组，合计 12。后续主 Agent 安全回归 98 passed / 21 deselected（76.09s）、Postgres 定向 11 passed / 1 skipped（0.09s）通过记录已补；没有新的全量结果，不推断原 12 项在全量中已全部通过。
+- strict frozen manifest 从 mutable workspace 补缺项的增量已撤销；严格 snapshot 已恢复 HEAD、完全无 diff，新 18 项测试通过。这里的无 diff 仅指严格 snapshot 恢复，不代表整个工作树干净；冻结输入缺项应明确拒绝或重新冻结，不能把当前可变工作区补入旧快照后宣称严格冻结。
+- live 环境 gate 仍需在检查时真正读取实时环境；缓存的 `actual_digest` 不能包装成实时检查。失败、不可读取或没有实时证据时不得宣称 live 环境匹配。
+- ledger 恢复须维持 `UNKNOWN` + resource fence + 显式人工 reconcile；callback 不得自行解锁，也不能盲重放未知副作用。终态报告、线程结束或数据库恢复不等于安全解除围栏。
+- 旧 tests / fixture 应迁移到安全契约，不删除、排除或削弱断言来换取全绿；已记录的安全及 Postgres 定向结果不能替代修复后全量与阶段复核。本次仅记录事实及要求，不修改源码或测试。
 
-本次采样时间：2026-10-03 11:48:41（Asia/Shanghai），仍为非原子采样。只读Git确认HEAD仍`373d74fcad6b580117a673f4abfaa98c4e8b6e52`，index空，阶段commit SHA为null。没有把当前文件hash改写到原始18路径基线。
+### 外部设计研究核验边界
+
+2026-10-03 对官方 Pi / OpenCode / Claude / Hermes 的 HTTP 及浏览器核验均失败，原因包括网络 socket 权限与审批 reviewer 503。README 中链接仅作参考入口；“薄 harness”、client/server 分离、hooks / 项目指令及经验 / Skill 组织均为待验证启发，不是本轮成功在线读取或核验的事实。Claude Code 不是完全开源 harness，不将其内部实现视为可直接移植的开源代码。本次文档更新未重新联网核验。
+
+浏览器独立产物：`.tracefix/b01-behavior-0lEsnt/report.json`，1897字节，SHA256：`1accfe6b476ddad9cf349a678dabf343e7ad43d4bd5608f73eb17ec3806cc4ec`。报告标记independent-playwright-v2、final_scoring_only=true。clean通过initial_unchecked、complete、reload_completed、cancel_completion、reload_uncompleted、todo_filter、done_filter；completion_only在cancel_completion未发出预期状态更新，waitForResponse超时后按预期拒绝。**这是本地源码浏览器正负例，未证明付费模型+Docker+MCP闭环；Oracle是评测侧工具，不是Agent Run自动终点。** 该部分证据支持S1-04的局部行为检查，不能单独宣告阶段一或完整FIX_VERIFIED门禁完成。
+
+## 历史源码漂移与协调记录
+
+以下是2026-10-03 11:48:41（Asia/Shanghai）的历史非原子采样：当时HEAD为`373d74fcad6b580117a673f4abfaa98c4e8b6e52`、index空、阶段commit SHA为null。下表hash与归属待协调结论只描述该时刻，不能用于当前HEAD的暂存或回滚；后续文档曾以`e86aabd3f744955b9c63cd1a7a673d045fcc6b9b`为基准，当前核验 HEAD 为 `70a7d06099398f3075bba1538ca3cccd2cf0b2d2`，既有未提交增量需另行审查。
 
 | 路径 | 本次只读采样字节数 | SHA256 | mtime（Asia/Shanghai） | 归属/风险 |
 | --- | --- | --- | --- | --- |
@@ -157,14 +211,14 @@ scope沿用主Agent授权。需求映射用于追踪联合覆盖，不代表Work
 
 原始baseline18paths、最初3项漂移及用户旧GraphRecursionError保护记录保持不变。外部`runtime/tools.py`、`ARCHITECTURE_REVIEW_SUMMARY.md`、`tests/test_architecture_repairs.py`没有归本任务授权，不能纳入commit；workspace.py的外来变化同样不能自动归为阶段1。
 
-本轮只读hunk审计结论：`backend/packages/agent/src/tracefix/execution/browser.py`、`backend/packages/agent/src/tracefix/model/prompts.py`、`profiles/persistence.spec.json`、`evals/oracle.mjs`、checker相关实现及新增行为测试可归入stage1；`backend/packages/agent/src/tracefix/runtime/contracts.py`、`backend/packages/agent/src/tracefix/runtime/engine.py`、`tests/test_batch_completion.py`只能按精确hunk暂存；`backend/packages/agent/src/tracefix/execution/workspace.py`无可安全暂存hunk。该结论不表示阶段1已通过。
+当时的只读hunk审计认为browser、prompts、profile、Oracle、checker和新增行为测试可归入stage1，contracts、engine及test_batch_completion需精确hunk暂存，workspace无可安全暂存hunk。**该暂存方案已过时**：当前部分实现及外来hunk已在Git历史中，用户已统一接管；不复用旧坐标、不回滚、不把历史commit冒称本轮验收。
 
-两项未决决定：
+协调状态已更新：
 
-1. **同工作区外来改动所有权与重叠hunk协调**：contracts/engine与runtimeWorker scope重叠，workspace/test_batch_completion也有新增改动；稳定源码快照和提交隔离尚未成立。
-2. **既有失败修复授权**：用户是否授权修复configured_worker_model收集问题与原有14fail仍待答复；两份args.spec fixture额外授权不能代替此授权。
+1. **源码与历史提交已由用户统一接管**：当前核验基准为HEAD`70a7d06099398f3075bba1538ca3cccd2cf0b2d2`；旧外来/混合hunk记录只作历史，不再描述为当前dirty阻塞。
+2. **既有失败修复授权已获**：授权不等于问题已全部解决；最近一次全量的 12 项失败与后续安全、Postgres 定向通过分列保留，新全量待补，阶段 commit 环境阻塞，不删除、弱化或排除失败来制造全绿。
 
-主Agent已停止本组生产/测试源码写入，等待用户协调；本Worker仍只维护两份台账。**线程goal仍active**，没有暂停或终结目标。阶段1已报告实施但未验收、未提交，阶段2—4未开始且不得推进。待协调后的稳定快照、相应测试通过及独立hunk审查证据到齐，才可重新评估提交门禁。
+本次文档更新仅维护三份授权文档，不改源码或历史提交。阶段一已报告实施、九文件及后续定向通过，新全量和独立阶段复核待补，阶段 commit 环境阻塞；阶段 2—4 未开始、无新 worktree，不得凭定向通过或别人的历史 commit 推进。不从旧“goal active/停止写入”记录推断当前调度状态。
 
 ## 需求与验收矩阵
 
@@ -174,28 +228,28 @@ scope沿用主Agent授权。需求映射用于追踪联合覆盖，不代表Work
 
 | ID | 明确需求 | 必须取得的测试/验收证据 | 状态 |
 | --- | --- | --- | --- |
-| C01 | 主Agent负责调度、统计、复核和提交，实际代码由子Agent修改；子Agent按用户要求使用最新模型最高推理等级。 | 记录每项改动的执行Worker及模型配置；主Agent独立核对diff、测试结果和交付证据。 | 未开始 |
+| C01 | 当前源码由用户统一接管；新增子Agent继承父Agent的模型与推理配置，不递归派生。 | 记录实际执行Worker及模型配置；独立核对diff、测试结果和交付证据，不能用配置要求替代实测记录。 | 已补本轮 spawn 继承记录；全部配置审计待补；本次不派 Agent |
 | C02 | 四阶段严格顺序执行，每阶段修改、验证、测试通过并完成本地commit后才启动下一阶段。 | 上一阶段全部需求有充分证据、测试无未解释失败、commit SHA可查；规划或工作树中的通过结果不能代替提交验收。 | 未开始 |
 | C03 | 仅本地commit，不push，不擅自新建branch。 | 提交留在当前main分支；记录父提交和阶段提交；无远程发布动作。 | 未开始 |
 | C04 | 保护基线全部既有改动，阶段提交不得混入原有hunk或未跟踪文件。 | 按路径及hunk审查暂存差异，确认提交只含本阶段授权增量；重叠hunk、来源漂移和依赖未厘清时禁止提交。 | 未开始 |
 | C05 | 保留现有无Run硬总量上限设计。 | 可观测tokens、费用、队列和耗时；不得未经另行决策引入Run级调用、token、费用或任务总数硬上限。 | 未开始 |
 | C06 | 复用已有阶段、证据、源码版本、作用域和副作用控制。 | 新增接口、插件和Worker不可绕开确定性授权、审批、回执和验证门禁；角色名不授予能力。 | 未开始 |
 | C07 | 证据如实分级，缺失、跳过、模拟及基础设施失败不得写为实测成功。 | 每项证据记录执行命令、退出码、源码/环境标识、产物及局限；provider usage、真实GUI和付费模型成绩只引用真实产物。 | 未开始 |
-| C08 | 阶段0仅建立两个指定文件；不改生产/测试代码，不运行测试，不git add/commit，不递归派Agent。 | 本Worker只使用apply_patch维护台账与manifest；阶段0初次登记不代表测试或实施完成，后续仅依据实际证据更新状态。 | 未开始 |
+| C08 | 历史阶段0仅建立两个指定文件；不改生产/测试代码，不运行测试，不git add/commit，不递归派Agent。 | 历史初次登记不代表测试或实施完成，后续仅依据实际证据更新；本次仅用 apply_patch 更新三份授权文档，不修改 manifest。 | 历史范围保留；本次文档边界已记录 |
 
 ### 阶段1：业务不变量、正确复现序列与独立回归
 
-状态：**已报告实施，提交门禁未通过**。当前定向9文件回归报告173 passed / 0 failed，两个独立persistence fixture报告2 passed；旧172/2fail仅保留为历史失败。外来或混合hunk及workspace.py无安全暂存边界仍未解决，goal仍active。
+状态：**S1 已报告实施、九文件及后续定向通过，新全量待补，阶段验收 commit 环境阻塞**。主 Agent 最新独立九文件回归为 173 passed（486.36s）；最近一次全量为 12 failed、1372 passed、2 skipped（1612.44s，总计 1386）。后续安全回归为 98 passed、21 deselected（76.09s），Postgres 定向为 11 passed、1 skipped（0.09s）；严格 snapshot 恢复 HEAD、完全无 diff，新 18 项测试通过。139.77s 的旧 recheck、fixture 2 passed 与旧172/2 failed均按历史批次保留。用户已统一接管且既有失败修复授权已获，以当前 HEAD 及实际增量为准；新全量、live gate 实时检查、阶段复核仍待补足，不复用旧 dirty/hunk 暂存结论，不绕过审批故障进入阶段二。
 
 | ID | 明确需求 | 必须取得的测试/验收证据 | 状态 |
 | --- | --- | --- | --- |
-| S1-01 | 建立任务适用的业务不变量和必须保留的正常能力，将其绑定目标及源码版本。 | 覆盖正常、逆向、刷新后持久化和相邻功能；不能以禁用原功能满足正向断言。 | 已报告实施；验收未通过 |
-| S1-02 | 从探索轨迹提取表达真实目标的复现序列，排除调查失败和重试后独立确认并冻结。 | 错误或不可重放序列不进入可修复结论；确认后的序列、状态前置条件及hash可追溯。 | 已报告实施；验收未通过 |
-| S1-03 | 对冻结序列做独立重放并校验环境、源码和TestSpec。 | 复现不成立或前置条件变化时重新诊断/明确INCONCLUSIVE；不得靠修改业务行为让错误计划可执行。 | 已报告实施；验收未通过 |
-| S1-04 | 加入B01历史无效补丁负例，明确拒绝删除或停用取消完成功能的补丁。 | 旧无效补丁不能FIX_VERIFIED；有效修复通过完成→刷新→取消完成→刷新→筛选，并保存对应真实证据或明确未实测。 | 已报告实施；验收未通过 |
-| S1-05 | 原问题验证和独立业务回归均纳入验收。 | 正向、逆向及不变量回归均覆盖；缺失、失败或过期证据阻止成功结论。 | 已报告实施；验收未通过 |
-| S1-06 | 独立最终Oracle与修复反馈分离。 | 最终评分不被同题循环调试和经验学习污染；明确开发回归与held-out评分边界。 | 已报告实施；验收未通过 |
-| S1-07 | 成功门禁消费匹配当前补丁的业务证据并保留原六类验证约束。 | 缺失不变量、旧hash、错误环境或无效artifact均拒绝；有效正例及历史负例同时成立。 | 已报告实施；验收未通过 |
+| S1-01 | 建立任务适用的业务不变量和必须保留的正常能力，将其绑定目标及源码版本。 | 覆盖正常、逆向、刷新后持久化和相邻功能；不能以禁用原功能满足正向断言。 | 定向通过；新全量与阶段复核待补，commit 环境阻塞 |
+| S1-02 | 从探索轨迹提取表达真实目标的复现序列，排除调查失败和重试后独立确认并冻结。 | 错误或不可重放序列不进入可修复结论；确认后的序列、状态前置条件及hash可追溯。 | 定向通过；新全量与阶段复核待补，commit 环境阻塞 |
+| S1-03 | 对冻结序列做独立重放并校验环境、源码和TestSpec。 | 复现不成立或前置条件变化时重新诊断/明确INCONCLUSIVE；不得靠修改业务行为让错误计划可执行。 | 定向通过；严格 snapshot 已恢复，live 实时检查与新全量待补 |
+| S1-04 | 加入B01历史无效补丁负例，明确拒绝删除或停用取消完成功能的补丁。 | 旧无效补丁不能FIX_VERIFIED；有效修复通过完成→刷新→取消完成→刷新→筛选，并保存对应真实证据或明确未实测。 | 本地源码正负例通过；新全量与阶段复核待补，commit 环境阻塞 |
+| S1-05 | 原问题验证和独立业务回归均纳入验收。 | 正向、逆向及不变量回归均覆盖；缺失、失败或过期证据阻止成功结论。 | 定向通过；新全量与阶段复核待补，commit 环境阻塞 |
+| S1-06 | 独立最终Oracle与修复反馈分离。 | 最终评分不被同题循环调试和经验学习污染；明确开发回归与held-out评分边界。 | 评测侧边界已记录；不等于Run自动执行Oracle |
+| S1-07 | 成功门禁消费匹配当前补丁的业务证据并保留原六类验证约束。 | 缺失不变量、旧hash、错误环境或无效artifact均拒绝；有效正例及历史负例同时成立。 | 定向通过；live 实时检查待实现/复核，新全量待补，commit 环境阻塞 |
 
 ### 阶段2：控制API、版本事件、客户端契约和Worker恢复
 
@@ -248,19 +302,31 @@ scope沿用主Agent授权。需求映射用于追踪联合覆盖，不代表Work
 
 ## 测试gate执行和证据口径
 
-本Worker未运行测试。主Agent报告的基线测试结果见专节，其中Python收集及排除运行均存在失败。需求矩阵为待覆盖行为，不得把基线结果冒充阶段实现验收。阶段测试执行前由负责Worker登记精确命令，主Agent独立核对覆盖范围、原始日志及结果。
+本次文档更新未运行测试。最新主 Agent 独立九文件、全量、Node 与 Worker 路由结果均由用户提供，不能冒称本次文档更新独立复验。旧基线、139.77s 的 recheck 与 fixture 结果按历史分列；最新全量已明确失败。后续修复重跑仍须登记精确命令、退出码、原始日志和覆盖范围，不猜测结果；定向通过不等于全量通过或阶段 commit 完成。
+
+后续 pytest 统一在系统 `TEMP` 下创建每次新名的目录；以下为开发示例，未在本次文档任务中执行，也不是上述已知成绩的原始命令：
+
+```powershell
+$testRun = Join-Path $env:TEMP ("tracefix-tests-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $testRun | Out-Null
+.\.venv\Scripts\python.exe -m pytest -q `
+  --basetemp "$testRun/pytest" --junitxml "$testRun/junit.xml"
+Write-Output "pytest exit code: $LASTEXITCODE"
+```
+
+每次执行都重新生成 `$testRun`，不复用 basetemp；pytest 会清理指定的 basetemp，禁止指向仓库、系统 `TEMP` 根目录或已有证据目录。JUnit 位于 basetemp 之外，建议与精确命令、退出码、stdout/stderr、HEAD 及实际增量标识一起保存；失败与修复后重跑分别保留，不覆盖历史 XML 或失败记录。S1 九文件命令见 README 的 checker 开发者入口；完整真实 E2E 仍需独立产物。
 
 每个需求的证据应记录：需求ID、实施Worker、实际模型/推理等级、实现位置、源码HEAD与本阶段增量hash、环境/镜像及TestSpec/Skill版本、测试命令、退出码、实际用例/断言范围、原始产物、独立审查结论、未覆盖项。失败修复后的重跑需要保留原失败记录。仅有脚本、mock、计划、成功状态标签或旁路单测均不足以证明真实完整闭环。
 
 阶段4指标要先写分母再比较：有效修复数由独立Oracle判定；False Success数量为内部宣称成功而独立评分不通过的任务数，比率分母为内部宣称成功数。有效修复率需明确以全部计划任务还是可评测任务为分母，并同时报告基础设施失败。费用包含失败和重试，未知usage/价格记未知，不用0替代；实付与估算分列，零有效修复记单价不可计算。实验采用相同任务、版本和模型条件来保证可比较性，这不构成运行时新增硬总量限制。
 
-阶段2恢复证据必须覆盖排队、执行中、重试、取消及未知副作用边界。数据库或进程恢复不代表外部副作用exactly-once；浏览器和容器状态需单独确认。阶段3冻结必须包含Skill正文及references实际内容，只有名称、路径或hash不能恢复历史请求；撤回既要影响未来激活，也要保留历史审计和对在途Run的显式处理。
+阶段2恢复证据必须覆盖排队、执行中、重试、取消及未知副作用边界，包括 `UNKNOWN`、resource fence 与显式人工 reconcile，必须拒绝 callback 自行解锁。数据库或进程恢复不代表外部副作用exactly-once；浏览器和容器状态需单独确认。阶段3冻结必须包含Skill正文及references实际内容，只有名称、路径或hash不能恢复历史请求；撤回既要影响未来激活，也要保留历史审计和对在途Run的显式处理。记录上述现有安全修复要求不代表阶段 2 或 3 已开始。
 
 ## 阶段交付记录
 
 | 阶段 | 实施/模型配置 | 修改路径/增量 | 验证与测试 | 独立复核 | 本地commit | 下一阶段资格 |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | runtimeWorker + checkerWorker；实际模型配置待补 | 12个实施路径已报告；安全路径与精确hunk边界已登记 | 当前定向9文件173passed/0failed；独立persistence fixture 2passed；历史172/2fail保留；本地浏览器正负例通过 | 提交门禁未通过；混合树不稳定 | 未提交；SHA=null，index空 | 不具备 |
+| 1 | 历史 runtimeWorker + checkerWorker；本轮分工见编排记录，spawn 省略 model/reasoning 继承父配置 | 按 HEAD 及实际增量审查；70a7d06 外部依赖提交不计验收；严格 snapshot 已恢复 HEAD、无 diff | 九文件 173 passed（486.36s）；最近全量 12 failed / 1372 passed / 2 skipped（1612.44s，总计 1386）；后续安全 98 passed / 21 deselected（76.09s），Postgres 11 passed / 1 skipped（0.09s），新 18 项测试通过；Node 10 passed，typecheck/build exit 0，Worker 路由 11 passed；历史证据保留 | 新全量、live 实时检查与阶段复核待补；不宣称完整真实 E2E 或全部模型配置审计完成 | 环境阻塞：index.lock PermissionDenied、审批 reviewer 503；无 index 变化、无 commit，不绕过 | 不具备；不能进入阶段二 |
 | 2 | 未分派/未开始 | 无 | 未执行；命令、退出码、产物待登记 | 未执行 | 未提交；SHA为空 | 不具备 |
 | 3 | 未分派/未开始 | 无 | 未执行；命令、退出码、产物待登记 | 未执行 | 未提交；SHA为空 | 不具备 |
 | 4 | 未分派/未开始 | 无 | 未执行；命令、退出码、产物待登记 | 未执行 | 未提交；SHA为空 | 不具备 |
@@ -274,4 +340,4 @@ scope沿用主Agent授权。需求映射用于追踪联合覆盖，不代表Work
 - 暂存区差异复核、既有改动隔离证明、拟提交内容验证、父commit和本阶段commit SHA。
 - 主Agent是否准许开启下一阶段；只有当前阶段验收通过且本地commit成功才能填写“是”。
 
-当前台账已登记失败基线、阶段1已报告实施内容、实际测试证据及新增并发漂移。阶段1提交门禁未通过，阶段2—4未开始；四阶段验收及commit均未完成。goal仍active，源码写入由主Agent停止待用户协调。
+当前台账保留历史失败基线、历史并发漂移、旧定向批次、最近一次全量失败与后续定向通过事实；用户已统一接管且既有失败修复授权已获。严格 snapshot 已恢复 HEAD、无 diff，新 18 项测试通过；新全量、live gate 真正实时检查及独立阶段复核仍待补。阶段验收 commit 因 index 权限与审批 reviewer 503 环境阻塞，已告知用户修复审批服务，不绕过；无 index 变化、无 commit，S2—S4 未开始、无新 worktree，不能进入阶段二。本次仅用 apply_patch 更新三份文档，不修改源码/测试、不运行测试、不暂存、不提交、不 push、不删除、不派 Agent，不把历史 commit、本地源码浏览器正负例或局部路由通过冒称完整真实 E2E 或阶段验收。

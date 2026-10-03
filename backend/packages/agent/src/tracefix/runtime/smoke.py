@@ -25,18 +25,36 @@ PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4
 class FakeRunner:
     def __init__(self, source, fail=None):
         self.source, self.closed, self.fail = source, False, fail
-    async def inspect_images(self): return 'fake-ci-environment'
+        self.actual_digest = ''
+        self.inspect_calls = 0
+        self.environment_digest = 'fake-ci-environment'
+        self.inspect_results = []
+        self.started = False
+    async def inspect_images(self, *, runtime=False):
+        self.inspect_calls += 1
+        if runtime and (not self.started or self.closed):
+            raise RuntimeError('CI 模拟运行环境未启动或已清理')
+        # 独立于 actual_digest 缓存，允许 CI 注入新采样、永久漂移及 inspect 故障。
+        result = self.inspect_results.pop(0) if self.inspect_results else self.environment_digest
+        if isinstance(result, BaseException):
+            raise result
+        if type(result) is str and result:
+            self.actual_digest = result
+        return result
     async def start(self, source):
         if source != self.source:
             return {'passed': False, 'exit_code': 1, 'output': '源码快照摘要不匹配'}
-        return await self.command('start')
+        result = await self.command('start')
+        self.started = result['passed']
+        self.closed = False
+        return result
     async def version(self): return self.source
     async def health(self): return await self.command('health')
     async def command(self, kind):
         exit_code = 1 if kind == self.fail else 0
         return {'passed': exit_code == 0, 'exit_code': exit_code, 'output': 'CI 模拟命令：'+kind}
     async def rebuild(self): return await self.command('build')
-    async def close(self): self.closed=True
+    async def close(self): self.closed=True;self.started=False
 
 
 class FakeBrowser:
