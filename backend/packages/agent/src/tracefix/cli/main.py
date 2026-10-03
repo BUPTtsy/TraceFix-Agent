@@ -37,6 +37,20 @@ from tracefix.storage.presentation import label
 from tracefix.storage.store import PostgresStore
 
 
+def configured_worker_model():
+    """仅实际覆盖时创建 Worker Gateway，未覆盖字段继承 Supervisor 环境配置。"""
+    configuration = {
+        'base_url': os.getenv('TRACEFIX_WORKER_BASE_URL'),
+        'key': os.getenv('TRACEFIX_WORKER_API_KEY'),
+        'text_model': os.getenv('TRACEFIX_WORKER_TEXT_MODEL'),
+        'vision_model': os.getenv('TRACEFIX_WORKER_VISION_MODEL'),
+    }
+    if not any(configuration.values()):
+        return None
+    # 独立配置中显式空视觉模型关闭图片；省略该项仍继承 Supervisor。
+    return Gateway(**configuration)
+
+
 class Session:
     def __init__(self, args, store, saver):
         self.args, self.store, self.saver = args, store, saver
@@ -281,7 +295,8 @@ class Session:
         if record.get('agentRunId'):
             await self.ensure_runtime()
             previous = self.store.load(record['agentRunId'], self.scope)
-            self.validate_workspace(previous, data_root=record.get('dataRoot'))
+            if previous.repo_snapshot_ref:
+                self.validate_workspace(previous, data_root=record.get('dataRoot'))
         claim = os.getenv('TRACEFIX_CONTINUATION_ID')
         if claim and self.web_console_run_id == record['id']:
             if record.get('continuationId') != claim or record['status'] not in {'running', 'stopping'}:
@@ -424,6 +439,7 @@ class Session:
         self.engine = Engine(self.store, self.artifacts, self.scopes, self.ctx, profile, workspace,
             runner, browser, BrowserPolicyRouter(Gateway(), student), retriever, source, self.saver, self.notify,
             rule_resolver=rule_resolver, rule_library=rule_library)
+        self.engine.worker_model = configured_worker_model()
         self.engine.memory = memory
         self.engine.documents = self.documents
         self.engine.current_run = state.run_id
