@@ -6,9 +6,11 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tracefix.execution.repository import file_manifest
 from tracefix.knowledge.context import SkillCatalog
 from tracefix.model.gateway import Gateway, ModelError
 from tracefix.rules import Rule, RuleResolver
+from tracefix.runtime import smoke
 from tracefix.runtime.contracts import BrowserAction, Decision, Phase, RunState, digest
 from tracefix.runtime.smoke import PNG, make_engine
 
@@ -53,13 +55,17 @@ def test_builtin_skills_have_a_model_consumer_phase():
 
 
 async def skill_engine(root, *, category='a11y', url_patterns=None):
-    engine, state = make_engine(root)
+    original_index = smoke.safe_index_files
+
+    def initialize_skill_source(source_root, paths):
+        # 在冻结快照前真实索引源码，让 make_engine 安全提交并导出完整的 tracked entries。
+        (source_root / 'src/Search.tsx').write_bytes(b'export const Search = () => null;\n')
+        return original_index(source_root, [*paths, 'src/Search.tsx'])
+
+    with pytest.MonkeyPatch.context() as fixture_patch:
+        fixture_patch.setattr(smoke, 'safe_index_files', initialize_skill_source)
+        engine, state = make_engine(root)
     engine.subagent_enabled = False
-    component = engine.workspace.root / 'src/Search.tsx'
-    component.write_text('export const Search = () => null;\n', encoding='utf-8')
-    engine.source['files']['src/Search.tsx'] = digest(component.read_bytes())
-    state.source_manifest = digest(engine.source)
-    state.repo_snapshot_ref = engine.put(state, engine.source)
     rule = Rule(id='skill-rule', name='页面状态规则', status='enabled', category=category,
         phases=['PREPARE', 'EXPLORE', 'DIAGNOSE'],
         scope={'url_patterns': url_patterns or []},
@@ -73,6 +79,21 @@ async def skill_engine(root, *, category='a11y', url_patterns=None):
     engine.store.save(state)
     engine.model = Gateway(key='fixture', vision_model='', max_retry_delay=0)
     return engine, state
+
+
+async def test_skill_engine_binds_complete_tracked_snapshot(tmp_path):
+    engine, state = await skill_engine(tmp_path)
+    source = copy.deepcopy(engine.source)
+    assert source['entries'] == file_manifest(engine.workspace.root)
+    assert source['entries']['src/Search.tsx']['tracked'] is True
+    assert source['entries']['src/Search.tsx']['git_mode'] == '100644'
+    assert source['files']['src/Search.tsx'] == digest(b'export const Search = () => null;\n')
+    assert engine.workspace.require_repository_snapshot() == source
+    engine.workspace.validate_repository(engine.scopes, engine.context, source)
+    assert engine.get(state, state.repo_snapshot_ref) == source
+    assert state.source_manifest == engine.runner.source == digest(source)
+    assert state.test_spec_hash == digest(engine.spec(state))
+    assert engine.source == source
 
 
 @pytest.mark.parametrize('category', ['a11y', 'visual'])

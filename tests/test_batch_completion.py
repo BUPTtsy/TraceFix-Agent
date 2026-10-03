@@ -460,18 +460,24 @@ async def test_persistence_profile_rejects_loss_of_uncomplete_behavior(tmp_path,
         return await original_command(kind)
 
     engine.runner.command = reset_scenario
-    engine.workspace.path('src/value.ts', write=True).write_bytes(
-        b'export const persisted = true;\n')
+    # 先从独立环境采样完成真实初始化，再冻结计划及候选补丁的证据绑定。
+    engine.runner.environment_digest = 'profile-regression-environment'
+    engine.store.save(state)
+    output = await engine.prepare(state, None)
+    state = RunState(**output['data'])
+    assert engine.runner.started and not engine.runner.closed
+    assert state.source_aligned and state.environment_digest == engine.runner.environment_digest
     state.execution_mode = 'batch'
     state.phase, state.validation_index = Phase.VERIFY, 4
-    state.reproduced = state.source_aligned = True
+    state.reproduced = True
     state.reproduction_plan_frozen = True
-    state.environment_digest = 'profile-regression-environment'
-    state.patch_hash = digest(engine.workspace.diff().encode())
     state.test_spec_ref = engine.put(state, spec.model_dump())
     state.test_spec_hash = digest(spec)
     replay_plan = [action.model_dump() for action in spec.regression_plan[:2]]
     state.replay_plan_ref = engine.put(state, replay_plan)
+    engine.workspace.path('src/value.ts', write=True).write_bytes(
+        b'export const persisted = true;\n')
+    state.patch_hash = digest(engine.workspace.diff().encode())
     replay_plan_hash = digest(replay_plan)
     binding = verification_binding(state, replay_plan_hash)
     for kind in ('static', 'unit', 'build', 'health'):

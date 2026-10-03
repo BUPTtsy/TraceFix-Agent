@@ -113,6 +113,12 @@ async def test_retries_are_excluded_before_patch_and_same_plan_verifies_persiste
 
 async def plan_engine(tmp_path, indices):
     engine, state = make_engine(tmp_path)
+    # 复现 fixture 也走真实初始化，源码清单和环境摘要均由生产流程验证。
+    engine.store.save(state)
+    output = await engine.prepare(state, None)
+    state = RunState(**output['data'])
+    assert engine.runner.started and not engine.runner.closed
+    assert state.source_aligned and state.environment_digest == engine.runner.environment_digest
     state.phase = Phase.REPRODUCE
     state.observation_ref = await engine.capture(state, await engine.browser.action(BrowserAction(kind='observe')))
     state.replay_plan_ref = engine.put(state, [action.model_dump() for action in exploration_actions()])
@@ -157,6 +163,11 @@ async def test_plan_cannot_be_reselected_after_patch(tmp_path):
 ])
 async def test_reproduction_counts_only_independent_failures(tmp_path, passes, confirmed):
     engine, state = make_engine(tmp_path)
+    engine.store.save(state)
+    output = await engine.prepare(state, None)
+    state = RunState(**output['data'])
+    assert engine.runner.started and not engine.runner.closed
+    assert state.source_aligned and state.environment_digest == engine.runner.environment_digest
     state.mode, state.phase = 'test', Phase.REPRODUCE
     state.reproduction_plan_frozen = True
     state.replay_plan_ref = engine.put(state, [])
@@ -175,14 +186,19 @@ async def test_verification_preserves_reload_and_checks_final_state(tmp_path, lo
     engine, state = make_engine(tmp_path)
     engine.browser = ToggleBrowser(engine.workspace)
     engine.browser.lose_on_reload = lose_on_reload
+    engine.store.save(state)
+    output = await engine.prepare(state, None)
+    state = RunState(**output['data'])
+    assert engine.runner.started and not engine.runner.closed
+    assert state.source_aligned and state.environment_digest == engine.runner.environment_digest
+    state.reproduction_plan_frozen = True
+    state.replay_plan_ref = engine.put(state, [action.model_dump() for action in exploration_actions()[:3]])
     proposal = PatchProposal(summary='修复接口', evidence_refs=['baseline.json'], edits=[FileEdit(
         path='src/value.ts', before_hash=digest(engine.workspace.read('src/value.ts').encode()),
         content='export const persisted = true;\n')])
     result = engine.workspace.apply(proposal)
     state.patch_hash = result['patch_hash']
     state.phase, state.validation_index = Phase.VERIFY, 4
-    state.reproduction_plan_frozen = True
-    state.replay_plan_ref = engine.put(state, [action.model_dump() for action in exploration_actions()[:3]])
     engine.store.save(state)
     while state.phase == Phase.VERIFY and state.validation_index == 4:
         output = await engine.verify(state, None)
@@ -196,9 +212,13 @@ async def test_verification_preserves_reload_and_checks_final_state(tmp_path, lo
 @pytest.mark.parametrize('invented_reference', [False, True])
 async def test_diagnose_reads_current_validation_and_checks_its_observation_refs(tmp_path, invented_reference):
     engine, state = make_engine(tmp_path)
+    engine.store.save(state)
+    output = await engine.prepare(state, None)
+    state = RunState(**output['data'])
+    assert engine.runner.started and not engine.runner.closed
+    assert state.source_aligned and state.environment_digest == engine.runner.environment_digest
     state.phase = Phase.DIAGNOSE
-    state.reproduced = state.source_aligned = True
-    state.environment_digest = await engine.runner.inspect_images()
+    state.reproduced = True
     plan = [BrowserAction(kind='observe').model_dump()]
     state.replay_plan_ref = engine.put(state, plan)
     state.reproduction_plan_frozen = True

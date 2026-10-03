@@ -129,6 +129,43 @@ async def test_approved_local_commit_and_finalize_keep_b12_verified(verified_eng
     assert report['behavior_scenarios'] == ['B12-round-trip']
 
 
+async def test_verification_rechecks_current_workspace_diff(verified_engine, monkeypatch):
+    engine, state = verified_engine
+    monkeypatch.setattr(engine.workspace, 'diff', lambda base='HEAD': 'changed after validation')
+    assert not engine.verification_passed(state)
+
+
+async def test_verification_rechecks_frozen_workspace(verified_engine, monkeypatch):
+    engine, state = verified_engine
+
+    def reject_workspace(snapshot):
+        raise PermissionError('workspace changed after validation')
+
+    monkeypatch.setattr(engine.workspace, 'check_frozen', reject_workspace)
+    assert not engine.verification_passed(state)
+
+
+async def test_verification_rechecks_current_environment_digest(verified_engine):
+    engine, state = verified_engine
+    engine.runner.actual_digest = 'different-environment'
+    assert not engine.verification_passed(state)
+
+
+async def test_runtime_verification_uses_this_sample_not_runner_cache(verified_engine):
+    engine, state = verified_engine
+    calls = []
+    engine.runner.actual_digest = 'stale-cache'
+
+    async def inspect_images(*, runtime=False):
+        assert runtime
+        calls.append('inspect')
+        return state.environment_digest
+
+    engine.runner.inspect_images = inspect_images
+    assert await engine.runtime_verification_passed(state)
+    assert calls == ['inspect']
+
+
 @pytest.mark.parametrize('kind', KINDS)
 async def test_failed_result_never_inherits_successful_wrapper(verified_engine, kind):
     engine, state = verified_engine
@@ -284,8 +321,9 @@ async def test_latest_failure_blocks_production_verify_instead_of_old_success(ve
     engine.store.save(state)
     output = await engine.verify(state, None)
     rejected = RunState(**output['data'])
-    assert rejected.phase == Phase.VERIFY and rejected.validation_index == 0
-    assert rejected.validation_refs == [] and rejected.error == '确定性验证门禁拒绝了该证据'
+    assert output['next_node'] == 'finalize' and rejected.phase == Phase.FINALIZE
+    assert rejected.outcome == Outcome.INFRA_FAILURE and rejected.validation_refs
+    assert rejected.error_details['terminal_reason'] == 'runtime_environment_gate_failed'
 
 
 @pytest.mark.parametrize('kind', ['static', 'unit', 'build', 'health'])

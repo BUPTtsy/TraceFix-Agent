@@ -1,11 +1,13 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from tracefix.config import Project
+from tracefix.config import Profile, Project
 from tracefix.cli.main import Session
 from tracefix.execution.repository import run_git, safe_commit, safe_index_files
+from tracefix.execution.platforms import bind_mount, container_user
 from tracefix.execution.runner import DockerRunner
 from tracefix.execution.workspace import Workspace
 from tracefix.knowledge.scope import ScopeResolver
@@ -313,18 +315,77 @@ async def test_runner_refuses_drift_before_any_docker_side_effect(tmp_path, chan
 async def test_runner_accepts_bound_export_and_allowed_continuation(tmp_path):
     root, scopes, ctx, workspace, snapshot = exported(tmp_path)
     calls = []
-    runner = DockerRunner(SimpleNamespace(image='fixture', port=3000, health_path='/health',
-                                         commands={'start': ['node', 'fixture']}),
-                          workspace, 'run_gate')
+    profile = Profile(project='app', source_commit='HEAD', image='fixture',
+        browser_image='fixture-browser:1.0', commands={'start': ['node', 'fixture'],
+            **{name: ['node', name] for name in ('reset', 'static', 'unit', 'build')}})
+    runner = DockerRunner(profile, workspace, 'run_gate')
+    source_manifest = digest(snapshot)
+    app_image_id, browser_image_id = 'sha256:' + 'a' * 64, 'sha256:' + 'b' * 64
+    image_call = ('image', 'inspect', profile.image, profile.browser_image)
+    network_call = ('network', 'create', '--internal', '--label',
+                    'tracefix.run=' + runner.run_id, runner.network)
+    start_call = ('run', '-d', '--name', runner.name, '--network', runner.network,
+        '--network-alias', 'app', '--label', 'tracefix.run=' + runner.run_id,
+        '--user', container_user(), '--cap-drop=ALL', '--security-opt=no-new-privileges',
+        '--pids-limit=128', '--memory=1g', '--cpus=2', '--read-only',
+        '--tmpfs', '/tmp:rw,nosuid,size=128m,mode=1777',
+        '--tmpfs', '/app/dist:rw,nosuid,size=128m,mode=1777',
+        '--mount', bind_mount(workspace.root),
+        '--mount', 'type=volume,dst=/app/node_modules,readonly',
+        '-e', 'NODE_PATH=/deps/node_modules', '-e', 'TRACEFIX_SOURCE=' + source_manifest,
+        app_image_id, *profile.commands['start'])
+    health_code = "let ok=false;for(let i=0;i<30;i++){try{const r=await fetch(process.argv[1]);if(r.ok){ok=true;break}}catch{}await new Promise(r=>setTimeout(r,500))}if(!ok)process.exit(1);console.log('健康检查通过')"
+    health_call = ('exec', runner.name, 'node', '--input-type=module', '-e', health_code,
+                   f'http://127.0.0.1:{profile.port}{profile.health_path}')
+    version_call = ('exec', runner.name, 'node', '--input-type=module', '-e',
+        "console.log(await (await fetch(process.argv[1])).text())",
+        f'http://127.0.0.1:{profile.port}{profile.version_path}')
+    runtime_call = ('container', 'inspect', runner.name, runner.name + '-browser')
+    outputs = {
+        image_call: json.dumps([{'Id': app_image_id}, {'Id': browser_image_id}]),
+        network_call: 'c' * 64,
+        start_call: 'd' * 64,
+        health_call: '健康检查通过\n',
+        version_call: json.dumps({'source_manifest': source_manifest}),
+        runtime_call: json.dumps([
+            {'Name': '/' + name, 'Id': container_id, 'Image': image_id,
+             'State': {'Running': True},
+             'Config': {'Image': image_id, 'Labels': {'tracefix.run': runner.run_id}},
+             'NetworkSettings': {'Networks': {runner.network: {'NetworkID': 'c' * 64}}},
+             'HostConfig': {'NetworkMode': runner.network}}
+            for name, container_id, image_id in (
+                (runner.name, 'd' * 64, app_image_id),
+                (runner.name + '-browser', 'e' * 64, browser_image_id))]),
+    }
+
     async def docker(*args, **kwargs):
+        workspace.check_frozen(snapshot)
         calls.append(args)
-        return {'passed': True}
+        # 未知调用立即失败，不能用通用成功响应吞掉错误的 Docker 参数。
+        assert args in outputs, f'非预期 Docker 调用：{args!r}'
+        assert kwargs == ({'check': False} if args == health_call else {})
+        return {'passed': True, 'exit_code': 0, 'output': outputs[args]}
+
     runner.docker = docker
-    assert (await runner.start(digest(snapshot)))['passed']
+    assert (await runner.start(source_manifest))['passed']
+    assert calls == [image_call, network_call, start_call, health_call]
+    environment_digest = digest({
+        'profile': profile.model_dump(), 'image_ids': [app_image_id, browser_image_id]})
+    assert runner.resolved_image_ids == {'app': app_image_id, 'browser': browser_image_id}
+    assert await runner.version() == source_manifest
+    assert await runner.inspect_images(runtime=True) == environment_digest
+    assert runner.actual_digest == environment_digest
     (workspace.root / 'src/value.ts').write_text('export const value = true;\n')
     workspace.validate_repository(scopes, ctx, snapshot, base_commit=workspace.head(),
                                    patch_hash=digest(workspace.diff().encode()))
-    assert (await runner.start(digest(snapshot)))['passed']
+    # 合法源码续跑仍绑定同一快照与固定镜像，不得重新解析可变 tag。
+    assert digest(snapshot) == source_manifest
+    assert (await runner.start(source_manifest))['passed']
+    assert await runner.version() == source_manifest
+    assert await runner.inspect_images(runtime=True) == environment_digest
+    assert calls == [image_call, network_call, start_call, health_call, version_call, runtime_call,
+                     network_call, start_call, health_call, version_call, runtime_call]
+    assert sum(args[:2] == ('image', 'inspect') for args in calls) == 1
     assert sum(args[:2] == ('network', 'create') for args in calls) == 2
 
 

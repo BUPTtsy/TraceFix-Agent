@@ -47,16 +47,21 @@ class BehaviorBrowser(FakeBrowser):
         return raw
 
 
-def verification_engine(tmp_path, failure=None):
+async def verification_engine(tmp_path, failure=None):
     engine, state = make_engine(tmp_path)
-    state.environment_digest = 'fake-ci-environment'
+    # 通过真实初始化采样并启动环境，不能用摘要缓存或手写启动状态冒充实时环境。
+    engine.store.save(state)
+    output = await engine.prepare(state, None)
+    state = RunState(**output['data'])
+    assert engine.runner.started and not engine.runner.closed
+    assert state.source_aligned and state.environment_digest == engine.runner.environment_digest
     spec = engine.spec(state).model_copy(update={'behavior_scenarios': [scenario()]})
     state.test_spec_ref = engine.put(state, spec.model_dump())
     state.test_spec_hash = digest(spec)
     state.reproduction_plan_frozen = True
     state.replay_plan_ref = engine.put(state, [step.action.model_dump() for step in scenario().steps[:2]])
     state.phase = Phase.VERIFY
-    state.reproduced = state.source_aligned = True
+    state.reproduced = True
     state.execution_mode = 'batch'
     proposal = PatchProposal(summary='有效或无效业务修复候选', evidence_refs=['baseline.json'], edits=[
         FileEdit(path='src/value.ts', before_hash=digest(engine.workspace.read('src/value.ts').encode()),
@@ -136,7 +141,7 @@ def test_invalid_behavior_specs_are_rejected(invalid):
 
 
 async def test_valid_round_trip_passes_all_six_gates_and_behavior_checkpoints(tmp_path):
-    engine, state = verification_engine(tmp_path)
+    engine, state = await verification_engine(tmp_path)
     state = await verify_until_transition(engine, state)
     assert state.outcome == Outcome.FIX_VERIFIED
     validations = [engine.get(state, ref) for ref in state.validation_refs]
@@ -147,8 +152,36 @@ async def test_valid_round_trip_passes_all_six_gates_and_behavior_checkpoints(tm
     assert gate(engine, state)
 
 
+@pytest.mark.parametrize('environment_change', ['stale-cache', 'drift', 'inspect-failure', 'closed'])
+async def test_behavior_verification_requires_independent_live_environment(tmp_path, environment_change):
+    engine, state = await verification_engine(tmp_path)
+    frozen_environment = state.environment_digest
+    frozen_plan = state.replay_plan_ref
+    inspect_calls = engine.runner.inspect_calls
+    if environment_change == 'stale-cache':
+        engine.runner.actual_digest = 'stale-cache'
+    elif environment_change == 'drift':
+        engine.runner.environment_digest = 'new-live-environment'
+    elif environment_change == 'inspect-failure':
+        engine.runner.inspect_results = [RuntimeError('实时环境不可读取')]
+    else:
+        await engine.runner.close()
+
+    state = await verify_until_transition(engine, state)
+    assert engine.runner.inspect_calls == inspect_calls + 1
+    assert state.environment_digest == frozen_environment
+    assert state.replay_plan_ref == frozen_plan and state.reproduction_plan_frozen
+    assert gate(engine, state)
+    if environment_change == 'stale-cache':
+        assert state.outcome == Outcome.FIX_VERIFIED
+        assert engine.runner.actual_digest == frozen_environment
+    else:
+        assert state.outcome == Outcome.INFRA_FAILURE
+        assert state.error_details['terminal_reason'] == 'runtime_environment_gate_failed'
+
+
 async def test_each_behavior_scenario_starts_from_an_independent_reset(tmp_path):
-    engine, state = verification_engine(tmp_path)
+    engine, state = await verification_engine(tmp_path)
     spec = engine.spec(state)
     spec.behavior_scenarios = [
         BehaviorScenario(id='forward', steps=[scenario().steps[0]]),
@@ -168,7 +201,7 @@ async def test_each_behavior_scenario_starts_from_an_independent_reset(tmp_path)
 
 @pytest.mark.parametrize('failure,step', [('no-forward', 1), ('no-reverse', 3), ('no-reverse-persistence', 4)])
 async def test_business_regression_cannot_be_hidden_by_final_state(tmp_path, failure, step):
-    engine, state = verification_engine(tmp_path, failure)
+    engine, state = await verification_engine(tmp_path, failure)
     state.validation_index = 6
     engine.store.save(state)
     state = await verify_until_transition(engine, state)
@@ -182,7 +215,7 @@ async def test_business_regression_cannot_be_hidden_by_final_state(tmp_path, fai
 
 
 async def test_one_way_patch_passes_original_but_fails_independent_round_trip(tmp_path):
-    engine, state = verification_engine(tmp_path, 'no-reverse')
+    engine, state = await verification_engine(tmp_path, 'no-reverse')
     state = await verify_until_transition(engine, state)
     values = [engine.get(state, ref) for ref in state.validation_refs]
     assert all(value['passed'] for value in values[:6])
@@ -195,7 +228,7 @@ async def test_one_way_patch_passes_original_but_fails_independent_round_trip(tm
                                   'reordered-steps', 'stale-validation', 'latest-failure', 'forged-pass',
                                   'wrong-observation-hash', 'wrong-action-hash'])
 async def test_incomplete_or_stale_behavior_evidence_rejects_fix(tmp_path, damage):
-    engine, state = verification_engine(tmp_path)
+    engine, state = await verification_engine(tmp_path)
     state = await verify_until_transition(engine, state)
     values = [Validation(**engine.get(state, ref)) for ref in state.validation_refs]
     result_ref = values[-1].artifact_ref
@@ -246,8 +279,8 @@ async def test_incomplete_or_stale_behavior_evidence_rejects_fix(tmp_path, damag
     assert not gate(engine, state, missing=missing, transform=transform, validations=values)
 
 
-def test_frozen_spec_and_post_patch_replay_cannot_be_replaced(tmp_path):
-    engine, state = verification_engine(tmp_path)
+async def test_frozen_spec_and_post_patch_replay_cannot_be_replaced(tmp_path):
+    engine, state = await verification_engine(tmp_path)
     for delta in [{'test_spec_hash': 'new'}, {'test_spec_ref': 'new.json'}, {'replay_plan_ref': 'new.json'},
                   {'reproduction_plan_frozen': False}, {'exploration_plan_ref': 'new.json'}]:
         with pytest.raises(ValueError):
@@ -261,7 +294,7 @@ def test_spec_cannot_be_frozen_for_the_first_time_after_patch():
 
 
 async def test_spec_and_plan_hash_changes_invalidate_behavior_verification(tmp_path):
-    engine, state = verification_engine(tmp_path)
+    engine, state = await verification_engine(tmp_path)
     state = await verify_until_transition(engine, state)
     for target in (state.test_spec_ref, state.replay_plan_ref):
         def transform(ref, value):
@@ -276,7 +309,7 @@ async def test_spec_and_plan_hash_changes_invalidate_behavior_verification(tmp_p
 
 
 async def test_spec_reader_is_required_when_a_frozen_spec_is_present(tmp_path):
-    engine, state = verification_engine(tmp_path)
+    engine, state = await verification_engine(tmp_path)
     state = await verify_until_transition(engine, state)
     values = [Validation(**engine.get(state, ref)) for ref in state.validation_refs]
     assert not verification_gate(state, values, lambda ref: engine.bundle_exists(state, ref))
@@ -298,7 +331,7 @@ async def test_legacy_spec_without_behavior_fields_keeps_original_six_gates(tmp_
 
 
 async def test_post_patch_unbound_replay_preserves_frozen_plan_and_finishes_inconclusive(tmp_path):
-    engine, state = verification_engine(tmp_path)
+    engine, state = await verification_engine(tmp_path)
     spec = engine.spec(state)
     spec.behavior_scenarios[0].steps[0].action.locator = Locator(role='button', name='Missing control')
     state.test_spec_ref = engine.put(state, spec.model_dump())
@@ -314,7 +347,7 @@ async def test_post_patch_unbound_replay_preserves_frozen_plan_and_finishes_inco
 
 
 async def test_finalization_rechecks_behavior_evidence(tmp_path):
-    engine, state = verification_engine(tmp_path)
+    engine, state = await verification_engine(tmp_path)
     state = await verify_until_transition(engine, state)
     validation = engine.get(state, state.validation_refs[-1])
     result = engine.get(state, validation['artifact_ref'])
@@ -330,7 +363,7 @@ async def test_finalization_rechecks_behavior_evidence(tmp_path):
 @pytest.mark.parametrize('damage', ['missing', 'corrupt', 'hash-mismatch'])
 @pytest.mark.parametrize('outcome', [Outcome.FIX_VERIFIED, Outcome.INFRA_FAILURE])
 async def test_finalization_exports_failure_report_when_frozen_spec_is_unavailable(tmp_path, damage, outcome):
-    engine, state = verification_engine(tmp_path)
+    engine, state = await verification_engine(tmp_path)
     state = await verify_until_transition(engine, state)
     expected_diff = engine.workspace.diff()
     spec_path = engine.artifacts.root / state.scope_id / state.run_id / state.test_spec_ref
