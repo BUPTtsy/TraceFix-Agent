@@ -157,7 +157,9 @@ def verify_evidence(state, artifacts, frozen_spec: Path, *, case: str) -> set[st
         raise RuntimeError("真实 E2E 的 Run 规范与源码修改前冻结的规范不一致")
     validations = [Validation.model_validate(artifact_read(reference))
                    for reference in state.validation_refs]
-    if not verification_gate(state, validations, artifact_exists, artifact_read=artifact_read):
+    if not verification_gate(state, validations, artifact_exists, artifact_read=artifact_read,
+                             artifact_read_bytes=lambda reference: artifacts.read(
+                                 state.scope_id, state.run_id, reference)):
         raise RuntimeError("真实 E2E 独立验证门禁拒绝：验证项、业务检查点或源码/补丁/规范绑定不完整")
     return {validation.kind for validation in validations if validation.passed}
 
