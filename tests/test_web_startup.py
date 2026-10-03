@@ -5,6 +5,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
+from packaging.tags import compatible_tags, cpython_tags
+from packaging.utils import canonicalize_name, parse_wheel_filename
 
 
 def load_tool(name):
@@ -68,6 +72,28 @@ def test_incompatible_modes_fail_before_startup(arguments):
     with pytest.raises(SystemExit) as error:
         module.main(arguments)
     assert error.value.code == 2
+
+
+def test_windows_wheelhouse_contains_every_locked_requirement():
+    root = Path(__file__).resolve().parents[1]
+    wheels = [parse_wheel_filename(path.name) for path in (root / 'vendor/wheels-win_amd64').glob('*.whl')]
+    supported = set(cpython_tags((3, 12), platforms=['win_amd64']))
+    supported.update(compatible_tags((3, 12), interpreter='cp312', platforms=['win_amd64']))
+    environment = {**default_environment(), 'sys_platform': 'win32', 'os_name': 'nt',
+        'platform_system': 'Windows', 'platform_machine': 'AMD64', 'python_version': '3.12',
+        'python_full_version': '3.12.0', 'platform_python_implementation': 'CPython',
+        'implementation_name': 'cpython', 'implementation_version': '3.12.0'}
+    missing = []
+    for line in (root / 'requirements.lock').read_text(encoding='utf-8').splitlines():
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        requirement = Requirement(line)
+        if requirement.marker and not requirement.marker.evaluate(environment):
+            continue
+        if not any(name == canonicalize_name(requirement.name) and version in requirement.specifier
+                   and tags & supported for name, version, build, tags in wheels):
+            missing.append(str(requirement))
+    assert not missing, f'Windows CPython 3.12 x64 离线 wheel 缺失：{missing}'
 
 
 def test_busy_port_is_rejected_without_starting_services():
