@@ -31,11 +31,13 @@ class ToolOperationUnknown(RuntimeError):
     status = 'UNKNOWN_OPERATION'
     category = 'tool_execution'
 
-    def __init__(self, message, *, call_id, name):
+    def __init__(self, message, *, call_id, name, operation_id=None):
         super().__init__(message)
         self.details = {'status': self.status, 'category': self.category,
                         'tool_call_id': call_id, 'tool_name': name,
                         'requires_manual_review': True, 'retryable': False}
+        if operation_id:
+            self.details['operation_id'] = operation_id
 
 
 def model_tool_name(name):
@@ -261,11 +263,12 @@ async def _resolve(value):
 class ToolPipeline:
     def __init__(self, registry, handlers: Mapping[str, Callable], phase, *, operation=None,
                  emit=None, store_artifact=None, count_tokens=None, scope_check=None,
-                 approve=None):
+                 approve=None, resource_resolver=None):
         self.registry, self.handlers, self.phase = registry, dict(handlers), Phase(phase)
         self.operation, self.emit, self.store_artifact = operation, emit, store_artifact
         self.count_tokens = count_tokens or estimate_tokens
         self.scope_check, self.approve = scope_check, approve
+        self.resource_resolver = resource_resolver
         self.submission_value = None
         self.completed_calls = {}
 
@@ -320,8 +323,12 @@ class ToolPipeline:
                 result = self._rejected(call, ToolRejected('工具审批或策略检查未通过'))
                 await self._event('tool.error', result.model_dump(mode='json', by_alias=True))
                 return result
-        intent = {'tool_name': call.name, 'tool_call_id': call.call_id,
-                  'arguments': call.arguments, 'side_effect': call.spec.side_effect}
+        arguments = (call.input.model_dump(mode='json')
+                     if isinstance(call.input, BaseModel) else call.input)
+        intent = {'tool_name': call.name,
+                  'arguments': arguments, 'side_effect': call.spec.side_effect}
+        if effect and self.resource_resolver:
+            intent['resources'] = self.resource_resolver(call.name, arguments)
 
         async def perform():
             try:
@@ -346,15 +353,17 @@ class ToolPipeline:
             await self._event('tool.started', {'tool_call_id': call.call_id, 'intent': intent})
         try:
             if effect:
+                await self._event('tool.requested', {'tool_call_id': call.call_id, 'intent': intent})
                 # operation 包装负责持久化执行意图及回执，不能绕过它直接写入。
                 key = call.spec.idempotency_key(call.input)
                 if not isinstance(key, str) or not key.strip():
                     raise ToolProtocolError('工具幂等键必须为非空字符串')
                 receipt = await self.operation(call.name, intent, perform,
-                                               idempotency_key=call.call_id + ':' + key)
+                                               idempotency_key=call.name + ':' + key)
             else:
                 receipt = await perform()
-            result = ToolResult.model_validate(receipt)
+            result = ToolResult.model_validate(receipt).model_copy(
+                update={'call_id': call.call_id, 'name': call.name})
         except Exception as error:
             await self._event('tool.error', {'tool_call_id': call.call_id, 'tool_name': call.name,
                               'error': sanitize(str(error)), 'side_effect': call.spec.side_effect})
@@ -365,7 +374,8 @@ class ToolPipeline:
             elif effect:
                 # 非确定拒绝的副作用失败可能已生效，转为未知操作等待人工复核。
                 raise ToolOperationUnknown('工具副作用结果未知：' + sanitize(str(error)),
-                                           call_id=call.call_id, name=call.name) from error
+                                           call_id=call.call_id, name=call.name,
+                                           operation_id=getattr(error, 'tracefix_operation_id', None)) from error
             if isinstance(error, (ValueError, PermissionError, FileNotFoundError, TimeoutError)):
                 result = self._rejected(call, error)
             else:

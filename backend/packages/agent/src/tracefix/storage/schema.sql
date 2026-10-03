@@ -12,8 +12,19 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE TABLE IF NOT EXISTS operations (
  id text PRIMARY KEY, run_id text NOT NULL, scope_id text NOT NULL,
- intent_hash text NOT NULL, status text NOT NULL, receipt jsonb
+ intent_hash text NOT NULL, status text NOT NULL, receipt jsonb,
+ resources jsonb, owner_token text, epoch text, resolution jsonb
 );
+ALTER TABLE operations ADD COLUMN IF NOT EXISTS resources jsonb;
+ALTER TABLE operations ADD COLUMN IF NOT EXISTS owner_token text;
+ALTER TABLE operations ADD COLUMN IF NOT EXISTS epoch text;
+ALTER TABLE operations ADD COLUMN IF NOT EXISTS resolution jsonb;
+UPDATE operations SET status='UNKNOWN', resources='["*"]'::jsonb
+ WHERE status='STARTED' AND owner_token IS NULL;
+UPDATE operations SET resources='["*"]'::jsonb
+ WHERE status <> 'DONE' AND (resources IS NULL OR resources='[]'::jsonb);
+CREATE INDEX IF NOT EXISTS operations_pending_scope ON operations(scope_id)
+ WHERE status <> 'DONE';
 CREATE TABLE IF NOT EXISTS memory_items (
  id text PRIMARY KEY, scope_id text NOT NULL, layer text NOT NULL,
  kind text NOT NULL, logical_key text NOT NULL, visibility text NOT NULL,

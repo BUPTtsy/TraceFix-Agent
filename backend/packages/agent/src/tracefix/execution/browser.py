@@ -39,6 +39,10 @@ def validate_spec_observation(spec, observation):
     locators = [check.locator for check in spec.assertions + spec.regression_assertions
                 if check.condition != 'absent']
     locators += [action.locator for action in spec.regression_plan if action.locator]
+    for scenario in spec.behavior_scenarios:
+        locators += [step.action.locator for step in scenario.steps if step.action.locator]
+        locators += [check.locator for step in scenario.steps for check in step.assertions
+                     if check.condition != 'absent']
     for locator in locators:
         same_role = [item for item in observed if item['role'] == locator.role]
         exact = [item for item in same_role if item['name'] == locator.name]
@@ -66,6 +70,9 @@ def assertions(snapshot, checks):
             passed = f'[{a.condition}]' in found[0]['attrs']
         elif passed and a.condition == 'enabled':
             passed = '[disabled]' not in found[0]['attrs']
+        elif passed and a.condition == 'unchecked':
+            passed = (found[0]['role'] in {'checkbox', 'radio', 'switch', 'menuitemcheckbox', 'menuitemradio'}
+                      and re.search(r'\[checked(?:[=\s][^\]]*)?\]', found[0]['attrs']) is None)
         results.append({'assertion': a.model_dump(), 'passed': passed, 'matches': len(found)})
     return {'passed': bool(results) and all(r['passed'] for r in results), 'assertions': results}
 

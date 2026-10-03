@@ -89,7 +89,7 @@ authorized_actions 是动作名称数组，只能选择 navigate、click、type�
 错误示例：["navigate to http://app:3000", "click the checkbox", "reload the page"]。
 必须包含流程必需的 navigate 和 finish，其余动作仅按用户目标所需选择。
 assertions 和 regression_assertions 不得为空；每项必须含 locator 与有效 condition。
-condition 只能是 visible、absent、checked、disabled、enabled；“完成状态保留”应验证 checked，不能仅验证 visible。
+condition 只能是 visible、absent、checked、unchecked、disabled、enabled；“完成状态保留”应验证 checked，不能仅验证 visible。
 使用 observation.snapshot 的真实 role 和完整 accessible name，不能只用任务标题猜测控件名称。
 例如页面为 checkbox "Complete Write project brief" 时，name 必须是 "Complete Write project brief"，
 不能写成 "Write project brief"，也不能把 Complete 翻译成中文。
@@ -97,6 +97,12 @@ condition 只能是 visible、absent、checked、disabled、enabled；“完成�
 regression_plan 是独立回归场景，其动作必须属于 authorized_actions；不要把原问题步骤简单复制成回归测试。
 冻结的重放动作 observation_id 和 element_ref 均为 null，运行时会从最新观测重新绑定。
 只读观察现有 heading/button 等也可作为独立回归，regression_plan 可以为空。
+behavior_scenarios 用于保留相关业务能力，每项含唯一 id、description、steps。
+每个 step 含 action 与 assertions，断言在该动作完成后立即执行；最后一步必须有断言，多步场景还必须有中间断言。
+对于可逆交互，覆盖正向操作、持久化检查、逆向操作及其持久化检查；必要时检查 enabled，防止禁用原功能来满足原问题断言。
+例如 checked 与 unchecked 分别表达勾选和取消勾选后的状态；不能只检查标题存在或场景最终状态。
+场景从独立重置后的环境执行，不能依赖探索阶段或上一场景遗留状态；不能使用 finish，动作必须在授权范围内。
+所有业务场景在修改代码前随 TestSpec 一起冻结，修补后不能增删场景、替换步骤或放宽断言。
 """
 
 PATCH = """

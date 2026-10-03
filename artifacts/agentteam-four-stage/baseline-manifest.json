@@ -1,0 +1,1503 @@
+{
+  "schema_version": 1,
+  "purpose": "阶段0既有未提交改动保护基线；不是验收完成证明或可逆工作区备份",
+  "captured_at_utc": "2026-10-03T03:12:35.9417796Z",
+  "captured_at_asia_shanghai": "2026-10-03T11:12:35.9417796+08:00",
+  "git_head": "373d74fcad6b580117a673f4abfaa98c4e8b6e52",
+  "git_branch": "main",
+  "staged_paths": [],
+  "hash_algorithm": "SHA256 of raw working-tree file bytes",
+  "diff_basis": "git diff --no-ext-diff --no-textconv --unified=0，沿用仓库现有换行归一化配置",
+  "snapshot_atomic": false,
+  "baseline_status": "needs_reconciliation",
+  "stage_zero_scope": "只创建/维护docs/agentteam-four-stage.md和本文件；不测试、不暂存、不提交、不修改其他文件",
+  "preexisting_path_count": 18,
+  "tracked_count": 11,
+  "untracked_count": 7,
+  "excluded_path_patterns": [
+    ".pytest*/**",
+    ".test-basetemp*/**",
+    "tracefix.pytest*/**",
+    "tracefix.tmp-retry*/**",
+    "**/.env*"
+  ],
+  "secrets_policy": "不读取或记录.env文件、密钥和原始请求内容；仅保存路径、hash、Git元数据和非敏感摘要。",
+  "observed_drift": [
+    {
+      "path": "backend/packages/agent/src/tracefix/runtime/tools.py",
+      "first_observed_sha256": "cca030867582b8633ebf539f057bef8a6bd6cd4927d2234165ace4f3f62c5a27",
+      "baseline_sha256": "b8ea13b9b682107a4ca13d61670b3bddd2f9964f885cb8a48fe492cac37e570e",
+      "resolution": "unresolved",
+      "observed_by": "文档Worker只读扫描；来源未核验，不推断变更作者或归属"
+    },
+    {
+      "path": "ARCHITECTURE_REVIEW_SUMMARY.md",
+      "first_observed_sha256": "d276eb3374a97b58e5c4890ab53cf3c4d79c75fb496e90021d4bf1aeb0094c6f",
+      "baseline_sha256": "994e75f298db9131bb2ba7a413bc721aae566def929e74ea01592496b7363bc6",
+      "resolution": "unresolved",
+      "observed_by": "文档Worker只读扫描；来源未核验，不推断变更作者或归属"
+    },
+    {
+      "path": "tests/test_architecture_repairs.py",
+      "first_observed_sha256": "220ba0605d8151c6c53621c92d04756eb462ac9206b0c9b084b941228d1ee734",
+      "baseline_sha256": "d329fca894a4eb77ee459f918f967183f1844be12e83df891a7e726d0e83ee5c",
+      "resolution": "unresolved",
+      "observed_by": "文档Worker只读扫描；来源未核验，不推断变更作者或归属"
+    }
+  ],
+  "entries": [
+    {
+      "path": ".gitignore",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": true,
+      "status_code": " M",
+      "size_bytes": 940,
+      "sha256": "892207bdb93e9f89762f00a491bd2f726f17baf6cf9b76b5cb3518f59f4a3567",
+      "git_head_blob_oid": "d0848a98d3383091112508b17c2683fff8dc81e4",
+      "git_index_blob_oid": "d0848a98d3383091112508b17c2683fff8dc81e4",
+      "git_index_mode": "100644",
+      "diff_additions": 1,
+      "diff_deletions": 0,
+      "hunk_ranges": [
+        "@@ -24,0 +25 @@"
+      ],
+      "hunk_summary": "已有忽略规则变动：1行新增；未检查新增规则语义。"
+    },
+    {
+      "path": "backend/apps/console-api/server/index.mjs",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": true,
+      "status_code": " M",
+      "size_bytes": 22376,
+      "sha256": "280c10d41df09edad45dd168c6af6089df4e3216f5e4e475572f73e8789c8deb",
+      "git_head_blob_oid": "488f2cedd16d9547af38c4cc6037a38baed4f9d7",
+      "git_index_blob_oid": "488f2cedd16d9547af38c4cc6037a38baed4f9d7",
+      "git_index_mode": "100644",
+      "diff_additions": 48,
+      "diff_deletions": 43,
+      "hunk_ranges": [
+        "@@ -9,0 +10,2 @@",
+        "@@ -10,0 +13 @@",
+        "@@ -90 +93 @@",
+        "@@ -92,0 +96,2 @@",
+        "@@ -97,0 +103 @@",
+        "@@ -110,3 +116,8 @@",
+        "@@ -121,4 +132,4 @@",
+        "@@ -126 +137,4 @@",
+        "@@ -128 +142 @@",
+        "@@ -130 +144 @@",
+        "@@ -133,6 +146,0 @@",
+        "@@ -140,24 +148,9 @@",
+        "@@ -176,0 +170,10 @@",
+        "@@ -251 +254,3 @@",
+        "@@ -290 +295 @@"
+      ],
+      "hunk_summary": "已有聊天代理与审计、进程停止/生命周期、guidance路由改动，15个hunk；属于基线，不归入阶段2。"
+    },
+    {
+      "path": "backend/packages/agent/src/tracefix/knowledge/assembler.py",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": true,
+      "status_code": " M",
+      "size_bytes": 14062,
+      "sha256": "4bc80cb4688adbf7459321f1d034062651e80ef56cec6ad7f2a1bd8e12d78d35",
+      "git_head_blob_oid": "9fd04490841f4c2737e5bb29a3878ccb78f22d21",
+      "git_index_blob_oid": "9fd04490841f4c2737e5bb29a3878ccb78f22d21",
+      "git_index_mode": "100644",
+      "diff_additions": 28,
+      "diff_deletions": 5,
+      "hunk_ranges": [
+        "@@ -72,0 +73,7 @@",
+        "@@ -84,5 +91 @@",
+        "@@ -213,0 +217,20 @@"
+      ],
+      "hunk_summary": "已有递归失败事实判定及裁剪前诊断/工作记忆事实保护改动，3个hunk。"
+    },
+    {
+      "path": "backend/packages/agent/src/tracefix/knowledge/context.py",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": true,
+      "status_code": " M",
+      "size_bytes": 11629,
+      "sha256": "57555bb704aa0432db49ec95ab504092ca885e41eb0f7b6f7b055d39aab4a317",
+      "git_head_blob_oid": "62ffe2fa9801c66109b24d3e804729b0f071c497",
+      "git_index_blob_oid": "62ffe2fa9801c66109b24d3e804729b0f071c497",
+      "git_index_mode": "100644",
+      "diff_additions": 4,
+      "diff_deletions": 1,
+      "hunk_ranges": [
+        "@@ -11,0 +12 @@",
+        "@@ -44 +45,3 @@"
+      ],
+      "hunk_summary": "build_context附近及导入区共2个hunk；仅核对范围，未通读正文。"
+    },
+    {
+      "path": "backend/packages/agent/src/tracefix/knowledge/memory.py",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": true,
+      "status_code": " M",
+      "size_bytes": 14801,
+      "sha256": "5f277051fd4ad71de7350eeabe1f412f34fbae68f47fa0fb6882a1f6d43d1fb2",
+      "git_head_blob_oid": "205da2bf38fbb49272bb870782235d01708b2466",
+      "git_index_blob_oid": "205da2bf38fbb49272bb870782235d01708b2466",
+      "git_index_mode": "100644",
+      "diff_additions": 2,
+      "diff_deletions": 1,
+      "hunk_ranges": [
+        "@@ -143 +143,2 @@"
+      ],
+      "hunk_summary": "MemoryLibrary附近1个hunk；仅核对范围，未推断功能完成。"
+    },
+    {
+      "path": "backend/packages/agent/src/tracefix/model/chat.py",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": true,
+      "status_code": " M",
+      "size_bytes": 6798,
+      "sha256": "d47407304081a9e74a793f2f29290332624f055739018768582ee6caeae73c4b",
+      "git_head_blob_oid": "650aab324ff2d5ecb6d4b99fca29201f25f83108",
+      "git_index_blob_oid": "650aab324ff2d5ecb6d4b99fca29201f25f83108",
+      "git_index_mode": "100644",
+      "diff_additions": 65,
+      "diff_deletions": 8,
+      "hunk_ranges": [
+        "@@ -1 +1 @@",
+        "@@ -3,0 +4,4 @@",
+        "@@ -24,0 +29 @@",
+        "@@ -37,5 +42,35 @@",
+        "@@ -50,0 +86,3 @@",
+        "@@ -54,2 +92,4 @@",
+        "@@ -58,0 +99,2 @@",
+        "@@ -59,0 +102,13 @@",
+        "@@ -61,0 +117 @@",
+        "@@ -62,0 +119 @@"
+      ],
+      "hunk_summary": "已有流式聊天、请求/响应审计、thinking及usage、完整结束判定相关改动，10个hunk；正文差异输出有截断，不宣称完整审查。"
+    },
+    {
+      "path": "backend/packages/agent/src/tracefix/runtime/continuation.py",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": true,
+      "status_code": " M",
+      "size_bytes": 4862,
+      "sha256": "cd5b4a5becb0c2663a619724f04c068e26a613856f9027246f736a233a14a4c4",
+      "git_head_blob_oid": "d60e060da8f41b686a8dd700da3e18340bb233d7",
+      "git_index_blob_oid": "d60e060da8f41b686a8dd700da3e18340bb233d7",
+      "git_index_mode": "100644",
+      "diff_additions": 10,
+      "diff_deletions": 0,
+      "hunk_ranges": [
+        "@@ -20,0 +21,3 @@",
+        "@@ -84,0 +88,7 @@"
+      ],
+      "hunk_summary": "continuation_state与derive_run附近2个新增hunk；本次输出有截断，摘要仅采用范围。"
+    },
+    {
+      "path": "backend/packages/agent/src/tracefix/runtime/engine.py",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": true,
+      "status_code": " M",
+      "size_bytes": 108608,
+      "sha256": "6a51e8915c3d824ffca8be4d7d66e0686842adfefa1c7d82d5e58dcb95506dd5",
+      "git_head_blob_oid": "1e515a7fbe395f989a1c2c75bbc12c81df6751b5",
+      "git_index_blob_oid": "1e515a7fbe395f989a1c2c75bbc12c81df6751b5",
+      "git_index_mode": "100644",
+      "diff_additions": 1,
+      "diff_deletions": 1,
+      "hunk_ranges": [
+        "@@ -1758 +1758 @@"
+      ],
+      "hunk_summary": "标准Git归一化差异为1758行GraphRecursionError条件变更；工作树混合LF/CRLF，原始字节差异可能放大。"
+    },
+    {
+      "path": "backend/packages/agent/src/tracefix/runtime/tools.py",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": true,
+      "status_code": " M",
+      "size_bytes": 22190,
+      "sha256": "b8ea13b9b682107a4ca13d61670b3bddd2f9964f885cb8a48fe492cac37e570e",
+      "git_head_blob_oid": "9868ddc54be361f6d7233dd54b966d06e8ec3c19",
+      "git_index_blob_oid": "9868ddc54be361f6d7233dd54b966d06e8ec3c19",
+      "git_index_mode": "100644",
+      "diff_additions": 8,
+      "diff_deletions": 4,
+      "hunk_ranges": [
+        "@@ -323,2 +323,4 @@",
+        "@@ -348,0 +351 @@",
+        "@@ -354 +357 @@",
+        "@@ -357 +360,2 @@"
+      ],
+      "hunk_summary": "已有最终输入归一化、intent移除call_id、tool.requested事件、按工具名构造幂等key及回执call_id绑定；扫描间继续变化，归属待核。"
+    },
+    {
+      "path": "tests/test_batch_completion.py",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": true,
+      "status_code": " M",
+      "size_bytes": 19411,
+      "sha256": "b6289b6fc09bb0270f493e8befc78b6df1956423b4c42f29b40762380a772e95",
+      "git_head_blob_oid": "e8461aba6f6ccabf8194e8bd3b4bd2011e344b66",
+      "git_index_blob_oid": "e8461aba6f6ccabf8194e8bd3b4bd2011e344b66",
+      "git_index_mode": "100644",
+      "diff_additions": 3,
+      "diff_deletions": 2,
+      "hunk_ranges": [
+        "@@ -163 +163,2 @@",
+        "@@ -165 +166 @@"
+      ],
+      "hunk_summary": "两处已有批处理上下文/递归异常测试修改；仅核对hunk范围，未运行。"
+    },
+    {
+      "path": "tests/test_gateway_streaming.py",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": true,
+      "status_code": " M",
+      "size_bytes": 14120,
+      "sha256": "9cfdec1f7cbf3945b24acfc98bf4679c39d0eb4ed6b5d4d24979e562a5b9156c",
+      "git_head_blob_oid": "5c1e5c813ecc39171db46fa577874f28a4786cd7",
+      "git_index_blob_oid": "5c1e5c813ecc39171db46fa577874f28a4786cd7",
+      "git_index_mode": "100644",
+      "diff_additions": 29,
+      "diff_deletions": 0,
+      "hunk_ranges": [
+        "@@ -8,0 +9 @@",
+        "@@ -73,0 +75,28 @@"
+      ],
+      "hunk_summary": "已有_chat_events导入和流式响应结束/异常测试，2个hunk；未运行。"
+    },
+    {
+      "path": ".cleanup-manifest.txt",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": false,
+      "status_code": "??",
+      "size_bytes": 8000,
+      "sha256": "9db604b528f754ca93929209c9b90b9695e98d539f2ac4bbc4e3d4439f6a3cfa",
+      "git_head_blob_oid": null,
+      "git_index_blob_oid": null,
+      "git_index_mode": null,
+      "diff_additions": null,
+      "diff_deletions": null,
+      "hunk_ranges": [],
+      "hunk_summary": "既有未跟踪文件，仅采集路径/大小/hash；没有相对于HEAD的Git hunk，整个现有文件均属于基线，未读取正文。"
+    },
+    {
+      "path": ".tmp-m0-real-e2e-skip.json",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": false,
+      "status_code": "??",
+      "size_bytes": 289,
+      "sha256": "0e18e42d560cba64a6873b198dc5d73168731f3d05d424754a4c17b794c347cb",
+      "git_head_blob_oid": null,
+      "git_index_blob_oid": null,
+      "git_index_mode": null,
+      "diff_additions": null,
+      "diff_deletions": null,
+      "hunk_ranges": [],
+      "hunk_summary": "既有未跟踪文件，仅采集路径/大小/hash；没有相对于HEAD的Git hunk，整个现有文件均属于基线，未读取正文。"
+    },
+    {
+      "path": "ARCHITECTURE_REVIEW_SUMMARY.md",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": false,
+      "status_code": "??",
+      "size_bytes": 34303,
+      "sha256": "994e75f298db9131bb2ba7a413bc721aae566def929e74ea01592496b7363bc6",
+      "git_head_blob_oid": null,
+      "git_index_blob_oid": null,
+      "git_index_mode": null,
+      "diff_additions": null,
+      "diff_deletions": null,
+      "hunk_ranges": [],
+      "hunk_summary": "既有未跟踪文件，仅采集路径/大小/hash；没有相对于HEAD的Git hunk，整个现有文件均属于基线，未读取正文。"
+    },
+    {
+      "path": "backend/apps/console-api/server/chat-completion.mjs",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": false,
+      "status_code": "??",
+      "size_bytes": 13563,
+      "sha256": "95ae359292246dea99ec85e55e8e0d920cbfe21785a1227ec0e59a354bc873ec",
+      "git_head_blob_oid": null,
+      "git_index_blob_oid": null,
+      "git_index_mode": null,
+      "diff_additions": null,
+      "diff_deletions": null,
+      "hunk_ranges": [],
+      "hunk_summary": "既有未跟踪文件，仅采集路径/大小/hash；没有相对于HEAD的Git hunk，整个现有文件均属于基线，未读取正文。"
+    },
+    {
+      "path": "backend/apps/console-api/server/chat-project.mjs",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": false,
+      "status_code": "??",
+      "size_bytes": 12726,
+      "sha256": "604d7cab4a995816f49539c4946071a69aa019398f9d3aa67f54df8a16c890d3",
+      "git_head_blob_oid": null,
+      "git_index_blob_oid": null,
+      "git_index_mode": null,
+      "diff_additions": null,
+      "diff_deletions": null,
+      "hunk_ranges": [],
+      "hunk_summary": "既有未跟踪文件，仅采集路径/大小/hash；没有相对于HEAD的Git hunk，整个现有文件均属于基线，未读取正文。"
+    },
+    {
+      "path": "tests/test_architecture_repairs.py",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": false,
+      "status_code": "??",
+      "size_bytes": 5645,
+      "sha256": "d329fca894a4eb77ee459f918f967183f1844be12e83df891a7e726d0e83ee5c",
+      "git_head_blob_oid": null,
+      "git_index_blob_oid": null,
+      "git_index_mode": null,
+      "diff_additions": null,
+      "diff_deletions": null,
+      "hunk_ranges": [],
+      "hunk_summary": "既有未跟踪文件，仅采集路径/大小/hash；没有相对于HEAD的Git hunk，整个现有文件均属于基线，未读取正文。"
+    },
+    {
+      "path": "tools/maintenance/commit-web-startup.ps1",
+      "ownership": "preexisting_excluded_from_stage_commits",
+      "tracked": false,
+      "status_code": "??",
+      "size_bytes": 1620,
+      "sha256": "6fb11e789645051b8d5f51ca31505a3b394297688ea2f52f621147ae1d2a1907",
+      "git_head_blob_oid": null,
+      "git_index_blob_oid": null,
+      "git_index_mode": null,
+      "diff_additions": null,
+      "diff_deletions": null,
+      "hunk_ranges": [],
+      "hunk_summary": "既有未跟踪文件，仅采集路径/大小/hash；没有相对于HEAD的Git hunk，整个现有文件均属于基线，未读取正文。"
+    }
+  ],
+  "artifact_ignore_rules": {
+    "docs/agentteam-four-stage.md": ".gitignore:14 docs/*",
+    "artifacts/agentteam-four-stage/baseline-manifest.json": ".gitignore:20 artifacts/"
+  },
+  "requirements_count": 42,
+  "common_requirements": [
+    {
+      "id": "C01",
+      "requirement": "主Agent负责调度、统计、复核和提交，实际代码由子Agent修改；子Agent按用户要求使用最新模型最高推理等级。",
+      "gate": "记录每项改动的执行Worker及模型配置；主Agent独立核对diff、测试结果和交付证据。",
+      "status": "not_started",
+      "evidence": []
+    },
+    {
+      "id": "C02",
+      "requirement": "四阶段严格顺序执行，每阶段修改、验证、测试通过并完成本地commit后才启动下一阶段。",
+      "gate": "上一阶段全部需求有充分证据、测试无未解释失败、commit SHA可查；规划或工作树中的通过结果不能代替提交验收。",
+      "status": "not_started",
+      "evidence": []
+    },
+    {
+      "id": "C03",
+      "requirement": "仅本地commit，不push，不擅自新建branch。",
+      "gate": "提交留在当前main分支；记录父提交和阶段提交；无远程发布动作。",
+      "status": "not_started",
+      "evidence": []
+    },
+    {
+      "id": "C04",
+      "requirement": "保护基线全部既有改动，阶段提交不得混入原有hunk或未跟踪文件。",
+      "gate": "按路径及hunk审查暂存差异，确认提交只含本阶段授权增量；重叠hunk、来源漂移和依赖未厘清时禁止提交。",
+      "status": "not_started",
+      "evidence": []
+    },
+    {
+      "id": "C05",
+      "requirement": "保留现有无Run硬总量上限设计。",
+      "gate": "可观测tokens、费用、队列和耗时；不得未经另行决策引入Run级调用、token、费用或任务总数硬上限。",
+      "status": "not_started",
+      "evidence": []
+    },
+    {
+      "id": "C06",
+      "requirement": "复用已有阶段、证据、源码版本、作用域和副作用控制。",
+      "gate": "新增接口、插件和Worker不可绕开确定性授权、审批、回执和验证门禁；角色名不授予能力。",
+      "status": "not_started",
+      "evidence": []
+    },
+    {
+      "id": "C07",
+      "requirement": "证据如实分级，缺失、跳过、模拟及基础设施失败不得写为实测成功。",
+      "gate": "每项证据记录执行命令、退出码、源码/环境标识、产物及局限；provider usage、真实GUI和付费模型成绩只引用真实产物。",
+      "status": "not_started",
+      "evidence": []
+    },
+    {
+      "id": "C08",
+      "requirement": "阶段0仅建立两个指定文件；不改生产/测试代码，不运行测试，不git add/commit，不递归派Agent。",
+      "gate": "本Worker只使用apply_patch维护台账与manifest；阶段0初次登记不代表测试或实施完成，后续仅依据实际证据更新状态。",
+      "status": "not_started",
+      "evidence": []
+    }
+  ],
+  "stages": [
+    {
+      "number": 1,
+      "title": "业务不变量、正确复现序列与独立回归",
+      "status": "in_progress",
+      "requirements": [
+        {
+          "id": "S1-01",
+          "requirement": "建立任务适用的业务不变量和必须保留的正常能力，将其绑定目标及源码版本。",
+          "gate": "覆盖正常、逆向、刷新后持久化和相邻功能；不能以禁用原功能满足正向断言。",
+          "status": "implemented_reported_not_accepted",
+          "evidence": [
+            "stage1-parent-final-nine-file-suite"
+          ],
+          "accepted": false
+        },
+        {
+          "id": "S1-02",
+          "requirement": "从探索轨迹提取表达真实目标的复现序列，排除调查失败和重试后独立确认并冻结。",
+          "gate": "错误或不可重放序列不进入可修复结论；确认后的序列、状态前置条件及hash可追溯。",
+          "status": "implemented_reported_not_accepted",
+          "evidence": [
+            "stage1-parent-final-nine-file-suite"
+          ],
+          "accepted": false
+        },
+        {
+          "id": "S1-03",
+          "requirement": "对冻结序列做独立重放并校验环境、源码和TestSpec。",
+          "gate": "复现不成立或前置条件变化时重新诊断/明确INCONCLUSIVE；不得靠修改业务行为让错误计划可执行。",
+          "status": "implemented_reported_not_accepted",
+          "evidence": [
+            "stage1-parent-final-nine-file-suite"
+          ],
+          "accepted": false
+        },
+        {
+          "id": "S1-04",
+          "requirement": "加入B01历史无效补丁负例，明确拒绝删除或停用取消完成功能的补丁。",
+          "gate": "旧无效补丁不能FIX_VERIFIED；有效修复通过完成→刷新→取消完成→刷新→筛选，并保存对应真实证据或明确未实测。",
+          "status": "implemented_reported_not_accepted",
+          "evidence": [
+            "stage1-b01-local-browser-source-oracle",
+            "stage1-parent-final-nine-file-suite"
+          ],
+          "accepted": false
+        },
+        {
+          "id": "S1-05",
+          "requirement": "原问题验证和独立业务回归均纳入验收。",
+          "gate": "正向、逆向及不变量回归均覆盖；缺失、失败或过期证据阻止成功结论。",
+          "status": "implemented_reported_not_accepted",
+          "evidence": [
+            "stage1-parent-final-nine-file-suite"
+          ],
+          "accepted": false
+        },
+        {
+          "id": "S1-06",
+          "requirement": "独立最终Oracle与修复反馈分离。",
+          "gate": "最终评分不被同题循环调试和经验学习污染；明确开发回归与held-out评分边界。",
+          "status": "implemented_reported_not_accepted",
+          "evidence": [
+            "stage1-parent-final-nine-file-suite"
+          ],
+          "accepted": false
+        },
+        {
+          "id": "S1-07",
+          "requirement": "成功门禁消费匹配当前补丁的业务证据并保留原六类验证约束。",
+          "gate": "缺失不变量、旧hash、错误环境或无效artifact均拒绝；有效正例及历史负例同时成立。",
+          "status": "implemented_reported_not_accepted",
+          "evidence": [
+            "stage1-parent-final-nine-file-suite"
+          ],
+          "accepted": false
+        }
+      ],
+      "delivery": {
+        "worker": [
+          "runtimeWorker",
+          "checkerWorker"
+        ],
+        "model": null,
+        "reasoning_level": null,
+        "baseline_head": "373d74fcad6b580117a673f4abfaa98c4e8b6e52",
+        "changed_paths": [
+          "backend/packages/agent/src/tracefix/runtime/contracts.py",
+          "backend/packages/agent/src/tracefix/runtime/engine.py",
+          "backend/packages/agent/src/tracefix/execution/browser.py",
+          "backend/packages/agent/src/tracefix/model/prompts.py",
+          "tests/test_behavior_invariants.py",
+          "profiles/persistence.spec.json",
+          "evals/oracle.mjs",
+          "tools/checks/verify_real_e2e.py",
+          "tools/checks/verify_b01_behavior_ui.mjs",
+          "tests/test_behavior_checker.py",
+          "tests/test_batch_checker.py",
+          "tests/test_real_e2e_cleanup.py"
+        ],
+        "test_commands": [
+          "定向9文件回归（精确命令由主Agent掌握）",
+          "两个独立persistence fixture回归（精确命令由主Agent掌握）",
+          "node tools/checks/verify_b01_behavior_ui.mjs"
+        ],
+        "test_exit_codes": [
+          {
+            "command": "定向9文件回归（精确命令由主Agent掌握）",
+            "exit_code": null,
+            "reported": "173 passed / 0 failed"
+          },
+          {
+            "command": "两个独立persistence fixture回归（精确命令由主Agent掌握）",
+            "exit_code": null,
+            "reported": "2 passed"
+          },
+          {
+            "command": "node tools/checks/verify_b01_behavior_ui.mjs",
+            "exit_code": 0
+          },
+          {
+            "command": null,
+            "mode": "collect-only",
+            "exit_code": 2
+          }
+        ],
+        "test_artifacts": [
+          {
+            "id": "stage1-parent-final-nine-file-suite",
+            "path": ".tracefix/agentteam-stage1-final-20261003.xml",
+            "sha256": "77a3ff2233187818e372a242c7bb4ad9a25c5498908164f2889e4bf2ad26b6d0"
+          },
+          {
+            "id": "stage1-b01-local-browser-source-oracle",
+            "path": ".tracefix/b01-behavior-0lEsnt/report.json",
+            "sha256": "1accfe6b476ddad9cf349a678dabf343e7ad43d4bd5608f73eb17ec3806cc4ec"
+          }
+        ],
+        "reviewer": "主Agent",
+        "review_result": "当前定向9文件回归报告173 passed/0 failed，两个独立persistence fixture报告2 passed；旧172 passed/2 failed记录保留为历史失败。contracts.py、engine.py、test_batch_completion.py含外来或混合hunk，workspace.py无可安全暂存hunk，当前没有稳定可提交快照；阶段1提交门禁未通过。",
+        "staged_diff_review": "index为空；browser/prompts/profile/oracle/checker及新增行为测试可归入stage1，contracts/engine/test_batch_completion.py只能精确hunk暂存，workspace.py无可安全暂存hunk；未暂存、未提交",
+        "commit_sha": null,
+        "parent_commit_sha": null,
+        "completed_at": null
+      },
+      "assignments": [
+        {
+          "worker": "runtimeWorker",
+          "scope": [
+            "contracts",
+            "engine",
+            "browser",
+            "prompts",
+            "新tests_behavior_invariants"
+          ],
+          "status": "implementation_reported_source_writes_stopped",
+          "requirements": [
+            "S1-01",
+            "S1-02",
+            "S1-03",
+            "S1-07"
+          ]
+        },
+        {
+          "worker": "checkerWorker",
+          "scope": [
+            "profile",
+            "evals/oracle",
+            "verify_real_e2e",
+            "新verify_b01_behavior_ui",
+            "新tests_behavior_checker"
+          ],
+          "status": "implementation_reported_source_writes_stopped",
+          "requirements": [
+            "S1-04",
+            "S1-05",
+            "S1-06"
+          ]
+        }
+      ],
+      "commit_gate_status": "not_passed",
+      "hunk_audit": {
+        "status": "reported_not_accepted",
+        "source": "本轮只读hunk审计结论；本Worker未修改源码、未暂存、未提交",
+        "safe_stage1_hunks": [
+          "backend/packages/agent/src/tracefix/execution/browser.py",
+          "backend/packages/agent/src/tracefix/model/prompts.py",
+          "profiles/persistence.spec.json",
+          "evals/oracle.mjs",
+          "tools/checks/verify_real_e2e.py",
+          "tools/checks/verify_b01_behavior_ui.mjs",
+          "tests/test_behavior_checker.py",
+          "tests/test_behavior_invariants.py",
+          "tests/test_batch_checker.py",
+          "tests/test_real_e2e_cleanup.py"
+        ],
+        "exact_hunk_only": [
+          "backend/packages/agent/src/tracefix/runtime/contracts.py",
+          "backend/packages/agent/src/tracefix/runtime/engine.py",
+          "tests/test_batch_completion.py"
+        ],
+        "unsafe_to_stage": [
+          "backend/packages/agent/src/tracefix/execution/workspace.py"
+        ],
+        "conclusion": "browser/prompts/profile/oracle/checker及新增行为测试可归入stage1；contracts/engine/test_batch_completion只能按精确hunk暂存；workspace.py无可安全暂存hunk；阶段1仍未通过提交门禁"
+      },
+      "blockers": [
+        "父级最终9文件suite仍2失败，旧profile fixture与新behavior场景/断言数不匹配；不能标全绿",
+        "全量collect-only 699 collected/1error，configured_worker_model缺失，exit2；既有14fail也无通过证据",
+        "测试期间外来源码修改导致输出行号漂移；当前混合树没有稳定快照验收",
+        "同工作区外来改动所有权及contracts/engine重叠hunk待用户协调",
+        "既有基线失败修复授权待用户答复；仅args.spec两份fixture已获额外授权",
+        "用户旧GraphRecursionError及其他外来改动不得混入commit",
+        "本地源码浏览器正负例不是付费模型+Docker+MCP完整闭环"
+      ],
+      "implementation_status": "implemented_reported_pending_acceptance",
+      "source_write_status": "stopped_by_main_agent_pending_coordination",
+      "implemented_files": [
+        {
+          "path": "backend/packages/agent/src/tracefix/runtime/contracts.py",
+          "worker": "runtimeWorker",
+          "work": "schema及业务证据gate",
+          "overlap": "外来patch_base_commit字段及校验与本组scope重叠，待hunk归属协调",
+          "implementation_source": "主Agent报告及已授权scope映射；本Worker只读确认路径存在，未作源码独立验收",
+          "exists_observed": true,
+          "commit_eligible": false
+        },
+        {
+          "path": "backend/packages/agent/src/tracefix/runtime/engine.py",
+          "worker": "runtimeWorker",
+          "work": "业务证据gate、checkpoint observation断言复核",
+          "overlap": "保留用户旧GraphRecursionError修复；外来patch_base_commit/diff(base)与本组scope重叠",
+          "implementation_source": "主Agent报告及已授权scope映射；本Worker只读确认路径存在，未作源码独立验收",
+          "exists_observed": true,
+          "commit_eligible": false
+        },
+        {
+          "path": "backend/packages/agent/src/tracefix/execution/browser.py",
+          "worker": "runtimeWorker",
+          "work": "浏览器observation及行为证据支持",
+          "implementation_source": "主Agent报告及已授权scope映射；本Worker只读确认路径存在，未作源码独立验收",
+          "exists_observed": true,
+          "commit_eligible": false
+        },
+        {
+          "path": "backend/packages/agent/src/tracefix/model/prompts.py",
+          "worker": "runtimeWorker",
+          "work": "冻结spec与业务约束提示",
+          "implementation_source": "主Agent报告及已授权scope映射；本Worker只读确认路径存在，未作源码独立验收",
+          "exists_observed": true,
+          "commit_eligible": false
+        },
+        {
+          "path": "tests/test_behavior_invariants.py",
+          "worker": "runtimeWorker",
+          "work": "新业务不变量及证据gate测试",
+          "implementation_source": "主Agent报告及已授权scope映射；本Worker只读确认路径存在，未作源码独立验收",
+          "exists_observed": true,
+          "commit_eligible": false
+        },
+        {
+          "path": "profiles/persistence.spec.json",
+          "worker": "checkerWorker",
+          "work": "业务场景及冻结spec profile",
+          "implementation_source": "主Agent报告及已授权scope映射；本Worker只读确认路径存在，未作源码独立验收",
+          "exists_observed": true,
+          "commit_eligible": false
+        },
+        {
+          "path": "evals/oracle.mjs",
+          "worker": "checkerWorker",
+          "work": "独立最终业务Oracle",
+          "implementation_source": "主Agent报告及已授权scope映射；本Worker只读确认路径存在，未作源码独立验收",
+          "exists_observed": true,
+          "commit_eligible": false
+        },
+        {
+          "path": "tools/checks/verify_real_e2e.py",
+          "worker": "checkerWorker",
+          "work": "冻结spec checker及typed gate完整验证",
+          "implementation_source": "主Agent报告及已授权scope映射；本Worker只读确认路径存在，未作源码独立验收",
+          "exists_observed": true,
+          "commit_eligible": false
+        },
+        {
+          "path": "tools/checks/verify_b01_behavior_ui.mjs",
+          "worker": "checkerWorker",
+          "work": "本地真实浏览器B01源码正负例harness",
+          "implementation_source": "主Agent报告及已授权scope映射；本Worker只读确认路径存在，未作源码独立验收",
+          "exists_observed": true,
+          "commit_eligible": false
+        },
+        {
+          "path": "tests/test_behavior_checker.py",
+          "worker": "checkerWorker",
+          "work": "新行为checker测试",
+          "implementation_source": "主Agent报告及已授权scope映射；本Worker只读确认路径存在，未作源码独立验收",
+          "exists_observed": true,
+          "commit_eligible": false
+        },
+        {
+          "path": "tests/test_batch_checker.py",
+          "worker": "另一已授权Worker",
+          "work": "本次args.spec新契约fixture适配",
+          "authorization": "仅本次新契约适配，不包含既有14fail修复",
+          "implementation_source": "主Agent报告及已授权scope映射；本Worker只读确认路径存在，未作源码独立验收",
+          "exists_observed": true,
+          "commit_eligible": false
+        },
+        {
+          "path": "tests/test_real_e2e_cleanup.py",
+          "worker": "另一已授权Worker",
+          "work": "本次args.spec新契约fixture适配",
+          "authorization": "仅本次新契约适配，不包含既有14fail修复",
+          "implementation_source": "主Agent报告及已授权scope映射；本Worker只读确认路径存在，未作源码独立验收",
+          "exists_observed": true,
+          "commit_eligible": false
+        }
+      ],
+      "test_evidence": [
+        {
+          "id": "stage1-parent-initial-targeted",
+          "source": "主Agent报告",
+          "command": null,
+          "artifact": null,
+          "passed": 69,
+          "failed": 6,
+          "exit_code": null,
+          "reason": "checker旧fixture与新强语义验证不匹配，后续Worker报告已修；保留首轮失败，不推断当前全绿"
+        },
+        {
+          "id": "stage1-runtime-targeted",
+          "source": "Worker结果经主Agent转述",
+          "command": null,
+          "artifact": null,
+          "passed": 95,
+          "failed": null,
+          "exit_code": null,
+          "scope": "runtime定向结果；不能代表父级全量或当前混合树"
+        },
+        {
+          "id": "stage1-checker-targeted",
+          "source": "Worker结果经主Agent转述",
+          "command": null,
+          "artifact": null,
+          "passed": 38,
+          "failed": null,
+          "exit_code": null,
+          "scope": "checker定向结果；不能代表父级全量或当前混合树"
+        },
+        {
+          "id": "stage1-parent-final-nine-file-suite",
+          "record_status": "historical_failure_record",
+          "source": "主Agent报告；本Worker只读解析JUnit XML确认计数及失败名，未重跑测试",
+          "command": null,
+          "artifact": ".tracefix/agentteam-stage1-final-20261003.xml",
+          "artifact_sha256": "77a3ff2233187818e372a242c7bb4ad9a25c5498908164f2889e4bf2ad26b6d0",
+          "artifact_size_bytes": 33457,
+          "tests": 172,
+          "passed": 170,
+          "failed": 2,
+          "errors": 0,
+          "skipped": 0,
+          "reported_elapsed_seconds": 146.02,
+          "junit_suite_time_seconds": 145.973,
+          "exit_code": null,
+          "source_snapshot_stable": false,
+          "test_files": [
+            "tests/test_batch_checker.py",
+            "tests/test_batch_completion.py",
+            "tests/test_behavior_checker.py",
+            "tests/test_behavior_invariants.py",
+            "tests/test_contracts.py",
+            "tests/test_engine.py",
+            "tests/test_native_engine.py",
+            "tests/test_real_e2e_cleanup.py",
+            "tests/test_reproduction_plan.py"
+          ],
+          "failures": [
+            {
+              "nodeid": "tests/test_batch_completion.py::test_persistence_profile_rejects_loss_of_uncomplete_behavior[False]",
+              "message": "AssertionError: Phase.VERIFY != Phase.FINALIZE"
+            },
+            {
+              "nodeid": "tests/test_batch_completion.py::test_persistence_profile_rejects_loss_of_uncomplete_behavior[True]",
+              "message": "[True, True, False, False] != [True, True, False]"
+            }
+          ],
+          "diagnosis_source": "主Agent报告旧profile fixture未适配新behavior场景/断言数；源码在测试期间有本组外修改，输出行号漂移，不能据此证明当前混合树稳定"
+        },
+        {
+          "id": "stage1-b01-local-browser-source-oracle",
+          "source": "主Agent报告进程exit0；本Worker只读核对独立报告，不重跑浏览器",
+          "command": "node tools/checks/verify_b01_behavior_ui.mjs",
+          "exit_code": 0,
+          "artifact": ".tracefix/b01-behavior-0lEsnt/report.json",
+          "artifact_sha256": "1accfe6b476ddad9cf349a678dabf343e7ad43d4bd5608f73eb17ec3806cc4ec",
+          "artifact_size_bytes": 1897,
+          "report_status": "passed",
+          "oracle": "independent-playwright-v2",
+          "final_scoring_only": true,
+          "variants": [
+            {
+              "name": "clean",
+              "expected": "pass",
+              "exit_code": 0,
+              "oracle_passed": true,
+              "passed_steps": 7,
+              "steps": [
+                "initial_unchecked",
+                "complete",
+                "reload_completed",
+                "cancel_completion",
+                "reload_uncompleted",
+                "todo_filter",
+                "done_filter"
+              ]
+            },
+            {
+              "name": "completion_only",
+              "expected": "reject_cancel_completion",
+              "exit_code": 1,
+              "oracle_passed": false,
+              "passed_steps": 3,
+              "rejected_step": 4,
+              "rejected_step_name": "cancel_completion",
+              "error": "page.waitForResponse: Timeout 4000ms exceeded while waiting for event response",
+              "interpretation": "取消完成未发预期状态更新，负例按预期被拒绝；子过程exit1属于负例成功判定"
+            }
+          ],
+          "scope": "仅本地真实浏览器源码正负例；不是付费模型+Docker+MCP闭环",
+          "proves_current_mixed_tree_stable": false
+        },
+        {
+          "id": "stage1-parent-full-collect-only",
+          "source": "主Agent报告，未提供原始artifact",
+          "command": null,
+          "mode": "collect-only",
+          "collected": 699,
+          "errors": 1,
+          "exit_code": 2,
+          "error_file": "tests/test_worker_configuration.py",
+          "reason": "configured_worker_model缺失",
+          "scope": "只收集未运行，不表示699个测试通过"
+        },
+        {
+          "id": "stage1-current-targeted-nine-file-regression",
+          "source": "主Agent报告；本Worker未执行测试",
+          "command": "定向9文件回归（精确命令由主Agent掌握）",
+          "tests": 173,
+          "passed": 173,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "exit_code": null,
+          "status": "reported_pass",
+          "stable_snapshot": false,
+          "scope": "阶段1定向回归；当前混合工作树不能据此形成可提交快照",
+          "history_reference": "stage1-parent-final-nine-file-suite"
+        },
+        {
+          "id": "stage1-current-independent-persistence-fixtures",
+          "source": "主Agent报告；本Worker未执行测试",
+          "command": "两个独立persistence fixture回归（精确命令由主Agent掌握）",
+          "tests": 2,
+          "passed": 2,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0,
+          "exit_code": null,
+          "status": "reported_pass",
+          "stable_snapshot": false,
+          "scope": "独立fixture证据；不能替代稳定源码快照与阶段提交门禁"
+        }
+      ],
+      "source_drift": {
+        "sampled_at_utc": "2026-10-03T03:48:41.2343523Z",
+        "sampled_at_asia_shanghai": "2026-10-03T11:48:41.2343523+08:00",
+        "snapshot_atomic": false,
+        "ownership": "主Agent报告本组外并发改动；具体作者和可提交hunk归属待用户协调",
+        "files": [
+          {
+            "path": "backend/packages/agent/src/tracefix/runtime/contracts.py",
+            "size_bytes": 23390,
+            "last_write_time_asia_shanghai": "2026-10-03T11:40:27.3962766+08:00",
+            "sha256": "bd3dbb25051ca533a3b2521aa7f5a69a9429ffda9422325569669712bd4a1714",
+            "markers": [
+              "patch_base_commit字段",
+              "patch_base_commit变更限制"
+            ],
+            "stage1_scope_overlap": true
+          },
+          {
+            "path": "backend/packages/agent/src/tracefix/runtime/engine.py",
+            "size_bytes": 113709,
+            "last_write_time_asia_shanghai": "2026-10-03T11:46:58.0387335+08:00",
+            "sha256": "5b4379f7045f1f9d3d28793c53d5f1dd38bb7198ca8a33374b89f85de3ce5643",
+            "markers": [
+              "patch_base_commit",
+              "workspace.diff(base)",
+              "workspace.apply/reconcile(base)",
+              "report.patch_base_commit"
+            ],
+            "stage1_scope_overlap": true,
+            "protected_baseline_sha256": "6a51e8915c3d824ffca8be4d7d66e0686842adfefa1c7d82d5e58dcb95506dd5"
+          },
+          {
+            "path": "backend/packages/agent/src/tracefix/execution/workspace.py",
+            "size_bytes": 18607,
+            "last_write_time_asia_shanghai": "2026-10-03T11:46:58.0377287+08:00",
+            "sha256": "3390f65a8dae6b8dcca7819391b34ad9bd1d2bc543ee92d6a09bacbb0013747e",
+            "markers": [
+              "diff(base)参与patch_hash"
+            ],
+            "authorized_stage1_path": false
+          },
+          {
+            "path": "tests/test_batch_completion.py",
+            "size_bytes": 21773,
+            "last_write_time_asia_shanghai": "2026-10-03T11:46:58.0397309+08:00",
+            "sha256": "b8062200f6c053a463e1f84bf850f901766eb0e6a363f9d1ecfe020802e7ae63",
+            "protected_baseline": {
+              "size_bytes": 19411,
+              "sha256": "b6289b6fc09bb0270f493e8befc78b6df1956423b4c42f29b40762380a772e95",
+              "hunk_count": 2,
+              "hunks": [
+                "@@ -163 +163,2 @@",
+                "@@ -165 +166 @@"
+              ]
+            },
+            "parent_reported_intermediate": {
+              "size_bytes": 21203,
+              "last_write_time_asia_shanghai": "2026-10-03 11:40:27",
+              "sha256": null
+            },
+            "markers": [
+              "新增interactive_commit测试",
+              "patch_base_commit断言",
+              "diff(baseline)断言"
+            ],
+            "current_hunk_ranges": [
+              "@@ -12 +12 @@",
+              "@@ -15,0 +16,47 @@",
+              "@@ -163 +210,2 @@",
+              "@@ -165 +213 @@",
+              "@@ -305 +353 @@"
+            ],
+            "note": "当前只读采样比主Agent中间报告继续增加570字节并改变mtime；保持原基线，不推断新代码已获本任务授权"
+          }
+        ],
+        "restrictions": [
+          "不覆盖原baseline18paths或最初observed_drift",
+          "外来runtime/tools.py、ARCHITECTURE_REVIEW_SUMMARY.md、tests/test_architecture_repairs.py无归本任务授权，不纳入commit",
+          "contracts/engine重叠变动及workspace.py变动须先厘清hunk归属",
+          "用户旧GraphRecursionError修复不能混入commit"
+        ],
+        "effect": "无法将历史测试结果绑定稳定当前源码快照，阶段1提交门禁未通过"
+      },
+      "pending_decisions": [
+        {
+          "id": "workspace_change_ownership",
+          "status": "awaiting_user_coordination",
+          "question": "同一工作区外来并发变动的所有权与重叠hunk如何协调",
+          "effect": "contracts/engine/workspace/test_batch_completion快照不稳定，不能擅自吸收、回退或提交"
+        },
+        {
+          "id": "baseline_failure_repair_authorization",
+          "status": "awaiting_user_authorization",
+          "question": "是否授权修复既有Python收集问题和14项baseline失败以保证阶段全量通过",
+          "effect": "授权未到前不修这些既有生产/测试问题；两份args.spec fixture的额外授权不扩展此范围"
+        }
+      ],
+      "goal_status": "active",
+      "extra_authorized_fixture_paths": [
+        "tests/test_batch_checker.py",
+        "tests/test_real_e2e_cleanup.py"
+      ],
+      "review_requirements": [
+        {
+          "requirement": "checkpoint不能仅相信passed标签；读取observation复核断言",
+          "status": "实现由主Agent报告；稳定源码上的独立验收尚未通过"
+        },
+        {
+          "requirement": "checker验证typed gate完整结构和语义，不只验证六种kind集合",
+          "status": "实现由主Agent报告；稳定源码上的独立验收尚未通过"
+        }
+      ]
+    },
+    {
+      "number": 2,
+      "title": "控制API、版本事件、客户端契约和Worker恢复",
+      "status": "not_started",
+      "requirements": [
+        {
+          "id": "S2-01",
+          "requirement": "统一运行查询、暂停、取消、审批及继续执行的控制API契约。",
+          "gate": "接口有明确请求/响应/错误schema和兼容策略，客户端行为与服务端一致。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S2-02",
+          "requirement": "生成或校验客户端类型，建立契约漂移检查。",
+          "gate": "故意改变服务端字段或枚举时生成/校验门禁失败；恢复一致时通过。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S2-03",
+          "requirement": "事件带协议版本、Run及项目作用域、序号和状态revision。",
+          "gate": "拒绝过期revision和不支持版本；事件顺序、重复及旧客户端行为有明确测试。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S2-04",
+          "requirement": "SSE支持断线重连、续传游标和必要的权威状态重同步。",
+          "gate": "连接断开再连无静默漏事件；重复事件可去重，游标失效时显式重同步。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S2-05",
+          "requirement": "控制接口及事件订阅严格隔离项目/Run。",
+          "gate": "跨项目订阅、伪造Run和复用他项目游标不得读取或控制他项目状态。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S2-06",
+          "requirement": "审批和控制命令有幂等与并发冲突语义。",
+          "gate": "双客户端重复审批、重试请求、相同key不同参数和过期页面命令不得重复消费或覆盖新状态。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S2-07",
+          "requirement": "区分展示stdout与权威持久事件。",
+          "gate": "仅输出日志但事务未落盘不能对外声称已完成；崩溃后从持久状态重建。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S2-08",
+          "requirement": "Worker持久任务账本保存契约、父Run、依赖、源码revision、attempt、取消、结果及回执引用。",
+          "gate": "进程重启仍可查询所有关键状态和因果关系，状态转换不可丢失或越权。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S2-09",
+          "requirement": "定义排队、执行、重试、取消和部分结果的崩溃恢复协议。",
+          "gate": "在各边界终止并重启验证可恢复或明确失败；父取消传播，依赖与结果不凭内存推断。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S2-10",
+          "requirement": "恢复时核验generation、源码、权限和artifact，未知副作用必须进入核对流程。",
+          "gate": "不重复盲放未知操作；已完成结果可追溯；不把数据库恢复宣传为外部exactly-once或浏览器透明恢复。",
+          "status": "not_started",
+          "evidence": []
+        }
+      ],
+      "delivery": {
+        "worker": null,
+        "model": null,
+        "reasoning_level": null,
+        "baseline_head": null,
+        "changed_paths": [],
+        "test_commands": [],
+        "test_exit_codes": [],
+        "test_artifacts": [],
+        "reviewer": null,
+        "review_result": null,
+        "staged_diff_review": null,
+        "commit_sha": null,
+        "parent_commit_sha": null,
+        "completed_at": null
+      }
+    },
+    {
+      "number": 3,
+      "title": "Agent配置、权限审计、经验审核和Skill冻结",
+      "status": "not_started",
+      "requirements": [
+        {
+          "id": "S3-01",
+          "requirement": "Agent配置声明角色、模型、提示词、schema和配置版本。",
+          "gate": "非法配置被拒绝，Run与Worker可追溯实际配置；用户本次AgentTeam模型要求可验证。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S3-02",
+          "requirement": "Agent配置与任务能力受项目、Run、阶段、委派授权共同约束。",
+          "gate": "恶意角色名、越权工具/文件/网络声明不能扩大上层权限，允许的收窄配置可用。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S3-03",
+          "requirement": "依据执行时最终参数和真实副作用再次授权。",
+          "gate": "插件改参、伪报只读及授权后参数变化均被拦截或重新审批。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S3-04",
+          "requirement": "保存可解释权限决策审计。",
+          "gate": "包含匹配规则、策略版本、最终参数的安全表示、审批绑定和拒绝原因；不泄露密钥。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S3-05",
+          "requirement": "修复经验先成为带来源、适用条件和证据的候选。",
+          "gate": "关联Run、源码、patch hash、证据及项目作用域；不把一次成功泛化为普适经验。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S3-06",
+          "requirement": "经验晋升须经过业务验收、回归验证和人工/维护者授权。",
+          "gate": "仅FIX_VERIFIED标签不足以晋升；B01无效修复、未审批及held-out内容不得进入可信学习库。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S3-07",
+          "requirement": "每个Run冻结实际使用Skill正文及references内容快照和hash。",
+          "gate": "热更新、引用文件变更或删除后仍能复核原请求内容；仅存路径或正文hash不足以满足冻结。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S3-08",
+          "requirement": "提供经验/Skill撤回与作用域控制。",
+          "gate": "撤回后新检索不可激活；进行中Run遵循显式阻断/复核策略，不静默更换历史快照；历史审计仍可查。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S3-09",
+          "requirement": "恢复执行使用绑定快照，升级必须显式记录版本与生效点。",
+          "gate": "重启前后版本一致；跨项目越权、过期引用和隐式升级被拒绝，显式升级可审计。",
+          "status": "not_started",
+          "evidence": []
+        }
+      ],
+      "delivery": {
+        "worker": null,
+        "model": null,
+        "reasoning_level": null,
+        "baseline_head": null,
+        "changed_paths": [],
+        "test_commands": [],
+        "test_exit_codes": [],
+        "test_artifacts": [],
+        "reviewer": null,
+        "review_result": null,
+        "staged_diff_review": null,
+        "commit_sha": null,
+        "parent_commit_sha": null,
+        "completed_at": null
+      }
+    },
+    {
+      "number": 4,
+      "title": "ACI、单多Agent、记忆消融与独立真实评分",
+      "status": "not_started",
+      "requirements": [
+        {
+          "id": "S4-01",
+          "requirement": "预先定义ACI实验因素，包括搜索、编辑失败反馈和浏览器观察组织。",
+          "gate": "实验每次明确变更因素及对照，不能仅凭更少token推断修复收益。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S4-02",
+          "requirement": "比较单/多Agent与记忆开/关等消融条件。",
+          "gate": "固定或完整记录模型、任务、源码、环境、Skill版本和重复策略，报告交互影响及限制。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S4-03",
+          "requirement": "独立最终评分保持留出数据隔离。",
+          "gate": "评分规则在实验前冻结；同题held-out结果不回灌修复和记忆；报告逐题原始评分。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S4-04",
+          "requirement": "保留真实GUI、模型和执行产物，区分离线模拟、基础设施失败及未执行项。",
+          "gate": "真实Run/artifact可回查；mock通过不计真实修复；环境失败/跳过不伪造为通过。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S4-05",
+          "requirement": "报告有效修复率及False Success并明确分母。",
+          "gate": "至少给出任务数、完成数、内部成功数、独立有效修复数；False Success=内部宣称成功但独立判无效，比例分母为内部成功数；零分母记不适用。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S4-06",
+          "requirement": "记录端到端耗时及tokens，并区分provider实测和估算。",
+          "gate": "usage缺失记未知且报告覆盖率，不写0或伪造；请求/响应usage和缓存计费可追溯，排队/重试计入约定耗时。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S4-07",
+          "requirement": "报告每个有效修复成本及估值依据。",
+          "gate": "总已知实付或估算成本/独立有效修复数，失败尝试计入；缺失成本不报告为完整总成本；零有效修复时不报告有限单价。",
+          "status": "not_started",
+          "evidence": []
+        },
+        {
+          "id": "S4-08",
+          "requirement": "汇总逐条件真实结果、样本数、失败类型和不确定性，据此提出采用决策。",
+          "gate": "附原始产物与复算方法；小样本不宣称确定收益，未有真实GUI/付费模型成绩时明确缺口，阶段不可凭脚本存在宣告完成。",
+          "status": "not_started",
+          "evidence": []
+        }
+      ],
+      "delivery": {
+        "worker": null,
+        "model": null,
+        "reasoning_level": null,
+        "baseline_head": null,
+        "changed_paths": [],
+        "test_commands": [],
+        "test_exit_codes": [],
+        "test_artifacts": [],
+        "reviewer": null,
+        "review_result": null,
+        "staged_diff_review": null,
+        "commit_sha": null,
+        "parent_commit_sha": null,
+        "completed_at": null
+      }
+    }
+  ],
+  "commit_gate": {
+    "owner": "主Agent",
+    "required": [
+      "基线漂移已厘清；再次核对HEAD、索引、路径及SHA256",
+      "全部本阶段需求对应充分实现/验证证据",
+      "适用测试实际通过，环境限制和跳过单独记录",
+      "暂存差异仅包含阶段增量，没有既有hunk或未跟踪文件混入",
+      "对拟提交内容验证；不把依赖未提交旧改动的共享工作树通过结果当作独立提交可用证明",
+      "主Agent本地commit成功并登记SHA后，才允许下一阶段",
+      "既有Python收集失败及14失败的修复必须先获得用户明确授权；未通过全量门禁不得提交并开启阶段2"
+    ],
+    "status": "not_passed"
+  },
+  "limitations": [
+    "Git读取与文件hash采样非事务快照；扫描期间三个既有路径发生变化，来源尚未核实。",
+    "hash及hunk摘要不能还原旧内容；重叠修改需主Agent先形成可复核的独立增量方案，不能据此自动整文件暂存。",
+    "临时pytest目录未纳入清单；git status对其中部分目录曾报权限不足，不尝试访问或清理。",
+    "engine.py有混合换行；raw SHA256与Git归一化差异口径不同，禁止顺便格式化既有改动。",
+    "两个本任务产物被现有.gitignore忽略，主Agent后续若纳入提交应仅对两个明确路径作精确处理，不修改.gitignore掩盖范围。",
+    "正文只定向读取7个文件的差异（部分输出被截断）；其他路径仅元数据/差异范围/二进制hash采样，未审计未跟踪文件正文；未运行测试。",
+    "基线测试结束不表示既有文件漂移已协调解决；保留原采样SHA256及needs_reconciliation状态，不用测试报告改写基线hash。"
+  ],
+  "baseline_test_report": {
+    "status": "finished_with_failures",
+    "source": "主Agent通过本次Worker消息报告；本Worker未亲自执行命令，尚未收到原始日志/产物路径或hash",
+    "independently_verified": false,
+    "all_green": false,
+    "node": [
+      {
+        "command": "npm test",
+        "working_directory": null,
+        "exit_code": null,
+        "results": [
+          {
+            "suite": "console-service",
+            "passed": 5
+          },
+          {
+            "suite": "console-api",
+            "passed": 4
+          }
+        ],
+        "note": "主Agent报告两个suite通过；未提供原始日志、执行目录或退出码，不推断其他套件结果"
+      },
+      {
+        "command": "npm run typecheck",
+        "working_directory": null,
+        "exit_code": 0
+      },
+      {
+        "command": "npm run build",
+        "working_directory": null,
+        "exit_code": 0
+      }
+    ],
+    "python_full_collection": {
+      "command": null,
+      "status": "collection_failed",
+      "file": "tests/test_worker_configuration.py",
+      "reason": "缺configured_worker_model（主Agent报告；完整traceback未提供）",
+      "exit_code": null
+    },
+    "python_excluding_collection_failure": {
+      "command": null,
+      "excluded_files": [
+        "tests/test_worker_configuration.py"
+      ],
+      "passed": 600,
+      "failed": 14,
+      "skipped": 2,
+      "elapsed_seconds": 189.46,
+      "exit_code": null,
+      "failed_nodeids": [
+        "tests/test_api_configuration.py::test_stream_chat_uses_same_default_text_model",
+        "tests/test_cli.py::test_fake_engine_lifecycle_reaches_approval_then_rejection_without_live_activity",
+        "tests/test_cli_workspace.py::test_chat_streams_scoped_references_with_identity",
+        "tests/test_local_tools.py::test_common_registry_readonly_and_explicit_worker_write",
+        "tests/test_local_tools.py::test_gui_child_engine_uses_supervisor_permissions",
+        "tests/test_local_tools.py::test_read_pagination_edit_uniqueness_and_write_scope",
+        "tests/test_local_tools.py::test_write_creates_file_and_glob_orders_by_modification_time",
+        "tests/test_local_tools.py::test_notebook_insert_replace_delete_preserves_metadata",
+        "tests/test_local_tools.py::test_seven_tools_execute_through_registered_pipeline",
+        "tests/test_local_tools.py::test_supervisor_delegate_passes_explicit_write_contract",
+        "tests/test_local_tools.py::test_bash_docker_readonly_and_scoped_writeback",
+        "tests/test_local_tools.py::test_bash_rejects_unsafe_writeback[unauthorized]",
+        "tests/test_local_tools.py::test_bash_rejects_unsafe_writeback[conflict]",
+        "tests/test_tool_engine.py::test_gateway_executes_registered_code_tool_and_returns_typed_submission"
+      ],
+      "note": "显式排除收集失败文件的基线，不代表Python全量通过；精确命令、执行目录、日志与产物待回填"
+    },
+    "repair_authorization": {
+      "status": "awaiting_user_response",
+      "requested_by": "主Agent",
+      "request": "是否授权修复既有基线失败以保证每阶段全量通过",
+      "restriction": "收到明确授权前，不修改这些既有生产/测试问题；不得弱化断言或继续排除失败以宣称全绿"
+    }
+  },
+  "stage_zero_status": "baseline_collection_finished_with_failures",
+  "protected_preexisting_hunks": [
+    {
+      "path": "backend/packages/agent/src/tracefix/runtime/engine.py",
+      "range": "@@ -1758 +1758 @@",
+      "summary": "用户既有GraphRecursionError条件修复；不属于阶段1，不得混入阶段commit",
+      "baseline_sha256": "6a51e8915c3d824ffca8be4d7d66e0686842adfefa1c7d82d5e58dcb95506dd5"
+    }
+  ],
+  "thread_goal_status": "active",
+  "current_repository_observation": {
+    "git_head": "373d74fcad6b580117a673f4abfaa98c4e8b6e52",
+    "staged_paths": [],
+    "stage_commit_sha": null,
+    "source": "本Worker只读git rev-parse HEAD和git diff --cached --name-only；不执行暂存或提交"
+  },
+  "stage1_coordination": {
+    "status": "pending_user_decisions",
+    "source_writes_stopped_by": "主Agent",
+    "pending_decisions": [
+      {
+        "id": "workspace_change_ownership",
+        "status": "awaiting_user_coordination",
+        "question": "同一工作区外来并发变动的所有权与重叠hunk如何协调",
+        "effect": "contracts/engine/workspace/test_batch_completion快照不稳定，不能擅自吸收、回退或提交"
+      },
+      {
+        "id": "baseline_failure_repair_authorization",
+        "status": "awaiting_user_authorization",
+        "question": "是否授权修复既有Python收集问题和14项baseline失败以保证阶段全量通过",
+        "effect": "授权未到前不修这些既有生产/测试问题；两份args.spec fixture的额外授权不扩展此范围"
+      }
+    ],
+    "source_drift": {
+      "sampled_at_utc": "2026-10-03T03:48:41.2343523Z",
+      "sampled_at_asia_shanghai": "2026-10-03T11:48:41.2343523+08:00",
+      "snapshot_atomic": false,
+      "ownership": "主Agent报告本组外并发改动；具体作者和可提交hunk归属待用户协调",
+      "files": [
+        {
+          "path": "backend/packages/agent/src/tracefix/runtime/contracts.py",
+          "size_bytes": 23390,
+          "last_write_time_asia_shanghai": "2026-10-03T11:40:27.3962766+08:00",
+          "sha256": "bd3dbb25051ca533a3b2521aa7f5a69a9429ffda9422325569669712bd4a1714",
+          "markers": [
+            "patch_base_commit字段",
+            "patch_base_commit变更限制"
+          ],
+          "stage1_scope_overlap": true
+        },
+        {
+          "path": "backend/packages/agent/src/tracefix/runtime/engine.py",
+          "size_bytes": 113709,
+          "last_write_time_asia_shanghai": "2026-10-03T11:46:58.0387335+08:00",
+          "sha256": "5b4379f7045f1f9d3d28793c53d5f1dd38bb7198ca8a33374b89f85de3ce5643",
+          "markers": [
+            "patch_base_commit",
+            "workspace.diff(base)",
+            "workspace.apply/reconcile(base)",
+            "report.patch_base_commit"
+          ],
+          "stage1_scope_overlap": true,
+          "protected_baseline_sha256": "6a51e8915c3d824ffca8be4d7d66e0686842adfefa1c7d82d5e58dcb95506dd5"
+        },
+        {
+          "path": "backend/packages/agent/src/tracefix/execution/workspace.py",
+          "size_bytes": 18607,
+          "last_write_time_asia_shanghai": "2026-10-03T11:46:58.0377287+08:00",
+          "sha256": "3390f65a8dae6b8dcca7819391b34ad9bd1d2bc543ee92d6a09bacbb0013747e",
+          "markers": [
+            "diff(base)参与patch_hash"
+          ],
+          "authorized_stage1_path": false
+        },
+        {
+          "path": "tests/test_batch_completion.py",
+          "size_bytes": 21773,
+          "last_write_time_asia_shanghai": "2026-10-03T11:46:58.0397309+08:00",
+          "sha256": "b8062200f6c053a463e1f84bf850f901766eb0e6a363f9d1ecfe020802e7ae63",
+          "protected_baseline": {
+            "size_bytes": 19411,
+            "sha256": "b6289b6fc09bb0270f493e8befc78b6df1956423b4c42f29b40762380a772e95",
+            "hunk_count": 2,
+            "hunks": [
+              "@@ -163 +163,2 @@",
+              "@@ -165 +166 @@"
+            ]
+          },
+          "parent_reported_intermediate": {
+            "size_bytes": 21203,
+            "last_write_time_asia_shanghai": "2026-10-03 11:40:27",
+            "sha256": null
+          },
+          "markers": [
+            "新增interactive_commit测试",
+            "patch_base_commit断言",
+            "diff(baseline)断言"
+          ],
+          "current_hunk_ranges": [
+            "@@ -12 +12 @@",
+            "@@ -15,0 +16,47 @@",
+            "@@ -163 +210,2 @@",
+            "@@ -165 +213 @@",
+            "@@ -305 +353 @@"
+          ],
+          "note": "当前只读采样比主Agent中间报告继续增加570字节并改变mtime；保持原基线，不推断新代码已获本任务授权"
+        }
+      ],
+      "restrictions": [
+        "不覆盖原baseline18paths或最初observed_drift",
+        "外来runtime/tools.py、ARCHITECTURE_REVIEW_SUMMARY.md、tests/test_architecture_repairs.py无归本任务授权，不纳入commit",
+        "contracts/engine重叠变动及workspace.py变动须先厘清hunk归属",
+        "用户旧GraphRecursionError修复不能混入commit"
+      ],
+      "effect": "无法将历史测试结果绑定稳定当前源码快照，阶段1提交门禁未通过"
+    },
+    "excluded_external_changes": [
+      "backend/packages/agent/src/tracefix/runtime/tools.py",
+      "ARCHITECTURE_REVIEW_SUMMARY.md",
+      "tests/test_architecture_repairs.py"
+    ]
+  }
+}

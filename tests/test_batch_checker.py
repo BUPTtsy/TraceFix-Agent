@@ -9,7 +9,10 @@ from tracefix.storage.artifacts import Artifacts
 
 
 def test_real_e2e_failure_preserves_batch_report_and_patch_refs(tmp_path, monkeypatch):
-    module = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'tools/checks/verify_real_e2e.py'))
+    root = Path(__file__).resolve().parents[1]
+    module = runpy.run_path(str(root / 'tools/checks/verify_real_e2e.py'))
+    spec = tmp_path / 'persistence.spec.json'
+    spec.write_bytes((root / 'profiles/persistence.spec.json').read_bytes())
     run_flow = module['run_flow']
     commands = []
     state = SimpleNamespace(run_status='FAILED', outcome='REPAIR_EXHAUSTED',
@@ -22,6 +25,9 @@ def test_real_e2e_failure_preserves_batch_report_and_patch_refs(tmp_path, monkey
             Path(arguments[-1]).mkdir(parents=True)
         if '--run' in arguments:
             assert arguments[arguments.index('--execution-mode') + 1] == 'batch'
+            frozen = Path(arguments[arguments.index('--spec') + 1])
+            assert frozen != spec
+            assert frozen.read_bytes() == spec.read_bytes()
             assert options['check'] is False
             data_root = Path(arguments[arguments.index('--data') + 1])
             artifacts = Artifacts(data_root / 'artifacts')
@@ -38,7 +44,7 @@ def test_real_e2e_failure_preserves_batch_report_and_patch_refs(tmp_path, monkey
     monkeypatch.setitem(run_flow.__globals__, 'load_state', lambda *args: state)
     output = tmp_path / 'batch-report.json'
     with pytest.raises(RuntimeError, match='连续三轮无有效补丁'):
-        run_flow(SimpleNamespace(case='B01'), output)
+        run_flow(SimpleNamespace(case='B01', spec=spec), output)
 
     report = json.loads(output.read_text(encoding='utf-8'))
     assert report['status'] == 'failed'

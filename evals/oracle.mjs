@@ -6,19 +6,59 @@ const {chromium}=require(process.env.TRACEFIX_PLAYWRIGHT_MODULE || 'playwright')
 const url=process.env.BUGBOARD_URL || 'http://127.0.0.1:3000';
 const caseId=process.argv[2] || 'B01';
 if(!['127.0.0.1','localhost','app'].includes(new URL(url).hostname))throw new Error('Oracle restricted to local sandbox');
-const browser=await chromium.launch({headless:true});
-const context=await browser.newContext({viewport:{width:1280,height:800},locale:'en-US'});
-const page=await context.newPage();
+let browser,context,page;
 let passed=false,error=null;
+const steps=[];
 const by=(role,name)=>page.getByRole(role,{name,exact:true});
 const visible=async(role,name)=>{await by(role,name).waitFor({state:'visible',timeout:4000});};
 const ensure=(ok,message)=>{if(!ok)throw new Error(message);};
+async function step(name,work){
+ try{await work();steps.push({name,passed:true});}
+ catch(failure){steps.push({name,passed:false,error:failure.message});throw failure;}
+}
+async function checkboxState(checked){
+ const checkbox=by('checkbox','Complete Write project brief');
+ await checkbox.waitFor({state:'visible',timeout:4000});
+ const deadline=Date.now()+4000;
+ while(Date.now()<deadline){
+  if(await checkbox.isEnabled() && await checkbox.isChecked()===checked){
+   ensure(await page.getByRole('alert').count()===0,'task update displayed an error');
+   return;
+  }
+  await page.waitForTimeout(50);
+ }
+ throw new Error(checked?'completed state missing':'ability to cancel completion missing');
+}
+async function toggleCompletion(checked){
+ const [response]=await Promise.all([
+  page.waitForResponse(response=>/\/api\/tasks\/\d+$/.test(new URL(response.url()).pathname) && ['PATCH','POST'].includes(response.request().method()),{timeout:4000}),
+  by('checkbox','Complete Write project brief').click(),
+ ]);
+ ensure(response.ok(),'task update failed');
+ await response.finished();
+ await checkboxState(checked);
+}
 try{
+ browser=await chromium.launch({headless:true});
+ context=await browser.newContext({viewport:{width:1280,height:800},locale:'en-US'});
+ page=await context.newPage();
  const reset=await context.request.post(url+'/__reset');ensure(reset.ok(),'reset failed');
  await page.goto(url);await visible('heading','Task board');
  await by('checkbox','Complete Write project brief').waitFor({timeout:5000});
  switch(caseId){
- case 'B01': await by('checkbox','Complete Write project brief').check();await page.waitForTimeout(500);await page.reload();ensure(await by('checkbox','Complete Write project brief').isChecked(),'status not persisted');break;
+ case 'B01':
+  await step('initial_unchecked',()=>checkboxState(false));
+  await step('complete',()=>toggleCompletion(true));
+  await step('reload_completed',async()=>{await page.reload();await checkboxState(true);});
+  await step('cancel_completion',()=>toggleCompletion(false));
+  await step('reload_uncompleted',async()=>{await page.reload();await checkboxState(false);});
+  await step('todo_filter',async()=>{await by('button','Todo').click();await checkboxState(false);});
+  await step('done_filter',async()=>{
+   await by('button','Done').click();
+   await visible('checkbox','Complete Prepare release checklist');
+   ensure(await by('checkbox','Complete Write project brief').count()===0,'uncompleted task remains in Done');
+  });
+  break;
  case 'B02': await by('button','Delete Write project brief').click();await page.waitForTimeout(500);await page.reload();ensure(await by('checkbox','Complete Write project brief').count()===0,'delete failed');break;
  case 'B03': await by('button','Add task').click();await visible('alert','');ensure((await page.getByRole('alert').innerText()).includes('required'),'missing error');break;
  case 'B04': await by('button','Edit Write project brief').click();ensure(await by('textbox','Task title').inputValue()==='Write project brief','draft missing');break;
@@ -35,6 +75,6 @@ try{
  }
  passed=true;
 }catch(e){error=e.message;}
-finally{await browser.close();}
-console.log(JSON.stringify({case_id:caseId,passed,error,oracle:'independent-playwright-v1',final_scoring_only:true}));
+finally{if(browser)await browser.close();}
+console.log(JSON.stringify({case_id:caseId,passed,error,steps,oracle:'independent-playwright-v2',final_scoring_only:true}));
 process.exitCode=passed?0:1;

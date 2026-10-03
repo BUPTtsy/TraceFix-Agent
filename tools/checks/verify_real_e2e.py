@@ -6,6 +6,7 @@ environment it reports SKIPPED locally or FAILED in required CI mode.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -90,6 +92,84 @@ def write_json(path: Path, value: dict):
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def validate_spec(contents: bytes, *, case: str):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend/packages/agent/src"))
+    from tracefix.runtime.contracts import TestSpec
+
+    specification = TestSpec.model_validate_json(contents.decode("utf-8-sig"))
+    if case == "B01":
+        task_name = "Complete Write project brief"
+
+        def task_assertion(assertions, condition):
+            return any(assertion.locator.role == "checkbox" and assertion.locator.name == task_name
+                       and assertion.condition == condition for assertion in assertions)
+
+        required = [("click", "checkbox", task_name, "checked"),
+                    ("navigate", None, None, "checked"),
+                    ("click", "checkbox", task_name, "unchecked"),
+                    ("navigate", None, None, "unchecked"),
+                    ("click", "button", "Todo", "unchecked"),
+                    ("click", "button", "Done", "absent")]
+        covered = False
+        for scenario in specification.behavior_scenarios:
+            for offset in range(len(scenario.steps) - len(required) + 1):
+                matched = True
+                for step, (kind, role, name, condition) in zip(scenario.steps[offset:], required):
+                    action = step.action
+                    if (action.kind != kind or not task_assertion(step.assertions, condition)
+                            or (role is not None and (action.locator is None
+                                or action.locator.role != role or action.locator.name != name))):
+                        matched = False
+                        break
+                if matched:
+                    covered = True
+                    break
+        if not task_assertion(specification.assertions, "checked") or not covered:
+            raise ValueError("B01 冻结规范必须包含原问题 checked 断言和完成/刷新/取消完成/刷新/Todo/Done 双向业务场景")
+    return specification
+
+
+def freeze_spec(run_root: Path, source: Path, *, case: str = "B01") -> tuple[Path, str]:
+    contents = source.read_bytes()
+    validate_spec(contents, case=case)
+    digest = hashlib.sha256(contents).hexdigest()
+    destination = run_root / "frozen-spec.json"
+    run_root.mkdir(parents=True, exist_ok=True)
+    with destination.open("xb") as output:
+        output.write(contents)
+    return destination, digest
+
+
+def verify_evidence(state, artifacts, frozen_spec: Path, *, case: str) -> set[str]:
+    from tracefix.runtime.contracts import TestSpec, Validation, verification_gate
+
+    def artifact_exists(reference):
+        return artifacts.exists(state.scope_id, state.run_id, reference)
+
+    def artifact_read(reference):
+        return artifacts.json(state.scope_id, state.run_id, reference)
+
+    expected = validate_spec(frozen_spec.read_bytes(), case=case)
+    if not state.test_spec_ref or not artifact_exists(state.test_spec_ref):
+        raise RuntimeError("真实 E2E 缺少冻结规范证据")
+    actual = TestSpec.model_validate(artifact_read(state.test_spec_ref))
+    if actual != expected:
+        raise RuntimeError("真实 E2E 的 Run 规范与源码修改前冻结的规范不一致")
+    validations = [Validation.model_validate(artifact_read(reference))
+                   for reference in state.validation_refs]
+    if not verification_gate(state, validations, artifact_exists, artifact_read=artifact_read):
+        raise RuntimeError("真实 E2E 独立验证门禁拒绝：验证项、业务检查点或源码/补丁/规范绑定不完整")
+    return {validation.kind for validation in validations if validation.passed}
+
+
+def agent_command(registry: Path, data_root: Path, spec: Path) -> list:
+    return [str(PYTHON), "tools/bootstrap/launch.py", "--plain", "--project", "bugboard",
+            "--projects", registry, "--profile", ROOT / "profiles/bugboard.yaml",
+            "--data", data_root, "--spec", spec, "--run", "--goal",
+            "把 Write project brief 标记为完成，刷新页面并验证状态持久化；失败则修复。",
+            "--mode", "repair", "--execution-mode", "batch"]
+
+
 def load_state(data_root: Path, dsn: str, run_id: str):
     sys.path.insert(0, str(ROOT / "backend/packages/agent/src"))
     from tracefix.storage.store import PostgresStore
@@ -103,7 +183,7 @@ def load_state(data_root: Path, dsn: str, run_id: str):
 
 def run_flow(args, output_path: Path) -> int:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_root = ROOT / ".tracefix" / "real-e2e" / stamp
+    run_root = ROOT / ".tracefix" / "real-e2e" / f"{stamp}-{uuid.uuid4().hex[:12]}"
     data_root = run_root / "data"
     demo_root = run_root / "bugboard-target"
     registry = run_root / "projects.json"
@@ -123,6 +203,9 @@ def run_flow(args, output_path: Path) -> int:
               "run_root": str(run_root.relative_to(ROOT))}
     compose_started = False
     try:
+        frozen_spec, spec_hash = freeze_spec(run_root, args.spec, case=args.case)
+        result.update({"frozen_spec": str(frozen_spec.relative_to(ROOT)),
+                       "frozen_spec_sha256": spec_hash})
         command([python, "bugboard/scripts/init_demo.py", "--case", args.case,
                  "--destination", demo_root], env=env)
         registry.write_text(json.dumps({"projects": [{
@@ -145,12 +228,10 @@ def run_flow(args, output_path: Path) -> int:
             inspected = command([docker, "image", "inspect", image], check=False, timeout=60)
             if inspected.returncode:
                 command(build, env=env, timeout=3600)
-        common = [python, "tools/bootstrap/launch.py", "--plain", "--project", "bugboard",
-                  "--projects", registry, "--profile", ROOT / "profiles/bugboard.yaml",
-                  "--data", data_root, "--spec", ROOT / "profiles/persistence.spec.json"]
-        agent_result = command([*common, "--run", "--goal",
-                 "把 Write project brief 标记为完成，刷新页面并验证状态持久化；失败则修复。",
-                 "--mode", "repair", "--execution-mode", "batch"], env=env, check=False, timeout=3600)
+        agent_result = command(agent_command(registry, data_root, frozen_spec),
+                               env=env, check=False, timeout=3600)
+        if hashlib.sha256(frozen_spec.read_bytes()).hexdigest() != spec_hash:
+            raise RuntimeError("真实 E2E 的冻结规范在执行期间发生变化")
         artifact_root = data_root / "artifacts" / "bugboard"
         run_dirs = sorted((item for item in artifact_root.glob("run_*") if item.is_dir()),
                           key=lambda item: item.stat().st_mtime)
@@ -180,13 +261,7 @@ def run_flow(args, output_path: Path) -> int:
             raise RuntimeError("真实 E2E 未导出已通过验证的有效补丁")
         if not state.validation_refs:
             raise RuntimeError("真实 E2E 未生成验证引用")
-        kinds = set()
-        for reference in state.validation_refs:
-            validation = artifacts.json("bugboard", run_id, reference)
-            if validation.get("passed"):
-                kinds.add(validation.get("kind"))
-        if REQUIRED_VALIDATIONS - kinds:
-            raise RuntimeError(f"真实 E2E 验证项不完整：缺少 {sorted(REQUIRED_VALIDATIONS - kinds)}")
+        kinds = verify_evidence(state, artifacts, frozen_spec, case=args.case)
         result.update({"status": "passed", "run_id": run_id, "outcome": str(state.outcome),
                        "validation_kinds": sorted(kinds), "report_ref": state.report_ref,
                        "report_summary": report.get("result_summary")})
@@ -204,6 +279,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="TraceFix 真实模型 + Docker + MCP E2E 验收")
     parser.add_argument("--case", default="B01", choices=[f"B{i:02d}" for i in range(1, 13)])
     parser.add_argument("--required", action="store_true", help="缺少真实环境时以失败退出（CI 使用）")
+    parser.add_argument("--spec", type=Path, default=ROOT / "profiles/persistence.spec.json",
+                        help="在初始化和修复源码前保存快照的验收规范")
     parser.add_argument("--output", type=Path, default=ROOT / "artifacts/real-e2e/report.json")
     args = parser.parse_args(argv)
     load_local_env()

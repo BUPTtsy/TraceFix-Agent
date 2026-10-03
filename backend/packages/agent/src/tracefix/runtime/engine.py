@@ -29,6 +29,8 @@ from tracefix.runtime.contracts import (BudgetExceeded, BrowserAction, Decision,
 from tracefix.runtime.guidance import (GuidanceLedger, GuidanceRejected, active_guidance,
                                       retarget_state)
 from tracefix.runtime.tool_handlers import build_runtime_tools
+from tracefix.runtime.verification import verification_binding
+from tracefix.runtime.effects import file_resource, make_operation_executor
 from tracefix.knowledge.assembler import ContextAssembler, ContextWindowError
 from tracefix.storage.artifacts import redact, sanitize
 from tracefix.storage.presentation import label, readable, report_page
@@ -294,7 +296,23 @@ class Engine:
         return self.artifacts.json(s.scope_id, s.run_id, ref)
 
     def spec(self, s):
-        return TestSpec(**self.get(s, s.test_spec_ref))
+        raw = self.get(s, s.test_spec_ref)
+        if digest(raw) != s.test_spec_hash:
+            raise ValueError('冻结的 TestSpec 内容与哈希不匹配')
+        return TestSpec(**raw)
+
+    def verification_context(self, s):
+        plan = self.get(s, s.replay_plan_ref) if s.replay_plan_ref else []
+        return verification_binding(s, digest(plan))
+
+    def verification_passed(self, s):
+        try:
+            validations = [Validation(**self.get(s, ref)) for ref in s.validation_refs]
+            return verification_gate(s, validations, lambda ref: self.bundle_exists(s, ref),
+                artifact_read=lambda ref: self.get(s, ref),
+                artifact_read_bytes=lambda ref: self.artifacts.read(s.scope_id, s.run_id, ref))
+        except Exception:
+            return False
 
     def agent_instructions(self, s):
         if not s.agent_instructions_ref:
@@ -452,31 +470,49 @@ class Engine:
         s = self.changed(s, loop_state_fingerprints=history)
         return s, False
 
-    async def operation(self, s, name, intent, fn, reconcile=None, idempotency_key=None):
-        op_id = f'{s.run_id}:{s.revision}:{name}:{idempotency_key or digest(intent)[:24]}'
+    def operation_resources(self, name, intent):
+        if isinstance(intent, dict) and intent.get('resources') is not None:
+            return intent['resources']
+        if name == 'scenario.reset':
+            return ['browser', 'sandbox']
+        if name.startswith('browser'):
+            return ['browser']
+        if name.startswith(('sandbox.', 'baseline.', 'verify.')):
+            return ['sandbox']
+        if name in {'workspace.patch', 'local.commit'}:
+            return [file_resource(self.workspace.root)]
+        return ['*']
+
+    def operation_intent(self, s, name, intent, *, idempotency_key=None):
+        execution = {
+            'phase': str(s.phase), 'step': s.step, 'replay_index': s.replay_index,
+            'trial': s.trial, 'validation_index': s.validation_index,
+            'patch_hash': s.patch_hash,
+        }
+        semantic = {key: value for key, value in intent.items() if key not in {'call_id', 'tool_call_id'}}
         if idempotency_key:
-            intent = {**intent, 'idempotency_key': idempotency_key}
+            return {**semantic, 'resources': self.operation_resources(name, intent)}
+        return {**semantic, 'execution': execution,
+                'resources': self.operation_resources(name, intent)}
+
+    async def operation(self, s, name, intent, fn, reconcile=None, idempotency_key=None,
+                        tool_call_id=None):
+        prepared = self.operation_intent(s, name, intent, idempotency_key=idempotency_key)
+        correlation = tool_call_id if tool_call_id is not None else intent.get('tool_call_id')
+        if correlation is not None or intent.get('call_id') is not None:
+            self.event(s, 'operation.called', {'name': name, 'call_id': intent.get('call_id'),
+                'tool_call_id': correlation, 'execution': prepared.get('execution')})
+        executor = make_operation_executor(self.store, s, notify=self._notify)
         try:
-            receipt = self.store.begin(s, op_id, intent, notify=self._notify)
-        except UnknownOperation:
-            if not reconcile:
-                raise
-            receipt = reconcile()
-            self.store.finish(s, op_id, receipt, notify=self._notify)
-        if receipt is not None:
-            return receipt
-        try:
-            result = await fn()
+            return await executor(name, prepared, fn, idempotency_key=idempotency_key,
+                                  reconcile=reconcile)
         except (MCPConnectionError, MCPActionUnknown) as error:
-            self.event(s, 'tool.error', {'operation_id': op_id,
+            self.event(s, 'tool.error', {'call_id': intent.get('call_id'),
+                'tool_call_id': tool_call_id if tool_call_id is not None else intent.get('tool_call_id'),
+                'operation_id': getattr(error, 'tracefix_operation_id', None),
                 'error': sanitize(error_message(error)), 'status': error.status,
                 'category': error.category, 'details': redact(error.details)})
             raise
-        except Exception as error:
-            error.tracefix_operation_id = op_id
-            raise
-        self.store.finish(s, op_id, result, notify=self._notify)
-        return result
 
     async def model_call(self, s, schema, ctx, image=None, validate_output=None):
         ctx = {**ctx, 'phase': str(s.phase), 'execution_mode': s.execution_mode}
@@ -749,10 +785,14 @@ class Engine:
     async def capture(self, s, raw, action=None):
         previous = self.get(s, s.observation_ref) if s.observation_ref else None
         png = raw.pop('png')
+        if (type(png) is not bytes or not png.startswith(b'\x89PNG\r\n\x1a\n')
+                or len(png) <= 8):
+            raise ValueError('浏览器截图必须是非空 PNG bytes')
         if self.profile.screenshot_redaction != 'public_demo':
             raise PermissionError('私有截图在捕获前需要经过批准的脱敏适配器处理')
         screenshot = self.put(s, png, 'png', name='页面截图')
-        raw['screenshot_ref'] = screenshot
+        raw.update(self.verification_context(s), type='gui_observation',
+                   screenshot_ref=screenshot, screenshot_hash=digest(png))
         raw['redaction'] = 'public_demo_no_credentials'
         observation_ref = self.put(s, raw, name='页面观察')
         if self.rule_library and self.rule_resolver:
@@ -795,9 +835,7 @@ class Engine:
             raw = await self.browser.action(action)
             return {'observation_ref': await self.capture(s, raw, action)}
         intent = action.model_dump()
-        if tool_call_id:
-            intent['tool_call_id'] = tool_call_id
-        receipt = await self.operation(s, 'browser', intent, perform)
+        receipt = await self.operation(s, 'browser', intent, perform, tool_call_id=tool_call_id)
         return receipt['observation_ref']
 
     def _graph(self, saver):
@@ -908,6 +946,13 @@ class Engine:
                                 'status': s.run_status, 'error_details': s.error_details})
                             return self.output(s, 'finalize')
                     if isinstance(e, ReplayUnbound):
+                        if s.patch_hash:
+                            s = self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.INCONCLUSIVE,
+                                             replay_index=0, pending_action=None,
+                                             error=sanitize(f'{type(e).__name__}: {error_message(e)}')[:1500],
+                                             error_details={'terminal_reason': 'frozen_replay_unbound'})
+                            self.event(s, 'run.error', {'error': s.error, 'error_details': s.error_details})
+                            return self.output(s, 'finalize')
                         target = Phase.EXPLORE if s.phase == Phase.REPRODUCE else Phase.DIAGNOSE
                         s = self.changed(s, phase=target, replay_plan_ref=None,
                                          exploration_plan_ref=None, reproduction_plan_frozen=False,
@@ -1155,6 +1200,17 @@ class Engine:
     async def prepare(self, s, _):
         self.warn_retrieval_degraded(s)
         if s.step == 0:
+            self.scopes.assert_current(self.context)
+            if s.scope_id != self.context.active_scope:
+                raise PermissionError('运行状态与当前 scope 不一致')
+            snapshot = self.workspace.require_repository_snapshot(self.source)
+            if digest(snapshot) != s.source_manifest:
+                raise PermissionError('运行状态与源码快照摘要不一致')
+            if not s.repo_snapshot_ref or self.get(s, s.repo_snapshot_ref) != snapshot:
+                raise PermissionError('运行状态与绑定源码快照不一致')
+            self.workspace.validate_repository(self.scopes, self.context, snapshot,
+                base_commit=s.patch_base_commit, patch_hash=s.patch_hash,
+                branch=s.local_branch or 'tracefix/' + s.run_id)
             async def prepare_env():
                 if s.continuation_count:
                     await self.runner.close()
@@ -1263,13 +1319,19 @@ class Engine:
         s = self.changed(s, observation_ref=ref, replay_plan_ref=plan_ref, step=s.step+1)
         return self.output(s, 'explore_gate')
 
-    def check(self, s, checks):
+    def check(self, s, checks, *, kind='original', scenario=None, scenario_step=None):
         obs = self.get(s, s.observation_ref)
         result = assertions(obs['snapshot'], checks)
-        result.update(observation_ref=s.observation_ref, test_spec_hash=s.test_spec_hash,
-                      plan_hash=digest(self.get(s, s.replay_plan_ref)) if s.replay_plan_ref else None,
-                      source_manifest=s.source_manifest, environment_digest=s.environment_digest,
-                      patch_hash=s.patch_hash)
+        binding = self.verification_context(s)
+        result.update(binding, type='validation_result', kind=kind,
+                      observation_ref=s.observation_ref, observation_hash=digest(obs),
+                      execution_plan_hash=binding['plan_hash'] if kind == 'original' else digest(
+                          [action.model_dump(mode='json') for action in self.spec(s).regression_plan]))
+        if scenario is not None:
+            result.update(type='assertion_checkpoint', kind='behavior', scenario_id=scenario.id,
+                          scenario_hash=digest(scenario), scenario_step=scenario_step,
+                          action_hash=digest(scenario.steps[scenario_step - 1].action),
+                          execution_plan_hash=digest([step.action.model_dump(mode='json') for step in scenario.steps]))
         ref = self.put(s, result, name='断言检查结果')
         self.event(s, 'gate.decided', {'passed': result['passed'], 'evidence_ref': ref})
         return result, ref
@@ -1498,28 +1560,61 @@ class Engine:
     async def patch(self, s, _):
         self.scopes.assert_current(self.context)
         self.sync_guidance(s)
+        spec = self.spec(s)
+        if spec.behavior_scenarios and not (s.reproduction_plan_frozen and s.replay_plan_ref):
+            raise ValueError('业务验证要求在补丁前冻结复现计划')
         if not all(self.bundle_exists(s,r) for r in s.evidence_refs):
             raise ValueError('所需的复现证据缺失或已损坏')
         proposal = PatchProposal(**self.get(s, s.patch_ref))
+        if not s.patch_base_commit:
+            s = self.changed(s, patch_base_commit=self.workspace.head())
         s.budget = s.budget.charge('patches')
         self.store.save(s)
         async def apply():
-            return self.workspace.apply(proposal)
-        r = await self.operation(s, 'workspace.patch', proposal.model_dump(), apply,
-                                 reconcile=lambda: self.workspace.reconcile(proposal))
-        diff = self.put(s, self.workspace.diff(), 'diff', name='补丁差异')
+            return self.workspace.apply(proposal, base=s.patch_base_commit)
+        r = await self.operation(s, 'workspace.patch',
+                                 {**proposal.model_dump(), 'base_commit': s.patch_base_commit}, apply,
+                                 reconcile=lambda: self.workspace.reconcile(proposal, base=s.patch_base_commit))
+        diff = self.put(s, self.workspace.diff(s.patch_base_commit), 'diff', name='补丁差异')
         self.event(s, 'patch.applied', {'diff_ref': diff, 'patch_hash': r['patch_hash']})
         s = self.changed(s, phase=Phase.VERIFY, patch_hash=r['patch_hash'], validation_index=0, replay_index=0)
         return self.output(s, 'prelude')
 
     async def verify(self, s, _):
         self.workspace.check_frozen(self.source)
-        if digest(self.workspace.diff().encode()) != s.patch_hash:
+        if digest(self.workspace.diff(s.patch_base_commit or 'HEAD').encode()) != s.patch_hash:
             raise PermissionError('补丁在验证开始后发生了变化')
-        kinds = ['static', 'unit', 'build', 'health', 'original', 'regression']
+        spec = self.spec(s)
+        kinds = ['static', 'unit', 'build', 'health', 'original', 'regression'] + ['behavior'] * len(spec.behavior_scenarios)
         kind = kinds[s.validation_index]
-        if kind in {'original', 'regression'}:
-            spec = self.spec(s)
+        scenario = spec.behavior_scenarios[s.validation_index - 6] if kind == 'behavior' else None
+        if scenario is not None:
+            if s.replay_index == 0:
+                result = await self.reset(s)
+                return self.output(self.changed(s, observation_ref=result['observation_ref'],
+                                               replay_index=1, behavior_check_refs=[]), 'prelude')
+            if s.replay_index <= len(scenario.steps):
+                step_index = s.replay_index
+                step = scenario.steps[step_index - 1]
+                ref = await self.act(s, step.action, frozen=True)
+                s = self.changed(s, observation_ref=ref, replay_index=step_index + 1)
+                result = None
+                if step.assertions:
+                    result, ref = self.check(s, step.assertions, scenario=scenario, scenario_step=step_index)
+                    s = self.changed(s, behavior_check_refs=s.behavior_check_refs + [ref])
+                if (result is None or result['passed']) and step_index < len(scenario.steps):
+                    return self.output(s, 'prelude')
+            checkpoints = [self.get(s, ref) for ref in s.behavior_check_refs]
+            expected_steps = [index for index, step in enumerate(scenario.steps, 1) if step.assertions]
+            last_checkpoint = checkpoints[-1] if checkpoints else {}
+            result = {'passed': ([item['scenario_step'] for item in checkpoints] == expected_steps
+                                 and all(item['passed'] for item in checkpoints)),
+                      'scenario_id': scenario.id, 'scenario_hash': digest(scenario),
+                      'checkpoint_refs': list(s.behavior_check_refs),
+                      'observation_ref': last_checkpoint.get('observation_ref'),
+                      'observation_hash': last_checkpoint.get('observation_hash'),
+                      'execution_plan_hash': digest([step.action.model_dump(mode='json') for step in scenario.steps])}
+        elif kind in {'original', 'regression'}:
             plan = ([BrowserAction(**a) for a in self.get(s, s.replay_plan_ref)] if kind == 'original' else spec.regression_plan)
             if s.replay_index == 0:
                 r = await self.reset(s)
@@ -1527,7 +1622,7 @@ class Engine:
             if s.replay_index <= len(plan):
                 ref = await self.act(s, plan[s.replay_index-1], frozen=True)
                 return self.output(self.changed(s, observation_ref=ref, replay_index=s.replay_index+1), 'prelude')
-            result, _ = self.check(s, spec.assertions if kind == 'original' else spec.regression_assertions)
+            result, _ = self.check(s, spec.assertions if kind == 'original' else spec.regression_assertions, kind=kind)
         else:
             async def run():
                 if kind == 'health':
@@ -1538,11 +1633,17 @@ class Engine:
             result = await self.operation(s, 'verify.'+kind, {'kind': kind, 'patch_hash': s.patch_hash}, run)
         self.workspace.check_frozen(self.source)
         validation_name = {'static': '静态检查', 'unit': '单元测试', 'build': '构建',
-                           'health': '健康检查', 'original': '原问题重测', 'regression': '回归测试'}[kind]
+                           'health': '健康检查', 'original': '原问题重测', 'regression': '回归测试',
+                           'behavior': '业务行为场景'}[kind]
+        binding = self.verification_context(s)
+        result = {**result, **binding, 'type': 'validation_result', 'kind': kind}
         artifact = self.put(s, result, name=validation_name+'结果')
-        validation = Validation(kind=kind, passed=result['passed'], source_manifest=s.source_manifest,
+        validation = Validation(kind=kind, passed=result['passed'], scope_id=s.scope_id, run_id=s.run_id,
+            verifier_version=binding['verifier_version'], source_manifest=s.source_manifest,
             patch_hash=s.patch_hash, environment_digest=s.environment_digest,
-            test_spec_hash=s.test_spec_hash, artifact_ref=artifact)
+            test_spec_hash=s.test_spec_hash, artifact_ref=artifact,
+            scenario_id=scenario.id if scenario else None, scenario_hash=digest(scenario) if scenario else None,
+            replay_plan_hash=binding['plan_hash'])
         ref = self.put(s, validation.model_dump(), name=validation_name+'验证记录')
         s = self.changed(s, validation_refs=s.validation_refs+[ref], replay_index=0)
         if not validation.passed:
@@ -1550,8 +1651,7 @@ class Engine:
             return self.output(self.changed(s, phase=Phase.DIAGNOSE), 'prelude')
         if s.validation_index < len(kinds)-1:
             return self.output(self.changed(s, validation_index=s.validation_index+1), 'prelude')
-        vals = [Validation(**self.get(s, r)) for r in s.validation_refs]
-        if not verification_gate(s, vals, lambda ref: self.bundle_exists(s, ref)):
+        if not self.verification_passed(s):
             s = self.changed(s, phase=Phase.VERIFY, validation_index=0, replay_index=0,
                              validation_refs=[], error='确定性验证门禁拒绝了该证据',
                              error_details={'feedback': '验证证据已失效，从第一项重新验证'})
@@ -1574,8 +1674,21 @@ class Engine:
         interrupt({'approval_id': s.approval_ref, 'patch_hash': s.patch_hash,
                    'action': '创建本地候选提交；不得发布到远程或合并'})
         action = {'action': 'local_commit', 'branch': 'tracefix/'+s.run_id}
-        if digest(self.workspace.diff().encode()) != s.patch_hash:
+        self.workspace.check_frozen(self.source)
+        if not s.patch_base_commit:
+            s = self.changed(s, patch_base_commit=self.workspace.head())
+        if digest(self.workspace.diff(s.patch_base_commit).encode()) != s.patch_hash:
             raise PermissionError('审批对应的补丁哈希已变化')
+        persisted = self.store.load(s.run_id, s.scope_id)
+        approval_fields = ('validation_refs', 'evidence_refs', 'patch_hash', 'patch_base_commit',
+            'source_manifest', 'environment_digest', 'test_spec_ref', 'test_spec_hash',
+            'replay_plan_ref', 'reproduction_plan_frozen', 'reproduced', 'source_aligned')
+        if (any(getattr(persisted, field) != getattr(s, field) for field in approval_fields)
+                or not self.verification_passed(persisted)):
+            s = self.changed(persisted, phase=Phase.FINALIZE, run_status=RunStatus.RUNNING,
+                outcome=Outcome.INFRA_FAILURE, error='审批对应的验证证据已失效',
+                error_details={'terminal_reason': 'approval_verification_invalid'})
+            return self.output(s, 'finalize')
         approved = self.store.consume_approval(s.approval_ref, s, action)
         branch = None
         if approved:
@@ -1620,7 +1733,7 @@ class Engine:
                              error=s.error or '未形成确定性验收结论')
         diff_error = None
         try:
-            diff_text = self.workspace.diff()
+            diff_text = self.workspace.diff(s.patch_base_commit or 'HEAD')
         except Exception as e:
             diff_text = ''
             diff_error = sanitize(error_message(e))[:300]
@@ -1629,9 +1742,8 @@ class Engine:
         verified = False
         if s.outcome == Outcome.FIX_VERIFIED:
             try:
-                validations = [Validation(**self.get(s, ref)) for ref in s.validation_refs]
                 verified = (patch_available and digest(diff_text.encode()) == s.patch_hash
-                            and verification_gate(s, validations, lambda ref: self.bundle_exists(s, ref)))
+                            and self.verification_passed(s))
             except (OSError, ValueError, KeyError):
                 verified = False
             if not verified:
@@ -1680,6 +1792,7 @@ class Engine:
                   'remote_config': s.remote_config,
                   'outcome': s.outcome, 'reproduced': s.reproduced,
                   'patch_hash': s.patch_hash, 'branch': s.local_branch, 'merged': False,
+                  'patch_base_commit': s.patch_base_commit,
                   'patch_diff_ref': diff_ref, 'patch_available': patch_available,
                   'patch_verification': patch_verification, 'patch_export_error': diff_error,
                   'result_summary': result_summary,
@@ -1698,9 +1811,32 @@ class Engine:
                   'agent_instructions_hash': s.agent_instructions_hash,
                   'agent_instructions_path': s.agent_instructions_path,
                   'limits': '未发现问题仅适用于本次测试规范覆盖的范围。修复通过仅代表本地验证通过，不代表已合并或发布。'}
-        report.update(collect_issues(s, self.store.trace(s.run_id, s.scope_id), lambda reference: self.get(s, reference)))
+        report['behavior_scenarios_error'] = None
+        if s.test_spec_ref:
+            try:
+                report['behavior_scenarios'] = [scenario.id for scenario in self.spec(s).behavior_scenarios]
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                report['behavior_scenarios'] = None
+                report['behavior_scenarios_error'] = sanitize(f'{type(error).__name__}: {error_message(error)}')[:1500]
+                self.event(s, 'run.warning', {'source': 'report_behavior_scenarios',
+                    'test_spec_ref': s.test_spec_ref, 'error': report['behavior_scenarios_error']})
+        try:
+            report.update(collect_issues(s, self.store.trace(s.run_id, s.scope_id), lambda reference: self.get(s, reference)))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            report['issues'] = []
+            report['issues_error'] = sanitize(error_message(error))[:300]
+            report['summary'] = '问题明细不可用：关联证据损坏或无法读取，不能确认问题数量。'
+            report['coverage'] = '问题明细覆盖不可用；请核对损坏证据和运行警告。'
+            report['tested_urls'] = []
+            self.event(s, 'run.warning', {'source': 'report_issues',
+                'error': report['issues_error']})
         ref = self.put(s, report, name='修复报告数据')
         page = report_page(report)
+        if report.get('issues_error'):
+            page = page.replace('<p>未形成有证据的问题记录。</p>',
+                '<p>问题明细不可用：' + html.escape(report['issues_error']) + '</p>')
+        if report['behavior_scenarios_error']:
+            page += '<h2>业务场景覆盖不可用</h2><p>' + html.escape(report['behavior_scenarios_error']) + '</p>'
         for evidence in s.evidence_refs:
             try:
                 item = self.get(s, evidence)
@@ -1755,7 +1891,7 @@ class Engine:
             except Exception as e:
                 scope_id = state.scope_id if state else self.context.active_scope
                 current = self.store.load(run_id, scope_id)
-                if current.execution_mode != 'batch':
+                if current.execution_mode != 'batch' and not isinstance(e, GraphRecursionError):
                     raise
                 if current.run_status in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL,
                                           RunStatus.FAILED, RunStatus.SUPERSEDED}:

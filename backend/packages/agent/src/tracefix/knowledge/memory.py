@@ -140,7 +140,8 @@ class MemoryLibrary:
         """插入本地索引项并维护 FTS5 词法字段；结构化内容经脱敏后序列化。"""
         record = dict(record)
         content = record['content']
-        content = json.dumps(redact(content), ensure_ascii=False) if not isinstance(content, str) else content
+        content = redact(content)
+        content = json.dumps(content, ensure_ascii=False) if not isinstance(content, str) else content
         search_text = ' '.join(sorted(terms(content)))
         values = (record['id'], record['scope_id'], record['layer'], record['kind'],
                   record.get('logical_key', record['id']), record.get('visibility', 'LOCAL'),

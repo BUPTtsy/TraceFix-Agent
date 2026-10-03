@@ -278,6 +278,10 @@ class Session:
         if self.active():
             raise ValueError('当前已有活动 Run')
         record = self.workspace_commands.run(run_id)
+        if record.get('agentRunId'):
+            await self.ensure_runtime()
+            previous = self.store.load(record['agentRunId'], self.scope)
+            self.validate_workspace(previous, data_root=record.get('dataRoot'))
         claim = os.getenv('TRACEFIX_CONTINUATION_ID')
         if claim and self.web_console_run_id == record['id']:
             if record.get('continuationId') != claim or record['status'] not in {'running', 'stopping'}:
@@ -335,8 +339,8 @@ class Session:
             destination = Path(remote.get('destination') or project.root)
             if not destination.is_absolute():
                 destination = Path.cwd() / destination
-            project.root = destination.resolve()
-            prepare_checkout(remote, project.root)
+            result = prepare_checkout({**remote, 'source_commit': profile.source_commit}, destination)
+            project.root = Path(result['destination'])
         url = state.url if reuse_workspace else self.args.url or profile.url
         Policy(profile.allowed_origins).url(url)
         if state is None:
@@ -352,20 +356,18 @@ class Session:
             state.continuation_instruction = record.get('continuationInstruction')
         workspace_path = Path(self.args.data)/'workspaces'/state.run_id
         if reuse_workspace:
-            source = self.artifacts.json(self.scope, state.run_id, state.repo_snapshot_ref)
-            workspace = Workspace(workspace_path, self.scopes.projects[self.scope].allowed_files)
-            if not (workspace.root / '.git').is_dir():
-                raise FileNotFoundError('原任务工作区不存在，无法继续；历史轨迹和报告仍保留')
+            workspace, source = self.validate_workspace(state)
             snapshot = self.artifacts.json(self.scope, state.run_id, state.memory_snapshot_ref)
             if snapshot['epochs'] != [list(entry) for entry in self.ctx.epochs]:
                 raise PermissionError('项目权限已变化，请检查原任务的作用域')
-            diff = workspace.diff()
-            if (state.patch_hash and digest(diff.encode()) != state.patch_hash) or (not state.patch_hash and diff):
-                raise PermissionError('原任务补丁已变化，请核对工作区后继续')
         else:
             workspace, source = Workspace.export(self.scopes, self.ctx, profile.source_commit, workspace_path)
-            if state.inherited_evidence_refs and state.source_manifest and digest(source) != state.source_manifest:
-                raise PermissionError('派生任务源码与父任务冻结清单不一致，不能复用父任务证据')
+            if state.inherited_evidence_refs:
+                state.evidence_refs = []
+                state.inherited_evidence_refs = []
+                state.reproduction_plan_frozen = False
+                state.reproduced = False
+                state.replay_plan_ref = None
             state.source_manifest = digest(source)
             state.repo_snapshot_ref = self.artifacts.put(self.scope, state.run_id, source, label='源码快照')
             state.memory_snapshot_ref = self.artifacts.put(self.scope, state.run_id, dataclasses.asdict(self.ctx), label='上下文快照')
@@ -393,7 +395,19 @@ class Session:
             self.render.text(f'继续原任务 {state.run_id}：第 {state.continuation_count} 次继续；此前非成功结束已标记，轨迹将追加。')
         self.task = asyncio.create_task(self.drive(state))
 
+    def validate_workspace(self, state, workspace=None, source=None, data_root=None):
+        source = source if source is not None else self.artifacts.json(self.scope, state.run_id, state.repo_snapshot_ref)
+        workspace = workspace or Workspace(Path(data_root or self.args.data)/'workspaces'/state.run_id,
+                                           self.scopes.projects[self.scope].allowed_files)
+        if state.scope_id != self.ctx.active_scope or state.source_manifest != digest(source):
+            raise PermissionError('运行状态与源码快照身份不一致')
+        workspace.validate_repository(self.scopes, self.ctx, source,
+            base_commit=state.patch_base_commit, patch_hash=state.patch_hash,
+            branch=state.local_branch or 'tracefix/' + state.run_id)
+        return workspace, source
+
     def bind(self, state, profile, workspace, source):
+        self.validate_workspace(state, workspace, source)
         runner = DockerRunner(profile, workspace, state.run_id)
         browser = MCPBrowser(runner.browser_command(), Policy(profile.allowed_origins))
         embedding = None
@@ -491,6 +505,7 @@ class Session:
         s = self.store.load(run_id, self.scope)
         if s.run_status not in {RunStatus.PAUSED, RunStatus.WAITING_APPROVAL}:
             raise ValueError('只可恢复已暂停的安全边界；意外崩溃的 RUNNING 状态须检查操作回执')
+        workspace, source = self.validate_workspace(s)
         self.begin_console_run(s)
         if not self.engine or self.run_id != run_id:
             # A stopped browser cannot promise restoration of an arbitrary pixel state.
@@ -501,8 +516,6 @@ class Session:
             if old['epochs'] != [list(x) for x in self.ctx.epochs]:
                 raise PermissionError('Scope 权限已变化')
             profile = self.project_profile()
-            source = self.artifacts.json(self.scope, run_id, s.repo_snapshot_ref)
-            workspace = Workspace(Path(self.args.data)/'workspaces'/run_id, self.scopes.projects[self.scope].allowed_files)
             self.bind(s, profile, workspace, source)
             env = await self.engine.runner.inspect_images()
             if env != s.environment_digest:

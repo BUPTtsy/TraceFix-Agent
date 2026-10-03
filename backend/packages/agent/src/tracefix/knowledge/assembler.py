@@ -70,6 +70,13 @@ class ContextAssembly:
     compacted: bool
 
 
+def failed_fact(value) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return bool(value.get('error') or value.get('isError') or value.get('is_error')
+                or value.get('passed') is False or failed_fact(value.get('result')))
+
+
 def compact_steps(steps: list[dict], *, keep_recent=4) -> dict:
     """确定性地汇总旧步骤，同时保留失败证据和最近步骤。
 
@@ -81,11 +88,7 @@ def compact_steps(steps: list[dict], *, keep_recent=4) -> dict:
     failures = []
     summaries = []
     for index, step in enumerate(older, 1):
-        result = step.get('result')
-        failed = step.get('error') or step.get('isError') or step.get('passed') is False
-        if isinstance(result, dict):
-            failed = failed or result.get('error') or result.get('isError') or result.get('passed') is False
-        if failed:
+        if failed_fact(step):
             # 失败步骤是诊断证据，不能像成功步骤一样只保留摘要。
             failures.append(deepcopy(step))
             continue
@@ -211,6 +214,26 @@ class ContextAssembler:
         available = self.available - extra_tokens
         original = deepcopy(context)
         original.pop('context_manifest', None)
+        facts = {}
+        for field in ('recent_steps', 'recent_action_results'):
+            failures = [item for item in original.get(field) or [] if failed_fact(item)]
+            if failures:
+                facts[field] = failures
+        memory = original.get('working_memory')
+        if isinstance(memory, dict):
+            notes = {key: memory[key] for key in ('finding', 'excluded') if memory.get(key)}
+            if notes:
+                facts['working_memory'] = notes
+        observation = original.get('observation')
+        if isinstance(observation, dict):
+            diagnostics = {key: observation[key] for key in ('console', 'network')
+                           if observation.get(key)}
+            if diagnostics:
+                facts['observation'] = diagnostics
+        if facts:
+            if 'pruning_facts' in original:
+                facts['previous'] = original['pruning_facts']
+            original['pruning_facts'] = facts
         ordered = {key: original[key] for key in self.ORDER if key in original}
         ordered.update({key: original[key] for key in sorted(original) if key not in ordered})
         omitted = {}

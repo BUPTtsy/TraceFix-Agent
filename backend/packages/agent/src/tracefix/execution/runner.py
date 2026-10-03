@@ -5,7 +5,7 @@ import json
 import os
 
 from tracefix.runtime.contracts import digest
-from tracefix.execution.platforms import subprocess_options, terminate_tree, container_user, bind_mount, is_link
+from tracefix.execution.platforms import subprocess_options, terminate_tree, container_user, bind_mount
 
 
 async def process(argv, timeout=120):
@@ -46,16 +46,16 @@ class DockerRunner:
         return self.actual_digest
 
     def prepare_mountpoints(self):
-        """创建允许挂载的目录，并拒绝链接或同名普通文件。"""
-        for name in ('dist', 'node_modules'):
-            path = self.workspace.root / name
-            if is_link(path) or (path.exists() and not path.is_dir()):
-                raise PermissionError(f'容器挂载点不是普通目录：{name}')
-            path.mkdir(exist_ok=True)
+        """只核对 export 已冻结的空挂载目录，不在启动时补建。"""
+        self.workspace.prepare_mountpoints()
 
     async def start(self, source_manifest):
         """创建内部网络和只读应用容器，然后执行健康检查。"""
+        snapshot = self.workspace.require_repository_snapshot()
+        if digest(snapshot) != source_manifest:
+            raise PermissionError('沙箱请求与绑定仓库快照摘要不一致')
         self.prepare_mountpoints()
+        self.workspace.check_frozen(snapshot)
         await self.docker('network', 'create', '--internal', '--label', 'tracefix.run='+self.run_id, self.network)
         await self.docker('run', '-d', '--name', self.name, '--network', self.network, '--network-alias', 'app',
             '--label', 'tracefix.run='+self.run_id, '--user', container_user(),

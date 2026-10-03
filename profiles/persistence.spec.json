@@ -10,6 +10,40 @@
     {"kind":"navigate","value":"http://app:3000/"},
     {"kind":"click","locator":{"role":"button","name":"Todo"}}
   ],
-  "regression_assertions":[{"locator":{"role":"heading","name":"Task board"},"condition":"visible"},{"locator":{"role":"button","name":"Add task"},"condition":"enabled"},{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"visible"}],
+  "regression_assertions":[{"locator":{"role":"heading","name":"Task board"},"condition":"visible"},{"locator":{"role":"button","name":"Add task"},"condition":"enabled"},{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"visible"},{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"unchecked"}],
+  "behavior_scenarios":[{
+    "id":"b01-completion-round-trip",
+    "description":"A fresh seeded sandbox must preserve completing and cancelling completion across reloads and status filters.",
+    "steps":[
+      {
+        "action":{"kind":"observe"},
+        "assertions":[{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"unchecked"},{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"enabled"}]
+      },
+      {
+        "action":{"kind":"click","locator":{"role":"checkbox","name":"Complete Write project brief"}},
+        "assertions":[{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"checked"},{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"enabled"}]
+      },
+      {
+        "action":{"kind":"navigate","value":"http://app:3000/"},
+        "assertions":[{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"checked"},{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"enabled"}]
+      },
+      {
+        "action":{"kind":"click","locator":{"role":"checkbox","name":"Complete Write project brief"}},
+        "assertions":[{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"unchecked"},{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"enabled"}]
+      },
+      {
+        "action":{"kind":"navigate","value":"http://app:3000/"},
+        "assertions":[{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"unchecked"},{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"enabled"}]
+      },
+      {
+        "action":{"kind":"click","locator":{"role":"button","name":"Todo"}},
+        "assertions":[{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"visible"},{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"unchecked"}]
+      },
+      {
+        "action":{"kind":"click","locator":{"role":"button","name":"Done"}},
+        "assertions":[{"locator":{"role":"checkbox","name":"Complete Write project brief"},"condition":"absent"},{"locator":{"role":"checkbox","name":"Complete Prepare release checklist"},"condition":"visible"}]
+      }
+    ]
+  }],
   "max_steps":12
 }

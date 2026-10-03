@@ -20,6 +20,7 @@ from tracefix.execution.platforms import container_user, is_link
 from tracefix.execution.runner import process
 from tracefix.runtime.contracts import Contract, Phase, digest, new_id
 from tracefix.runtime.tools import ToolRejected
+from tracefix.runtime.effects import apply_effect_receipt, run_effect
 from tracefix.workers.locks import WorkspaceMutex
 
 
@@ -171,6 +172,27 @@ class LocalTools:
             if not path.exists():
                 raise ToolRejected('本地编辑工具不支持创建新文件')
             return self.workspace.stage(path.relative_to(self.root).as_posix(), arguments.content)
+
+    async def write_effect(self, arguments, tool_name):
+        path_value = arguments.file_path if tool_name != 'NotebookEdit' else arguments.notebook_path
+        path = self.path(path_value, write=True)
+        relative = path.relative_to(self.root).as_posix()
+        with self.mutex.write_lock(path):
+            staged = self.workspace.staged_content(relative)
+            baseline = path.read_bytes()
+            content = staged if staged is not None else baseline
+            prepared = await run_effect('local.prepare', {
+                'tool': tool_name,
+                'content': content.decode('utf-8'),
+                'arguments': arguments.model_dump(mode='json'),
+                'cell_id': new_id('cell')}, timeout_s=45)
+            if digest(content) != prepared['before_hash']:
+                raise ToolRejected('本地写入基线在执行期间变化，拒绝回写')
+            with apply_effect_receipt():
+                current = self.workspace.staged_content(relative)
+                if current != staged or path.read_bytes() != baseline:
+                    raise ToolRejected('本地写入基线在执行期间变化，拒绝回写')
+                return self.workspace.stage(relative, prepared['content'])
 
     def edit(self, arguments):
         path = self.path(arguments.file_path, write=True)
@@ -331,8 +353,9 @@ class LocalTools:
                 for target in targets.values():
                     if not target.exists():
                         raise ToolRejected('Bash 不支持创建新文件')
-                self.workspace.stage_many({relative: data.decode('utf-8')
-                                           for relative, data in changes.items()})
+                with apply_effect_receipt():
+                    self.workspace.stage_many({relative: data.decode('utf-8')
+                                               for relative, data in changes.items()})
             return {**result, 'files_changed': list(changes), 'cwd': '/workspace', 'staged': True}
 
 
@@ -352,7 +375,9 @@ def register_local_tools(engine, state, context, bind):
             continue
         if writing and not tools.write_enabled:
             continue
-        async def handler(arguments, call_id, callback=callback):
+        async def handler(arguments, call_id, callback=callback, name=name, writing=writing):
+            if writing:
+                return await tools.write_effect(arguments, name)
             return await asyncio.to_thread(callback, arguments)
         bind(name, description, model, handler, phases=set(Phase),
              side_effect='write' if writing else 'read', parallel_safe=not writing)

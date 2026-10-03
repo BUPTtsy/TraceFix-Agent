@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {DatabaseSync} from 'node:sqlite';
-import {artifactIndex, readArtifact} from './artifacts.js';
+import {artifactIndex, evidenceClosure, readArtifact, readArtifactBytes} from './artifacts.js';
 import {loadConfig, projectCatalog} from './config.js';
 import {canContinue, ConsoleDatabase, DataError, timestamp} from './database.js';
 import {RuleDatabase} from './rules.js';
@@ -69,10 +69,9 @@ export function createConsoleService(options: ConsoleOptions = {}) {
   function runView(id: string): Data {
     const record = database.run(id);
     const index = record.agentRunId ? artifactIndex(artifactRoot(record), record.projectId, record.agentRunId) : {};
-    const knowledgeRefs = new Set((record.knowledge || []).map((entry: Data) => entry.artifact_ref));
-    const artifacts = Object.entries(index).filter(([ref, entry]) =>
-      ref.endsWith('.diff') || ref.endsWith('.html') || ref === record.reportRef || knowledgeRefs.has(ref) ||
-      ['修复报告数据', '完整事件数据', '继续执行前状态'].some(name => entry['用途']?.includes(name)))
+    const allowed = record.agentRunId ? evidenceClosure(artifactRoot(record), record.projectId,
+      record.agentRunId, record.reportRef, index) : new Set<string>();
+    const artifacts = Object.entries(index).filter(([ref]) => allowed.has(ref))
       .map(([ref, entry]) => ({ref, label: entry['用途'], bytes: entry['字节数']}));
     return {...record, canContinue: canContinue(record.status, record.outcome), artifacts,
       ruleSnapshot: record.agentRunId ? rules.snapshot(record.agentRunId) : null};
@@ -165,7 +164,7 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     if (operation === 'artifact') {
       const record = runView(fields.id);
       if (!record.artifacts.some((entry: Data) => entry.ref === fields.ref)) throw new DataError('只允许读取此 Run 的报告或补丁');
-      return {content: readArtifact(artifactRoot(record), record.projectId, record.agentRunId, fields.ref)};
+      return {encoding: 'base64', content: readArtifactBytes(artifactRoot(record), record.projectId, record.agentRunId, fields.ref).toString('base64')};
     }
     if (operation === 'run.create') {
       const project = catalog().find(item => item.id === fields.projectId);

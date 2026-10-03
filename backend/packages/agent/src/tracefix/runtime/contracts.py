@@ -138,7 +138,28 @@ class BrowserAction(Contract):
 
 class Assertion(Contract):
     locator: Locator
-    condition: Literal["visible", "absent", "checked", "disabled", "enabled"] = "visible"
+    condition: Literal["visible", "absent", "checked", "unchecked", "disabled", "enabled"] = "visible"
+
+
+class BehaviorStep(Contract):
+    action: BrowserAction
+    assertions: list[Assertion] = Field(default_factory=list)
+
+
+class BehaviorScenario(Contract):
+    id: str = Field(min_length=1)
+    description: str = ""
+    steps: list[BehaviorStep] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_checkpoints(self):
+        if not self.steps[-1].assertions:
+            raise ValueError('业务场景最后一步必须包含断言')
+        if len(self.steps) > 1 and not any(step.assertions for step in self.steps[:-1]):
+            raise ValueError('多步业务场景必须包含中间断言')
+        if any(step.action.kind == 'finish' for step in self.steps):
+            raise ValueError('业务场景不能使用 finish 跳过运行时验证')
+        return self
 
 
 class GuidanceAck(Contract):
@@ -157,6 +178,7 @@ class TestSpec(Contract):
     assertions: list[Assertion] = Field(min_length=1)
     regression_plan: list[BrowserAction] = Field(default_factory=list)
     regression_assertions: list[Assertion] = Field(min_length=1)
+    behavior_scenarios: list[BehaviorScenario] = Field(default_factory=list)
     guidance_ack: list[GuidanceAck] = Field(default_factory=list)
     @model_validator(mode="after")
     def validate_actions(self):
@@ -166,6 +188,15 @@ class TestSpec(Contract):
             raise ValueError('regression_plan 含有未被 authorized_actions 授权的动作')
         if any(action.observation_id is not None or action.element_ref is not None for action in self.regression_plan):
             raise ValueError('regression_plan 的 observation_id 和 element_ref 必须为 null，重放时由运行时绑定')
+        ids = [scenario.id for scenario in self.behavior_scenarios]
+        if len(ids) != len(set(ids)):
+            raise ValueError('业务场景 id 不可重复')
+        for scenario in self.behavior_scenarios:
+            for step in scenario.steps:
+                if step.action.kind not in self.authorized_actions:
+                    raise ValueError('业务场景含有未被 authorized_actions 授权的动作')
+                if step.action.observation_id is not None or step.action.element_ref is not None:
+                    raise ValueError('业务场景的 observation_id 和 element_ref 必须为 null')
         return self
 
 
@@ -249,14 +280,20 @@ class PatchProposal(Contract):
 
 
 class Validation(Contract):
-    kind: Literal["static", "unit", "build", "health", "original", "regression"]
-    passed: bool
+    kind: Literal["static", "unit", "build", "health", "original", "regression", "behavior"]
+    type: Literal["validation"] = "validation"
+    passed: bool = Field(strict=True)
+    scope_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
     source_manifest: str
     patch_hash: str
     environment_digest: str
     verifier_version: str = SCHEMA_VERSION
     test_spec_hash: str
-    artifact_ref: str
+    artifact_ref: str = Field(min_length=1)
+    scenario_id: str | None = None
+    scenario_hash: str | None = None
+    replay_plan_hash: str = Field(min_length=1)
 
 
 class RunState(Contract):
@@ -295,6 +332,7 @@ class RunState(Contract):
     working_set_refs: list[str] = Field(default_factory=list)
     patch_ref: str | None = None
     patch_hash: str | None = None
+    patch_base_commit: str | None = Field(default=None, pattern=r'^(?:[a-f0-9]{40}|[a-f0-9]{64})$')
     validation_refs: list[str] = Field(default_factory=list)
     pending_action: dict | None = None
     budget: Usage = Field(default_factory=Usage)
@@ -311,6 +349,7 @@ class RunState(Contract):
     trial: int = 0
     failure_signatures: list[str] = Field(default_factory=list)
     validation_index: int = 0
+    behavior_check_refs: list[str] = Field(default_factory=list)
     error: str | None = None
     error_details: dict | None = None
     diagnosis_retry_count: int = 0
@@ -368,6 +407,13 @@ def reduce_state(state: RunState, expected_revision: int, **delta) -> RunState:
     if state.test_spec_ref and any(delta.get(field, getattr(state, field)) != getattr(state, field)
                                    for field in ('test_spec_ref', 'test_spec_hash')):
         raise ValueError('已冻结的 TestSpec 不可变更')
+    if state.patch_base_commit and delta.get('patch_base_commit', state.patch_base_commit) != state.patch_base_commit:
+        raise ValueError('已固定的补丁基线不可变更')
+    if state.patch_hash and not state.test_spec_ref and delta.get('test_spec_ref'):
+        raise ValueError('修补后不能补充冻结 TestSpec')
+    if state.patch_hash and any(delta.get(field, getattr(state, field)) != getattr(state, field)
+                               for field in ('replay_plan_ref', 'exploration_plan_ref', 'reproduction_plan_frozen')):
+        raise ValueError('修补后不能更改冻结复现计划')
     phase = Phase(delta.get("phase", state.phase))
     if phase != state.phase and phase not in TRANSITIONS[state.phase]:
         if not (state.continuation_count and state.phase == Phase.PREPARE and phase == Phase.VERIFY
@@ -378,18 +424,12 @@ def reduce_state(state: RunState, expected_revision: int, **delta) -> RunState:
     if delta.get("patch_hash", state.patch_hash) != state.patch_hash:
         delta["validation_refs"] = []
         delta["approval_ref"] = None
+        delta["behavior_check_refs"] = []
     return RunState.model_validate({**state.model_dump(), **delta, "revision": state.revision + 1})
 
 
-def verification_gate(state: RunState, validations: list[Validation], artifact_exists) -> bool:
-    required = {"static", "unit", "build", "health", "original", "regression"}
-    good = set()
-    for v in validations:
-        current = (v.source_manifest == state.source_manifest and v.patch_hash == state.patch_hash
-                   and v.environment_digest == state.environment_digest
-                   and v.test_spec_hash == state.test_spec_hash
-                   and v.verifier_version == SCHEMA_VERSION)
-        if current and v.passed and artifact_exists(v.artifact_ref):
-            good.add(v.kind)
-    return bool(state.reproduced and state.source_aligned and state.patch_hash
-                and required <= good and all(artifact_exists(r) for r in state.evidence_refs))
+def verification_gate(state: RunState, validations: list[Validation], artifact_exists, *,
+                      artifact_read=None, artifact_read_bytes=None) -> bool:
+    from tracefix.runtime.verification import verify_artifacts
+
+    return verify_artifacts(state, validations, artifact_exists, artifact_read, artifact_read_bytes)

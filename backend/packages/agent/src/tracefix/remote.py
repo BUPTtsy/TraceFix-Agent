@@ -4,10 +4,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlsplit
+
+from tracefix.execution.repository import plain_root, repository_binding, run_git
 
 
 REMOTE_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -30,7 +31,7 @@ def validate_repository(value: str) -> str:
 
 def validate_branch(value: str) -> str:
     value = value.strip()
-    if not value or not REMOTE_BRANCH.fullmatch(value) or value.startswith("/") or value.endswith("/"):
+    if not value or not REMOTE_BRANCH.fullmatch(value) or value.startswith(("/", '-')) or value.endswith(("/", '.lock')):
         raise ValueError("分支名称包含无效字符")
     if ".." in value or "//" in value or value.endswith("."):
         raise ValueError("分支名称不能包含连续点、连续斜杠或点结尾")
@@ -97,23 +98,31 @@ def prepare_checkout(settings: dict, destination: Path) -> dict:
     branch = settings.get('branch')
     if branch:
         validate_branch(branch)
-    destination = destination.expanduser().resolve()
+    destination = plain_root(destination)
     if destination.exists():
         if (destination / '.git').is_dir():
+            identity = repository_binding(destination, repository, f'refs/remotes/origin/{base}',
+                                          expected_branch=branch or base)
+            if identity['head'] != identity['base']:
+                raise PermissionError('existing checkout HEAD 与 origin/base 不一致')
+            if settings.get('source_commit') and run_git(destination, 'rev-parse', '--verify',
+                    settings['source_commit'] + '^{commit}').decode().strip() != identity['base']:
+                raise PermissionError('existing checkout 与 source commit 不一致')
             return {'destination': str(destination), 'repository': repository, 'base': base,
-                    'branch': branch, 'action': 'existing'}
+                    'branch': branch, 'action': 'existing', 'identity': identity}
         if any(destination.iterdir()):
             raise ValueError('远程仓库目标目录非空且不是 Git 工作区')
     destination.parent.mkdir(parents=True, exist_ok=True)
-    command = ['git', 'clone', '--origin', 'origin', '--branch', base,
-               '--single-branch', f'https://github.com/{repository}.git', str(destination)]
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', timeout=120)
+        run_git(None, 'clone', '--origin', 'origin', '--branch', base, '--single-branch',
+                '--', f'https://github.com/{repository}.git', str(destination), timeout=120)
         if branch and branch != base:
-            subprocess.run(['git', '-C', str(destination), 'switch', '--create', branch],
-                           check=True, capture_output=True, text=True, encoding='utf-8', timeout=30)
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-        detail = getattr(error, 'stderr', '') or str(error)
-        raise RuntimeError(f'远程仓库拉取失败: {detail[-500:]}') from error
+            run_git(destination, 'switch', '--create', branch)
+        identity = repository_binding(destination, repository, f'refs/remotes/origin/{base}',
+                                      expected_branch=branch or base)
+        if identity['head'] != identity['base']:
+            raise PermissionError('远程 checkout HEAD 与 base 不一致')
+    except (OSError, RuntimeError) as error:
+        raise RuntimeError(f'远程仓库拉取失败: {str(error)[-500:]}') from error
     return {'destination': str(destination), 'repository': repository, 'base': base,
-            'branch': branch, 'action': 'cloned'}
+            'branch': branch, 'action': 'cloned', 'identity': identity}

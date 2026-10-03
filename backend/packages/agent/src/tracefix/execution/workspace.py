@@ -3,13 +3,14 @@
 import difflib
 import os
 import re
-import subprocess
 from fnmatch import fnmatchcase
 from pathlib import Path
 
 from tracefix.runtime.contracts import PatchProposal, digest
 from tracefix.runtime.guidance import GuidanceRejected
 from tracefix.execution.platforms import safe_relative, is_link
+from tracefix.execution.repository import (file_manifest, plain_root, repository_binding,
+    run_git, safe_commit, safe_index_files)
 
 # 冻结证据的词元：测试与判定(oracle)不得被 Agent 自己的补丁改写。
 FROZEN_TOKENS = frozenset({'test', 'tests', 'conftest', 'spec', 'specs', 'oracle', 'oracles'})
@@ -40,20 +41,15 @@ def is_frozen_path(relative) -> bool:
 
 
 def git(root: Path, *args, env=None):
-    p = subprocess.run(["git", "-c", "core.autocrlf=false", "-c", "core.safecrlf=false",
-                        "-c", "core.quotePath=false", "-C", str(root), *args], capture_output=True, timeout=30, env=env)
-    if p.returncode:
-        raise RuntimeError(f'Git 命令执行失败（退出码 {p.returncode}）：' + p.stderr.decode(errors="replace")[:500])
-    return p.stdout
+    if env is not None:
+        raise ValueError('Git 环境只能由安全仓库 helper 构造')
+    return run_git(root, *args)
 
 
 def commit_workspace(root: Path, message: str):
     name = os.getenv('TRACEFIX_GIT_AUTHOR_NAME', '').strip() or 'TraceFix'
     email = os.getenv('TRACEFIX_GIT_AUTHOR_EMAIL', '').strip() or 'tracefix@localhost'
-    environment = dict(os.environ)
-    environment.update(GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email,
-                       GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email)
-    return git(root, 'commit', '-qm', message, env=environment)
+    return safe_commit(root, message, name, email)
 
 
 class Workspace:
@@ -61,20 +57,25 @@ class Workspace:
 
     def __init__(self, root: Path, allowed_files: list[str]):
         """绑定根目录和允许写入的 glob 模式。"""
-        self.root = root.resolve()
+        self.root = plain_root(root)
         self.allowed_files = allowed_files
         self.guidance_constraints = []
         # Local edit tools write into this overlay until a PatchProposal is
         # accepted by the normal patch transaction.  Keeping the overlay out
         # of the working tree preserves the frozen reproduction baseline.
         self._staged_files = {}
+        self.repository_snapshot = None
 
     @classmethod
     def export(cls, scopes, ctx, commit: str, target: Path):
         """将指定提交导出到临时目录，并构造对应的工作区对象。"""
-        source = scopes.projects[ctx.active_scope].root
+        scopes.assert_current(ctx)
+        project = scopes.projects[ctx.active_scope]
+        source = plain_root(project.root)
         top = Path(git(source, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+        identity = repository_binding(top, project.repo_id, commit, require_clean=False)
         resolved = git(source, "rev-parse", "--verify", f"{commit}^{{commit}}").decode().strip()
+        target = plain_root(target)
         if target.exists():
             raise FileExistsError("该 Run 的工作区已存在")
         target.mkdir(parents=True)
@@ -96,6 +97,8 @@ class Workspace:
                 continue
             if mode == "120000" or kind != "blob":
                 raise PermissionError("授权导出中存在符号链接/子模块；请先展平已批准的依赖")
+            if mode != '100644':
+                raise PermissionError('授权导出暂不支持可执行文件模式；必须使用保留执行位的显式迁移')
             data = git(top, "cat-file", "blob", blob)
             if len(data) > 2_000_000:
                 raise ValueError("源文件超过 2 MB；请排除生成的资源文件")
@@ -106,10 +109,115 @@ class Workspace:
         if not manifest:
             raise ValueError("源码导出为空")
         workspace = cls(target, scopes.projects[ctx.active_scope].allowed_files)
-        git(target, "init", "-q")
-        git(target, "add", ".")
+        git(target, "init", "-q", '--initial-branch=tracefix/export')
+        safe_index_files(target, sorted(manifest))
         commit_workspace(target, "Frozen authorized source export")
-        return workspace, {"commit": resolved, "files": manifest, "subdir": prefix}
+        workspace.prepare_mountpoints(create=True)
+        snapshot = {"commit": resolved, "files": manifest, "subdir": prefix,
+            'repository_version': 1, 'scope_id': ctx.active_scope, 'repo_id': project.repo_id,
+            'source_root': str(source), 'source_repository': identity,
+            'source_tree': git(top, 'rev-parse', f'{resolved}^{{tree}}').decode().strip(),
+            'workspace_root': str(workspace.root), 'workspace_repository': repository_binding(target),
+            'entries': file_manifest(target)}
+        workspace.repository_snapshot = snapshot
+        return workspace, snapshot
+
+    def prepare_mountpoints(self, *, create=False):
+        paths = [self.root / name for name in ('dist', 'node_modules')]
+        for path in paths:
+            if is_link(path) or (path.exists() and (not path.is_dir() or any(path.iterdir()))):
+                raise PermissionError('运行期挂载点必须是空的普通目录：' + path.name)
+            if not create and not path.is_dir():
+                raise PermissionError('绑定快照的挂载目录已删除：' + path.name)
+        if create:
+            for path in paths:
+                path.mkdir(exist_ok=True)
+
+    def require_repository_snapshot(self, snapshot=None):
+        snapshot = snapshot if snapshot is not None else self.repository_snapshot
+        required = {'repository_version', 'scope_id', 'repo_id', 'source_root', 'source_repository',
+                    'source_tree', 'workspace_root', 'workspace_repository', 'commit', 'files', 'entries', 'subdir'}
+        if (not isinstance(snapshot, dict) or not required <= snapshot.keys()
+                or snapshot['repository_version'] != 1):
+            raise PermissionError('历史源码快照缺少仓库身份；须人工迁移或创建新 Run，不能直接恢复')
+        for name in ('source_repository', 'workspace_repository'):
+            binding = snapshot[name]
+            if not isinstance(binding, dict) or not {'root', 'repo_id', 'origin', 'head', 'base', 'tree', 'branch', 'clean'} <= binding.keys():
+                raise PermissionError('仓库身份快照不完整')
+        if not isinstance(snapshot['entries'], dict) or not snapshot['files']:
+            raise PermissionError('仓库文件 manifest 不完整')
+        if snapshot['workspace_root'] != str(self.root) or snapshot['workspace_repository']['root'] != str(self.root):
+            raise PermissionError('沙箱工作区真实 root 与快照绑定不一致')
+        if not isinstance(snapshot['files'], dict) or any(
+                not isinstance(entry, dict) or not {'kind', 'tracked', 'mode', 'git_mode', 'content'} <= entry.keys()
+                for entry in snapshot['entries'].values()):
+            raise PermissionError('文件 manifest 类型记录不完整')
+        for relative, content in snapshot['files'].items():
+            entry = snapshot['entries'].get(relative, {})
+            if entry.get('kind') != 'file' or entry.get('tracked') is not True or entry.get('content') != content:
+                raise PermissionError('源码摘要与 tracked 文件 manifest 不一致')
+        for name in ('dist', 'node_modules'):
+            entry = snapshot['entries'].get(name, {})
+            if entry.get('kind') != 'directory' or entry.get('tracked') is not False or entry.get('content') != '':
+                raise PermissionError('快照未固定空的运行期挂载目录')
+        return snapshot
+
+    def validate_repository(self, scopes, ctx, snapshot, *, base_commit=None,
+                            patch_hash=None, branch=None):
+        snapshot = self.require_repository_snapshot(snapshot)
+        scopes.assert_current(ctx)
+        project = scopes.projects[ctx.active_scope]
+        source = plain_root(project.root)
+        if (snapshot['scope_id'] != ctx.active_scope or snapshot['repo_id'] != project.repo_id
+                or snapshot['source_root'] != str(source)
+                or snapshot['workspace_root'] != str(self.root)):
+            raise PermissionError('源码快照与 scope/repo/root 绑定不一致')
+        expected_source = snapshot['source_repository']
+        current_source = repository_binding(Path(expected_source['root']), project.repo_id,
+                                            snapshot['commit'], require_clean=False)
+        top = Path(git(source, 'rev-parse', '--show-toplevel').decode().strip()).resolve()
+        if str(top) != expected_source['root'] or current_source != expected_source:
+            raise PermissionError('源仓库 origin/HEAD/branch/commit 身份已变化')
+        if git(top, 'rev-parse', f"{snapshot['commit']}^{{tree}}").decode().strip() != snapshot['source_tree']:
+            raise PermissionError('源仓库树与快照不一致')
+        expected_workspace = snapshot['workspace_repository']
+        current = repository_binding(self.root, require_clean=False)
+        baseline = base_commit or expected_workspace['head']
+        if baseline != expected_workspace['head']:
+            raise PermissionError('补丁 baseline 与导出仓库绑定不一致')
+        if (current['origin'] != expected_workspace['origin']
+                or current['branch'] not in {branch, expected_workspace['branch']}
+                or git(self.root, 'rev-parse', f'{baseline}^{{tree}}').decode().strip() != expected_workspace['tree']):
+            raise PermissionError('工作区 origin/branch/baseline 身份不一致')
+        if current['head'] != baseline:
+            if not branch or current['branch'] != branch:
+                raise PermissionError('工作区 HEAD 未绑定候选分支')
+            try:
+                git(self.root, 'merge-base', '--is-ancestor', baseline, current['head'])
+            except RuntimeError as error:
+                raise PermissionError('工作区 baseline 不是当前 HEAD 的祖先') from error
+            commits = git(self.root, 'rev-list', f'{baseline}..{current["head"]}').decode().splitlines()
+            for commit in commits:
+                tree_files = {}
+                for record in git(self.root, 'ls-tree', '-rz', commit).split(b'\0'):
+                    if record:
+                        metadata, name = record.split(b'\t', 1)
+                        mode, kind, blob = metadata.decode().split()
+                        relative = name.decode()
+                        if mode != '100644' or kind != 'blob':
+                            raise PermissionError('候选提交存在链接/类型变化')
+                        tree_files[relative] = digest(git(self.root, 'cat-file', 'blob', blob))
+                if tree_files.keys() != snapshot['files'].keys():
+                    raise PermissionError('候选提交存在文件新增/删除')
+                for relative, content in tree_files.items():
+                    if content != snapshot['files'][relative]:
+                        self.path(relative, write=True)
+        self.check_frozen(snapshot)
+        diff = self.diff(base=baseline)
+        if (patch_hash and digest(diff.encode()) != patch_hash) or (not patch_hash and diff):
+            raise PermissionError('原任务补丁已变化，请核对工作区后继续')
+        self.repository_snapshot = snapshot
+        return snapshot
 
     def path(self, relative, write=False):
         """解析相对路径，同时检查符号链接、冻结文件和写入白名单。"""
@@ -282,7 +390,7 @@ class Workspace:
                 raise GuidanceRejected('补丁超过用户约束的改动行数', details={
                     'actual_lines': changed_lines, 'max_lines_changed': constraint.max_lines_changed})
 
-    def apply(self, patch: PatchProposal):
+    def apply(self, patch: PatchProposal, base='HEAD'):
         """先完整校验补丁，再逐文件替换，返回可恢复的补丁摘要。"""
         if len({e.path for e in patch.edits}) != len(patch.edits):
             raise ValueError("存在重复的编辑路径")
@@ -303,21 +411,40 @@ class Workspace:
             tmp.write_bytes(after)
             os.replace(tmp, p)
         self.clear_staged()
-        return {"patch_hash": digest(self.diff().encode()), "files": [e.path for e in patch.edits]}
+        return {"patch_hash": digest(self.diff(base).encode()), "files": [e.path for e in patch.edits],
+                "base_commit": base}
 
-    def reconcile(self, patch: PatchProposal):
+    def reconcile(self, patch: PatchProposal, base='HEAD'):
         """确认磁盘状态是否与补丁的全部目标内容一致。"""
         hashes = [digest(self.path(e.path).read_bytes()) for e in patch.edits]
         if all(h == digest(e.content.encode()) for h, e in zip(hashes, patch.edits)):
-            return {"patch_hash": digest(self.diff().encode()), "files": [e.path for e in patch.edits]}
+            return {"patch_hash": digest(self.diff(base).encode()), "files": [e.path for e in patch.edits],
+                    "base_commit": base}
         raise RuntimeError("补丁状态未知；请先检查工作区再恢复")
 
-    def diff(self):
-        """返回工作区相对 HEAD 的纯文本差异。"""
-        return git(self.root, "diff", "--no-ext-diff", "--no-color", "HEAD").decode()
+    def head(self):
+        return git(self.root, 'rev-parse', '--verify', 'HEAD').decode().strip()
+
+    def diff(self, base='HEAD'):
+        """返回工作区相对指定基线的纯文本差异。"""
+        return git(self.root, "diff", "--no-ext-diff", '--no-textconv', "--no-color", base, '--').decode()
 
     def check_frozen(self, source_manifest):
         """验证文件集合和冻结文件摘要未被运行过程悄然改变。"""
+        source_manifest = self.require_repository_snapshot(source_manifest)
+        if source_manifest.get('repository_version') == 1:
+            self.require_repository_snapshot(source_manifest)
+            self.prepare_mountpoints()
+            actual_entries = file_manifest(self.root)
+            expected_entries = source_manifest['entries']
+            if actual_entries.keys() != expected_entries.keys():
+                raise PermissionError('工作区 manifest 文件/目录集合变化')
+            for relative, expected in expected_entries.items():
+                actual_entry = actual_entries[relative]
+                if any(actual_entry[key] != expected[key] for key in ('kind', 'tracked', 'mode', 'git_mode')):
+                    raise PermissionError('工作区 manifest 文件类型/链接/索引变化：' + relative)
+                if actual_entry['content'] != expected['content']:
+                    self.path(relative, write=True)
         tracked = set(source_manifest['files'])
         actual = set()
         for p in self.root.rglob('*'):
@@ -338,8 +465,13 @@ class Workspace:
         if not name.startswith('tracefix/run_'):
             raise PermissionError("本地分支名称无效")
         existing = git(self.root, "branch", "--list", name).decode().strip()
-        if not existing:
+        if existing:
+            if git(self.root, 'branch', '--show-current').decode().strip() != name:
+                raise PermissionError('候选分支与当前工作区不匹配')
+        else:
             git(self.root, "checkout", "-qb", name)
-            git(self.root, "add", ".")
+        if git(self.root, 'status', '--porcelain').strip():
+            safe_index_files(self.root, sorted(self.repository_snapshot['files']
+                             if self.repository_snapshot else git(self.root, 'ls-files', '-z').decode().split('\0')[:-1]))
             commit_workspace(self.root, "TraceFix verified candidate")
         return name

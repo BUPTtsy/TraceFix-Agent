@@ -10,6 +10,7 @@ from pydantic import ConfigDict, Field
 from tracefix.runtime.contracts import (BrowserAction, Contract, Decision, PatchProposal,
                                        Phase, TestSpec, digest)
 from tracefix.runtime.tools import ToolPipeline, ToolRegistry, ToolRejected, ToolSpec
+from tracefix.runtime.effects import file_resource, make_operation_executor, run_effect
 
 
 class EmptyInput(Contract):
@@ -42,8 +43,14 @@ class RuntimeTools:
     handlers: dict
     phase: Phase
     submissions: dict = field(default_factory=dict)
+    operation_executor: object = None
+    resource_resolver: object = None
 
     def pipeline(self, **callbacks):
+        if self.operation_executor is not None:
+            callbacks['operation'] = self.operation_executor
+        if self.resource_resolver is not None:
+            callbacks['resource_resolver'] = self.resource_resolver
         return ToolPipeline(self.registry, self.handlers, self.phase, **callbacks)
 
 
@@ -244,9 +251,11 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
             if state.observation_ref:
                 refs.append(state.observation_ref)
             try:
-                value = await asyncio.to_thread(memory.note, scope_id=state.scope_id,
-                    run_id=state.run_id, note=arguments, allowed_evidence_refs=refs,
-                    source_manifest=state.source_manifest)
+                value = await run_effect('memory.note', {
+                    'path': str(memory.path), 'scope_id': state.scope_id,
+                    'run_id': state.run_id, 'note': arguments.model_dump(mode='json'),
+                    'allowed_evidence_refs': refs, 'source_manifest': state.source_manifest},
+                    timeout_s=45)
             except (ValueError, PermissionError) as error:
                 raise ToolRejected(str(error)) from error
             return _value(value)
@@ -301,4 +310,20 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
         bind(name, '提交经过运行时校验的阶段结果；运行时继续决定断言、修复与状态转移。',
              input_model, submit, phases={required_phase}, side_effect='write',
              parallel_safe=False, submission=True, output_limit_tokens=2000)
-    return RuntimeTools(registry, handlers, phase, submissions)
+    def resources(name, arguments):
+        if name in {'Write', 'Edit', 'NotebookEdit'}:
+            return [file_resource(arguments.get('file_path') or arguments['notebook_path'])]
+        if name == 'Bash':
+            return [file_resource(engine.workspace.root)]
+        if name == 'memory.note':
+            return [file_resource(memory.path)]
+        if name == 'agent.delegate':
+            paths = arguments.get('writable_files') or []
+            return ([file_resource(engine.workspace.root / path) for path in paths]
+                    if paths else ['delegation:' + state.run_id])
+        return ['*']
+
+    store = getattr(engine, 'store', None)
+    executor = (make_operation_executor(store, state, notify=getattr(engine, '_notify', None))
+                if store is not None else None)
+    return RuntimeTools(registry, handlers, phase, submissions, executor, resources)

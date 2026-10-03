@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -182,7 +183,7 @@ class WorkerHandle:
     scheduler: "WorkerScheduler"
 
     def result(self, timeout: float | None = None) -> WorkerResult:
-        return self.future.result(timeout=timeout)
+        return self.scheduler.wait_blocking(self, timeout=timeout)
 
     def done(self) -> bool:
         return self.future.done()
@@ -213,13 +214,20 @@ class _Record:
     thread_id: int | None = None
     summary: str = ""
     error: str | None = None
+    queue_deadline: float = 0.0
+    queue_timer: threading.Timer | None = None
 
 
 class WorkerScheduler:
-    """Unbounded task queue backed by at most four worker threads."""
+    """Task queue backed by at most four worker threads.
+
+    Forward dependencies remain valid until the queue deadline. Queueing and
+    result waits default to 300 seconds; task timeouts may shorten queueing.
+    """
 
     DEFAULT_MAX_CONCURRENCY = 4
     DEFAULT_RETRY_LIMIT = 3
+    DEFAULT_WAIT_TIMEOUT_SECONDS = 300.0
 
     def __init__(
         self,
@@ -229,6 +237,8 @@ class WorkerScheduler:
         retry_limit: int = DEFAULT_RETRY_LIMIT,
         workspace: Any = None,
         lock_manager: WorkspaceMutex | None = None,
+        *,
+        wait_timeout_seconds: float = DEFAULT_WAIT_TIMEOUT_SECONDS,
     ) -> None:
         if isinstance(max_concurrency, bool) or isinstance(max_concurrency, float) and not max_concurrency.is_integer():
             raise ValueError("max_concurrency must be an integer between 1 and 4")
@@ -238,10 +248,13 @@ class WorkerScheduler:
             raise ValueError("retry_limit must be an integer between 0 and 3")
         if not 0 <= int(retry_limit) <= 3:
             raise ValueError("retry_limit must be between 0 and 3")
+        if isinstance(wait_timeout_seconds, bool) or not math.isfinite(wait_timeout_seconds) or wait_timeout_seconds <= 0:
+            raise ValueError("wait_timeout_seconds must be finite and positive")
         self.runner = runner
         self.event_sink = event_sink
         self.max_concurrency = int(max_concurrency)
         self.retry_limit = int(retry_limit)
+        self.wait_timeout_seconds = float(wait_timeout_seconds)
         self.executor = ThreadPoolExecutor(
             max_workers=self.max_concurrency,
             thread_name_prefix="tracefix-worker",
@@ -301,10 +314,26 @@ class WorkerScheduler:
                 raise ValueError(f"worker task_id already exists: {task.task_id}")
             if task.task_id in task.depends_on:
                 raise ValueError("worker task cannot depend on itself")
+            pending = list(task.depends_on)
+            visited: set[str] = set()
+            while pending:
+                dependency_id = pending.pop()
+                if dependency_id == task.task_id:
+                    raise ValueError(f"worker dependency cycle includes: {task.task_id}")
+                if dependency_id in visited:
+                    continue
+                visited.add(dependency_id)
+                dependency = self._records.get(dependency_id)
+                if dependency is not None:
+                    pending.extend(dependency.task.depends_on)
             worker_id = new_worker_id("worker")
             future: Future = Future()
             record = _Record(task, worker_id, future, threading.Event(), selected,
                              submitted_at=time.time())
+            queue_timeout = min(self.wait_timeout_seconds, task.timeout_seconds or self.wait_timeout_seconds)
+            record.queue_deadline = time.monotonic() + queue_timeout
+            record.queue_timer = threading.Timer(queue_timeout, self._expire_queued, args=(task.task_id,))
+            record.queue_timer.daemon = True
             self._records[task.task_id] = record
             self._emit(WorkerEventType.CREATED, record, status=WorkerStatus.CREATED)
             record.status = WorkerStatus.QUEUED
@@ -316,6 +345,8 @@ class WorkerScheduler:
                 max_concurrency=self.max_concurrency,
             )
             for dependency_id in task.depends_on:
+                if record.future.done():
+                    break
                 dependency = self._records.get(dependency_id)
                 if dependency is None:
                     self._waiting_for.setdefault(dependency_id, set()).add(task.task_id)
@@ -324,6 +355,7 @@ class WorkerScheduler:
                         lambda _future, task_id=task.task_id: self._dependencies_ready(task_id))
             self._dependency_available(task.task_id)
             self._schedule_if_ready(record)
+            record.queue_timer.start()
             return WorkerHandle(task, future, worker_id, self)
 
     enqueue = submit
@@ -351,22 +383,72 @@ class WorkerScheduler:
             if record.cancel_event.is_set():
                 self._finish_cancelled(record, max(1, record.attempt), "worker cancelled while waiting")
                 return
-            dependencies = [self._records.get(dependency_id)
-                            for dependency_id in record.task.depends_on]
-            if not all(dependency is not None and dependency.future.done()
-                       for dependency in dependencies):
-                return
             self._schedule_if_ready(record)
 
     def _schedule_if_ready(self, record: _Record) -> None:
         if self._closed or record.scheduled or record.future.done() or record.cancel_event.is_set():
             return
-        if any(not (dependency := self._records.get(dependency_id))
-               or not dependency.future.done()
-               for dependency_id in record.task.depends_on):
+        ready = True
+        for dependency_id in record.task.depends_on:
+            dependency = self._records.get(dependency_id)
+            if dependency is None or not dependency.future.done():
+                ready = False
+                continue
+            if dependency.future.cancelled() or dependency.future.exception() is not None:
+                self._finish_cancelled(record, 1, f"worker dependency failed: {dependency_id}")
+                return
+            result = dependency.future.result()
+            if result.status not in {WorkerStatus.SUCCEEDED, WorkerStatus.PARTIAL} or result.error:
+                self._finish_cancelled(record, 1, f"worker dependency {dependency_id} ended with {result.status.value}")
+                return
+        if not ready:
+            return
+        if time.monotonic() >= record.queue_deadline:
+            self._expire_queued(record.task.task_id)
             return
         record.scheduled = True
         self.executor.submit(self._execute, record, record.runner)
+
+    def _expire_queued(self, task_id: str) -> None:
+        with self._lock:
+            record = self._records.get(task_id)
+            if record is None or record.future.done() or record.started_at is not None:
+                return
+            remaining = record.queue_deadline - time.monotonic()
+            if remaining > 0:
+                record.queue_timer = threading.Timer(remaining, self._expire_queued, args=(task_id,))
+                record.queue_timer.daemon = True
+                record.queue_timer.start()
+                return
+            missing = [dependency_id for dependency_id in record.task.depends_on
+                       if dependency_id not in self._records]
+            error = "worker queue deadline exceeded"
+            if missing:
+                error += f"; missing dependencies: {', '.join(missing)}"
+            record.cancel_event.set()
+            self._finish(record, WorkerResult(
+                task_id=record.task.task_id,
+                worker_id=record.worker_id,
+                run_id=record.task.run_id,
+                phase=record.task.phase,
+                role=record.task.role,
+                role_label=record.task.role_label or record.task.role,
+                status=WorkerStatus.EXPIRED,
+                summary="Worker expired before execution could start.",
+                max_attempts=record.task.max_attempts,
+                finished_at=time.time(),
+                error=error[:4_000],
+            ))
+
+    def _clear_queue_wait(self, record: _Record) -> None:
+        if record.queue_timer is not None:
+            record.queue_timer.cancel()
+        for dependency_id in record.task.depends_on:
+            waiting = self._waiting_for.get(dependency_id)
+            if waiting is not None:
+                waiting.discard(record.task.task_id)
+                if not waiting:
+                    self._waiting_for.pop(dependency_id, None)
 
     def _call_runner(self, runner, task, context: WorkerContext):
         value = runner(task, context)
@@ -418,6 +500,12 @@ class WorkerScheduler:
             if record.cancel_event.is_set():
                 return self._finish_cancelled(record, attempt)
             with self._lock:
+                if record.future.done():
+                    return
+                if record.started_at is None:
+                    if time.monotonic() >= record.queue_deadline:
+                        return self._expire_queued(record.task.task_id)
+                    self._clear_queue_wait(record)
                 record.status = WorkerStatus.RUNNING
                 record.attempt = attempt
                 record.started_at = time.time()
@@ -529,6 +617,7 @@ class WorkerScheduler:
 
     def _finish(self, record: _Record, result: WorkerResult) -> WorkerResult:
         with self._lock:
+            self._clear_queue_wait(record)
             record.status = result.status
             record.finished_at = time.time()
             record.summary = result.summary
@@ -537,6 +626,7 @@ class WorkerScheduler:
             if not record.future.done():
                 record.future.set_result(result)
         self._emit(
+            WorkerEventType.EXPIRED if result.status == WorkerStatus.EXPIRED else
             WorkerEventType.PARTIAL if result.status == WorkerStatus.PARTIAL else WorkerEventType.COMPLETED,
             record,
             status=result.status,
@@ -551,6 +641,7 @@ class WorkerScheduler:
         return result
 
     def _finish_cancelled(self, record: _Record, attempt: int, error: str = "worker cancelled") -> WorkerResult:
+        error = error[:4_000]
         with self._lock:
             existing = self._results.get(record.task.task_id)
             if record.future.done() and existing is not None:
@@ -570,6 +661,8 @@ class WorkerScheduler:
             error=error,
         )
         with self._lock:
+            record.cancel_event.set()
+            self._clear_queue_wait(record)
             record.status = WorkerStatus.CANCELLED
             record.finished_at = time.time()
             record.error = error
@@ -587,26 +680,38 @@ class WorkerScheduler:
             error=error,
             duration_ms=result.duration_ms,
         )
-        for dependency_id, waiting in list(self._waiting_for.items()):
-            waiting.discard(record.task.task_id)
-            if not waiting:
-                self._waiting_for.pop(dependency_id, None)
         return result
 
     async def run_async(self, task: WorkerTask, runner: Callable[..., Any] | None = None) -> WorkerResult:
         return await self.wait(self.submit(task, runner))
 
     async def wait(self, handles, timeout: float | None = None):
+        timeout = self._wait_timeout(timeout)
         multiple = isinstance(handles, (list, tuple, set))
         items = list(handles) if multiple else [handles]
-        futures = [asyncio.wrap_future(item.future if isinstance(item, WorkerHandle) else item) for item in items]
-        values = await asyncio.wait_for(asyncio.gather(*futures), timeout=timeout) if timeout else await asyncio.gather(*futures)
+        futures = [asyncio.shield(asyncio.wrap_future(
+            item.future if isinstance(item, WorkerHandle) else item)) for item in items]
+        gathering = asyncio.gather(*futures)
+        try:
+            values = await asyncio.wait_for(asyncio.shield(gathering), timeout=timeout)
+        except BaseException:
+            gathering.cancel()
+            await asyncio.gather(gathering, return_exceptions=True)
+            raise
         return values if multiple else values[0]
+
+    def _wait_timeout(self, timeout: float | None) -> float:
+        value = self.wait_timeout_seconds if timeout is None else timeout
+        if isinstance(value, bool) or not math.isfinite(value) or value < 0:
+            raise ValueError("timeout must be finite and non-negative")
+        return float(value)
 
     def wait_blocking(self, handles, timeout: float | None = None):
         multiple = isinstance(handles, (list, tuple, set))
         items = list(handles) if multiple else [handles]
-        values = [item.result(timeout) if isinstance(item, WorkerHandle) else item.result(timeout) for item in items]
+        deadline = time.monotonic() + self._wait_timeout(timeout)
+        values = [(item.future if isinstance(item, WorkerHandle) else item).result(
+            timeout=max(0.0, deadline - time.monotonic())) for item in items]
         return values if multiple else values[0]
 
     def cancel(self, task_id: str) -> bool:
@@ -615,6 +720,8 @@ class WorkerScheduler:
             if record is None or record.future.done():
                 return False
             record.cancel_event.set()
+            if record.started_at is None:
+                self._finish_cancelled(record, 1, "worker cancelled while queued")
             return True
 
     def get(self, task_id: str) -> WorkerResult | None:
