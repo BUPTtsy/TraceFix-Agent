@@ -1050,9 +1050,31 @@ class Engine:
         receipt = await self.operation(s, 'browser', intent, perform, tool_call_id=tool_call_id)
         current_ref = receipt['observation_ref']
         current = self.get(s, current_ref)
+
+        def record_business_outcome(check_kind, result, *, persist=False):
+            status = 'passed' if result['passed'] else 'failed'
+            browser_action = getattr(self.browser, 'last_action', None)
+            if isinstance(browser_action, dict):
+                browser_action.update(business_status=status,
+                                      business_observation_ref=current_ref,
+                                      business_assertions=result['assertions'])
+            event_state = self.changed(s, observation_ref=current_ref) if persist else s
+            self.event(event_state, 'action.business.outcome', {
+                'status': status,
+                'passed': result['passed'],
+                'check': check_kind,
+                'observation_ref': current_ref,
+                'assertions': result['assertions'],
+                'tool_call_id': tool_call_id,
+            })
+
+        business_result = None
+        business_check = None
         if action.postconditions:
             result = assertions(current.get('snapshot', ''), action.postconditions)
+            business_result, business_check = result, 'postconditions'
             if not result['passed']:
+                record_business_outcome(business_check, result, persist=True)
                 raise ValueError('动作后置断言不满足：' + json.dumps(result['assertions'], ensure_ascii=False))
         wait = action.wait
         if wait and wait.assertions:
@@ -1060,15 +1082,19 @@ class Engine:
             observations = 0
             while True:
                 result = assertions(current.get('snapshot', ''), wait.assertions)
+                business_result, business_check = result, 'wait'
                 if result['passed']:
                     break
                 if observations >= wait.max_observations or time.monotonic() >= deadline:
+                    record_business_outcome(business_check, result, persist=True)
                     raise ValueError('可观察等待超时：' + json.dumps(result['assertions'], ensure_ascii=False))
                 await asyncio.sleep(min(wait.interval_seconds, max(0, deadline - time.monotonic())))
                 raw = await self.browser.action(BrowserAction(kind='observe'))
                 current_ref = await self.capture(s, raw)
                 current = self.get(s, current_ref)
                 observations += 1
+        if business_result is not None:
+            record_business_outcome(business_check, business_result)
         return current_ref
 
     def _graph(self, saver):
@@ -2256,7 +2282,15 @@ class Engine:
                 self.event(s, 'run.warning', {'source': 'report_memory',
                                             'error': sanitize(error_message(error))[:300]})
         s = self.changed(s, report_ref=ref, run_status=status, pending_action=None)
-        self.event(s, 'run.finished', {'report_ref': ref, 'html_ref': html_ref, 'outcome': s.outcome})
+        self.event(s, 'run.finished', {
+            'report_ref': ref,
+            'html_ref': html_ref,
+            'outcome': s.outcome,
+            'status': s.run_status,
+            'error': s.error,
+            'error_details': s.error_details,
+            'cancelled': s.run_status == RunStatus.CANCELLED,
+        })
         events = self.store.trace(s.run_id, s.scope_id)
         self.put(s, events, name='完整事件数据')
         self.put(s, '\n\n'.join(json.dumps(readable(event), ensure_ascii=False, indent=2) for event in events),

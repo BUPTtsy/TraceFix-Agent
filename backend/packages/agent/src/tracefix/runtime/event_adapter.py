@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from typing import Any
 
 
+CLI_CONTRACT_VERSION = "tracefix-cli/1"
+
+
 class CursorError(ValueError):
     pass
 
@@ -64,6 +67,7 @@ class EventBatch:
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "contract_version": CLI_CONTRACT_VERSION,
             "events": copy.deepcopy(self.events),
             "cursor": self.cursor,
             "snapshot": copy.deepcopy(self.snapshot),
