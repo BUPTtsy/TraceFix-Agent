@@ -9,6 +9,7 @@ triggers:
   file_globs: ["**/*.tsx", "**/*.jsx", "**/*.vue"]
 tools_hint: [code.read, code.references, browser.console]
 owner: tracefix
+references: [references/diagnose-evidence.md]
 ---
 
 # frontend-diagnose

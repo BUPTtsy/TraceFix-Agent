@@ -10,6 +10,7 @@ triggers:
   file_globs: ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.vue", "**/*.py"]
 tools_hint: [code.read, code.references, propose_patch]
 owner: tracefix
+references: [references/edit-constraints.md]
 ---
 
 # minimal-patch

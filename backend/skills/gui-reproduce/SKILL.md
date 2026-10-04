@@ -7,6 +7,7 @@ phases: [REPRODUCE]
 triggers: {}
 tools_hint: [browser.navigate, browser.click, browser.snapshot]
 owner: tracefix
+references: [references/reproduce-checklist.md]
 ---
 
 # gui-reproduce

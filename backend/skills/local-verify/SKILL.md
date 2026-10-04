@@ -8,6 +8,7 @@ triggers:
   rule_categories: [functional, accessibility, visual]
 tools_hint: [code.read, browser.snapshot, submit_test_spec, propose_patch]
 owner: tracefix
+references: [references/verify-regression.md]
 ---
 
 # local-verify
