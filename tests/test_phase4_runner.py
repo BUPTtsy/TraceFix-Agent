@@ -1,5 +1,6 @@
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -101,3 +102,24 @@ def test_off_switch_reaches_existing_memory_methods_and_keeps_l1(tmp_path, monke
     assert memory.job_memory('scope', 'job', 'source') == []
     assert [item['event'] for item in trace] == ['memory.note', 'memory.save_job_memory', 'memory.job_memory']
     assert memory.working_memory('scope', 'run')['finding'][0]['text'] == 'current observation'
+
+
+def test_runner_single_off_sets_environment_used_by_real_memory_store(tmp_path):
+    source = _source(tmp_path)
+    config = _config(tmp_path, source)
+    calls = []
+
+    def adapter(**kwargs):
+        memory = MemoryLibrary(Path(kwargs['root']) / 'data' / 'memory.sqlite3')
+        instrument_memory_calls(memory, calls)
+        memory.note('scope', 'run', {'kind': 'finding', 'text': 'L1'})
+        memory.save_job_memory('scope', 'job', {'text': 'L2'}, source_run_id='old', source_manifest='source')
+        assert memory.job_memory('scope', 'job', 'source') == []
+        return {'status': 'completed', 'outcome': 'INCONCLUSIVE',
+                'trace': [{'event': 'model_call', 'model_agent_id': 'one'}, *calls],
+                'trace_origin': 'runtime_audit', 'gui_real': True}
+
+    row = FourCellRunner(config, tmp_path / 'runs', adapter=adapter).run_group(GROUPS[0])
+    assert row['evidence_kind'] == 'real'
+    assert [item['event'] for item in calls] == [
+        'memory.note', 'memory.save_job_memory', 'memory.job_memory']

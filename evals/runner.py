@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import inspect
 import json
@@ -320,10 +321,11 @@ class FourCellRunner:
         env = self._environment(group, path, fixed)
         started = time.monotonic()
         try:
-            value = self._invoke({'command': self.config.command, 'cwd': str(source),
-                                  'env': env, 'timeout': self.config.timeout_seconds,
-                                  'binding': binding.as_dict(), 'config': self.config,
-                                  'group': group, 'source': source, 'root': path}) or {}
+            with self._environment_context(env):
+                value = self._invoke({'command': self.config.command, 'cwd': str(source),
+                                      'env': env, 'timeout': self.config.timeout_seconds,
+                                      'binding': binding.as_dict(), 'config': self.config,
+                                      'group': group, 'source': source, 'root': path}) or {}
             if inspect.isawaitable(value):
                 raise TypeError('runner adapter 必须是同步边界；异步调用请在外层显式驱动')
             result = dict(value)
@@ -372,11 +374,24 @@ class FourCellRunner:
                'evidence_kind': summary['evidence_kind'], 'trace_summary': summary,
                'binding': binding.as_dict(), 'materialized_patch_hash': materialized_hash}
         self.rows.append(row)
-        public_row = dict(row)
-        for field in ('oracle_patch_hash', 'oracle_passed', 'oracle_status'):
-            public_row[field] = None
-        (path / 'row.json').write_text(json.dumps(public_row, ensure_ascii=False, indent=2), encoding='utf-8')
         return row
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _environment_context(env):
+        previous = {key: os.environ.get(key) for key in env if key.startswith('TRACEFIX_')}
+        try:
+            os.environ.update({key: str(value) for key, value in previous.items()
+                               if value is not None})
+            os.environ.update({key: str(value) for key, value in env.items()
+                               if key.startswith('TRACEFIX_')})
+            yield
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
     def _read_oracle_record(self, binding, acknowledgement):
         """Read score only from evaluator-private Oracle ledger."""
