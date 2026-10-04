@@ -580,7 +580,8 @@ class Engine:
         pending = s.pending_action
         if isinstance(pending, dict):
             pending = {key: value for key, value in pending.items()
-                       if key not in {'observation_id', 'element_ref'}}
+                       if key not in {'observation_id', 'element_ref', 'page_generation',
+                                      'generation', 'call_id', 'tool_call_id', 'attempt_id'}}
         return digest([snapshot, pending,
                        s.last_error_signature or (s.failure_signatures[-1]
                                                   if s.failure_signatures else None)])
