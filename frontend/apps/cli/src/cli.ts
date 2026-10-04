@@ -7,9 +7,9 @@ import {createConsoleService} from '@tracefix/console-service/dispatch';
 import {DataError} from '@tracefix/console-service/database';
 import {configureProject, createProject} from '@tracefix/console-service/config';
 import {capabilities, palette} from './terminal.js';
-import {LineEditor} from './editor.js';
 import {banner, help as helpLines, PLAIN_HELP} from './render.js';
 import {suggest} from './registry.js';
+import {ChunkedTextDecoder, EventIntake, type TraceFixMessage} from './tracefix-events.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..');
 process.chdir(root);
@@ -55,7 +55,8 @@ function argumentsOf(args: string[]): {options: Record<string, string | boolean>
  * 交互期间的行编辑器。非 TTY 路径下始终为 null，
  * 因此 print / 错误输出与改造前完全一致（纯文本、直写 stdout）。
  */
-let editor: LineEditor | null = null;
+let editor: {external: (write: () => void) => void} | null = null;
+let uiOutput: ((text: string, error?: boolean) => void) | null = null;
 
 /** 输出前先擦掉输入行，输出后重绘，避免流式输出冲掉用户正在敲的内容。 */
 function emit(write: () => void): void {
@@ -65,7 +66,7 @@ function emit(write: () => void): void {
 
 function print(value: any): void {
   const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
-  emit(() => process.stdout.write(text + '\n'));
+  if (uiOutput) uiOutput(text + '\n'); else emit(() => process.stdout.write(text + '\n'));
 }
 
 function pythonCommand(): [string, string[]] {
@@ -144,11 +145,21 @@ function interactiveAgent(args: string[], environment: Record<string, string>, r
     cwd: root, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env: {...process.env, ...environment},
   });
   activeAgent = child;
-  child.stdout?.on('data', chunk => emit(() => process.stdout.write(chunk)));
-  child.stderr?.on('data', chunk => emit(() => process.stderr.write(chunk)));
-  child.stdin?.on('error', error => emit(() => process.stderr.write(error.message + '\n')));
-  child.once('error', error => emit(() => process.stderr.write(error.message + '\n')));
+  const stdoutDecoder = new ChunkedTextDecoder();
+  const stderrDecoder = new ChunkedTextDecoder();
+  child.stdout?.on('data', chunk => {
+    if (uiOutput) stdoutDecoder.push(chunk).forEach(line => uiOutput?.(line + '\n'));
+    else emit(() => process.stdout.write(chunk));
+  });
+  child.stderr?.on('data', chunk => {
+    if (uiOutput) stderrDecoder.push(chunk).forEach(line => uiOutput?.(line + '\n', true));
+    else emit(() => process.stderr.write(chunk));
+  });
+  child.stdin?.on('error', error => uiOutput ? uiOutput(error.message + '\n', true) : emit(() => process.stderr.write(error.message + '\n')));
+  child.once('error', error => uiOutput ? uiOutput(error.message + '\n', true) : emit(() => process.stderr.write(error.message + '\n')));
   child.once('close', code => {
+    stdoutDecoder.flush().forEach(line => uiOutput?.(line + '\n'));
+    stderrDecoder.flush().forEach(line => uiOutput?.(line + '\n', true));
     activeAgent = null;
     if (code && cliArgs.includes('--command')) process.exitCode = code;
     try { dispatch('run.ended', {id: recordId, exitCode: code}); }
@@ -310,8 +321,14 @@ async function execute(text: string): Promise<boolean> {
     return true;
   }
   if (command === 'resume' || command === 'approve' || command === 'reject') {
-    const commands = command === 'resume' ? [`/resume ${findRun(positionals[0]).agentRunId}`] :
-      [`/resume ${findRun(positionals[1] || dispatch('runs', {projectId})[0]?.id).agentRunId}`, `/${command} ${positionals[0]}`];
+    const target = findRun(command === 'resume' ? positionals[0] : positionals[1] || dispatch('runs', {projectId})[0]?.id);
+    const commands = command === 'resume' ? [`/resume ${target.agentRunId}`] :
+      [`/resume ${target.agentRunId}`, `/${command} ${positionals[0]}`];
+    if (editor) {
+      interactiveAgent(['--project', projectId, '--projects', projectsPath, '--data', dataRoot],
+        {...agentEnvironment(), TRACEFIX_CONSOLE_RUN_ID: target.id}, target.id, commands);
+      return true;
+    }
     const code = await agent(['--project', projectId, '--projects', projectsPath, '--data', dataRoot,
       ...commands.flatMap(value => ['--command', value])], agentEnvironment());
     if (code) throw new DataError(`Agent 退出码：${code}`);
@@ -442,33 +459,59 @@ async function basic(): Promise<void> {
 
 /** TTY 交互路径：横幅、状态行、斜杠菜单、行编辑与历史。 */
 async function interactive(): Promise<void> {
-  const session = new LineEditor(terminal, colors,
-    {projectId: () => projectId, mode: () => mode, running: () => Boolean(activeAgent), goal: () => goal},
-    {interrupt: () => {
-      if (!activeAgent) return false;
-      activeAgent.stdin?.write('/interrupt\n');
+  (globalThis as {self?: unknown}).self ??= globalThis;
+  const {default: React} = await import('react');
+  const {render: inkRender} = await import('ink');
+  const {TraceFixUi} = await import('./claude-ui/TraceFixUi.js');
+  let runIntake = new EventIntake(projectId);
+  let runKey = '';
+  let outputSequence = 0;
+  let pushOutput: ((message: TraceFixMessage) => void) | null = null;
+  const pendingOutput: TraceFixMessage[] = [];
+  const publish = (message: TraceFixMessage) => {
+    if (pushOutput) pushOutput(message);
+    else pendingOutput.push(message);
+  };
+  let finish!: () => void;
+  const done = new Promise<void>(resolve => {finish = resolve;});
+  uiOutput = (text, error = false) => {
+    outputSequence += 1;
+    const rows = new EventIntake(projectId).accept([{type: error ? 'cli.error' : 'cli.output', scope_id: projectId, payload: {message: text}}]);
+    rows.forEach(row => publish({...row, id: `cli-output-${outputSequence}`}));
+  };
+  const renderInstance = await inkRender(React.createElement(TraceFixUi, {state: () => ({projectId, mode, goal, running: Boolean(activeAgent)}),
+    onSubmit: async line => {try {if (!await execute(line)) finish(); return true;} catch (error) {
+      uiOutput?.((error instanceof Error ? error.message : String(error)) + '\n', true);
       return true;
     }},
-    dataRoot);
-  editor = session;
-  for (const line of banner({projectId, mode, node: process.version, version: '0.1.1'}, colors, terminal.columns)) {
-    process.stdout.write(line + '\n');
-  }
-  session.start();
-  try {
-    while (true) {
-      const line = await session.read();
-      if (line === null) break;
-      try { if (!await execute(line)) break; }
-      catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        session.external(() => process.stderr.write(colors.red(message) + '\n'));
-      }
+    onCancel: () => {if (!activeAgent) return false; activeAgent.stdin?.write('/interrupt\n'); return true;},
+    registerOutput: push => {
+      pushOutput = push;
+      pendingOutput.splice(0).forEach(push);
     }
-  } finally {
-    session.stop();
-    editor = null;
-  }
+  }), {exitOnCtrlC: false});
+  editor = {external: write => write()};
+  const poll = setInterval(() => {
+    try {
+      const latest = dispatch('runs', {projectId})[0];
+      if (!latest) return;
+      const latestKey = `${projectId}:${latest.id}`;
+      if (runKey !== latestKey) {
+        runKey = latestKey;
+        runIntake = new EventIntake(projectId);
+      }
+      const messages = runIntake.accept(dispatch('run.trace', {id: latest.id, after: runIntake.after}));
+      messages.forEach(publish);
+    } catch (error) {
+      publish({id: `poll-error-${Date.now()}`, kind: 'error', text: error instanceof Error ? error.message : String(error), metadata: {}});
+    }
+  }, 500);
+  poll.unref();
+  await done;
+  clearInterval(poll);
+  renderInstance.unmount();
+  uiOutput = null;
+  editor = null;
 }
 
 main().catch(error => { process.stderr.write((error instanceof Error ? error.message : String(error)) + '\n'); process.exitCode = 2; });

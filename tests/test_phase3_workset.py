@@ -5,6 +5,7 @@ import pytest
 from tracefix.knowledge.assembler import ContextAssembler, TokenCounter, compact_steps
 from tracefix.knowledge.workset import expand_reference, prepare_workset, select_snapshot
 from tracefix.runtime.contracts import digest
+from tracefix.runtime.engine import public_context_manifest
 from tracefix.storage.artifacts import Artifacts
 
 
@@ -32,6 +33,37 @@ def test_middle_counterevidence_and_ancestors_are_semantically_selected():
     assert len(omitted) > 1400
     assert manifest['selected'] and manifest['dropped']
     assert manifest['content_hash'] == digest(current['snapshot'])
+
+
+def test_public_context_manifest_exposes_workset_indexes_without_private_content():
+    manifest = {
+        'version': 'tracefix/context/1',
+        'workset': {
+            'binding': {'scope_id': 'scope', 'run_id': 'run', 'revision': 4,
+                        'patch_hash': 'patch', 'source_manifest': 'source',
+                        'test_spec_hash': 'spec', 'private': 'oracle'},
+            'selected': [{'field': 'working_memory', 'id': 'note-1', 'refs': ['ev-1'],
+                          'binding': {'revision': 4, 'environment_digest': 'env'}}],
+            'dropped': [{'field': 'observation', 'reason': 'version_mismatch:patch_hash',
+                         'details': {'source': 'oracle', 'message': 'hidden'}}],
+            'limitations': ['upstream_truncated'],
+            'snapshot': {'ref': 'obs.json', 'version': 'workset/1', 'content_hash': 'hash',
+                         'selected': [{'start': 1, 'end': 2}], 'dropped': [{'start': 3, 'end': 4}],
+                         'coverage': 'semantic_view', 'span': [1, 4], 'off': False,
+                         'content': 'must not be copied'},
+        },
+    }
+    projected = public_context_manifest(manifest)
+    assert projected['version'] == 'tracefix/context/1'
+    assert projected['binding']['scope_id'] == 'scope'
+    assert projected['selected'][0]['refs'] == ['ev-1']
+    assert projected['dropped'][0] == {'field': 'observation', 'reason': 'version_mismatch:patch_hash'}
+    assert projected['snapshot']['selected'] == [{'start': 1, 'end': 2}]
+    assert projected['snapshot']['coverage'] == 'semantic_view'
+    assert projected['snapshot']['off'] is False
+    assert 'content' not in projected['snapshot']
+    assert 'private' not in json.dumps(projected)
+    assert 'hidden' not in json.dumps(projected)
 
 
 def test_semantic_range_expands_middle_original_and_is_scoped(tmp_path):

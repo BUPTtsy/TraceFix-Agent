@@ -1,4 +1,7 @@
+import json
 from types import SimpleNamespace
+
+import pytest
 
 from tracefix.runtime.contracts import Validation, digest
 from tracefix.runtime.validation_feedback import (
@@ -116,6 +119,133 @@ def test_error_feedback_binds_error_and_candidate_refs():
     assert feedback.failure_class == 'editing'
     assert feedback.next_phase == 'edit'
     assert digest(details) == feedback.artifact_hashes['error.json']
+
+
+def test_unknown_operation_error_routes_to_recovery_without_replay():
+    current = state()
+    details = {'status': 'UNKNOWN_OPERATION', 'category': 'missing_receipt',
+               'message': '执行回执缺失'}
+    artifacts = {'error.json': details, 'candidate.json': {'content': 'old'}}
+    exists, read = readers(artifacts)
+    feedback = build_error_feedback(current, details, error_ref='error.json',
+        artifact_exists=exists, artifact_read=read, replay_plan_hash='plan')
+    assert feedback.status == 'failed'
+    assert feedback.failure_class == 'recovery'
+    assert feedback.next_phase == 'recover'
+    assert feedback.error_code == 'UNKNOWN_OPERATION'
+
+
+@pytest.mark.parametrize('field', ['error_code', 'status', 'operation_status', 'request_status'])
+@pytest.mark.parametrize('status', ['UNKNOWN_OPERATION', 'WAITING_NETWORK'])
+def test_unknown_operation_fields_route_to_recovery(field, status):
+    current = state()
+    details = {field: status, 'message': '执行回执缺失', 'failure_category': 'editing'}
+    artifacts = {'error.json': details, 'candidate.json': {'content': 'old'}}
+    exists, read = readers(artifacts)
+    feedback = build_error_feedback(current, details, error_ref='error.json',
+        artifact_exists=exists, artifact_read=read, replay_plan_hash='plan')
+    assert feedback.failure_class == 'recovery'
+    assert feedback.next_phase == 'recover'
+    assert feedback.error_code == status
+
+
+def test_uncertain_operation_status_overrides_reported_edit_error():
+    current = state()
+    details = {'error_code': 'STALE_BASE', 'status': 'UNKNOWN_OPERATION',
+               'failure_category': 'editing'}
+    artifacts = {'error.json': details, 'candidate.json': {'content': 'old'}}
+    exists, read = readers(artifacts)
+    feedback = build_error_feedback(current, details, error_ref='error.json',
+        artifact_exists=exists, artifact_read=read, replay_plan_hash='plan')
+    assert feedback.failure_class == 'recovery'
+    assert feedback.next_phase == 'recover'
+    assert feedback.error_code == 'UNKNOWN_OPERATION'
+
+
+def assert_non_public_feedback(feedback, private_message):
+    assert feedback.status == 'stale'
+    assert feedback.binding_mismatches == ['non_public_evidence']
+    assert feedback.actual_refs == []
+    assert feedback.artifact_hashes == {}
+    assert feedback.binding['candidate_ref'] is None
+    assert feedback.binding['candidate_hash'] is None
+    assert feedback.scenario_id is None
+    assert feedback.validation_ref is None
+    assert feedback.failed_assertions == []
+    assert feedback.failure_signature is None
+    assert private_message not in json.dumps(feedback.model_dump())
+
+
+def test_nested_non_public_assertion_is_excluded_from_feedback():
+    data = bundle(False)
+    data[3]['result.json']['assertions'][0]['assertion'] = {
+        'condition': 'checked',
+        'evidence': {'source': 'oracle', 'message': 'held-out assertion'},
+    }
+    feedback = make_feedback(data)
+    assert_non_public_feedback(feedback, 'held-out assertion')
+
+
+def test_non_public_candidate_is_rejected_before_feedback_binding():
+    data = bundle(False)
+    data[3]['candidate.json']['details'] = {
+        'provenance': 'held_out', 'message': 'private candidate body',
+    }
+    feedback = make_feedback(data)
+    assert_non_public_feedback(feedback, 'private candidate body')
+
+
+@pytest.mark.parametrize('marker', [
+    {'source': 'oracle'}, {'provenance': 'held_out'}, {'evidence_source': 'held-out'},
+    {'held_out': True}, {'learnable': False}, {'final_scoring_only': True},
+    {'hidden': True}, {'private': True}, {'public': False}, {'visibility': 'private'},
+])
+@pytest.mark.parametrize('location', ['result', 'candidate', 'observation'])
+def test_nested_non_public_payloads_cannot_contribute_feedback_derivatives(marker, location):
+    data = bundle(False)
+    private_message = 'hidden fixture detail'
+    record = data[3][location + '.json']
+    record['details'] = {'nested': [{**marker, 'message': private_message}]}
+    if location == 'observation':
+        data[3]['result.json']['observation_hash'] = digest(record)
+    assert_non_public_feedback(make_feedback(data), private_message)
+
+
+def test_json_encoded_private_diagnostics_are_not_used_for_failure_signature():
+    data = bundle(False, kind='unit')
+    private_message = 'hidden diagnostics'
+    data[3]['result.json']['diagnostics'] = json.dumps({
+        'source': 'oracle', 'message': private_message,
+    })
+    assert_non_public_feedback(make_feedback(data), private_message)
+
+
+@pytest.mark.parametrize('location', ['error', 'candidate'])
+def test_error_feedback_rejects_nested_private_contents_and_hashes(location):
+    current = state()
+    private_message = 'private error feedback'
+    details = {'error_code': 'STALE_BASE'}
+    artifacts = {'error.json': details, 'candidate.json': {'content': 'old'}}
+    artifacts[location + '.json']['details'] = {'nested': {
+        'source': 'oracle', 'message': private_message,
+    }}
+    exists, read = readers(artifacts)
+    feedback = build_error_feedback(current, details, error_ref='error.json',
+        artifact_exists=exists, artifact_read=read, replay_plan_hash='plan')
+    assert_non_public_feedback(feedback, private_message)
+
+
+def test_public_nested_assertions_remain_bound_and_visible():
+    data = bundle(False)
+    assertion = {'condition': 'checked', 'details': {
+        'source': 'public_development', 'message': 'public fixture evidence',
+    }}
+    data[3]['result.json']['assertions'][0]['assertion'] = assertion
+    feedback = make_feedback(data)
+    assert feedback.status == 'failed'
+    assert feedback.failed_assertions == [{'assertion': assertion, 'matches': 1}]
+    assert feedback.artifact_hashes['result.json'] == digest(data[3]['result.json'])
+    assert feedback.failure_signature
 
 
 def test_gui_pass_without_observation_or_with_drifted_snapshot_is_unavailable():

@@ -1,6 +1,7 @@
 """Public development feedback; acceptance remains with verify_artifacts."""
 from __future__ import annotations
 
+import json
 from typing import Literal
 
 from pydantic import Field
@@ -37,7 +38,8 @@ _PRECONDITION_CODES = {'PRECONDITION_FAILED', 'PRECONDITION_MISMATCH', 'WRONG_SE
                        'WRONG_ACCOUNT', 'REPRODUCTION_PRECONDITION_FAILED'}
 _RECOVERY_CODES = {'WAIT_TIMEOUT', 'WAITING', 'STALE', 'STALE_LOCATOR', 'STALE_PAGE',
                    'CONTEXT_OVERFLOW', 'CONTEXT_PRESSURE', 'UNKNOWN', 'APPLY_UNKNOWN',
-                   'ENVIRONMENT_DRIFT', 'SOURCE_DRIFT'}
+                   'ENVIRONMENT_DRIFT', 'SOURCE_DRIFT', 'UNKNOWN_OPERATION',
+                   'WAITING_NETWORK'}
 _ROUTES = {
     'precondition': ('reproduce', '核对冻结场景的账号、数据和前置条件，再重新复现。'),
     'counterevidence': ('diagnose', '保留当前失败候选和反证，重新核对源码假设与业务不变量。'),
@@ -47,11 +49,34 @@ _ROUTES = {
 
 
 def _public(record):
-    if type(record) is not dict:
-        return True
-    return (record.get('learnable') is not False and record.get('final_scoring_only') is not True
-            and all(record.get(key) not in {'final_scoring_only', 'held_out', 'held-out', 'oracle'}
-                    for key in ('source', 'provenance', 'evidence_source')))
+    if isinstance(record, dict):
+        if (record.get('learnable') is False or record.get('final_scoring_only') is True
+                or record.get('held_out') is True or record.get('heldout') is True):
+            return False
+        for key in ('source', 'source_type', 'provenance', 'evidence_source', 'split',
+                    'evaluation_split', 'purpose'):
+            value = record.get(key)
+            if isinstance(value, str) and value.lower() in {
+                    'final_scoring_only', 'final_scoring', 'final_oracle', 'held_out',
+                    'held-out', 'heldout', 'oracle'}:
+                return False
+        if record.get('hidden') is True or record.get('private') is True:
+            return False
+        if record.get('public') is False:
+            return False
+        visibility = record.get('visibility')
+        if isinstance(visibility, str) and visibility.lower() in {'hidden', 'private', 'secret'}:
+            return False
+        return all(_public(value) for value in record.values())
+    if isinstance(record, (list, tuple)):
+        return all(_public(value) for value in record)
+    if isinstance(record, str):
+        try:
+            decoded = json.loads(record)
+        except (TypeError, ValueError):
+            return True
+        return isinstance(decoded, str) or _public(decoded)
+    return True
 
 
 def _read(ref, exists, reader):
@@ -69,9 +94,22 @@ def _binding(state, replay_plan_hash, candidate_hash=None):
 
 def _classify(kind, details):
     error_code = details.get('error_code')
+    if not isinstance(error_code, str):
+        for key in ('status', 'operation_status', 'request_status'):
+            value = details.get(key)
+            if isinstance(value, str) and value.upper() in _RECOVERY_CODES:
+                error_code = value
+                break
     error_code = error_code.upper() if type(error_code) is str else None
-    category = details.get('failure_category')
-    if error_code in _PRECONDITION_CODES or category == 'precondition':
+    category = details.get('failure_category') or details.get('category')
+    category = category.lower() if isinstance(category, str) else category
+    uncertain_operation = next((value.upper() for key in (
+        'error_code', 'status', 'operation_status', 'request_status')
+        if isinstance(value := details.get(key), str)
+        and value.upper() in {'UNKNOWN_OPERATION', 'WAITING_NETWORK'}), None)
+    if uncertain_operation:
+        failure_class, error_code = 'recovery', uncertain_operation
+    elif error_code in _PRECONDITION_CODES or category == 'precondition':
         failure_class = 'precondition'
     elif error_code in _EDIT_CODES or category in {'editing', 'syntax', 'type'}:
         failure_class = 'editing'
@@ -124,6 +162,14 @@ def _invalid(feedback, *, mismatches=(), missing=()):
         'binding_mismatches': list(mismatches), 'missing_refs': list(missing)})
 
 
+def _non_public(feedback):
+    return _invalid(feedback.model_copy(update={
+        'scenario_id': None, 'validation_ref': None, 'actual_refs': [], 'artifact_hashes': {},
+        'binding': {**feedback.binding, 'candidate_ref': None, 'candidate_hash': None},
+        'failed_candidate': False, 'failed_assertions': [], 'failure_signature': None,
+    }), mismatches=['non_public_evidence'])
+
+
 def build_validation_feedback(state, validation: Validation, *, artifact_exists, artifact_read,
                               replay_plan_hash: str, validation_ref: str | None = None,
                               artifact_read_bytes=None) -> ValidationFeedback:
@@ -147,6 +193,8 @@ def build_validation_feedback(state, validation: Validation, *, artifact_exists,
         candidate = collect(state.patch_ref)
         if type(candidate) is not dict:
             return _invalid(feedback, mismatches=['candidate_type'])
+        if not _public(candidate):
+            return _non_public(feedback)
         candidate_drift = [key for key, value in expected.items()
                            if key in candidate and candidate.get(key) != value]
         if candidate_drift:
@@ -155,6 +203,8 @@ def build_validation_feedback(state, validation: Validation, *, artifact_exists,
         feedback.binding['candidate_hash'] = digest(candidate)
         if validation_ref is not None:
             wrapper = collect(validation_ref)
+            if not _public(wrapper):
+                return _non_public(feedback)
             if wrapper != validation.model_dump(mode='json'):
                 return _invalid(feedback, mismatches=['validation_ref'])
         result = collect(validation.artifact_ref)
@@ -167,7 +217,7 @@ def build_validation_feedback(state, validation: Validation, *, artifact_exists,
     if type(result) is not dict:
         return _invalid(feedback, missing=[validation.artifact_ref])
     if not _public(result):
-        return _invalid(feedback, mismatches=['non_public_evidence'])
+        return _non_public(feedback)
     mismatches = [key for key, value in expected.items() if result.get(key) != value]
     if result.get('type') != 'validation_result' or result.get('kind') != validation.kind:
         mismatches.append('result_type_or_kind')
@@ -206,7 +256,7 @@ def build_validation_feedback(state, validation: Validation, *, artifact_exists,
         if type(record) is not dict:
             return _invalid(feedback, missing=[str(ref)])
         if not _public(record):
-            return _invalid(feedback, mismatches=['non_public_evidence'])
+            return _non_public(feedback)
         drift = [key for key, value in expected.items() if record.get(key) != value]
         if drift:
             return _invalid(feedback, mismatches=[f'{ref}:{key}' for key in drift])
@@ -240,7 +290,7 @@ def build_error_feedback(state, details: dict, *, error_ref: str, artifact_exist
     feedback = ValidationFeedback(status='unavailable', kind=kind,
                                   binding=_binding(state, replay_plan_hash))
     if not _public(details):
-        return _invalid(feedback, mismatches=['non_public_evidence'])
+        return _non_public(feedback)
     try:
         actual = _read(error_ref, artifact_exists, artifact_read)
         if actual != details:
@@ -249,6 +299,8 @@ def build_error_feedback(state, details: dict, *, error_ref: str, artifact_exist
         feedback.artifact_hashes = {error_ref: digest(actual)}
         if state.patch_ref:
             candidate = _read(state.patch_ref, artifact_exists, artifact_read)
+            if not _public(candidate):
+                return _non_public(feedback)
             feedback.binding['candidate_hash'] = digest(candidate)
             feedback.actual_refs.append(state.patch_ref)
             feedback.artifact_hashes[state.patch_ref] = digest(candidate)

@@ -86,6 +86,116 @@ def stable_snapshot(snapshot):
     return re.sub(r'\s*\[ref=[^\]]+\]', '', snapshot)
 
 
+_PUBLIC_CONTEXT_BINDING_KEYS = {
+    'scope_id', 'run_id', 'revision', 'source_manifest', 'patch_hash',
+    'page_generation', 'environment_digest', 'test_spec_hash', 'spec_hash',
+}
+_PUBLIC_CONTEXT_ITEM_KEYS = {'field', 'id', 'refs', 'binding', 'reason', 'ref', 'version',
+                             'content_hash', 'coverage', 'source_coverage', 'span',
+                             'character_span', 'line_count', 'off', 'start', 'end'}
+_PUBLIC_CONTEXT_MARKERS = {'hidden', 'private', 'secret', 'oracle', 'held_out', 'held-out',
+                           'heldout', 'final_scoring', 'final_scoring_only', 'final_oracle'}
+
+
+def _is_private_context_marker(value):
+    normalized = str(value).casefold().replace('-', '_')
+    return normalized in _PUBLIC_CONTEXT_MARKERS or any(
+        normalized.startswith(marker.replace('-', '_') + '_') for marker in _PUBLIC_CONTEXT_MARKERS)
+
+
+def _public_context_value(value):
+    if isinstance(value, str):
+        return None if _is_private_context_marker(value) else value
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        result = [_public_context_value(item) for item in value]
+        return None if any(item is None and original is not None for item, original in zip(result, value)) else result
+    if isinstance(value, dict):
+        if any(_is_private_context_marker(key) for key in value):
+            return None
+        result = {}
+        for key, item in value.items():
+            projected = _public_context_value(item)
+            if projected is None and item is not None:
+                return None
+            result[key] = projected
+        return result
+    return None
+
+
+def _project_context_binding(value):
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key in _PUBLIC_CONTEXT_BINDING_KEYS:
+        if key in value:
+            projected = _public_context_value(value[key])
+            if projected is not None:
+                result[key] = projected
+    return result
+
+
+def _project_context_items(value):
+    if not isinstance(value, list):
+        return []
+    result = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        projected = {}
+        for key in _PUBLIC_CONTEXT_ITEM_KEYS:
+            if key not in item:
+                continue
+            if key == 'binding':
+                projected[key] = _project_context_binding(item[key])
+                continue
+            value = _public_context_value(item[key])
+            if value is None and item[key] is not None:
+                projected = None
+                break
+            projected[key] = value
+        if projected is not None:
+            result.append(projected)
+    return result
+
+
+def public_context_manifest(manifest, *, run_id=None, revision=None):
+    """Return the public workset index without context bodies or private markers."""
+    if not isinstance(manifest, dict):
+        return {}
+    workset = manifest.get('workset') if isinstance(manifest.get('workset'), dict) else {}
+    result = {
+        'version': _public_context_value(manifest.get('version')),
+        'binding': _project_context_binding(workset.get('binding') or manifest.get('binding')),
+        'selected': _project_context_items(workset.get('selected')),
+        'dropped': _project_context_items(workset.get('dropped')),
+        'limitations': [value for value in (_public_context_value(item)
+                                             for item in workset.get('limitations', []))
+                        if value is not None],
+    }
+    if run_id is not None:
+        result['binding']['run_id'] = run_id
+    if revision is not None:
+        result['binding']['revision'] = revision
+    snapshot = workset.get('snapshot') if isinstance(workset.get('snapshot'), dict) else None
+    if snapshot is not None:
+        result['snapshot'] = {
+            'ref': _public_context_value(snapshot.get('ref')),
+            'version': _public_context_value(snapshot.get('version')),
+            'content_hash': _public_context_value(snapshot.get('content_hash')),
+            'binding': _project_context_binding(snapshot.get('binding')),
+            'selected': _project_context_items(snapshot.get('selected')),
+            'dropped': _project_context_items(snapshot.get('dropped')),
+            'coverage': _public_context_value(snapshot.get('coverage')),
+            'source_coverage': _public_context_value(snapshot.get('source_coverage')),
+            'span': _public_context_value(snapshot.get('span') or snapshot.get('character_span')),
+            'off': _public_context_value(snapshot.get('off')),
+            'line_count': _public_context_value(snapshot.get('line_count')),
+        }
+    return redact(result)
+
+
 class Engine:
     LOOP_STATE_WARNING = 2
     LOOP_STATE_LIMIT = 3
@@ -124,11 +234,25 @@ class Engine:
     def load_skill(self, s, name):
         prior = {(entry['name'], entry['version'], entry['content_hash']) for entry in s.skills_loaded}
         result = self.skill_store.load(s, self.skills, name, str(s.phase))
-        identity = {key: result[key] for key in ('name', 'version', 'content_hash')}
-        if tuple(identity.values()) not in prior:
+        identity = self._skill_event_identity(result)
+        if (identity['name'], identity['version'], identity['content_hash']) not in prior:
             self.store.save(s)
             self.event(s, 'skill.loaded', identity)
         return result
+
+    @staticmethod
+    def _skill_event_identity(skill):
+        identity = {key: skill[key] for key in ('name', 'version', 'content_hash')}
+        if skill.get('snapshot_ref'):
+            identity['snapshot_ref'] = skill['snapshot_ref']
+        identity['references'] = [
+            {key: reference[key] for key in ('path', 'content_hash', 'byte_count',
+                                              'source_hash', 'frozen_source_hash', 'source_redacted')
+             if key in reference}
+            for reference in skill.get('references', [])
+            if isinstance(reference, dict)
+        ]
+        return identity
 
     def inject_skills(self, s, context):
         selection_context = {**context, 'files': list(self.source.get('files', {}))}
@@ -137,10 +261,10 @@ class Engine:
             explicit=list(context.get('load_skills', [])), limit=6)
         updated = False
         for skill in result['skills']:
-            identity = {key: skill[key] for key in ('name', 'version', 'content_hash')}
-            if tuple(identity.values()) not in prior:
+            identity = self._skill_event_identity(skill)
+            if (identity['name'], identity['version'], identity['content_hash']) not in prior:
                 self.event(s, 'skill.loaded', identity)
-                prior.add(tuple(identity.values()))
+                prior.add((identity['name'], identity['version'], identity['content_hash']))
                 updated = True
         if updated:
             self.store.save(s)
@@ -767,7 +891,7 @@ class Engine:
                 except (TypeError, ValueError, KeyError):
                     continue
                 self.event(s, 'skills.injected', {**exchange, 'skills': [
-                    {key: item[key] for key in ('name', 'version', 'content_hash')} for item in injected]})
+                    self._skill_event_identity(item) for item in injected]})
                 break
             return exchange
 
@@ -947,11 +1071,14 @@ class Engine:
             if manifest_ref not in s.context_manifest_refs:
                 s.context_manifest_refs.append(manifest_ref)
                 self.store.save(s)
+            public_manifest = public_context_manifest(manifest, run_id=s.run_id, revision=s.revision)
             self.event(s, 'context.assembled', {'manifest_ref': manifest_ref,
-                        'compacted': compacted, 'tokens': manifest['tokens_after']})
+                        'compacted': compacted, 'tokens': manifest['tokens_after'],
+                        'workset': public_manifest})
             if compacted:
                 self.event(s, 'context.compacted', {'manifest_ref': manifest_ref,
-                    'tokens_before': manifest['tokens_before'], 'tokens_after': manifest['tokens_after']})
+                    'tokens_before': manifest['tokens_before'], 'tokens_after': manifest['tokens_after'],
+                    'workset': public_manifest})
         generation_kwargs = dict(validation)
         if getattr(selected_model, 'supports_tool_executor', False) and runtime_tools.registry.visible(s.phase):
             generation_kwargs.update(tool_registry=runtime_tools.registry, tool_pipeline=tool_pipeline)
