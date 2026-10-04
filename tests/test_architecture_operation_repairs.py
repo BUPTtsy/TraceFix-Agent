@@ -15,8 +15,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from tracefix.config import Project
+from tracefix.execution.repository import run_git, safe_commit, safe_index_files
 from tracefix.execution.workspace import Workspace
 from tracefix.knowledge.memory import MemoryLibrary, MemoryNote
+from tracefix.knowledge.scope import ScopeResolver
 from tracefix.runtime.contracts import Phase, RunState, digest
 from tracefix.runtime.effects import (EffectBoundaryError, file_resource, make_operation_executor,
                                      operation_identity, resources_intersect, run_effect)
@@ -315,13 +318,23 @@ async def test_default_owner_not_shared_by_two_async_tasks():
     store.finish(state, 'owned', {'executed': True})
 
 
-def local_engine(tmp_path):
-    source = tmp_path / 'source.py'
-    source.write_text('baseline\n', encoding='utf-8')
-    engine = SimpleNamespace(workspace=Workspace(tmp_path, ['source.py']), store=MemoryStore(), memory=None)
+def local_engine(tmp_path, files=None):
+    root = tmp_path / 'code'
+    root.mkdir()
+    contents = {'source.py': 'baseline\n', **(files or {})}
+    for relative, content in contents.items():
+        (root / relative).write_bytes(content.encode('utf-8'))
+    run_git(root, 'init', '-q', '--initial-branch=main')
+    safe_index_files(root, list(contents))
+    safe_commit(root, 'Operation fixture baseline', 'CI', 'ci@localhost')
+    project = Project(id='r05', repo_id='ci', root=root, allowed_files=list(contents))
+    scopes = ScopeResolver({'r05': project})
+    workspace, snapshot = Workspace.export(scopes, scopes.context('r05'), 'HEAD', tmp_path / 'workspace')
+    engine = SimpleNamespace(workspace=workspace, store=MemoryStore(), memory=None)
     state = state_for()
+    state.source_manifest = digest(snapshot)
     engine.store.save(state)
-    return engine, state, source
+    return engine, state, workspace.root / 'source.py'
 
 
 async def test_spawn_local_production_handler_updates_parent_only(tmp_path):
@@ -353,13 +366,15 @@ async def test_parent_overlay_change_during_prepare_is_not_overwritten(tmp_path,
     runtime = build_runtime_tools(engine, state, None)
     pending = asyncio.create_task(runtime.pipeline().execute('Write', {
         'file_path': str(source), 'content': 'worker\n'}, 'call'))
-    await entered.wait()
-    if changed == 'overlay':
-        engine.workspace.stage('source.py', 'concurrent\n')
-    else:
-        source.write_text('concurrent-disk\n', encoding='utf-8')
-    release.set()
-    result = await pending
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        if changed == 'overlay':
+            engine.workspace.stage('source.py', 'concurrent\n')
+        else:
+            source.write_text('concurrent-disk\n', encoding='utf-8')
+    finally:
+        release.set()
+        result = await pending
     assert result.is_error and not result.executed
     expected = b'concurrent\n' if changed == 'overlay' else b'initial-overlay\n'
     assert engine.workspace.staged_content('source.py') == expected
@@ -670,12 +685,10 @@ async def test_done_actions_allow_intentional_new_epoch_without_replaying_same_e
 
 
 async def test_spawn_edit_and_notebook_handlers_apply_parent_receipts(tmp_path):
-    engine, state, source = local_engine(tmp_path)
-    notebook_path = tmp_path / 'analysis.ipynb'
-    notebook_path.write_text(json.dumps({'cells': [{'cell_type': 'code', 'source': ['old'],
-        'metadata': {'preserve': True}, 'outputs': [], 'execution_count': None, 'id': 'existing'}]}),
-        encoding='utf-8')
-    engine.workspace.allowed_files.append('analysis.ipynb')
+    notebook = json.dumps({'cells': [{'cell_type': 'code', 'source': ['old'],
+        'metadata': {'preserve': True}, 'outputs': [], 'execution_count': None, 'id': 'existing'}]})
+    engine, state, source = local_engine(tmp_path, {'analysis.ipynb': notebook})
+    notebook_path = engine.workspace.root / 'analysis.ipynb'
     pipeline = build_runtime_tools(engine, state, None).pipeline()
     edited = await pipeline.execute('Edit', {'file_path': str(source), 'old_string': 'baseline',
                                            'new_string': 'edited'}, 'edit')
