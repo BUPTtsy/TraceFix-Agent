@@ -37,6 +37,7 @@ from tracefix.runtime.validation_feedback import (ValidationFeedback, build_vali
 from tracefix.runtime.verification import verification_binding
 from tracefix.runtime.effects import file_resource, make_operation_executor
 from tracefix.runtime.event_adapter import EventAdapter, EventCursor
+from tracefix.runtime.recovery import RecoveryController, classify_cause
 from tracefix.runtime.diagnosis import (DiagnosisDraft, DiagnosisReport, binding_from_observation,
     symptom_query, validate_report)
 from tracefix.knowledge.assembler import ContextAssembler, ContextWindowError
@@ -117,6 +118,7 @@ class Engine:
         self.document_context = {}
         self._trace_sequences = {}
         self.event_adapter = EventAdapter(store)
+        self.recovery = RecoveryController()
         self.skills = SkillCatalog(Path(__file__).resolve().parents[5] / 'skills')
         self.skill_store = SkillStore(self.artifacts)
         self.graph = self._graph(checkpointer)
@@ -611,14 +613,43 @@ class Engine:
         return fingerprint, warnings, signals
 
     def _mark_loop(self, s, fingerprint, warnings, signals):
+        cause = classify_cause(error=s.error, error_details=s.error_details,
+                               signals=signals, pending_action=s.pending_action,
+                               cancelled=s.error == '用户已取消')
         evidence = {'signals': signals, 'state_fingerprint': fingerprint,
                     'state_tail': (s.loop_state_fingerprints + [fingerprint])[-12:],
                     'action_tail': s.action_fingerprints[-12:],
                     'error_tail': s.loop_error_signatures[-12:],
-                    'step': s.step}
+                    'step': s.step, 'cause': cause.value}
+        decision = self.recovery.decide(cause, s.recovery_episodes, evidence=evidence)
+        evidence['recovery'] = {'action': decision.action.value, 'attempt': decision.attempt,
+                                'max_attempts': decision.max_attempts,
+                                'can_continue': decision.can_continue, 'reason': decision.reason}
+        episodes = self.recovery.record(
+            s.recovery_episodes, decision,
+            status='continued' if decision.can_continue else 'settled')
+        if decision.can_continue:
+            target_phase = s.phase
+            if (decision.action.value == 'correct_strategy'
+                    and s.phase in {Phase.PATCH, Phase.VERIFY}):
+                target_phase = Phase.DIAGNOSE
+            delta = {
+                'loop_state_fingerprints': [], 'loop_error_signatures': [],
+                'loop_no_progress_steps': 0, 'loop_warnings': s.loop_warnings + warnings,
+                'loop_evidence': evidence, 'loop_cause': cause.value,
+                'recovery_episodes': episodes, 'last_error_signature': None,
+                'error': None, 'error_details': {'recovery': evidence['recovery'], 'cause': cause.value},
+                'pending_action': None, 'abnormal_termination': False,
+            }
+            if target_phase != s.phase:
+                delta['phase'] = target_phase
+            s = self.changed(s, **delta)
+            self.event(s, 'recovery.started', evidence)
+            return s
         s = self.changed(s, loop_state_fingerprints=s.loop_state_fingerprints + [fingerprint],
                          loop_warnings=s.loop_warnings + warnings,
-                         loop_evidence=evidence, abnormal_termination=True,
+                         loop_evidence=evidence, loop_cause=cause.value,
+                         recovery_episodes=episodes, abnormal_termination=True,
                          phase=Phase.FINALIZE, outcome=Outcome.LOOP_DETECTED,
                          run_status=RunStatus.RUNNING, pending_action=None,
                          error='检测到死循环')
@@ -628,7 +659,8 @@ class Engine:
     def _record_loop_boundary(self, s):
         fingerprint, warnings, signals = self._loop_assessment(s)
         if signals:
-            return self._mark_loop(s, fingerprint, warnings, signals), True
+            marked = self._mark_loop(s, fingerprint, warnings, signals)
+            return marked, marked.outcome == Outcome.LOOP_DETECTED
         history = s.loop_state_fingerprints + [fingerprint]
         if warnings:
             s = self.changed(s, loop_state_fingerprints=history,
@@ -1165,7 +1197,7 @@ class Engine:
                             and not (isinstance(e, (ModelError, MCPConnectionError, MCPActionUnknown))
                             and e.status in {'UNKNOWN_OPERATION', 'WAITING_NETWORK'})):
                         s = self._mark_loop(s, self._loop_state_fingerprint(s), [], loop_signals)
-                        return self.output(s, 'finalize')
+                        return self.output(s, 'finalize' if s.outcome == Outcome.LOOP_DETECTED else 'prelude')
                     error_details = None
                     if isinstance(e, (ModelError, MCPConnectionError, MCPActionUnknown)):
                         error_details = redact({**e.details, 'status': e.status,
