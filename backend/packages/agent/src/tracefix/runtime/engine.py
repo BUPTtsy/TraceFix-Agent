@@ -1742,10 +1742,14 @@ class Engine:
         query = symptom_query(s.goal, self.spec(s).assertions, query_observation)
         # 直接读取当前授权文件以核验检索卡片，并提供补丁校验所需的 before_hash。
         preferred = [json.loads(card['content']).get('path') for card in code if card.get('content', '').startswith('{')]
+        card_limit = 60_000 * (s.diagnosis_retry_count + 1)
+        broad_cards = self.workspace.cards(limit_chars=card_limit, preferred_paths=preferred)
         if hasattr(self.workspace, 'fragments'):
             cards = self.workspace.fragments(query, preferred_paths=preferred, limit_chars=24_000)
+            if not cards:
+                cards = broad_cards
         else:
-            cards = self.workspace.cards(limit_chars=24_000, preferred_paths=preferred)
+            cards = broad_cards
         if self.rule_library and self.rule_resolver:
             files = []
             for path in self.workspace.files():
@@ -1817,6 +1821,7 @@ class Engine:
                 'observation': observation,
                 'symptom_binding': binding.model_dump(mode='json'),
                 'source_fragments': cards,
+                'cards': cards,
                 'workspace_root': str(self.workspace.root),
                 'action_observations': [{
                     'action': item['action'], 'observation_ref': item['observation_ref'],
@@ -1846,8 +1851,7 @@ class Engine:
         input_ref = self.put(s, diagnosis_context, name='诊断输入')
         self.event(s, 'diagnosis.started', {'input_ref': input_ref, 'source_manifest': s.source_manifest,
                                          'observation_ref': s.observation_ref})
-        model_support = getattr(self.model, 'supports_structured_diagnosis',
-                                isinstance(self.model, Gateway) or isinstance(getattr(self.model, 'teacher', None), Gateway))
+        model_support = getattr(self.model, 'supports_structured_diagnosis', False)
         if model_support:
             versions = {card['path']: card.get('content_version', digest(self.workspace.source_bytes(card['path'])[1]))
                         for card in cards}

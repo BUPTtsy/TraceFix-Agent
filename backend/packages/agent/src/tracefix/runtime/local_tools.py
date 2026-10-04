@@ -7,8 +7,10 @@ import csv
 import io
 import json
 import mimetypes
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Literal
@@ -356,8 +358,6 @@ class LocalTools:
         extensions = {'ts': {'.ts', '.tsx'}, 'js': {'.js', '.jsx', '.mjs'},
                       'py': {'.py'}, 'json': {'.json', '.ipynb'}}
         executable = shutil.which('rg')
-        if not executable:
-            raise ToolRejected('Grep 需要安装 ripgrep（rg）')
         paths = [path for path in self.files(arguments.path)
                  if (path.match(arguments.glob) or arguments.glob == '**/*')
                  and (not arguments.type or path.suffix in
@@ -388,14 +388,17 @@ class LocalTools:
                 staged_path.parent.mkdir(parents=True, exist_ok=True)
                 staged_path.write_bytes(data)
                 path_map[str(staged_path.resolve())] = (path, relative, baseline, data, overlay)
-            command = [executable, '--json', '--no-follow']
-            if arguments.output_mode != 'count':
-                command.extend(['--max-count', str(arguments.head_limit + 1)])
-            if arguments.multiline:
-                command.extend(['--multiline', '--multiline-dotall'])
-            if not arguments.case_sensitive:
-                command.append('--ignore-case')
-            command.extend(['--', arguments.pattern, *[str(staging_root / relative) for _, relative, *_ in records]])
+            if executable:
+                command = [executable, '--json', '--no-follow']
+                if arguments.output_mode != 'count':
+                    command.extend(['--max-count', str(arguments.head_limit + 1)])
+                if arguments.multiline:
+                    command.extend(['--multiline', '--multiline-dotall'])
+                if not arguments.case_sensitive:
+                    command.append('--ignore-case')
+                command.extend(['--', arguments.pattern, *[str(staging_root / relative) for _, relative, *_ in records]])
+            else:
+                command = [sys.executable, '-c', 'pass']
             with self.mutex.workspace_read():
                 response = subprocess.run(command, capture_output=True, timeout=30,
                                           encoding='utf-8', errors='replace')
@@ -408,11 +411,46 @@ class LocalTools:
                         raise ToolRejected('Grep 扫描期间源码发生变化，拒绝使用过期命中')
         if response.returncode not in {0, 1}:
             raise ToolRejected(response.stderr[:2000])
+        if executable:
+            scan_lines = response.stdout.splitlines()
+        else:
+            flags = 0 if arguments.case_sensitive else re.IGNORECASE
+            if arguments.multiline:
+                flags |= re.MULTILINE | re.DOTALL
+            try:
+                matcher = re.compile(arguments.pattern, flags)
+            except re.error as error:
+                raise ToolRejected(f'Grep 模式无效：{error}') from error
+            scan_lines = []
+            for path, relative, baseline, data, overlay in records:
+                staged_path = staging_root / relative
+                text = data.decode('utf-8', errors='replace')
+                if arguments.multiline:
+                    matches = list(matcher.finditer(text))
+                    if arguments.output_mode != 'count':
+                        matches = matches[:arguments.head_limit + 1]
+                    for match in matches:
+                        line_number = text.count('\n', 0, match.start()) + 1
+                        match_text = match.group(0)
+                        scan_lines.append(json.dumps({'type': 'match', 'data': {
+                            'path': {'text': str(staged_path)}, 'line_number': line_number,
+                            'lines': {'text': match_text}}}, ensure_ascii=False))
+                else:
+                    matched = 0
+                    for line_number, line in enumerate(text.splitlines(keepends=True), 1):
+                        if not matcher.search(line):
+                            continue
+                        matched += 1
+                        scan_lines.append(json.dumps({'type': 'match', 'data': {
+                            'path': {'text': str(staged_path)}, 'line_number': line_number,
+                            'lines': {'text': line}}}, ensure_ascii=False))
+                        if arguments.output_mode != 'count' and matched > arguments.head_limit:
+                            break
         results = []
         counts = {}
         ranges = {}
         source_revision = getattr(self.state, 'source_manifest', '') or ''
-        for line in response.stdout.splitlines():
+        for line in scan_lines:
             entry = json.loads(line)
             if entry['type'] != 'match':
                 continue
