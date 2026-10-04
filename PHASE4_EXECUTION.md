@@ -2,7 +2,6 @@
 
 - BASE_SHA：`3bc8b6a7419eaa002a71029c538152ee55c1bc5e`。
 - 分支：`codex/phase4-20261005`；worktree：`C:/Users/tsy/.codex/worktrees/phase4-20261005/tracefix`。
-- 当前 HEAD：`9df791a`；工作区在本次记录更新前保持干净。
 - DESIGN_ROOT：`D:/tracefix`。隔离树中研究设计未跟踪，仅从原始 checkout 只读获取。
 - 原始树 index/tracked 文件无改动，存在未跟踪资料；没有复制它们的生产代码或未提交实验。
 - 已读用户目标附件。阶段四只负责 T01 恢复、T09 最终隔离、T10 消融/统计及精确集成验收。
