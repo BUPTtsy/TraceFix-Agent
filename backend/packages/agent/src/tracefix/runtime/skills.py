@@ -90,7 +90,6 @@ class SkillStore:
     def load(self, state, catalog: SkillCatalog, name: str, phase: str,
              *, references: list[str] | None = None) -> dict[str, Any]:
         phase = phase.upper()
-        entry, content = catalog.load_document(name, phase)
         loaded = self._find_loaded(state, name, phase)
         if loaded and loaded.get('snapshot_ref'):
             snapshot = self._read_snapshot(state, loaded['snapshot_ref'])
@@ -98,6 +97,7 @@ class SkillStore:
                 raise ValueError('Skill 快照与当前阶段不匹配')
             return self._result(snapshot, loaded['snapshot_ref'])
 
+        entry, content = catalog.load_document(name, phase)
         actual_references = catalog.load_references(name, phase, references)
         snapshot_ref = self._write_snapshot(state, entry, content, actual_references, phase)
         snapshot = {
