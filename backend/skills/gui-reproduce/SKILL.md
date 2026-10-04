@@ -1,17 +1,20 @@
 ---
 name: gui-reproduce
-version: "1.1.0"
+version: "1.2.0"
 description: 重置完整沙箱并重放已经冻结的 GUI 动作计划。
 when_to_use: 已经选定独立复现步骤，需要在原始源码上重复验证时。
 phases: [REPRODUCE]
 triggers: {}
 tools_hint: [browser.navigate, browser.click, browser.snapshot]
 owner: tracefix
+references: [references/reproduce-checklist.md]
 ---
 
 # gui-reproduce
 
 输入可信的 RunState 和已授权的 Artifact 引用，输出一个类型化动作或验证结果。
+
+使用本次注入的 [刷新持久化复现清单](references/reproduce-checklist.md)，将其检查点映射到已冻结计划和当前证据；未执行项不能写成已复现。
 
 1. 重新验证作用域、阶段和预算。
 2. 重置完整沙箱并重放已冻结的动作计划。

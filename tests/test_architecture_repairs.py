@@ -56,25 +56,41 @@ def test_index_redacts_content_before_storage_hash_and_search(tmp_path, structur
 
 
 def test_pruning_keeps_failure_facts_and_diagnostic_channels(tmp_path):
+    from tracefix.knowledge.workset import expand_reference
     engine, state = make_engine(tmp_path / 'engine')
     failure = {'result': {'isError': True, 'error': 'critical failure'}, 'evidence_refs': ['ev']}
     history = [failure] + [{'step': index, 'result': 'ok ' * 60} for index in range(8)]
     assert failure in build_context(state, {}, pairs=history)['recent_action_results']
     assembler = ContextAssembler(context_window=850, output_tokens=100, overhead_tokens=50,
                                  counter=TokenCounter(lambda value: len(value)))
-    memory = {'finding': [{'text': 'regression', 'evidence_refs': ['ev']}],
-              'excluded': [{'text': 'not network'}], 'progress': [{'text': 'old ' * 80}]}
-    result = assembler.assemble({'recent_action_results': history, 'working_memory': memory,
-        'observation': {'snapshot': 'large ' * 200, 'console': 'error: stale', 'network': 'GET /api 500'}})
+    memory = {'finding': [{'text': 'refresh refutes stored state', 'evidence_refs': ['ev']}],
+              'excluded': [{'text': 'not network', 'metadata': {'patch_hash': 'old'}}],
+              'progress': [{'text': 'old ' * 80}]}
+    observation = {'snapshot': '- alert "refresh fails"',
+                   'console': 'error: stale ' * 100, 'network': 'GET /api 500 ' * 100}
+    ref = engine.artifacts.put(state.scope_id, state.run_id, observation)
+    observation['artifact_ref'] = ref
+    result = assembler.assemble({'goal': 'refresh fails', 'patch_hash': 'new',
+        'test_spec': {'regression_assertions': [{'condition': 'unchecked'}]},
+        'invariants': [{'ref': 'spec', 'text': 'cancel completion persists'}],
+        'recent_action_results': history, 'working_memory': memory, 'observation': observation})
     facts = result.context['pruning_facts']
-    assert facts['recent_action_results'] == [failure]
-    assert facts['observation'] == {'console': 'error: stale', 'network': 'GET /api 500'}
-    assert facts['working_memory']['finding'] == memory['finding']
-    assert facts['working_memory']['excluded'] == memory['excluded']
+    assert facts['invariants'] == [{'ref': 'spec', 'text': 'cancel completion persists'}]
+    assert 'observation' not in facts and 'recent_action_results' not in facts
+    assert result.context['test_spec'] == {'regression_assertions': [{'condition': 'unchecked'}]}
+    expanded = expand_reference(engine.artifacts, state.scope_id, state.run_id, ref,
+                                channel='console')
+    assert expanded['text'] == observation['console']
+    workset = result.manifest['workset']
+    assert any(item['reason'] == 'version_mismatch:patch_hash' for item in workset['dropped'])
+    assert workset['recent_action_results']['failures'][0]['fact']['error'] == 'critical failure'
     assert result.manifest['tokens_after'] <= result.manifest['input_limit']
     assert next(block for block in result.manifest['blocks'] if block['name'] == 'pruning_facts')['protected']
+    bounded = assembler.assemble({'recent_steps': [
+        {'error': 'too large ' * 200, 'artifact_ref': 'original-failure'}]})
+    assert bounded.manifest['tokens_after'] <= bounded.manifest['input_limit']
     with pytest.raises(ContextWindowError):
-        assembler.assemble({'recent_steps': [{'error': 'too large ' * 200}]})
+        assembler.assemble({'test_spec': {'frozen': 'too large ' * 200}})
 
 
 async def test_stable_operation_identity_uses_real_store_and_current_call_id(tmp_path):

@@ -1,3 +1,4 @@
+import base64
 import fnmatch
 import hashlib
 import json
@@ -60,6 +61,11 @@ class SkillCatalog:
 
     ALL_PHASES = ('PREPARE', 'EXPLORE', 'REPRODUCE', 'DIAGNOSE', 'PATCH', 'VERIFY', 'REVIEW', 'FINALIZE')
 
+    @staticmethod
+    def phase_name(phase: str) -> str:
+        normalized = str(phase).upper()
+        return 'PATCH' if normalized == 'EDIT' else normalized
+
     def __init__(self, root: Path):
         self.root = Path(root)
         self._cache: dict[Path, tuple[tuple[int, int, int, int], dict[str, Any], str]] = {}
@@ -99,13 +105,15 @@ class SkillCatalog:
         return path
 
     def _read_document(self, path: Path) -> tuple[dict[str, Any], str]:
+        if not path.resolve().is_relative_to(self.root.resolve()):
+            raise ValueError('Skill 路径超出资源根目录')
         metadata, raw = self._frontmatter(path)
         name = str(metadata.get('name', '')).strip()
         version = str(metadata.get('version') or '1.0.0').strip()
         description = str(metadata.get('description', '')).strip()
         if not name or not description:
             raise ValueError(f'Skill 元数据必须包含 name 和 description：{path}')
-        phases = [phase.upper() for phase in self._list(metadata.get('phases'))] or list(self.ALL_PHASES)
+        phases = [self.phase_name(phase) for phase in self._list(metadata.get('phases'))] or list(self.ALL_PHASES)
         triggers = metadata.get('triggers') or {}
         if not isinstance(triggers, dict):
             raise ValueError(f'Skill triggers 必须是对象：{path}')
@@ -113,6 +121,18 @@ class SkillCatalog:
             key: self._list(triggers.get(key))
             for key in ('frameworks', 'rule_categories', 'file_globs')
         }
+        references = self._list(metadata.get('references'))
+        skill_root = path.parent.resolve()
+        reference_paths = []
+        for reference in references:
+            reference_path = (skill_root / reference).resolve()
+            try:
+                reference_path.relative_to(skill_root)
+            except ValueError as error:
+                raise ValueError(f'Skill reference 路径超出资源目录：{reference}') from error
+            if not reference or reference_path == skill_root:
+                raise ValueError('Skill reference 路径不能为空')
+            reference_paths.append(reference_path.relative_to(skill_root).as_posix())
         entry = {
             'name': name,
             'version': version,
@@ -121,6 +141,7 @@ class SkillCatalog:
             'phases': phases,
             'triggers': normalized_triggers,
             'tools_hint': self._list(metadata.get('tools_hint')),
+            'references': reference_paths,
             'owner': str(metadata.get('owner') or 'builtin').strip(),
             'content_hash': hashlib.sha256(raw.encode('utf-8')).hexdigest(),
             '_path': path,
@@ -163,7 +184,7 @@ class SkillCatalog:
         return self.index(detailed=True)
 
     def summaries(self, phase: str | None = None) -> list[dict[str, str]]:
-        phase = phase.upper() if phase else None
+        phase = self.phase_name(phase) if phase else None
         return [
             {'name': entry['name'], 'description': entry['description']}
             for entry in self._entries()
@@ -178,10 +199,41 @@ class SkillCatalog:
 
     def load_document(self, name: str, phase: str) -> tuple[dict[str, Any], str]:
         document = next((item for item in self._documents() if item[0]['name'] == name), None)
-        if document is None or phase.upper() not in document[0]['phases']:
+        if document is None or self.phase_name(phase) not in document[0]['phases']:
             raise PermissionError('该阶段无法使用此 Skill')
         entry, raw = document
         return deepcopy(entry), raw
+
+    def load_references(self, name: str, phase: str, selected: list[str] | None = None,
+                        *, entry: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """读取 Skill 声明且本次实际使用的引用，返回原始字节的可复核摘要。"""
+        entry = entry if entry is not None else self.load_document(name, phase)[0]
+        if entry['name'] != name or self.phase_name(phase) not in entry['phases']:
+            raise PermissionError('该阶段无法使用此 Skill reference')
+        allowed = set(entry.get('references', []))
+        requested = entry.get('references', []) if selected is None else selected
+        if any(reference not in allowed for reference in requested):
+            raise PermissionError('Skill reference 未在 frontmatter 中声明')
+        skill_root = entry['_path'].parent.resolve()
+        if not skill_root.is_relative_to(self.root.resolve()):
+            raise PermissionError('Skill reference 路径超出资源根目录')
+        result = []
+        for relative in requested:
+            path = (skill_root / relative).resolve()
+            try:
+                path.relative_to(skill_root)
+            except ValueError as error:
+                raise PermissionError('Skill reference 路径无效') from error
+            raw = path.read_bytes()
+            result.append({
+                'path': relative,
+                'source': path.as_posix(),
+                'version': entry['version'],
+                'content_hash': hashlib.sha256(raw).hexdigest(),
+                'content': raw.decode('utf-8'),
+                'content_b64': base64.b64encode(raw).decode('ascii'),
+            })
+        return result
 
     @staticmethod
     def _values(context: dict[str, Any], key: str) -> set[str]:
@@ -227,7 +279,7 @@ class SkillCatalog:
         return {'frameworks': frameworks, 'rule_categories': rule_categories, 'files': files}
 
     def matches(self, entry: dict[str, Any], phase: str, context: dict[str, Any]) -> bool:
-        if phase.upper() not in entry['phases']:
+        if self.phase_name(phase) not in entry['phases']:
             return False
         values = self._context_values(context)
         triggers = entry.get('triggers') or {}

@@ -1,6 +1,6 @@
 ---
 name: frontend-diagnose
-version: "1.1.0"
+version: "1.2.0"
 description: 在诊断前读取证据和当前前端源码卡片，提出可验证的根因。
 when_to_use: 问题涉及前端状态、组件渲染、事件处理或刷新后的页面行为时。
 phases: [DIAGNOSE]
@@ -9,11 +9,14 @@ triggers:
   file_globs: ["**/*.tsx", "**/*.jsx", "**/*.vue"]
 tools_hint: [code.read, code.references, browser.console]
 owner: tracefix
+references: [references/diagnose-evidence.md]
 ---
 
 # frontend-diagnose
 
 输入可信的 RunState 和已授权的 Artifact 引用，输出一个类型化动作或验证结果。
+
+使用本次注入的 [handler/store/API 诊断清单](references/diagnose-evidence.md)。当前反证优先于通用配方，未知项保留待验证。
 
 1. 重新验证作用域、阶段和预算。
 2. 提议根因前先读取证据和当前源码卡片。

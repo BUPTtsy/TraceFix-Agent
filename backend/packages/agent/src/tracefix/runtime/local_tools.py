@@ -13,12 +13,13 @@ import tempfile
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from tracefix.execution.platforms import container_user, is_link
+from tracefix.execution.workspace import CandidateRejected
 from tracefix.execution.runner import process
 from tracefix.runtime.contracts import Contract, Phase, RunState, digest, new_id
-from tracefix.runtime.tools import ToolRejected
+from tracefix.runtime.tools import ToolRejected, ToolResult
 from tracefix.runtime.effects import apply_effect_receipt, run_effect
 from tracefix.workers.locks import WorkspaceMutex
 
@@ -36,11 +37,34 @@ class WriteInput(Contract):
     content: str
 
 
-class EditInput(Contract):
-    file_path: str = Field(min_length=1)
+class EditBlock(Contract):
     old_string: str = Field(min_length=1)
     new_string: str
+
+
+class EditInput(Contract):
+    file_path: str = Field(min_length=1)
+    old_string: str | None = Field(default=None, min_length=1)
+    new_string: str = ''
     replace_all: bool = False
+    edits: list[EditBlock] = Field(default_factory=list, max_length=8)
+    expected_overlay_revision: int | None = Field(default=None, ge=0)
+    expected_overlay_hash: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode='after')
+    def valid_shape(self):
+        if self.edits:
+            if not self.file_path or self.old_string is not None or self.replace_all:
+                raise ValueError('局部批量编辑必须提供 file_path、edits，且禁止 replace_all')
+        elif not self.file_path or self.old_string is None:
+            raise ValueError('Edit 必须提供 file_path/old_string，或提供局部 edits')
+        if self.local_mode and self.replace_all:
+            raise ValueError('版本绑定局部编辑禁止 replace_all')
+        return self
+
+    @property
+    def local_mode(self):
+        return bool(self.edits) or self.expected_overlay_hash is not None or self.expected_overlay_revision is not None
 
 
 class GlobInput(Contract):
@@ -243,6 +267,14 @@ class LocalTools:
         metadata['content'] = '\n'.join(
             f'{index + 1}\t{line}' for index, line in enumerate(lines)
             if arguments.offset <= index + 1 < arguments.offset + arguments.limit)
+        relative = path.relative_to(self.root).as_posix()
+        metadata.update(path=str(path), before_hash=digest(baseline),
+                disk_before_hash=digest(baseline), overlay_hash=digest(data),
+                overlay_revision=self.workspace.file_overlay_revision(relative),
+                line_ending='CRLF' if b'\r\n' in data else 'LF',
+                raw_content=''.join(text.splitlines(keepends=True)[
+                    arguments.offset - 1:arguments.offset - 1 + arguments.limit]),
+                offset=arguments.offset)
         return metadata
 
     def write(self, arguments):
@@ -259,6 +291,9 @@ class LocalTools:
         path = self.path(path_value, write=True)
         relative = path.relative_to(self.root).as_posix()
         with self.mutex.write_lock(path):
+            if tool_name == 'Edit' and arguments.local_mode:
+                with apply_effect_receipt():
+                    return self._local_edit(relative, arguments)
             staged = self.staged_content(relative)
             if not path.is_file():
                 raise ToolRejected('本地编辑工具不支持创建新文件')
@@ -288,11 +323,24 @@ class LocalTools:
             relative = path.relative_to(self.root).as_posix()
             staged = self.staged_content(relative)
             text = (staged if staged is not None else path.read_bytes()).decode('utf-8')
+            if arguments.local_mode:
+                with apply_effect_receipt():
+                    return self._local_edit(relative, arguments)
             count = text.count(arguments.old_string)
             if not count or count != 1 and not arguments.replace_all:
                 raise ToolRejected('old_string 必须存在且唯一；多处替换需指定 replace_all')
             return self.store_content(path, text.replace(arguments.old_string, arguments.new_string,
                                                         -1 if arguments.replace_all else 1))
+
+    def _local_edit(self, relative, arguments):
+        edits = ([(block.old_string, block.new_string) for block in arguments.edits]
+                 if arguments.edits else [(arguments.old_string, arguments.new_string)])
+        result = self.workspace.stage_local_edit(relative, edits,
+            expected_overlay_revision=arguments.expected_overlay_revision,
+            expected_overlay_hash=arguments.expected_overlay_hash)
+        result = self.workspace.bind_staged_candidate(result, self.state, self.engine.artifacts)
+        self.engine.store.save(self.state)
+        return result
 
     def glob(self, arguments):
         self.require_tool('Glob')
@@ -527,7 +575,7 @@ def register_local_tools(engine, state, context, bind):
         ('Glob', GlobInput, tools.glob, False, '按文件名 glob（如 **/*.ts）列出授权文件，按修改时间降序排序；path 为绝对目录。'),
         ('Grep', GrepInput, tools.grep, False, '正则内容搜索；支持 glob/type 过滤、multiline 和 content/files_with_matches/count 三种输出。'),
         ('Write', WriteInput, tools.write, True, '覆盖授权绝对路径的已有文件，仅暂存到 overlay；禁止新建文件，精确替换优先 Edit。'),
-        ('Edit', EditInput, tools.edit, True, '精确字符串替换；old_string 必须存在且唯一，replace_all=true 可替换全部匹配。'),
+        ('Edit', EditInput, tools.edit, True, '旧模式支持单块精确替换；局部模式用 edits 在同一共同基线提交多个唯一、不重叠块，带 expected_overlay_revision/hash，失败返回可纠正错误，不自动模糊匹配或 replace_all。'),
         ('NotebookEdit', NotebookEditInput, tools.notebook_edit, True, '按零起始 cell_number 替换、插入或删除 Jupyter cell；保留 notebook 元数据，代码修改清空旧输出。'),
     ]
     for name, model, callback, writing, description in definitions:
@@ -536,9 +584,13 @@ def register_local_tools(engine, state, context, bind):
         if writing and not tools.write_enabled:
             continue
         async def handler(arguments, call_id, callback=callback, name=name, writing=writing):
-            if writing:
-                return await tools.write_effect(arguments, name)
-            return await asyncio.to_thread(callback, arguments)
+            try:
+                if writing:
+                    return await tools.write_effect(arguments, name)
+                return await asyncio.to_thread(callback, arguments)
+            except CandidateRejected as error:
+                return ToolResult(call_id=call_id, name=name, isError=True,
+                    result=error.details, error={**error.details, 'message': str(error), 'executed': False})
         bind(name, description, model, handler, phases=set(Phase),
              side_effect='write' if writing else 'read', parallel_safe=not writing)
     if tools.worker and tools.worker_allowed_tools is not None and not ({'Bash', 'shell', 'shell.readonly', 'shell.patch'} & tools.worker_allowed_tools):

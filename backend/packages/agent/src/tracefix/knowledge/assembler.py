@@ -7,11 +7,13 @@
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from tracefix.runtime.contracts import digest
+from tracefix.knowledge.workset import cluster_steps, prepare_workset, select_snapshot
 
 
 class ContextWindowError(RuntimeError):
@@ -78,54 +80,16 @@ def failed_fact(value) -> bool:
 
 
 def compact_steps(steps: list[dict], *, keep_recent=4) -> dict:
-    """确定性地汇总旧步骤，同时保留失败证据和最近步骤。
-
-    成功旧步骤只留下动作摘要与证据引用，失败步骤完整保留；这样可以减少
-    token，却不会丢失诊断失败所需的错误、证据和当前操作上下文。
-    """
-    older = steps[:-keep_recent] if keep_recent else steps
-    recent = steps[-keep_recent:] if keep_recent else []
-    failures = []
-    summaries = []
-    for index, step in enumerate(older, 1):
-        if failed_fact(step):
-            # 失败步骤是诊断证据，不能像成功步骤一样只保留摘要。
-            failures.append(deepcopy(step))
-            continue
-        action = step.get('action') or {}
-        if not isinstance(action, dict):
-            action = {'kind': str(action)}
-        summaries.append({'step': step.get('step', index), 'kind': action.get('kind'),
-                          'locator': action.get('locator'), 'value': action.get('value'),
-                          'summary': step.get('summary', ''),
-                          'evidence_refs': list(step.get('evidence_refs') or []),
-                          'observation_ref': step.get('observation_ref')})
-    return {'progress': summaries, 'failures': failures, 'recent_steps': deepcopy(recent),
-            'merged_steps': len(older)}
+    """汇总旧步骤的语义簇与原件引用，保留最近完整步骤和未知操作状态。"""
+    return cluster_steps(steps, keep_recent=keep_recent)
 
 
-def compress_snapshot(snapshot: str, counter: TokenCounter, token_limit: int) -> tuple[str, list[int]]:
-    """按完整行裁剪快照，并交替保留首尾行。
-
-    快照压缩只改变发送给模型的视图；省略的行号与完整快照仍通过
-    observation artifact 可追溯，因此不会把压缩结果当成原始证据。
-    """
-    if counter.count(snapshot) <= token_limit:
-        return snapshot, []
-    lines = snapshot.splitlines()
-    marker = '... [上下文快照已压缩，完整内容保留在 observation artifact] ...'
-    selected = set()
-    candidates = []
-    for index in range(len(lines)):
-        # 交替尝试首尾行，避免从行中间截断 snapshot。
-        candidates.extend((index, len(lines) - index - 1))
-    for index in dict.fromkeys(candidates):
-        candidate = selected | {index}
-        text = '\n'.join([lines[position] for position in sorted(candidate)] + [marker])
-        if counter.count(text) <= token_limit:
-            selected = candidate
-    text = '\n'.join([lines[position] for position in sorted(selected)] + ([marker] if selected else []))
-    return text, [index + 1 for index in range(len(lines)) if index not in selected]
+def compress_snapshot(snapshot: str, counter: TokenCounter, token_limit: int, *,
+                      query='', ref=None, binding=None) -> tuple[str, list[int]]:
+    """按任务与错误语义保留完整行及祖先，省略内容可按原件引用展开。"""
+    text, omitted, _ = select_snapshot(snapshot, counter, token_limit,
+                                       query=query, ref=ref, binding=binding)
+    return text, omitted
 
 
 class ContextAssembler:
@@ -160,16 +124,37 @@ class ContextAssembler:
         self.available = context_window - output_tokens - overhead_tokens
         self.counter = counter or TokenCounter()
 
-    def _fit(self, field, value, limit):
+    def _fit(self, field, value, limit, *, query='', binding=None, workset=None):
         """在字段自己的预算内裁剪，返回保留值及可追踪的省略标识。"""
         if self.counter.count(value) <= limit:
+            if field == 'observation' and isinstance(value, dict) and workset is not None:
+                _, _, selection = select_snapshot(value.get('snapshot') or '', self.counter, limit,
+                    query=query, ref=value.get('artifact_ref') or value.get('observation_ref')
+                    or value.get('ref'), binding=binding)
+                workset['snapshot'] = selection
+                workset['snapshot']['source_coverage'] = (
+                    'upstream_truncated' if workset.get('limitations') else value.get('coverage', 'unknown'))
             return value, []
         if field == 'observation' and isinstance(value, dict):
-            # 先压缩 snapshot，再在仍超限时折叠 console/network；完整原件留在 artifact。
             observation = deepcopy(value)
             snapshot = observation.pop('snapshot', '')
+            for channel in ('console', 'network'):
+                if channel in observation:
+                    logs = observation[channel]
+                    logs = logs if isinstance(logs, list) else [logs]
+                    ranked = sorted(enumerate(logs), key=lambda item: (
+                        not bool(re.search(
+                            r'error|fail|exception|500|反证|失败|错误', serialized(item[1]), re.I)),
+                        -item[0]))
+                    retained = []
+                    for _, item in ranked:
+                        if self.counter.count(retained + [item]) <= max(0, limit // 5):
+                            retained.append(item)
+                    observation[channel] = retained
             remaining = max(0, limit - self.counter.count(observation) - 20)
-            compacted, omitted = compress_snapshot(snapshot, self.counter, remaining)
+            ref = value.get('artifact_ref') or value.get('observation_ref') or value.get('ref')
+            compacted, omitted, selection = select_snapshot(snapshot, self.counter, remaining,
+                                                query=query, ref=ref, binding=binding)
             observation['snapshot'] = compacted
             if self.counter.count(observation) > limit:
                 for channel in ('console', 'network'):
@@ -177,13 +162,23 @@ class ContextAssembler:
                         observation[channel] = '[完整内容见 observation artifact]'
                 remaining = max(0, limit - self.counter.count({key: item for key, item in observation.items()
                                                             if key != 'snapshot'}) - 20)
-                observation['snapshot'], omitted = compress_snapshot(snapshot, self.counter, remaining)
+                observation['snapshot'], omitted, selection = select_snapshot(
+                    snapshot, self.counter, remaining, query=query, ref=ref, binding=binding)
+            if workset is not None:
+                workset['snapshot'] = selection
+                workset['snapshot']['source_coverage'] = (
+                    'upstream_truncated' if workset.get('limitations') else value.get('coverage', 'unknown'))
             return observation, ['snapshot_line:' + str(index) for index in omitted]
         if isinstance(value, list):
             # 列表按原顺序尝试保留，超出预算的项用 id/path 或索引记录。
             retained = []
             omitted = []
-            for index, item in enumerate(value):
+            ranked = sorted(enumerate(value), key=lambda entry: (
+                not (isinstance(entry[1], dict) and (
+                    entry[1].get('status') in {'unknown', 'pending'}
+                    or entry[1].get('fact', {}).get('status') in {'unknown', 'pending', 'failed'}
+                    or failed_fact(entry[1]))), -entry[0]))
+            for index, item in ranked:
                 if self.counter.count(retained + [item]) <= limit:
                     retained.append(item)
                 else:
@@ -194,7 +189,7 @@ class ContextAssembler:
             # 工作记忆只移除最早的列表项，保留最新假设、发现和待办。
             retained = deepcopy(value)
             omitted = []
-            for key in ('progress', 'hypothesis', 'todo', 'finding', 'excluded'):
+            for key in ('progress', 'hypothesis', 'finding', 'excluded', 'todo'):
                 items = retained.get(key)
                 if not isinstance(items, list):
                     continue
@@ -214,26 +209,7 @@ class ContextAssembler:
         available = self.available - extra_tokens
         original = deepcopy(context)
         original.pop('context_manifest', None)
-        facts = {}
-        for field in ('recent_steps', 'recent_action_results'):
-            failures = [item for item in original.get(field) or [] if failed_fact(item)]
-            if failures:
-                facts[field] = failures
-        memory = original.get('working_memory')
-        if isinstance(memory, dict):
-            notes = {key: memory[key] for key in ('finding', 'excluded') if memory.get(key)}
-            if notes:
-                facts['working_memory'] = notes
-        observation = original.get('observation')
-        if isinstance(observation, dict):
-            diagnostics = {key: observation[key] for key in ('console', 'network')
-                           if observation.get(key)}
-            if diagnostics:
-                facts['observation'] = diagnostics
-        if facts:
-            if 'pruning_facts' in original:
-                facts['previous'] = original['pruning_facts']
-            original['pruning_facts'] = facts
+        original, workset, query, binding = prepare_workset(original)
         ordered = {key: original[key] for key in self.ORDER if key in original}
         ordered.update({key: original[key] for key in sorted(original) if key not in ordered})
         omitted = {}
@@ -245,7 +221,8 @@ class ContextAssembler:
         # 先给大字段分配上限，再按优先级处理整体超限，保证压缩结果确定。
         for field, share in self.SHARES.items():
             if field in ordered:
-                ordered[field], omitted[field] = self._fit(field, ordered[field], int(available * share))
+                ordered[field], omitted[field] = self._fit(field, ordered[field], int(available * share),
+                                                          query=query, binding=binding, workset=workset)
         for field in self.OPTIONAL:
             if self.counter.count(ordered) <= available:
                 break
@@ -253,7 +230,9 @@ class ContextAssembler:
                 continue
             excess = self.counter.count(ordered) - available
             limit = max(0, self.counter.count(ordered[field]) - excess - 16)
-            ordered[field], additional = self._fit(field, ordered[field], limit)
+            source_value = original[field] if field == 'observation' else ordered[field]
+            ordered[field], additional = self._fit(field, source_value, limit,
+                                                   query=query, binding=binding, workset=workset)
             omitted[field] = list(dict.fromkeys(omitted.get(field, []) + additional))
         after = self.counter.count(ordered)
         if after > available:
@@ -265,5 +244,5 @@ class ContextAssembler:
         manifest = {'version': 'tracefix/context/1', 'counter': self.counter.name,
                     'exact_tokenizer': self.counter.exact, 'context_window': self.context_window,
                     'input_limit': available, 'tokens_before': before, 'tokens_after': after,
-                    'context_hash': digest(ordered), 'blocks': blocks}
+                    'context_hash': digest(ordered), 'blocks': blocks, 'workset': workset}
         return ContextAssembly(ordered, manifest, before != after)
