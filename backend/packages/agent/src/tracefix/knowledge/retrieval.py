@@ -7,12 +7,17 @@
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 import httpx
 import psycopg
 
 from tracefix.runtime.contracts import digest
+from tracefix.knowledge.experience import (
+    applicable, checked_probe, conditions, cross_run_enabled, experience_record,
+    public_content, source_applicability, verified_public_evidence,
+)
 
 
 def rrf(*rankings, k=60):
@@ -83,10 +88,11 @@ class Retriever:
     一旦置位，本次运行后续操作固定走回退，避免在半失败连接上反复重试。
     """
 
-    def __init__(self, store, scopes, ctx, embedding=None, fallback=None):
+    def __init__(self, store, scopes, ctx, embedding=None, fallback=None, *, cross_run=None):
         """绑定存储、作用域解析器、当前上下文和可选嵌入适配器。"""
         self.store, self.scopes, self.ctx, self.embedding = store, scopes, ctx, embedding
         self.fallback = fallback
+        self.cross_run = cross_run
         if self.fallback is None and os.getenv('TRACEFIX_MEMORY_DB'):
             from tracefix.knowledge.memory import MemoryLibrary
             self.fallback = MemoryLibrary(os.environ['TRACEFIX_MEMORY_DB'])
@@ -166,17 +172,25 @@ class Retriever:
                     'source_revision': revision, 'content': content, 'embedding': vector})
         self.fallback.prune_index(self.ctx.active_scope, revision, current_ids)
 
-    async def retrieve(self, query, source_revision, layer="M1", limit=10):
+    async def retrieve(self, query, source_revision, layer="M1", limit=10, *, state=None, phase=None,
+                       allow_compatible=False, artifact_exists=None, artifact_read=None):
         """执行检索并在数据库错误后固定切换到本地回退。"""
+        if layer in {'M3', 'L2', 'L3'} and not cross_run_enabled(self.cross_run):
+            return []
         try:
-            return await self._retrieve(query, source_revision, layer, limit)
+            return await self._retrieve(query, source_revision, layer, limit, state=state, phase=phase,
+                                        allow_compatible=allow_compatible,
+                                        artifact_exists=artifact_exists, artifact_read=artifact_read)
         except psycopg.Error:
             if self.fallback is None:
                 raise
             self.postgres_failed = True
-            return await self._retrieve(query, source_revision, layer, limit)
+            return await self._retrieve(query, source_revision, layer, limit, state=state, phase=phase,
+                                        allow_compatible=allow_compatible,
+                                        artifact_exists=artifact_exists, artifact_read=artifact_read)
 
-    async def _retrieve(self, query, source_revision, layer="M1", limit=10):
+    async def _retrieve(self, query, source_revision, layer="M1", limit=10, *, state=None, phase=None,
+                        allow_compatible=False, artifact_exists=None, artifact_read=None):
         """先在 SQL 中完成可见性过滤，再合并词法和稠密排名结果。
 
         过滤条件包含祖先作用域的 DESCENDANTS 权限、trusted 状态和
@@ -187,14 +201,28 @@ class Retriever:
             if self.fallback is None:
                 return []
             vector = await self.embedding.encode(query) if self.embedding else None
-            return self.fallback.retrieve(query, self.ctx, source_revision, layer, limit, vector)
+            return self.fallback.retrieve(query, self.ctx, source_revision, layer, limit, vector,
+                cross_run=cross_run_enabled(self.cross_run), state=state, phase=phase,
+                allow_compatible=allow_compatible, artifact_exists=artifact_exists, artifact_read=artifact_read)
         # 作用域、可见性、状态和源码快照先在 SQL 中过滤，跨作用域候选不会进入 Python 排名。
         clauses, params = [], []
         for scope, rev in self.ctx.revisions:
             clauses.append("(scope_id=%s AND revision<=%s" + ("" if scope == self.ctx.active_scope else " AND visibility='DESCENDANTS'") + ")")
             params.extend([scope, rev])
-        where = "(" + " OR ".join(clauses) + ") AND status='trusted' AND layer=%s AND source_revision IN (%s,'*')"
-        params += [layer, source_revision]
+        source_filter = ('TRUE' if allow_compatible else 'source_revision=%s') if layer == 'M3' else "source_revision IN (%s,'*')"
+        where = "(" + " OR ".join(clauses) + ") AND status='trusted' AND layer=%s AND " + source_filter
+        where += ' AND (expires_at IS NULL OR expires_at>%s)'
+        params += [layer, *([] if layer == 'M3' and allow_compatible else [source_revision]), time.time()]
+        if layer == 'M3':
+            metadata = self.store.conn.execute(
+                f'SELECT id,source_revision,applicability FROM memory_items WHERE {where}', params).fetchall()
+            eligible = [row['id'] for row in metadata if applicable(row, state, phase)
+                        and source_applicability(row, source_revision, state,
+                            artifact_exists=artifact_exists, artifact_read=artifact_read) != 'stale']
+            if not eligible:
+                return []
+            where += ' AND id=ANY(%s)'
+            params += [eligible]
         lexical = self.store.conn.execute(f"""SELECT *, ts_rank(search, plainto_tsquery('simple', %s)) AS score
             FROM memory_items WHERE {where} AND search @@ plainto_tsquery('simple', %s)
             ORDER BY score DESC, id LIMIT %s""", [query, *params, query, limit * 2]).fetchall()
@@ -208,10 +236,21 @@ class Retriever:
               [*params, v, v, limit * 2]).fetchall()
         records = {r["id"]: r for r in [*lexical, *dense]}
         ordered = rrf([r['id'] for r in lexical], [r['id'] for r in dense])
-        return [{k: v for k, v in records[i].items() if k not in {"embedding", "search"}} for i in ordered[:limit]]
+        selected = [{k: v for k, v in records[i].items() if k not in {"embedding", "search"}}
+                    for i in ordered[:limit]]
+        if layer == 'M3':
+            for record in selected:
+                record['applicability_status'] = source_applicability(record, source_revision, state,
+                    artifact_exists=artifact_exists, artifact_read=artifact_read)
+                record['why_retrieved'] = '当前源码和条件匹配的已验证经验'
+        return selected
 
     def candidate(self, state, content, kind):
         """写入候选记忆，并在 PostgreSQL 不可用时委托 SQLite。"""
+        if not cross_run_enabled(self.cross_run):
+            return None
+        if not public_content(content):
+            raise PermissionError('最终 Oracle 或 held-out 内容不能写入经验')
         try:
             return self._candidate(state, content, kind)
         except psycopg.Error:
@@ -232,9 +271,91 @@ class Retriever:
                 return self.fallback.candidate(state, content, kind,
                                               dict(self.ctx.revisions)[self.ctx.active_scope])
             return
-        key = digest([state.run_id, kind, content])
+        record = experience_record(state, content, kind, dict(self.ctx.revisions)[self.ctx.active_scope])
+        key = record['id']
+        content = json.dumps(record['content'], ensure_ascii=False)
         self.store.conn.execute("""INSERT INTO memory_items
-          (id,scope_id,layer,kind,logical_key,visibility,status,revision,source_revision,content,content_hash)
-          VALUES (%s,%s,'M3',%s,%s,'LOCAL','candidate',%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+          (id,scope_id,layer,kind,logical_key,visibility,status,revision,source_revision,content,content_hash,
+           source_run_id,patch_hash,environment_digest,test_spec_hash,applicability,evidence_refs,verification_refs)
+          VALUES (%s,%s,'M3',%s,%s,'LOCAL','candidate',%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb)
+          ON CONFLICT DO NOTHING""",
           (key, self.ctx.active_scope, kind, key, dict(self.ctx.revisions)[self.ctx.active_scope],
-           state.source_manifest, content, digest(content)))
+           state.source_manifest, content, digest(content), state.run_id, record['patch_hash'],
+           record['environment_digest'], record['test_spec_hash'], json.dumps(record['applicability']),
+           json.dumps(record['evidence_refs']), json.dumps(record['verification_refs'])))
+        return key
+
+    def promote(self, item_id, state, *, artifact_exists, artifact_read, artifact_read_bytes):
+        """公开开发证据重读通过后晋升；PostgreSQL 和 SQLite 使用同一验证门。"""
+        if not cross_run_enabled(self.cross_run):
+            return None
+        self.scopes.assert_current(self.ctx)
+        if not self.postgres_available():
+            if self.fallback is None:
+                return None
+            return self.fallback.promote(item_id, self.ctx.active_scope, state=state,
+                artifact_exists=artifact_exists, artifact_read=artifact_read,
+                artifact_read_bytes=artifact_read_bytes)
+        refs = verified_public_evidence(state, artifact_exists, artifact_read, artifact_read_bytes)
+        row = self.store.conn.execute(
+            'SELECT * FROM memory_items WHERE id=%s AND scope_id=%s',
+            (item_id, self.ctx.active_scope)).fetchone()
+        if row is None or row['status'] != 'candidate' or row['expires_at'] and row['expires_at'] <= time.time():
+            raise PermissionError('经验缺失、撤回或过期')
+        for field, state_field in (('source_revision', 'source_manifest'), ('source_run_id', 'run_id'),
+                                   ('patch_hash', 'patch_hash'), ('environment_digest', 'environment_digest'),
+                                   ('test_spec_hash', 'test_spec_hash')):
+            if row[field] != getattr(state, state_field, None):
+                raise PermissionError('经验与当前 patch/env/spec 不匹配')
+        stored_refs = row['verification_refs']
+        stored_refs = json.loads(stored_refs) if isinstance(stored_refs, str) else stored_refs
+        if not set(refs) <= set(stored_refs):
+            raise PermissionError('晋升引用未绑定公开验证 artifact')
+        self.store.conn.execute("UPDATE memory_items SET status='trusted' WHERE id=%s AND scope_id=%s",
+                                (item_id, self.ctx.active_scope))
+        return item_id
+
+    def revoke(self, item_id, reason):
+        self.scopes.assert_current(self.ctx)
+        if not self.postgres_available():
+            if self.fallback is not None:
+                return self.fallback.revoke(item_id, self.ctx.active_scope, reason)
+            return None
+        if not str(reason).strip():
+            raise ValueError('撤回必须记录原因')
+        self.store.conn.execute(
+            "UPDATE memory_items SET status='revoked',revoked_reason=%s,revoked_at=%s WHERE id=%s AND scope_id=%s",
+            (str(reason), time.time(), item_id, self.ctx.active_scope))
+
+    def clues(self, query, source_manifest, *, limit=3):
+        if not cross_run_enabled(self.cross_run):
+            return []
+        self.scopes.assert_current(self.ctx)
+        if not self.postgres_available():
+            return self.fallback.clues(query, self.ctx, source_manifest, limit=limit) if self.fallback else []
+        records = self.store.conn.execute(
+            "SELECT * FROM memory_items WHERE scope_id=%s AND layer='M3' AND status IN ('candidate','trusted') "
+            "AND revision<=%s AND (expires_at IS NULL OR expires_at>%s) "
+            "AND search @@ plainto_tsquery('simple',%s) ORDER BY id LIMIT %s",
+            (self.ctx.active_scope, dict(self.ctx.revisions)[self.ctx.active_scope], time.time(), query, limit)).fetchall()
+        return [{**{key: value for key, value in record.items() if key not in {'embedding', 'search'}},
+                 'applicability_status': 'stale' if record['source_revision'] != source_manifest else 'candidate',
+                 'requires_probe': True, 'actionable': False} for record in records]
+
+    def mark_compatible(self, item_id, state, probe_ref, *, artifact_exists, artifact_read):
+        if not cross_run_enabled(self.cross_run):
+            return None
+        self.scopes.assert_current(self.ctx)
+        if not self.postgres_available():
+            return self.fallback.mark_compatible(item_id, state, probe_ref,
+                artifact_exists=artifact_exists, artifact_read=artifact_read) if self.fallback else None
+        probe = checked_probe(state, probe_ref, artifact_exists, artifact_read)
+        row = self.store.conn.execute(
+            'SELECT * FROM memory_items WHERE id=%s AND scope_id=%s', (item_id, self.ctx.active_scope)).fetchone()
+        if row is None or row['status'] != 'trusted' or row['expires_at'] and row['expires_at'] <= time.time():
+            raise PermissionError('仅未撤回且未过期的已验证经验可激活兼容版本')
+        declared = conditions(row)
+        declared.setdefault('compatibility', {})[state.source_manifest] = probe
+        self.store.conn.execute('UPDATE memory_items SET applicability=%s::jsonb WHERE id=%s AND scope_id=%s',
+                                (json.dumps(declared), item_id, self.ctx.active_scope))
+        return item_id

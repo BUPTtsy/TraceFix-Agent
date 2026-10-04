@@ -33,6 +33,16 @@ CREATE TABLE IF NOT EXISTS memory_items (
  search tsvector GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED
 );
 CREATE INDEX IF NOT EXISTS memory_scope ON memory_items(scope_id, layer, status, revision);
+ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS source_run_id text;
+ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS expires_at double precision;
+ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS applicability jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS revoked_reason text;
+ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS revoked_at double precision;
+ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS evidence_refs jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS patch_hash text;
+ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS environment_digest text;
+ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS test_spec_hash text;
+ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS verification_refs jsonb NOT NULL DEFAULT '[]'::jsonb;
 CREATE INDEX IF NOT EXISTS memory_lexical ON memory_items USING gin(search);
 CREATE TABLE IF NOT EXISTS approvals (
  id text PRIMARY KEY, run_id text NOT NULL, scope_id text NOT NULL,
