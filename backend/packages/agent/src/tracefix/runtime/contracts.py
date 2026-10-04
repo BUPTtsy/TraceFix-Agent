@@ -124,8 +124,12 @@ class BrowserAction(Contract):
     kind: ActionKind
     observation_id: str | None = None
     element_ref: str | None = None
+    page_generation: int | None = Field(default=None, ge=0)
     locator: Locator | None = None
     value: str | None = None
+    preconditions: list[Assertion] = Field(default_factory=list)
+    postconditions: list[Assertion] = Field(default_factory=list)
+    wait: ObservableWait | None = None
 
     @model_validator(mode="after")
     def validate_shape(self):
@@ -139,6 +143,13 @@ class BrowserAction(Contract):
 class Assertion(Contract):
     locator: Locator
     condition: Literal["visible", "absent", "checked", "unchecked", "disabled", "enabled"] = "visible"
+
+
+class ObservableWait(Contract):
+    assertions: list[Assertion] = Field(default_factory=list)
+    timeout_seconds: float = Field(default=5, gt=0, le=30)
+    interval_seconds: float = Field(default=0.2, gt=0, le=2)
+    max_observations: int = Field(default=10, ge=1, le=30)
 
 
 class BehaviorStep(Contract):
@@ -174,6 +185,7 @@ class TestSpec(Contract):
     model_config = ConfigDict(extra="ignore")
     goal: str = Field(min_length=5)
     preconditions: list[str] = Field(default_factory=list)
+    executable_preconditions: list[Assertion] = Field(default_factory=list)
     authorized_actions: list[ActionKind] = Field(default_factory=lambda: ["navigate", "click", "type", "select", "press", "observe", "finish"],
         description='Exact action kinds, never sentences. Include navigate and finish; authorize only actions needed by the goal.')
     assertions: list[Assertion] = Field(min_length=1)
@@ -187,7 +199,8 @@ class TestSpec(Contract):
             raise ValueError('authorized_actions 必须包含流程必需的 navigate 和 finish')
         if any(action.kind not in self.authorized_actions for action in self.regression_plan):
             raise ValueError('regression_plan 含有未被 authorized_actions 授权的动作')
-        if any(action.observation_id is not None or action.element_ref is not None for action in self.regression_plan):
+        if any(action.observation_id is not None or action.element_ref is not None
+               or action.page_generation is not None for action in self.regression_plan):
             raise ValueError('regression_plan 的 observation_id 和 element_ref 必须为 null，重放时由运行时绑定')
         ids = [scenario.id for scenario in self.behavior_scenarios]
         if len(ids) != len(set(ids)):
@@ -196,7 +209,8 @@ class TestSpec(Contract):
             for step in scenario.steps:
                 if step.action.kind not in self.authorized_actions:
                     raise ValueError('业务场景含有未被 authorized_actions 授权的动作')
-                if step.action.observation_id is not None or step.action.element_ref is not None:
+                if (step.action.observation_id is not None or step.action.element_ref is not None
+                        or step.action.page_generation is not None):
                     raise ValueError('业务场景的 observation_id 和 element_ref 必须为 null')
         return self
 
@@ -328,6 +342,7 @@ class RunState(Contract):
     reproduction_plan_frozen: bool = False
     skills_loaded: list[dict] = Field(default_factory=list)
     observation_ref: str | None = None
+    reproduction_binding_ref: str | None = None
     evidence_refs: list[str] = Field(default_factory=list)
     hypothesis_refs: list[str] = Field(default_factory=list)
     working_set_refs: list[str] = Field(default_factory=list)

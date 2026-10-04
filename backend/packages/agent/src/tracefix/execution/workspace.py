@@ -40,6 +40,19 @@ def is_frozen_path(relative) -> bool:
     return any(FROZEN_TOKENS & tokens(part) for part in parts)
 
 
+def source_query_terms(query):
+    """提取症状文案、API 路径和标识符，优先保持完整文案。"""
+    text = str(query)
+    terms = {term.casefold(): 1 for term in re.findall(r'[\w\u4e00-\u9fff][\w\u4e00-\u9fff.:-]*', text)
+             if len(term) > 2 and term.casefold() not in {'the', 'and', 'for', 'with', 'from', 'that', 'this'}}
+    anchors = re.findall(r'["\']([^"\'\n]{2,200})["\']', text)
+    anchors += re.findall(r'/[\w./:-]+', text)
+    if 2 <= len(text.strip()) <= 200:
+        anchors.append(text.strip())
+    terms.update({anchor.casefold(): 5 for anchor in anchors})
+    return terms
+
+
 def git(root: Path, *args, env=None):
     if env is not None:
         raise ValueError('Git 环境只能由安全仓库 helper 构造')
@@ -338,7 +351,7 @@ class Workspace:
     def files(self):
         """枚举根目录下可读的普通文件，排除链接和受保护目录。"""
         for p in sorted(self.root.rglob('*')):
-            if p.is_file() and p.suffix in {'.ts', '.tsx', '.js', '.mjs', '.css'}:
+            if p.is_file() and p.suffix in {'.ts', '.tsx', '.js', '.jsx', '.mjs', '.css', '.json', '.py', '.html'}:
                 rel = p.relative_to(self.root).as_posix()
                 try:
                     self.path(rel)
@@ -358,6 +371,88 @@ class Workspace:
             baseline = self.path(path).read_bytes()
             result.append({"path": path, "content": body, "before_hash": digest(baseline)})
         return result
+
+    def source_bytes(self, relative):
+        """取得同次读取的磁盘基线与 overlay 内容，并拒绝读取期间变化。"""
+        path = self.path(relative)
+        before = path.stat()
+        staged = self.staged_content(relative)
+        baseline = path.read_bytes()
+        after = path.stat()
+        if ((before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                or staged != self.staged_content(relative)):
+            raise ValueError('源码读取期间发生变化')
+        return baseline, staged if staged is not None else baseline
+
+    def fragments(self, query, preferred_paths=(), limit_chars=16_000, context_lines=60, max_files=6):
+        """按症状词元返回少量有界源码片段。"""
+        if limit_chars < 1 or context_lines < 0 or max_files < 1:
+            raise ValueError('源码片段参数无效')
+        source_revision = digest(self.repository_snapshot) if self.repository_snapshot is not None else ''
+        query_terms = source_query_terms(query)
+        preferred = [str(Path(path).as_posix()) for path in preferred_paths]
+        candidates = []
+        for relative in self.files():
+            try:
+                baseline, data = self.source_bytes(relative)
+                body = data.decode('utf-8')
+            except (OSError, UnicodeDecodeError, PermissionError):
+                continue
+            folded = body.casefold()
+            score = sum(min(folded.count(term), 5) * weight for term, weight in query_terms.items())
+            name_score = sum(term in relative.casefold() for term in query_terms)
+            related_score = sum(marker in folded for marker in ('handler', 'store', 'hydration', 'api', 'i18n'))
+            preferred_score = len(preferred) - preferred.index(relative) if relative in preferred else 0
+            if score or name_score or preferred_score:
+                candidates.append((score * 10 + name_score * 3 + related_score + preferred_score,
+                                   relative, body, baseline, data))
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        has_hits = any(any(term in item[2].casefold() for term in query_terms) for item in candidates)
+        cards, used = [], 0
+        for _, relative, body, baseline, data in candidates:
+            if len(cards) >= max_files:
+                break
+            lines = body.splitlines()
+            folded_lines = [line.casefold() for line in lines]
+            scored_lines = [(sum(weight for term, weight in query_terms.items() if term in line), index)
+                            for index, line in enumerate(folded_lines)]
+            hit_lines = [index for score, index in sorted(scored_lines, key=lambda item: (-item[0], item[1]))
+                         if score]
+            if not hit_lines:
+                if relative not in preferred or has_hits or len(cards) >= min(max_files, 3):
+                    continue
+                ranges = [(0, min(len(lines), 160), 0)]
+            else:
+                ranges = []
+                for hit in hit_lines:
+                    start = max(0, hit - context_lines)
+                    end = min(len(lines), hit + context_lines + 1)
+                    if not any(start >= old_start and end <= old_end for old_start, old_end, _ in ranges):
+                        ranges.append((start, end, hit))
+            for start, end, center in ranges:
+                content = '\n'.join(f'{line_no}\t{lines[line_no - 1]}'
+                                     for line_no in range(start + 1, end + 1))
+                while used + len(content) > limit_chars and end - start > 1:
+                    if center - start >= end - center:
+                        start += 1
+                    else:
+                        end -= 1
+                    content = '\n'.join(f'{line_no}\t{lines[line_no - 1]}'
+                                        for line_no in range(start + 1, end + 1))
+                if not content or used + len(content) > limit_chars:
+                    continue
+                current_baseline, current_data = self.source_bytes(relative)
+                if current_baseline != baseline or current_data != data:
+                    raise ValueError('源码片段内容版本已变化')
+                cards.append({'path': relative, 'relative_path': relative, 'content': content,
+                              'before_hash': digest(baseline), 'start_line': start + 1,
+                              'end_line': end, 'content_version': digest(data),
+                              'source_revision': source_revision, 'overlay': data != baseline,
+                              'truncated': start > 0 or end < len(lines)})
+                used += len(content)
+                break
+        return cards
 
     def validate_guidance_patch(self, patch: PatchProposal):
         # 相对当前 HEAD 计算已有改动与候选补丁的累计变化，执行用户指定的总量限制。

@@ -28,6 +28,7 @@ class ReadInput(Contract):
     offset: int = Field(default=1, ge=1)
     limit: int = Field(default=2000, ge=1, le=2000)
     pages: list[int] = Field(default_factory=list, max_length=20)
+    expected_content_version: str | None = None
 
 
 class WriteInput(Contract):
@@ -196,12 +197,28 @@ class LocalTools:
     def read(self, arguments):
         self.require_tool('Read')
         path = self.path(arguments.file_path)
+        relative = path.relative_to(self.root).as_posix()
         with self.mutex.read_lock(path):
-            staged = self.staged_content(path.relative_to(self.root).as_posix())
+            disk_version = path.stat()
+            staged = self.staged_content(relative)
             baseline = path.read_bytes()
+            disk_after = path.stat()
+            if (disk_version.st_size, disk_version.st_mtime_ns, disk_version.st_ctime_ns) != (
+                    disk_after.st_size, disk_after.st_mtime_ns, disk_after.st_ctime_ns):
+                raise ToolRejected('读取期间磁盘文件发生变化，拒绝使用过期源码')
             data = staged if staged is not None else baseline
+            if staged != self.staged_content(relative):
+                raise ToolRejected('读取期间 overlay 发生变化，拒绝使用过期源码')
+        content_version = digest(data)
+        if arguments.expected_content_version is not None and arguments.expected_content_version != content_version:
+            raise ToolRejected('源码 content_version 已变化，请重新读取')
+        source_revision = getattr(self.state, 'source_manifest', '') or ''
+        metadata = {'path': str(path), 'relative_path': relative,
+                    'before_hash': digest(baseline), 'content_version': content_version,
+                    'source_revision': source_revision, 'overlay': staged is not None,
+                    'truncated': False, 'offset': arguments.offset}
         if path.suffix.lower() in {'.png', '.jpg', '.jpeg', '.gif', '.webp'}:
-            return {'path': str(path), 'type': 'image', 'mime_type': mimetypes.guess_type(path)[0],
+            return {**metadata, 'type': 'image', 'mime_type': mimetypes.guess_type(path)[0],
                     'base64': base64.b64encode(data).decode('ascii')}
         if path.suffix.lower() == '.pdf':
             import pypdf
@@ -209,20 +226,24 @@ class LocalTools:
             pages = arguments.pages or list(range(1, min(len(document.pages), 20) + 1))
             if any(page < 1 or page > len(document.pages) for page in pages):
                 raise ToolRejected('PDF 页码超出范围')
-            return {'type': 'pdf', 'total_pages': len(document.pages),
+            return {**metadata, 'type': 'pdf', 'total_pages': len(document.pages),
                     'pages': [{'page': page, 'text': document.pages[page - 1].extract_text()}
                               for page in pages]}
         text = data.decode('utf-8')
         if path.suffix == '.ipynb':
             notebook = json.loads(text)
             cells = notebook.get('cells', [])
-            return {'type': 'notebook', 'total_cells': len(cells),
+            return {**metadata, 'type': 'notebook', 'total_cells': len(cells),
                     'cells': cells[arguments.offset - 1:arguments.offset - 1 + arguments.limit]}
         lines = text.splitlines()
-        return {'path': str(path), 'total_lines': len(lines), 'before_hash': digest(baseline),
-                'offset': arguments.offset,
-                'content': '\n'.join(f'{index + 1}\t{line}' for index, line in enumerate(lines)
-                                     if arguments.offset <= index + 1 < arguments.offset + arguments.limit)}
+        end_line = min(len(lines), arguments.offset + arguments.limit - 1)
+        metadata.update(total_lines=len(lines), start_line=arguments.offset,
+                        end_line=end_line, truncated=arguments.offset > 1 or end_line < len(lines),
+                        next_offset=end_line + 1 if end_line < len(lines) else None)
+        metadata['content'] = '\n'.join(
+            f'{index + 1}\t{line}' for index, line in enumerate(lines)
+            if arguments.offset <= index + 1 < arguments.offset + arguments.limit)
+        return metadata
 
     def write(self, arguments):
         self.require_tool('Write')
@@ -294,22 +315,55 @@ class LocalTools:
                  and (not arguments.type or path.suffix in
                       extensions.get(arguments.type, {'.' + arguments.type}))]
         if not paths:
-            return {'matches': [], 'truncated': False}
-        command = [executable, '--json', '--no-follow']
-        if arguments.output_mode != 'count':
-            command.extend(['--max-count', str(arguments.head_limit + 1)])
-        if arguments.multiline:
-            command.extend(['--multiline', '--multiline-dotall'])
-        if not arguments.case_sensitive:
-            command.append('--ignore-case')
-        command.extend(['--', arguments.pattern, *[str(path) for path in paths]])
+            return {'matches': [], 'truncated': False, 'metadata': {},
+                    'source_revision': getattr(self.state, 'source_manifest', '') or ''}
+        records = []
+        disk_versions = {}
         with self.mutex.workspace_read():
-            response = subprocess.run(command, capture_output=True, timeout=30,
-                                      encoding='utf-8', errors='replace')
+            for path in paths:
+                relative = path.relative_to(self.root).as_posix()
+                disk_version = path.stat()
+                baseline = path.read_bytes()
+                staged = self.staged_content(relative)
+                data = staged if staged is not None else baseline
+                disk_after = path.stat()
+                version = (disk_version.st_size, disk_version.st_mtime_ns, disk_version.st_ctime_ns)
+                if version != (disk_after.st_size, disk_after.st_mtime_ns, disk_after.st_ctime_ns):
+                    raise ToolRejected('Grep 扫描前磁盘文件发生变化，拒绝使用过期源码')
+                disk_versions[relative] = version
+                records.append((path, relative, baseline, data, staged is not None))
+        with tempfile.TemporaryDirectory(prefix='tracefix-grep-') as staging_dir:
+            staging_root = Path(staging_dir)
+            path_map = {}
+            for path, relative, baseline, data, overlay in records:
+                staged_path = staging_root / relative
+                staged_path.parent.mkdir(parents=True, exist_ok=True)
+                staged_path.write_bytes(data)
+                path_map[str(staged_path.resolve())] = (path, relative, baseline, data, overlay)
+            command = [executable, '--json', '--no-follow']
+            if arguments.output_mode != 'count':
+                command.extend(['--max-count', str(arguments.head_limit + 1)])
+            if arguments.multiline:
+                command.extend(['--multiline', '--multiline-dotall'])
+            if not arguments.case_sensitive:
+                command.append('--ignore-case')
+            command.extend(['--', arguments.pattern, *[str(staging_root / relative) for _, relative, *_ in records]])
+            with self.mutex.workspace_read():
+                response = subprocess.run(command, capture_output=True, timeout=30,
+                                          encoding='utf-8', errors='replace')
+                for path, relative, baseline, data, overlay in records:
+                    current_path = self.path(str(path))
+                    disk_after = current_path.stat()
+                    version = (disk_after.st_size, disk_after.st_mtime_ns, disk_after.st_ctime_ns)
+                    if (version != disk_versions[relative] or current_path.read_bytes() != baseline
+                            or self.staged_content(relative) != (data if overlay else None)):
+                        raise ToolRejected('Grep 扫描期间源码发生变化，拒绝使用过期命中')
         if response.returncode not in {0, 1}:
             raise ToolRejected(response.stderr[:2000])
         results = []
         counts = {}
+        ranges = {}
+        source_revision = getattr(self.state, 'source_manifest', '') or ''
         for line in response.stdout.splitlines():
             entry = json.loads(line)
             if entry['type'] != 'match':
@@ -318,17 +372,42 @@ class LocalTools:
             path = match['path'].get('text')
             if not path:
                 continue
-            path = str(self.path(path))
+            record = path_map.get(str(Path(path).resolve()))
+            if record is None:
+                continue
+            original, relative, baseline, data, overlay = record
+            path = str(original)
+            content_version = digest(data)
             counts[path] = counts.get(path, 0) + 1
+            line_number = match['line_number']
+            match_text = match['lines'].get('text', '').rstrip('\r\n')
+            end_line = line_number + max(0, match_text.count('\n'))
+            current_range = ranges.setdefault(path, [line_number, end_line])
+            current_range[0] = min(current_range[0], line_number)
+            current_range[1] = max(current_range[1], end_line)
             if arguments.output_mode == 'files_with_matches':
                 if path not in results:
                     results.append(path)
             elif arguments.output_mode == 'content':
                 results.append({'path': path, 'line': match['line_number'],
-                                'content': match['lines'].get('text', '').rstrip('\r\n')})
+                                'content': match_text, 'relative_path': relative,
+                                'start_line': line_number, 'end_line': end_line,
+                                'content_version': content_version,
+                                'source_revision': source_revision, 'overlay': overlay,
+                                'truncated': False})
+        metadata = {}
+        for path, relative, baseline, data, overlay in records:
+            path = str(path)
+            if path in counts:
+                metadata[path] = {'relative_path': relative, 'start_line': ranges[path][0],
+                                  'end_line': ranges[path][1], 'content_version': digest(data),
+                                  'source_revision': source_revision, 'overlay': overlay,
+                                  'before_hash': digest(baseline)}
         if arguments.output_mode == 'count':
-            results = [{'path': path, 'count': count} for path, count in counts.items()]
-        return {'matches': results[:arguments.head_limit], 'truncated': len(results) > arguments.head_limit}
+            results = [{'path': path, 'count': count, **metadata[path], 'truncated': False}
+                       for path, count in counts.items()]
+        return {'matches': results[:arguments.head_limit], 'truncated': len(results) > arguments.head_limit,
+                'metadata': metadata, 'source_revision': source_revision}
 
     def notebook_edit(self, arguments):
         self.require_tool('NotebookEdit')

@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import html
 import json
 import os
 import re
+import time
 from collections import Counter
 from pathlib import Path
 from typing import TypedDict
@@ -31,6 +33,9 @@ from tracefix.runtime.guidance import (GuidanceLedger, GuidanceRejected, active_
 from tracefix.runtime.tool_handlers import build_runtime_tools
 from tracefix.runtime.verification import verification_binding
 from tracefix.runtime.effects import file_resource, make_operation_executor
+from tracefix.runtime.event_adapter import EventAdapter, EventCursor
+from tracefix.runtime.diagnosis import (DiagnosisDraft, DiagnosisReport, binding_from_observation,
+    symptom_query, validate_report)
 from tracefix.knowledge.assembler import ContextAssembler, ContextWindowError
 from tracefix.storage.artifacts import redact, sanitize
 from tracefix.storage.presentation import label, readable, report_page
@@ -108,6 +113,7 @@ class Engine:
         self.documents = None
         self.document_context = {}
         self._trace_sequences = {}
+        self.event_adapter = EventAdapter(store)
         self.skills = SkillCatalog(Path(__file__).resolve().parents[5] / 'skills')
         self.graph = self._graph(checkpointer)
 
@@ -313,6 +319,104 @@ class Engine:
     def get(self, s, ref):
         return self.artifacts.json(s.scope_id, s.run_id, ref)
 
+    def read_observation_channel(self, s, observation_ref, channel, *, start_line=1, end_line=None):
+        """按 observation 引用展开未经模型裁剪的页面通道；行范围是 1-based 且闭区间。"""
+        observation = self.get(s, observation_ref)
+        ref = (observation.get('raw_refs') or {}).get(channel)
+        if not ref:
+            raise KeyError(f'观测未保存完整通道：{channel}')
+        content = self.artifacts.read(s.scope_id, s.run_id, ref).decode('utf-8', errors='replace')
+        if type(start_line) is not int or start_line < 1:
+            raise ValueError('start_line 必须从 1 开始')
+        lines = content.splitlines()
+        if not lines and end_line is None:
+            return ''
+        last = len(lines) if end_line is None else end_line
+        if type(last) is not int or last < start_line:
+            raise ValueError('end_line 必须不小于 start_line')
+        return '\n'.join(lines[start_line - 1:last])
+
+    @staticmethod
+    def _bounded_text(value, limit, locators=()):
+        if not isinstance(value, str) or len(value) <= limit:
+            return value, []
+        lines = value.splitlines()
+        if not lines:
+            return value[:limit], [{'start': 1, 'end': 1}]
+        needles = [f'{item.role} "{item.name}"' for item in locators if item]
+        selected = {0, len(lines) - 1}
+        for index, line in enumerate(lines):
+            if any(needle.casefold() in line.casefold() for needle in needles):
+                selected.update(range(max(0, index - 1), min(len(lines), index + 2)))
+        output = []
+        retained = set()
+        for index in sorted(selected):
+            candidate = '\n'.join(output + [lines[index]])
+            if len(candidate) + 80 <= limit:
+                output.append(lines[index])
+                retained.add(index)
+        omitted = []
+        for index in range(len(lines)):
+            if index in retained:
+                continue
+            line_number = index + 1
+            if omitted and omitted[-1]['end'] == line_number - 1:
+                omitted[-1]['end'] = line_number
+            else:
+                omitted.append({'start': line_number, 'end': line_number})
+        output.append('[省略内容可按 observation artifact 与 view_omitted 行范围取回]')
+        return '\n'.join(output)[:limit], omitted
+
+    def bounded_observation_view(self, observation, *, locators=(), max_snapshot_chars=40_000,
+                                 max_log_chars=12_000):
+        """给模型的有界视图；observation artifact 本身永远不被该函数修改。"""
+        view = copy.deepcopy(observation)
+        snapshot, omitted = self._bounded_text(view.get('snapshot', ''), max_snapshot_chars, locators)
+        view['snapshot'] = snapshot
+        view_omitted = {'snapshot': omitted}
+        for channel in ('console', 'network'):
+            value, channel_omitted = self._bounded_text(view.get(channel, ''), max_log_chars)
+            view[channel] = value
+            view_omitted[channel] = channel_omitted
+        changed = any(view_omitted.values())
+        if isinstance(view.get('channels'), dict):
+            refs = view.get('raw_refs') or {}
+            metadata = (view.get('collection') or {}).get('channels', {})
+            view['channels'] = {channel: {'status': (
+                                          metadata.get(channel, {}).get('status')
+                                          if isinstance(metadata.get(channel), dict) else metadata.get(channel))
+                                          or ('available' if channel in refs else 'unavailable'),
+                                          'ref': refs.get(channel)}
+                               for channel in ('snapshot', 'console', 'network')}
+            changed = True
+        if changed:
+            view['view_omitted'] = view_omitted
+            view['view'] = 'bounded_model_projection'
+        return view
+
+    def model_observation_context(self, context):
+        """仅转换模型输入中的观察，不改变 runtime.get() 返回的完整原件。"""
+        projected = copy.deepcopy(context)
+        target_locators = []
+        spec = context.get('test_spec') or {}
+        for item in spec.get('assertions', []) if isinstance(spec, dict) else []:
+            if isinstance(item, dict) and item.get('locator'):
+                target_locators.append(type('LocatorView', (), item['locator'])())
+        def project(value):
+            if isinstance(value, dict):
+                result = dict(value)
+                if 'snapshot' in result and ('type' in result or 'raw_refs' in result):
+                    locators = list(target_locators)
+                    for item in result.get('assertions', []):
+                        if isinstance(item, dict) and item.get('locator'):
+                            locators.append(type('LocatorView', (), item['locator'])())
+                    return self.bounded_observation_view(result, locators=locators)
+                return {key: project(item) for key, item in result.items()}
+            if isinstance(value, list):
+                return [project(item) for item in value]
+            return value
+        return project(projected)
+
     def spec(self, s):
         raw = self.get(s, s.test_spec_ref)
         if digest(raw) != s.test_spec_hash:
@@ -376,7 +480,7 @@ class Engine:
 
     def event(self, s, kind, payload=None):
         e = self.store.event(s, kind, payload)
-        self._notify(e)
+        return self._notify(e)
 
     def warn_retrieval_degraded(self, s):
         # 检索和记忆共用后端，但分别发出事件，便于各展示层准确说明能力降级。
@@ -400,14 +504,22 @@ class Engine:
         key = (scope, run)
         if key not in self._trace_sequences:
             self._trace_sequences[key] = self.artifacts.trace_position(scope, run)
-        for entry in self.store.trace(run, scope, after=self._trace_sequences[key]):
+        cursor = EventCursor(scope, run, self._trace_sequences[key]).encode()
+        batch = self.event_adapter.read(run, scope, cursor)
+        if batch.snapshot is not None:
+            return batch
+        for entry in batch.events:
             self.artifacts.append_trace(entry)
             self._trace_sequences[key] = entry['seq']
-        if self.notify:
-            try:
-                self.notify(event)
-            except Exception:
-                pass
+            if self.notify:
+                try:
+                    self.notify(entry)
+                except Exception:
+                    pass
+        return batch
+
+    def read_events(self, s, cursor=None):
+        return self.event_adapter.read(s.run_id, s.scope_id, cursor)
 
     def changed(self, s, **delta):
         persisted = self.store.load(s.run_id, s.scope_id)
@@ -562,6 +674,7 @@ class Engine:
         ctx = {**ctx, 'phase': str(s.phase), 'execution_mode': s.execution_mode}
         # Worker calls select locally; never replace the shared supervisor model.
         selected_model = (self.worker_model if ctx.get('worker_depth') == 1
+                          and not ctx.get('worker_same_model')
                           and self.worker_model is not None else self.model)
         logical_call = s.budget.model_calls + 1
         ctx = self.guidance_context(s, ctx, logical_call)
@@ -589,10 +702,11 @@ class Engine:
         if s.error:
             ctx = {**ctx, 'runtime_feedback': s.error,
                    'runtime_error_details': s.error_details}
-        if self.memory is not None:
+        if self.memory is not None and not ctx.get('worker_readonly_investigation'):
             # 每次调用重新读取 L1/L2，让工具写入的新记忆立即生效；L2 按源码 manifest 隔离。
             ctx['working_memory'] = self.memory.working_memory(s.scope_id, s.run_id)
             ctx['job_memory'] = self.memory.job_memory(s.scope_id, s.job_id, s.source_manifest)
+        ctx = self.model_observation_context(ctx)
         budget = s.budget
 
         def attempt(model, request, attempt_number):
@@ -720,6 +834,7 @@ class Engine:
                 nonlocal ctx
                 ctx = self.guidance_context(s, ctx, logical_call)
                 ctx = self.inject_skills(s, ctx)
+                ctx = self.model_observation_context(ctx)
                 return ctx
             validation['context_provider'] = current_context
             failed_exchange_id = recovery.get('logical_exchange_id')
@@ -745,6 +860,8 @@ class Engine:
                         break
             async def execute_tool(name, arguments, call_id):
                 nonlocal ctx
+                if ctx.get('worker_readonly_investigation'):
+                    raise PermissionError('只读调查 Worker 未获浏览器动作权限')
                 self.sync_guidance(s)
                 self.scopes.assert_current(self.context)
                 action = Gateway.browser_action(name, arguments)
@@ -761,7 +878,8 @@ class Engine:
                         'message': sanitize(str(exc)), 'executed': False},
                         'observation_ref': s.observation_ref, 'observation': observation}
                 ref = await self.act(s, action, tool_call_id=call_id)
-                canonical = action.model_copy(update={'observation_id': None, 'element_ref': None})
+                canonical = action.model_copy(update={'observation_id': None, 'element_ref': None,
+                                                      'page_generation': None})
                 plan = self.get(s, s.replay_plan_ref) if s.replay_plan_ref else []
                 plan.append(canonical.model_dump())
                 plan_ref = self.put(s, plan, name='操作重放计划')
@@ -778,6 +896,23 @@ class Engine:
             validation['tool_executor'] = execute_tool
             validation['on_tool_result'] = tool_result
         runtime_tools = build_runtime_tools(self, s, schema, ctx, validate_output=validate_output)
+        if schema in {DiagnosisDraft, DiagnosisReport}:
+            for name in ('Read', 'Grep', 'Glob'):
+                handler = runtime_tools.handlers.get(name)
+                if handler is None:
+                    continue
+                async def read_evidence(arguments, call_id, handler=handler, name=name):
+                    result = await handler(arguments, call_id)
+                    ref = self.put(s, {'tool': name, 'arguments': arguments.model_dump(mode='json'),
+                        'result': result, 'source_manifest': s.source_manifest}, name='诊断工具证据')
+                    s.evidence_refs.append(ref)
+                    self.store.save(s)
+                    ctx['available_evidence_refs'] = list(dict.fromkeys(
+                        ctx.get('available_evidence_refs', []) + s.evidence_refs))
+                    ctx['evidence_refs'] = ctx['available_evidence_refs']
+                    self.event(s, 'diagnosis.source.read', {'tool': name, 'artifact_ref': ref})
+                    return {**result, 'artifact_ref': ref}
+                runtime_tools.handlers[name] = read_evidence
         # 工具写入共享运行时 operation 回执，完整结果交由 artifact 保存。
         async def tool_operation(name, intent, fn, *, idempotency_key=None):
             return await self.operation(s, name, intent, fn, idempotency_key=idempotency_key)
@@ -831,6 +966,7 @@ class Engine:
 
     async def capture(self, s, raw, action=None):
         previous = self.get(s, s.observation_ref) if s.observation_ref else None
+        raw = dict(raw)
         png = raw.pop('png')
         if (type(png) is not bytes or not png.startswith(b'\x89PNG\r\n\x1a\n')
                 or len(png) <= 8):
@@ -838,6 +974,25 @@ class Engine:
         if self.profile.screenshot_redaction != 'public_demo':
             raise PermissionError('私有截图在捕获前需要经过批准的脱敏适配器处理')
         screenshot = self.put(s, png, 'png', name='页面截图')
+        channels = raw.get('channels') if isinstance(raw.get('channels'), dict) else {}
+        raw_refs = dict(raw.get('raw_refs') or {})
+        for channel in ('snapshot', 'console', 'network'):
+            value = channels.get(channel, raw.get(channel))
+            if isinstance(value, str):
+                raw_refs[channel] = self.put(s, value, 'txt', name=f'观察原件_{channel}')
+        if raw_refs:
+            raw['raw_refs'] = raw_refs
+        collection = dict(raw.get('collection') or {})
+        collection.setdefault('channels', {
+            channel: ('available' if isinstance(channels.get(channel, raw.get(channel)), str) else 'unavailable')
+            for channel in ('snapshot', 'console', 'network')})
+        collection.setdefault('truncated', any(
+            isinstance(metadata, dict) and metadata.get('status') == 'truncated'
+            for metadata in collection['channels'].values()))
+        collection.setdefault('observed_at', raw.get('observed_at', time.time()))
+        raw['collection'] = collection
+        raw.setdefault('observed_at', collection['observed_at'])
+        raw.setdefault('content_version', collection.get('content_version') or digest(raw.get('snapshot', '')))
         raw.update(self.verification_context(s), type='gui_observation',
                    screenshot_ref=screenshot, screenshot_hash=digest(png))
         raw['redaction'] = 'public_demo_no_credentials'
@@ -863,6 +1018,14 @@ class Engine:
         self.scopes.assert_current(self.context)
         spec = self.spec(s)
         obs = self.get(s, s.observation_ref) if s.observation_ref else None
+        if action.page_generation is not None and (not obs or action.page_generation != obs.get('page_generation')):
+            raise ValueError('浏览器页面代次已过期，请先获取最新观察')
+        if action.preconditions:
+            if not obs:
+                raise ValueError('动作前置断言缺少当前观察')
+            precondition_result = assertions(obs.get('snapshot', ''), action.preconditions)
+            if not precondition_result['passed']:
+                raise ValueError('动作前置条件不满足：' + json.dumps(precondition_result['assertions'], ensure_ascii=False))
         if frozen and action.locator:
             try:
                 element_ref = resolve_locator(obs['snapshot'], action.locator)
@@ -870,11 +1033,13 @@ class Engine:
                 # 重放的是已记录的动作，没有可回退的模型；定位器不再唯一绑定说明该场景无法重放，
                 # 这不是基础设施故障，应作为无结论收尾。
                 raise ReplayUnbound('已记录的动作无法在当前页面重放：' + str(e)) from e
-            action = action.model_copy(update={'observation_id': obs['id'], 'element_ref': element_ref})
+            action = action.model_copy(update={'observation_id': obs['id'], 'element_ref': element_ref,
+                                               'page_generation': obs.get('page_generation')})
         elif frozen and action.kind == 'press':
             if not obs or not obs.get('id'):
                 raise ReplayUnbound('已记录的按键动作缺少当前页面观测，无法重放')
-            action = action.model_copy(update={'observation_id': obs['id']})
+            action = action.model_copy(update={'observation_id': obs['id'],
+                                               'page_generation': obs.get('page_generation')})
         self.browser.policy.browser(s, action, spec, obs)
         s.budget = s.budget.charge('browser_actions')
         self.store.save(s)
@@ -883,7 +1048,28 @@ class Engine:
             return {'observation_ref': await self.capture(s, raw, action)}
         intent = action.model_dump()
         receipt = await self.operation(s, 'browser', intent, perform, tool_call_id=tool_call_id)
-        return receipt['observation_ref']
+        current_ref = receipt['observation_ref']
+        current = self.get(s, current_ref)
+        if action.postconditions:
+            result = assertions(current.get('snapshot', ''), action.postconditions)
+            if not result['passed']:
+                raise ValueError('动作后置断言不满足：' + json.dumps(result['assertions'], ensure_ascii=False))
+        wait = action.wait
+        if wait and wait.assertions:
+            deadline = time.monotonic() + wait.timeout_seconds
+            observations = 0
+            while True:
+                result = assertions(current.get('snapshot', ''), wait.assertions)
+                if result['passed']:
+                    break
+                if observations >= wait.max_observations or time.monotonic() >= deadline:
+                    raise ValueError('可观察等待超时：' + json.dumps(result['assertions'], ensure_ascii=False))
+                await asyncio.sleep(min(wait.interval_seconds, max(0, deadline - time.monotonic())))
+                raw = await self.browser.action(BrowserAction(kind='observe'))
+                current_ref = await self.capture(s, raw)
+                current = self.get(s, current_ref)
+                observations += 1
+        return current_ref
 
     def _graph(self, saver):
         graph = StateGraph(GraphState)
@@ -1202,6 +1388,9 @@ class Engine:
         return list(records.values())
 
     async def discover(self, s):
+        if os.getenv('TRACEFIX_AGENT_MODE', '').lower() == 'single':
+            self.event(s, 'subtask.discover.disabled', {'agent_mode': 'single'})
+            return
         from tracefix.workers import HierarchyTrace, IsolatedGuiScout, SubAgentRuntime, WorkerTask
         # GUI scout 仅由父 Run 派发；已完成记录和深度检查阻止重复或递归探索。
         if os.getenv('TRACEFIX_BROWSER_WORKERS', '0') != '1' or getattr(self, 'subagent_depth', 0):
@@ -1398,14 +1587,27 @@ class Engine:
 
     async def reset(self, s):
         async def reset_env():
+            if s.reproduction_binding_ref:
+                binding = self.get(s, s.reproduction_binding_ref)
+                expected = {'source_manifest': s.source_manifest,
+                            'environment_digest': s.environment_digest,
+                            'test_spec_hash': s.test_spec_hash,
+                            'scope_id': s.scope_id, 'url': s.url}
+                if any(binding.get(key) != value for key, value in expected.items()):
+                    raise ValueError('冻结复现绑定与当前环境、源码或 TestSpec 不一致')
             await self.browser.close()
             r = await self.runner.command('reset')
             if not r['passed']:
                 raise RuntimeError('重置失败')
             await self.browser.open()
-            # New isolated browser process plus server reset, never reload alone.
             raw = await self.browser.action(BrowserAction(kind='navigate', value=s.url))
-            return {'observation_ref': await self.capture(s, raw)}
+            ref = await self.capture(s, raw)
+            checks = self.spec(s).executable_preconditions
+            if checks:
+                result = assertions(self.get(s, ref).get('snapshot', ''), checks)
+                if not result['passed']:
+                    raise ValueError('复现前置条件不满足：' + json.dumps(result['assertions'], ensure_ascii=False))
+            return {'observation_ref': ref}
         s.budget = s.budget.charge('browser_actions')
         self.store.save(s)
         return await self.operation(s, 'scenario.reset', {'trial': s.trial, 'validation': s.validation_index}, reset_env)
@@ -1462,7 +1664,13 @@ class Engine:
             return s
         plan = self.get(s, s.replay_plan_ref) if s.replay_plan_ref else []
         if not plan:
-            return self.changed(s, exploration_plan_ref=s.replay_plan_ref, reproduction_plan_frozen=True)
+            binding = self.put(s, {'source_manifest': s.source_manifest,
+                'environment_digest': s.environment_digest, 'test_spec_hash': s.test_spec_hash,
+                'scope_id': s.scope_id, 'url': s.url,
+                'preconditions': [item.model_dump(mode='json') for item in self.spec(s).executable_preconditions]},
+                name='复现绑定')
+            return self.changed(s, exploration_plan_ref=s.replay_plan_ref,
+                                reproduction_binding_ref=binding, reproduction_plan_frozen=True)
         selection = await self.model_call(s, ReproductionPlan, {
             'test_spec': self.spec(s).model_dump(), 'goal': s.goal,
             'exploration_actions': plan,
@@ -1471,7 +1679,11 @@ class Engine:
         indices = selection.action_indices
         if indices != sorted(set(indices)) or any(index < 0 or index >= len(plan) for index in indices):
             raise ModelOutputError('复现计划索引必须唯一、递增且在探索记录范围内')
-        selected = [plan[index] for index in indices]
+        selected = []
+        for index in indices:
+            action = BrowserAction(**plan[index])
+            selected.append(action.model_copy(update={
+                'observation_id': None, 'element_ref': None, 'page_generation': None}).model_dump(mode='json'))
         interactions = [index for index, action in enumerate(selected) if action['kind'] in {'click', 'type', 'select', 'press'}]
         original_interactions = [index for index, action in enumerate(plan) if action['kind'] in {'click', 'type', 'select', 'press'}]
         needs_reload = bool(original_interactions) and any(
@@ -1480,8 +1692,13 @@ class Engine:
                 action['kind'] == 'navigate' for action in selected[interactions[-1] + 1:])):
             raise ModelOutputError('复现计划必须包含交互及随后刷新验证')
         ref = self.put(s, selected, name='冻结复现计划')
+        binding = self.put(s, {'source_manifest': s.source_manifest,
+            'environment_digest': s.environment_digest, 'test_spec_hash': s.test_spec_hash,
+            'scope_id': s.scope_id, 'url': s.url,
+            'preconditions': [item.model_dump(mode='json') for item in self.spec(s).executable_preconditions]},
+            name='复现绑定')
         return self.changed(s, exploration_plan_ref=s.replay_plan_ref, replay_plan_ref=ref,
-                            reproduction_plan_frozen=True)
+                            reproduction_binding_ref=binding, reproduction_plan_frozen=True)
 
     async def diagnose(self, s, _):
         self.warn_retrieval_degraded(s)
@@ -1490,10 +1707,20 @@ class Engine:
         await self.retriever.index(self.workspace, overlay)
         code = await self.retriever.retrieve(s.goal, overlay, 'M1', 10)
         recipes = await self.retriever.retrieve(s.goal, s.source_manifest, 'M3', 3)
+        observation = self.get(s, s.observation_ref) if s.observation_ref else None
+        action_observations = self.phase_observations(s, Phase.VERIFY if s.patch_hash else Phase.REPRODUCE)[-4:]
+        if not action_observations:
+            action_observations = self.phase_observations(s, Phase.EXPLORE)[-4:]
+        query_observation = {**(observation or {}), 'network': '\n'.join(
+            [str((observation or {}).get('network', ''))] +
+            [str(item['observation'].get('network', '')) for item in action_observations])}
+        query = symptom_query(s.goal, self.spec(s).assertions, query_observation)
         # 直接读取当前授权文件以核验检索卡片，并提供补丁校验所需的 before_hash。
         preferred = [json.loads(card['content']).get('path') for card in code if card.get('content', '').startswith('{')]
-        cards = self.workspace.cards(limit_chars=60_000 * (s.diagnosis_retry_count + 1),
-                                     preferred_paths=preferred)
+        if hasattr(self.workspace, 'fragments'):
+            cards = self.workspace.fragments(query, preferred_paths=preferred, limit_chars=24_000)
+        else:
+            cards = self.workspace.cards(limit_chars=24_000, preferred_paths=preferred)
         if self.rule_library and self.rule_resolver:
             files = []
             for path in self.workspace.files():
@@ -1511,6 +1738,14 @@ class Engine:
         observation = self.get(s, s.observation_ref) if s.observation_ref else None
         if s.observation_ref and s.observation_ref not in s.evidence_refs:
             s = self.changed(s, evidence_refs=s.evidence_refs + [s.observation_ref])
+        for item in action_observations:
+            if item['observation_ref'] not in s.evidence_refs:
+                s.evidence_refs.append(item['observation_ref'])
+        for card in cards:
+            card_ref = self.put(s, card, name='诊断源码片段')
+            card['artifact_ref'] = card_ref
+            if card_ref not in s.evidence_refs:
+                s.evidence_refs.append(card_ref)
         context = build_context(s, self.spec(s).model_dump(), observation=observation, cards=cards,
                                 rules=self.active_rules(s, str(Phase.DIAGNOSE)))
         context['reference_documents'] = await select_documents(self, s)
@@ -1531,32 +1766,143 @@ class Engine:
         context['available_evidence_refs'] = list(dict.fromkeys(context['available_evidence_refs'] + s.evidence_refs))
         context.update(instruction='请诊断并返回最小化的完整文件替换内容。只能编辑当前允许的文件。引用已有证据；每个 before_hash 必须匹配已提供的文件。',
                        allowed_files=self.workspace.allowed_files, repair_memory=recipes, retrieval_ids=[x['id'] for x in code],
-                       failures=[self.get(s, r) for r in s.evidence_refs[-4 * (s.diagnosis_retry_count + 1):]],
+                       failures=[self.get(s, r) for r in s.evidence_refs[-4:]],
                        previous_validation=validations, validation_observations=validation_observations,
                        replay_plan=self.get(s, s.replay_plan_ref) if s.replay_plan_ref else [],
                        current_workspace_diff=self.workspace.diff(),
                        diagnosis_retry_count=s.diagnosis_retry_count,
                        diagnosis_feedback=[self.get(s, r) for r in s.diagnosis_feedback_refs[-self.DIAGNOSIS_RETRY_LIMIT:]])
+        diagnosis_report = None
+        action_id, window_start = None, None
+        for event in reversed(self.store.trace(s.run_id, s.scope_id)):
+            if event['type'] == 'tool.started' and event.get('payload', {}).get('intent', {}).get('kind') in {'click', 'type', 'select', 'press'}:
+                action_id, window_start = event['payload'].get('operation_id'), event.get('at')
+                break
+        binding = binding_from_observation(s, observation or {}, action_id=action_id,
+            window_start=window_start, window_end=(observation or {}).get('observed_at'),
+            dom_assertions=assertions((observation or {}).get('snapshot', ''), self.spec(s).assertions)['assertions'])
+        channel_refs = list((observation or {}).get('raw_refs', {}).values())
+        channel_refs.extend(ref for item in action_observations
+                            for ref in item['observation'].get('raw_refs', {}).values())
+        diagnosis_refs = list(dict.fromkeys(context['available_evidence_refs'] + [
+            ref for ref in channel_refs if self.artifacts.exists(s.scope_id, s.run_id, ref)]))
+        diagnosis_context = {'policy': context['policy'], 'goal': s.goal,
+                'scope': s.scope_id, 'test_spec': self.spec(s).model_dump(mode='json'),
+                'observation': observation,
+                'symptom_binding': binding.model_dump(mode='json'),
+                'source_fragments': cards,
+                'workspace_root': str(self.workspace.root),
+                'action_observations': [{
+                    'action': item['action'], 'observation_ref': item['observation_ref'],
+                    'observed_at': item['observation'].get('observed_at'),
+                    'url': item['observation'].get('url'),
+                    'raw_refs': item['observation'].get('raw_refs', {}),
+                    'assertions': assertions(item['observation'].get('snapshot', ''), self.spec(s).assertions)['assertions'],
+                    'console': self._bounded_text(item['observation'].get('console', ''), 6000)[0],
+                    'network': self._bounded_text(item['observation'].get('network', ''), 6000)[0],
+                    'collection': item['observation'].get('collection', {})} for item in action_observations],
+                'evidence_refs': diagnosis_refs,
+                'available_evidence_refs': diagnosis_refs,
+                'validation_results': [{'kind': item['kind'], 'passed': item['passed'],
+                    'assertions': item['result'].get('assertions', []),
+                    'observation_ref': item['result'].get('observation_ref')} for item in validations],
+                'worker_depth': 1, 'worker_same_model': True,
+                'worker_readonly_investigation': True,
+                'worker_allowed_files': list(dict.fromkeys(card['path'] for card in cards))[:15],
+                'allowed_tools': ['Read', 'Grep', 'Glob'],
+                'worker_allowed_tools': ['Read', 'Grep', 'Glob'],
+                'worker_write_enabled': False, 'worker_shell_mode': 'disabled',
+                'instruction': '输出可反驳的少量诊断假设；只能引用已有 evidence_refs 和当前源码片段。'
+                               'Read 参数是 file_path（workspace_root 下绝对路径）、offset（起始行）、limit（行数），'
+                               '可选 expected_content_version；按需读取命中邻域即可。'
+                               '沿文案/API搜索命中追踪 handler、store/state、API、hydration；'
+                               '无关404仅为线索，不能单独证明因果。source-map/initiator 不可用时标 unavailable，不推断无请求。'}
+        input_ref = self.put(s, diagnosis_context, name='诊断输入')
+        self.event(s, 'diagnosis.started', {'input_ref': input_ref, 'source_manifest': s.source_manifest,
+                                         'observation_ref': s.observation_ref})
+        model_support = getattr(self.model, 'supports_structured_diagnosis',
+                                isinstance(self.model, Gateway) or isinstance(getattr(self.model, 'teacher', None), Gateway))
+        if model_support:
+            versions = {card['path']: card.get('content_version', digest(self.workspace.source_bytes(card['path'])[1]))
+                        for card in cards}
+            def validate_diagnosis(candidate):
+                try:
+                    candidate = DiagnosisReport(**candidate.model_dump(mode='json'),
+                        binding=binding, source_version=s.source_manifest)
+                    candidate_versions = dict(versions)
+                    for hypothesis in candidate.hypotheses:
+                        for path in hypothesis.candidate_paths:
+                            self.workspace.path(path.path)
+                            candidate_versions[path.path] = digest(self.workspace.source_bytes(path.path)[1])
+                    validate_report(candidate, evidence_refs=s.evidence_refs + diagnosis_refs,
+                        allowed_files=list(self.workspace.files()), source_manifest=s.source_manifest,
+                        environment_digest=s.environment_digest, binding=binding, content_versions=candidate_versions)
+                except (ValueError, PermissionError) as error:
+                    raise ModelOutputError(str(error), category='diagnosis_validation') from error
+            diagnosis_draft = await self.model_call(s, DiagnosisDraft, diagnosis_context,
+                                                   validate_output=validate_diagnosis)
+            diagnosis_report = DiagnosisReport(**diagnosis_draft.model_dump(mode='json'),
+                binding=binding, source_version=s.source_manifest)
+            validate_report(diagnosis_report, evidence_refs=s.evidence_refs + diagnosis_refs,
+                allowed_files=list(self.workspace.files()), source_manifest=s.source_manifest,
+                environment_digest=s.environment_digest, binding=binding,
+                content_versions={path: digest(self.workspace.source_bytes(path)[1])
+                                  for hypothesis in diagnosis_report.hypotheses
+                                  for path in (candidate.path for candidate in hypothesis.candidate_paths)})
+            diagnosis_ref = self.put(s, diagnosis_report.model_dump(mode='json'), name='结构化诊断')
+            context['diagnosis_report_ref'] = diagnosis_ref
+            context['diagnosis'] = diagnosis_report.model_dump(mode='json')
+            context['hypothesis_refs'] = [item.id for item in diagnosis_report.hypotheses]
+            s.hypothesis_refs.append(diagnosis_ref)
+            self.store.save(s)
+            self.event(s, 'diagnosis.completed', {'report_ref': diagnosis_ref, 'generated_by': 'model',
+                'statuses': [item.status for item in diagnosis_report.hypotheses]})
+            if not any(item.status == 'supported' for item in diagnosis_report.hypotheses):
+                raise ModelOutputError('诊断尚无当前证据支持的根因；需执行区分性探针或补充来源',
+                    category='diagnosis_unresolved', details={'diagnosis_ref': diagnosis_ref,
+                        'unresolved': diagnosis_report.unresolved})
+        else:
+            diagnosis_report = DiagnosisReport(binding=binding, source_version=s.source_manifest,
+                generated_by='deterministic_unavailable', unresolved=['当前模型未声明结构化诊断支持'])
+            diagnosis_ref = self.put(s, diagnosis_report.model_dump(mode='json'), name='诊断不可用')
+            context['diagnosis'] = diagnosis_report.model_dump(mode='json')
+            self.event(s, 'diagnosis.unavailable', {'report_ref': diagnosis_ref,
+                'generated_by': 'deterministic_unavailable'})
         if s.diagnosis_retry_count:
             context['instruction'] += (' 上一次未形成有效补丁。重新核对完整复现步骤、当前页面、失败断言与源码调用链；'
-                                       '当前已补充更多源码和失败证据。只包含实际有改动的文件，'
+                                       '按未决预测定向搜索/重读片段；只包含实际有改动的文件，'
                                        '不要为了满足输出要求编造无意义改动。')
         worker_enabled = (os.getenv('TRACEFIX_WORKER', '1') != '0'
+            and os.getenv('TRACEFIX_AGENT_MODE', '').lower() != 'single'
             and getattr(self, 'subagent_enabled', True)
             and not getattr(self, 'subagent_depth', 0))
+        self.event(s, 'diagnosis.worker.policy', {'agent_mode': os.getenv('TRACEFIX_AGENT_MODE', 'multi'),
+            'legacy_worker_switch': os.getenv('TRACEFIX_WORKER', '1'), 'enabled': worker_enabled})
         if worker_enabled:
             from tracefix.runtime.worker import ReadOnlyWorker, SubtaskSpec
             specs = [SubtaskSpec(s.goal, 'code-explorer', s.revision,
                 tuple(card['path'] for card in cards[:3]), tuple(s.evidence_refs[-2:])),
-                SubtaskSpec(s.goal, 'evidence-reviewer', s.revision, (), tuple(s.evidence_refs[-4:]))]
+                SubtaskSpec(s.goal, 'evidence-reviewer', s.revision, (),
+                    tuple(dict.fromkeys([s.observation_ref] +
+                                        [item['observation_ref'] for item in action_observations])))]
             results = await ReadOnlyWorker(self).group(s, specs)
             accepted = []
             for result in results:
                 worker_ref = self.put(s, result.model_dump(), name='子任务调查结果')
                 s.subtask_refs.append(worker_ref)
-                if not result.unresolved or result.evidence_refs or result.files:
+                if result.status in {'completed', 'partial'} and (not result.unresolved or result.evidence_refs or result.files):
                     accepted.append(result.model_dump())
+            context['investigations'] = accepted
             context['read_only_investigations'] = accepted
+            claims = {}
+            for investigation in accepted:
+                for hypothesis in investigation.get('hypotheses', []):
+                    for candidate in hypothesis.get('candidate_paths', []):
+                        claims.setdefault(candidate['path'], []).append(hypothesis['summary'])
+            context['investigation_conflicts'] = [{'path': path, 'hypotheses': list(dict.fromkeys(summaries))}
+                for path, summaries in claims.items() if len(set(summaries)) > 1]
+            if context['investigation_conflicts']:
+                context['instruction'] += ' 只读调查存在冲突；先依据原件消歧，调查结果不能覆盖当前观察或补丁。'
             self.store.save(s)
         patch = await self.model_call(s, PatchProposal, context)
         self.validate_rule_refs(s, patch.rule_refs)

@@ -42,7 +42,8 @@ class MemoryStore:
         self._operation_owners = {}
 
     def save(self, state: RunState):
-        self.runs[state.run_id] = state.model_dump(mode="json")
+        with self._operation_lock:
+            self.runs[state.run_id] = state.model_dump(mode="json")
 
     def load(self, run_id: str, scope: str) -> RunState:
         s = RunState(**self.runs[run_id])
@@ -62,6 +63,23 @@ class MemoryStore:
     def trace(self, run_id, scope, after=0):
         self.load(run_id, scope)
         return copy.deepcopy([e for e in self.events.get(run_id, []) if e["seq"] > after])
+
+    def snapshot(self, run_id, scope):
+        with self._operation_lock:
+            state = self.load(run_id, scope)
+            pending = []
+            for operation_id, record in self.operations.items():
+                if record.get('run_id') == run_id and record.get('scope_id') == scope and record.get('status') != 'DONE':
+                    pending.append({key: copy.deepcopy(record.get(key)) for key in
+                                    ('operation_id', 'status', 'resources', 'epoch', 'resolution')})
+                    pending[-1]['operation_id'] = operation_id
+            return {'state': state.model_dump(mode='json'), 'pending_operations': pending}
+
+    def trace_snapshot(self, run_id, scope):
+        with self._operation_lock:
+            snapshot = self.snapshot(run_id, scope)
+            events = copy.deepcopy(self.events.get(run_id, []))
+            return events, snapshot, events[-1]['seq'] if events else 0
 
     def begin(self, state, op_id, intent, *, owner=None, resources=None, ancestors=(), notify=None):
         resource_keys = operation_resources(intent, resources)
@@ -263,6 +281,24 @@ class PostgresStore(MemoryStore):
             events.append(copy.deepcopy(event))
             previous_seq = event["seq"]
         return events
+
+    def snapshot(self, run_id, scope):
+        return self.trace_snapshot(run_id, scope)[1]
+
+    def trace_snapshot(self, run_id, scope):
+        with self._operation_lock, self.conn.transaction():
+            self.conn.execute("SELECT id FROM runs WHERE id=%s AND scope_id=%s FOR UPDATE", (run_id, scope))
+            state = self.load(run_id, scope)
+            rows = self.conn.execute(
+                "SELECT id,status,resources,epoch,resolution FROM operations WHERE run_id=%s AND scope_id=%s AND status <> 'DONE'",
+                (run_id, scope)).fetchall()
+            snapshot = {'state': state.model_dump(mode='json'), 'pending_operations': [
+                {"operation_id": row["id"], "status": row["status"],
+                 "resources": copy.deepcopy(row["resources"]), "epoch": row["epoch"],
+                 "resolution": copy.deepcopy(row["resolution"])} for row in rows]}
+            rows = self.conn.execute("SELECT payload FROM events WHERE run_id=%s ORDER BY seq", (run_id,)).fetchall()
+            events = [copy.deepcopy(row['payload']) for row in rows]
+            return events, snapshot, events[-1]['seq'] if events else 0
 
     def _scope_lock(self, scope_id):
         self.conn.execute("SET LOCAL lock_timeout = '5s'")

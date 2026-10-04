@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import dataclass, field
 
 from pydantic import ConfigDict, Field
@@ -97,12 +98,14 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
 
     register_local_tools(engine, state, context, bind)
 
-    if not worker_mode:
+    if not worker_mode and os.getenv('TRACEFIX_AGENT_MODE', '').lower() != 'single':
         from tracefix.workers.contracts import WorkerResult, WorkerTask
         from tracefix.workers.tools import supervisor_tools
         from tracefix.runtime.contracts import Usage, new_id
 
         async def delegate(arguments, call_id):
+            if os.getenv('TRACEFIX_AGENT_MODE', '').lower() == 'single':
+                raise ToolRejected('single 模式禁用模型子 Agent 委派')
             task = WorkerTask.from_delegate_args(arguments, run_id=state.run_id,
                                                 source_revision=state.revision)
             if task.write_enabled and not task.writable_files:

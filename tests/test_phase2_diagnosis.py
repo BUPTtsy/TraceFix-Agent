@@ -1,0 +1,179 @@
+import pytest
+
+from tracefix.model.gateway import ModelOutputError, ModelResult
+from tracefix.runtime.contracts import FileEdit, PatchProposal, Phase, digest
+from tracefix.runtime.diagnosis import (CandidatePath, DiagnosisDraft, DiagnosisReport, Hypothesis,
+    binding_from_observation, symptom_query, validate_report)
+from tracefix.runtime.smoke import make_engine
+from tracefix.runtime.worker import ReadOnlyWorker, SubtaskResult, SubtaskSpec
+
+
+async def diagnosis_engine(tmp_path):
+    engine, state = make_engine(tmp_path)
+    state.goal = '核对 persisted 状态与刷新后页面'
+    engine.store.save(state)
+    state = type(state)(**(await engine.prepare(state, None))['data'])
+    state.phase = Phase.DIAGNOSE
+    state.reproduced = True
+    from tracefix.runtime.contracts import BrowserAction
+    state.observation_ref = await engine.capture(state, await engine.browser.action(BrowserAction(kind='observe')))
+    state.evidence_refs = [state.observation_ref]
+    engine.store.save(state)
+    return engine, state
+
+
+async def test_structured_diagnosis_precedes_patch_and_keeps_versioned_fragments(tmp_path, monkeypatch):
+    engine, state = await diagnosis_engine(tmp_path)
+    monkeypatch.setenv('TRACEFIX_AGENT_MODE', 'single')
+    calls = []
+
+    class Model:
+        supports_structured_diagnosis = True
+
+        async def generate(self, schema, context, **options):
+            calls.append(schema)
+            if schema is DiagnosisDraft:
+                card = context['source_fragments'][0]
+                assert card['content_version']
+                assert card['end_line'] - card['start_line'] < 160
+                binding = context['symptom_binding']
+                assert binding['source_map']['status'] == 'unavailable'
+                value = DiagnosisDraft(
+                    hypotheses=[Hypothesis(id='persistence', summary='持久化状态源码候选',
+                        support_refs=[state.observation_ref, card['artifact_ref']],
+                        candidate_paths=[CandidatePath(path=card['path'], symbol='persisted',
+                            content_version=card['content_version'])],
+                        prediction='将 persisted 切换后观察 checkbox checked',
+                        minimal_probe='读取同版 value.ts 并核对刷新后断言', status='supported')])
+            else:
+                assert schema is PatchProposal
+                assert context['diagnosis']['hypotheses'][0]['status'] == 'supported'
+                value = PatchProposal(summary='修复持久化', evidence_refs=[state.observation_ref],
+                    edits=[FileEdit(path='src/value.ts', before_hash=digest(engine.workspace.path('src/value.ts').read_bytes()),
+                                    content='export const persisted = true;\n')])
+            return ModelResult(value, {}, 'test-structured-model', 'stop')
+
+    engine.model = Model()
+    output = await engine.diagnose(state, None)
+    saved = type(state)(**output['data'])
+    assert calls == [DiagnosisDraft, PatchProposal]
+    assert saved.phase == Phase.PATCH
+    report = engine.get(saved, saved.hypothesis_refs[-2])
+    assert report['generated_by'] == 'model'
+    assert report['binding']['observation_ref'] == state.observation_ref
+
+
+async def test_fake_diagnosis_is_explicitly_unavailable(tmp_path, monkeypatch):
+    engine, state = await diagnosis_engine(tmp_path)
+    monkeypatch.setenv('TRACEFIX_WORKER', '0')
+    await engine.diagnose(state, None)
+    events = engine.store.trace(state.run_id, state.scope_id)
+    unavailable = next(event for event in events if event['type'] == 'diagnosis.unavailable')
+    report = engine.get(state, unavailable['payload']['report_ref'])
+    assert report['generated_by'] == 'deterministic_unavailable'
+    assert report['hypotheses'] == []
+
+
+async def test_diagnosis_rejects_unknown_refs_and_marks_stale_source(tmp_path):
+    engine, state = await diagnosis_engine(tmp_path)
+    binding = binding_from_observation(state, engine.get(state, state.observation_ref))
+    report = DiagnosisReport(binding=binding, source_version=state.source_manifest,
+        hypotheses=[Hypothesis(id='candidate', summary='候选源码链', support_refs=['invented.json'],
+            prediction='区分字段映射', minimal_probe='只读当前源码', status='supported',
+            candidate_paths=[CandidatePath(path='src/value.ts', content_version='old')])])
+    with pytest.raises(ValueError, match='不存在'):
+        validate_report(report, evidence_refs=state.evidence_refs, allowed_files=['src/value.ts'],
+            source_manifest=state.source_manifest, environment_digest=state.environment_digest,
+            binding=binding, content_versions={'src/value.ts': 'current'})
+    report.hypotheses[0].support_refs = [state.observation_ref]
+    validate_report(report, evidence_refs=state.evidence_refs, allowed_files=['src/value.ts'],
+        source_manifest=state.source_manifest, environment_digest=state.environment_digest,
+        binding=binding, content_versions={'src/value.ts': 'current'})
+    assert report.hypotheses[0].status == 'unresolved'
+    assert report.hypotheses[0].candidate_paths[0].status == 'stale'
+
+
+async def test_worker_same_model_and_capabilities_are_enforced(tmp_path, monkeypatch):
+    engine, state = await diagnosis_engine(tmp_path)
+    monkeypatch.delenv('TRACEFIX_AGENT_MODE', raising=False)
+    monkeypatch.setenv('TRACEFIX_WORKER', '1')
+    before_ref = state.observation_ref
+
+    class ReadModel:
+        supports_tool_executor = True
+
+        async def generate(self, schema, context, **options):
+            assert schema is SubtaskResult
+            assert context['worker_same_model'] is True
+            assert {item.name for item in options['tool_registry'].specs} == {'Read', 'Grep', 'Glob'}
+            with pytest.raises(PermissionError, match='浏览器'):
+                await options['tool_executor']('BrowserNavigate', {'url': 'http://app:3000'}, 'forbidden')
+            value = SubtaskResult(summary='只读源码已核对', evidence_refs=[state.observation_ref],
+                files=['src/value.ts'], suggested_experiments=[], unresolved=[])
+            return ModelResult(value, {}, 'same-main-model', 'stop')
+
+    class WrongModel:
+        async def generate(self, *arguments, **options):
+            pytest.fail('调查不能使用另一个 Worker model')
+
+    engine.model = ReadModel()
+    engine.worker_model = WrongModel()
+    spec = SubtaskSpec(state.goal, 'code-explorer', state.revision, ('src/value.ts',), (state.observation_ref,))
+    result = await ReadOnlyWorker(engine).run(state, spec)
+    assert result.worker_id
+    assert result.worker_generation == spec.generation
+    assert result.source_manifest == state.source_manifest
+    assert state.observation_ref == before_ref
+    assert state.patch_ref is None
+
+
+async def test_worker_single_mode_blocks_before_model_dispatch(tmp_path, monkeypatch):
+    engine, state = await diagnosis_engine(tmp_path)
+    monkeypatch.setenv('TRACEFIX_AGENT_MODE', 'single')
+    spec = SubtaskSpec(state.goal, 'code-explorer', state.revision, ('src/value.ts',), (state.observation_ref,))
+    with pytest.raises(PermissionError, match='单 Agent'):
+        await ReadOnlyWorker(engine).run(state, spec)
+    assert state.budget.subtasks == 0
+
+
+def test_symptom_query_extracts_real_mcp_network_api_anchor():
+    query = symptom_query('完成后刷新', [], {
+        'network': '[POST] http://app:3000/api/tasks/1 => [404] Not Found'})
+    assert '/api/tasks/1' in query
+    assert '/api/tasks' in query.splitlines()
+
+
+async def test_on_demand_diagnosis_read_is_saved_and_can_be_cited(tmp_path, monkeypatch):
+    engine, state = await diagnosis_engine(tmp_path)
+    monkeypatch.setenv('TRACEFIX_AGENT_MODE', 'single')
+    binding = binding_from_observation(state, engine.get(state, state.observation_ref))
+
+    class ReadingModel:
+        supports_tool_executor = True
+
+        async def generate(self, schema, context, **options):
+            read = await options['tool_pipeline'].execute('Read', {
+                'file_path': str(engine.workspace.root / 'src/value.ts'), 'offset': 1, 'limit': 1}, 'read-current-source')
+            reference = read.result['artifact_ref']
+            assert reference in state.evidence_refs
+            stored = engine.get(state, reference)
+            assert stored['result']['content_version'] == digest(engine.workspace.read('src/value.ts').encode())
+            refreshed = options['context_provider']()
+            assert reference in refreshed['available_evidence_refs']
+            value = DiagnosisReport(binding=binding, source_version=state.source_manifest,
+                hypotheses=[Hypothesis(id='source-chain', summary='当前源码片段已取得',
+                    candidate_paths=[CandidatePath(path='src/value.ts',
+                        content_version=stored['result']['content_version'])],
+                    support_refs=[reference], prediction='读取同版源码应含 persisted=false',
+                    minimal_probe='Read 当前 value.ts', status='supported')])
+            return ModelResult(value, {}, 'fixture-read-model', 'stop')
+
+    engine.model = ReadingModel()
+    report = await engine.model_call(state, DiagnosisReport, {
+        'worker_depth': 1, 'worker_same_model': True, 'worker_readonly_investigation': True,
+        'worker_allowed_files': ['src/value.ts'], 'worker_allowed_tools': ['Read', 'Grep', 'Glob'],
+        'worker_write_enabled': False, 'worker_shell_mode': 'disabled'})
+    validate_report(report, evidence_refs=state.evidence_refs, allowed_files=['src/value.ts'],
+                    source_manifest=state.source_manifest, environment_digest=state.environment_digest,
+                    binding=binding,
+                    content_versions={'src/value.ts': digest(engine.workspace.source_bytes('src/value.ts')[1])})

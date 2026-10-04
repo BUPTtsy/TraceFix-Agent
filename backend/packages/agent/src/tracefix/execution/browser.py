@@ -13,6 +13,9 @@ from tracefix.runtime.contracts import digest, new_id
 from tracefix.storage.artifacts import sanitize
 
 ELEMENT = re.compile(r'^\s*- (?P<role>[\w-]+)(?: "(?P<name>(?:[^"\\]|\\.)*)")?(?P<attrs>[^\n]*?)(?:\s*:\s*.*)?$', re.MULTILINE)
+UPSTREAM_TRUNCATION = re.compile(
+    r'(?im)^\s*(?:\.{3}|…)?\s*(?:\[[^\n]*(?:truncat(?:ed|ion)|内容已省略)[^\n]*\]'
+    r'|(?:snapshot|output|content|response)\s+(?:is\s+|was\s+)?truncated\b)')
 
 
 def elements(snapshot):
@@ -31,6 +34,29 @@ def resolve_locator(snapshot, locator):
     if len(matches) != 1 or not matches[0]['ref']:
         raise ValueError(f"定位器无法唯一匹配元素：{locator.role} / {locator.name}")
     return matches[0]['ref']
+
+
+def resolve_action_locator(snapshot, locator):
+    """在新快照中唯一定位，并阻止点击活动弹窗外的背景元素。"""
+    target_ref = resolve_locator(snapshot, locator)
+    dialog_ancestors = []
+    has_dialog = False
+    target_in_dialog = False
+    for line in snapshot.splitlines():
+        match = ELEMENT.fullmatch(line)
+        if not match:
+            continue
+        indentation = len(line) - len(line.lstrip())
+        while dialog_ancestors and indentation <= dialog_ancestors[-1]:
+            dialog_ancestors.pop()
+        if match['role'] in {'dialog', 'alertdialog'} and '[hidden]' not in match['attrs']:
+            has_dialog = True
+            dialog_ancestors.append(indentation)
+        if f'[ref={target_ref}]' in match['attrs']:
+            target_in_dialog = bool(dialog_ancestors)
+    if has_dialog and not target_in_dialog:
+        raise ValueError('目标元素位于活动弹窗之外')
+    return target_ref
 
 
 def validate_spec_observation(spec, observation):
@@ -153,6 +179,11 @@ class MCPBrowser:
         self.last_action = None
         self._active_request = None
         self._action_dispatched = False
+        self._operation_lock = asyncio.Lock()
+        self._snapshot_guard = None
+        self._page_generation = 0
+        self._page_version = None
+        self._generation_invalidated = False
 
     async def open(self):
         """启动会话所有者任务，并等待工具发现和初始化完成。"""
@@ -161,6 +192,9 @@ class MCPBrowser:
         self.connection_state = 'connecting'
         self.connection_error = None
         self.observation = None
+        self._snapshot_guard = None
+        self._page_version = None
+        self._generation_invalidated = True
         ready = asyncio.get_running_loop().create_future()
         self.worker = asyncio.create_task(self._serve(ready))
         try:
@@ -351,52 +385,108 @@ class MCPBrowser:
 
     async def observe(self):
         """获取快照、截图和诊断信息，并缓存带唯一 ID 的观测。"""
-        try:
+        async with self._operation_lock:
             return await self._observe()
+
+    async def _observe(self):
+        try:
+            return await self._collect_observation()
         except MCPConnectionError:
             self.observation = None
             raise
 
-    async def _observe(self):
+    @staticmethod
+    def _collect_text(blocks, captured_at):
+        text_blocks = [block for block in blocks if block.type == 'text']
+        raw = '\n'.join(block.text for block in text_blocks)
+        text = sanitize(raw)
+        upstream_truncated = bool(UPSTREAM_TRUNCATION.search(raw))
+        for block in text_blocks:
+            metadata = getattr(block, 'meta', None) or getattr(block, '_meta', None) or {}
+            if isinstance(metadata, dict):
+                upstream_truncated = upstream_truncated or any(
+                    metadata.get(key) is True for key in ('truncated', 'isTruncated', 'upstream_truncated'))
+                upstream_truncated = upstream_truncated or metadata.get('status') == 'truncated'
+        status = 'truncated' if upstream_truncated else 'available' if text_blocks else 'unavailable'
+        return text, {
+            'status': status, 'captured_at': captured_at,
+            'content_version': digest(text) if text_blocks else None,
+            'provider_characters': len(raw), 'collector_characters': len(text),
+            'upstream_truncated': upstream_truncated, 'collector_truncated': False,
+        }
+
+    async def _collect_snapshot(self):
         blocks = await self.call('snapshot')
-        text = sanitize('\n'.join(c.text for c in blocks if c.type == 'text'))
+        captured_at = time.time()
+        text, metadata = self._collect_text(blocks, captured_at)
         match = re.search(r'(?:Page URL:|URL:)\s*(https?://\S+)', text)
         if not match:
             raise RuntimeError('MCP 快照中缺少页面 URL')
         url = match[1].rstrip('`')
         self.policy.url(url)
+        page_version = digest({'url': url, 'snapshot': text})
+        if self._generation_invalidated or page_version != self._page_version:
+            self._page_generation += 1
+        self._page_version = page_version
+        self._generation_invalidated = False
+        self._snapshot_guard = text
+        observation = {
+            'id': new_id('obs'), 'url': url, 'snapshot': text,
+            'page_generation': self._page_generation, 'observed_at': captured_at,
+            'collection': {
+                'version': 1, 'captured_at': captured_at,
+                'content_version': metadata['content_version'],
+                'channels': {'snapshot': metadata, 'a11y': metadata},
+            },
+        }
+        self.observation = observation
+        return observation
+
+    async def _collect_observation(self):
+        observation = await self._collect_snapshot()
+        channels = observation['collection']['channels']
         images = await self.call('screenshot', {'type': 'png'})
         png = next((base64.b64decode(c.data) for c in images if c.type == 'image'), None)
         if not png:
             raise RuntimeError('MCP 结果中缺少所需的截图')
+        channels['screenshot'] = {
+            'status': 'available', 'captured_at': time.time(), 'content_version': digest(png),
+            'collector_bytes': len(png), 'upstream_truncated': False, 'collector_truncated': False,
+        }
         extra = {}
         for channel in ('console', 'network'):
             if self.MAP[channel] in self.tools:
                 result = await self.call(channel, self.diagnostic_args(channel))
-                extra[channel] = sanitize('\n'.join(c.text for c in result if c.type == 'text'))[-12000:]
+                extra[channel], channels[channel] = self._collect_text(result, time.time())
             else:
                 extra[channel] = '该能力不可用'
-        snapshot = text
-        if len(snapshot) > 40000:
-            marker = '\n... [页面快照中间内容已省略] ...\n'
-            head_limit = (40000 - len(marker)) // 2
-            tail_limit = 40000 - len(marker) - head_limit
-            snapshot = text[:head_limit] + marker + text[-tail_limit:]
-        self.observation = {'id': new_id('obs'), 'url': url, 'snapshot': snapshot, **extra}
+                channels[channel] = {
+                    'status': 'unavailable', 'captured_at': None, 'content_version': None,
+                    'provider_characters': None, 'collector_characters': 0,
+                    'upstream_truncated': False, 'collector_truncated': False,
+                }
+        self.observation = {**observation, **extra}
         return {**self.observation, 'png': png}
 
     async def action(self, action):
-        """执行经过策略校验的标准动作，记录成功、失败或未知状态。"""
+        """串行执行标准动作，区分工具完成与尚未断言的业务状态。"""
+        async with self._operation_lock:
+            return await self._action(action)
+
+    async def _action(self, action):
         if action.kind in {'observe', 'finish'}:
-            return await self.observe()
+            return await self._observe()
         if action.kind not in {'navigate', 'click', 'type', 'select', 'press'}:
             raise PermissionError('不支持的浏览器动作')
         if action.kind in {'click', 'type', 'select', 'press'}:
             if not self.observation or action.observation_id != self.observation['id']:
                 raise PermissionError('MCP 页面观测已过期；请重新观测后再执行动作')
+            generation = getattr(action, 'page_generation', None)
+            if generation is not None and generation != self.observation.get('page_generation'):
+                raise PermissionError('MCP 页面 generation 已过期；请重新观测后再执行动作')
             if action.kind in {'click', 'type', 'select'}:
                 try:
-                    current_ref = resolve_locator(self.observation['snapshot'], action.locator)
+                    current_ref = resolve_locator(self._snapshot_guard or self.observation['snapshot'], action.locator)
                 except ValueError as error:
                     raise PermissionError('MCP 元素定位器已不在当前页面') from error
                 if action.element_ref != current_ref:
@@ -410,6 +500,15 @@ class MCPBrowser:
             'args_digest': digest(action.model_dump()),
             'started_at': time.time(),
             'status': 'IN_FLIGHT',
+            'pre_observation_id': self.observation['id'] if self.observation else None,
+            'pre_page_generation': self.observation.get('page_generation') if self.observation else None,
+            'before_observation_id': self.observation['id'] if self.observation else None,
+            'before_page_generation': self.observation.get('page_generation') if self.observation else None,
+            'post_observation_id': None,
+            'post_page_generation': None,
+            'after_observation_id': None,
+            'after_page_generation': None,
+            'business_status': 'unknown',
         }
         self._action_dispatched = False
         try:
@@ -437,7 +536,11 @@ class MCPBrowser:
         except Exception as error:
             self.last_action.update(status='FAILED', finished_at=time.time(), error=type(error).__name__)
             raise
-        self.last_action.update(status='DONE', finished_at=time.time())
+        self.last_action.update(status='DONE', finished_at=time.time(),
+                                post_observation_id=result['id'],
+                                post_page_generation=result.get('page_generation'),
+                                after_observation_id=result['id'],
+                                after_page_generation=result.get('page_generation'))
         self._action_dispatched = False
         return result
 
@@ -447,8 +550,17 @@ class MCPBrowser:
             self.policy.url(action.value)
             await self.call('navigate', {'url': action.value})
             self._action_dispatched = True
+            self._generation_invalidated = True
         elif action.kind in {'click', 'type', 'select'}:
-            args = {'element': f'{action.locator.role} {action.locator.name}', 'ref': action.element_ref}
+            observation = await self._collect_snapshot()
+            try:
+                fresh_ref = resolve_action_locator(self._snapshot_guard, action.locator)
+            except ValueError as error:
+                raise PermissionError('MCP 新快照无法安全唯一重定位；请重新观测') from error
+            self.last_action.update(grounding_observation_id=observation['id'],
+                                    grounding_page_generation=observation['page_generation'],
+                                    dispatched_element_ref=fresh_ref)
+            args = {'element': f'{action.locator.role} {action.locator.name}', 'ref': fresh_ref}
             if action.kind == 'type':
                 args['text'] = action.value
             if action.kind == 'select':
@@ -458,6 +570,8 @@ class MCPBrowser:
         elif action.kind == 'press':
             await self.call('press', {'key': action.value})
             self._action_dispatched = True
+            if action.value.casefold().replace(' ', '') in {'f5', 'control+r', 'ctrl+r', 'meta+r', 'command+r'}:
+                self._generation_invalidated = True
         elif action.kind not in {'observe', 'finish'}:
             raise PermissionError('不支持的标准动作')
-        return await self.observe()
+        return await self._observe()
