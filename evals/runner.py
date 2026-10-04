@@ -96,11 +96,23 @@ class CommandAdapter:
         result = {'status': 'completed' if process.returncode == 0 else 'failed',
                   'exit_code': process.returncode,
                   'stdout_tail': process.stdout[-4000:], 'stderr_tail': process.stderr[-4000:]}
-        try:
-            parsed = json.loads(process.stdout)
-            if isinstance(parsed, dict):
-                result.update(parsed)
-        except json.JSONDecodeError:
+        parsed = None
+        for line in reversed(process.stdout.splitlines()):
+            candidate = line.strip()
+            if candidate.startswith('BATCH_RESULT:'):
+                candidate = candidate.split(':', 1)[1].strip()
+            try:
+                value = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                parsed = value
+                break
+        if parsed is not None:
+            result.update(parsed)
+            if parsed.get('outcome') == 'FIX_VERIFIED':
+                result['internal_success'] = True
+        else:
             result.update({'outcome': 'INFRA_FAILURE' if process.returncode else 'inconclusive',
                            'infra_failure': process.returncode != 0})
         return result

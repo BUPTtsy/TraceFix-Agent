@@ -1,11 +1,13 @@
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from evals.config import EvaluationConfig, GROUPS
-from evals.runner import FourCellRunner, instrument_memory_calls
+from evals.runner import CommandAdapter, FourCellRunner, instrument_memory_calls
 from tracefix.knowledge.memory import MemoryLibrary
 
 
@@ -123,3 +125,12 @@ def test_runner_single_off_sets_environment_used_by_real_memory_store(tmp_path):
     assert row['evidence_kind'] == 'real'
     assert [item['event'] for item in calls] == [
         'memory.note', 'memory.save_job_memory', 'memory.job_memory']
+
+
+def test_command_adapter_parses_batch_result_line(tmp_path):
+    result = CommandAdapter()(command=(sys.executable, '-c',
+        "print('progress'); print('BATCH_RESULT: {\\\"outcome\\\":\\\"FIX_VERIFIED\\\"}')"),
+        cwd=str(tmp_path), env=os.environ.copy(), timeout=10, binding={}, config=None,
+        group=None)
+    assert result['outcome'] == 'FIX_VERIFIED'
+    assert result['internal_success'] is True
