@@ -47,7 +47,13 @@ tests/*
 .gitignore/
 .idea/
 .tmp*/
+/.tmp-*
 pytest*/
 pytest_*.txt
+/.pytest-*/
 .pytest-tmp-browser/
 .test*/
+/tracefix.pytest-*/
+/tracefix.tmp-*/
+/.cleanup-manifest.txt
+/.tracefix-collect.txt
