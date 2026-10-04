@@ -272,12 +272,29 @@ class FileEdit(Contract):
     content: str = Field(max_length=150_000)
 
 
+class StagedCandidateRef(Contract):
+    ref: str = Field(min_length=1)
+    path: str = Field(min_length=1)
+    expected_overlay_revision: int = Field(ge=1)
+    diff_ref: str = Field(min_length=1)
+
+
 class PatchProposal(Contract):
     summary: str
     evidence_refs: list[str] = Field(min_length=1)
     rule_refs: list[str] = Field(default_factory=list, max_length=50)
-    edits: list[FileEdit] = Field(min_length=1, max_length=8)
+    edits: list[FileEdit] = Field(default_factory=list, max_length=8)
+    staged_refs: list[StagedCandidateRef] = Field(default_factory=list, max_length=8)
     guidance_ack: list[GuidanceAck] = Field(default_factory=list)
+
+    @model_validator(mode='after')
+    def patch_source(self):
+        if not self.edits and not self.staged_refs:
+            raise ValueError('补丁必须提供 edits 或 staged_refs')
+        if self.edits and self.staged_refs and {edit.path for edit in self.edits} != {
+                candidate.path for candidate in self.staged_refs}:
+            raise ValueError('物化补丁路径必须与 staged_refs 一致')
+        return self
 
 
 class Validation(Contract):
@@ -332,6 +349,7 @@ class RunState(Contract):
     hypothesis_refs: list[str] = Field(default_factory=list)
     working_set_refs: list[str] = Field(default_factory=list)
     patch_ref: str | None = None
+    staged_candidate_refs: list[dict] = Field(default_factory=list)
     patch_hash: str | None = None
     patch_base_commit: str | None = Field(default=None, pattern=r'^(?:[a-f0-9]{40}|[a-f0-9]{64})$')
     validation_refs: list[str] = Field(default_factory=list)
@@ -355,6 +373,7 @@ class RunState(Contract):
     error_details: dict | None = None
     diagnosis_retry_count: int = 0
     diagnosis_feedback_refs: list[str] = Field(default_factory=list)
+    failed_candidate_signatures: list[dict] = Field(default_factory=list)
     local_branch: str | None = None
     action_fingerprints: list[str] = Field(default_factory=list)
     loop_state_fingerprints: list[str] = Field(default_factory=list)

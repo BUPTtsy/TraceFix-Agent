@@ -1,9 +1,9 @@
 ---
 name: local-verify
-version: "1.2.0"
+version: "1.3.0"
 description: 在规划阶段明确验证场景，在诊断阶段解释已有验证证据和失败原因。
 when_to_use: 编译 TestSpec，或根据已有本地验证结果诊断补丁时。
-phases: [PREPARE, DIAGNOSE]
+phases: [PREPARE, DIAGNOSE, VERIFY]
 triggers:
   rule_categories: [functional, accessibility, visual]
 tools_hint: [code.read, browser.snapshot, submit_test_spec, propose_patch]
@@ -14,6 +14,8 @@ references: [references/verify-regression.md]
 # local-verify
 
 只输出当前请求的 schema。收到 TestSpec 请求时规划可回放场景；收到 PatchProposal 请求时使用已有验证结果解释根因；知识检索和文档选择请求仍只返回检索词或文档 id。
+
+使用本次注入的 [公开业务回归清单](references/verify-regression.md)，只消费本候选 patch、环境与 TestSpec 绑定的公开开发证据。
 
 1. PREPARE 阶段根据首次观测选择真实 locator，明确原始断言和独立回归场景，由运行时冻结 TestSpec。
 2. DIAGNOSE 阶段核对 previous_validation 的补丁哈希、检查类型和真实输出，结合 validation_observations 定位失败原因。

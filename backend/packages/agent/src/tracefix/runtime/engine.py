@@ -28,7 +28,10 @@ from tracefix.runtime.contracts import (BudgetExceeded, BrowserAction, Decision,
     reduce_state, verification_gate)
 from tracefix.runtime.guidance import (GuidanceLedger, GuidanceRejected, active_guidance,
                                       retarget_state)
-from tracefix.runtime.tool_handlers import build_runtime_tools
+from tracefix.runtime.tool_handlers import build_runtime_tools, materialize_patch_proposal
+from tracefix.runtime.skills import SkillStore
+from tracefix.runtime.validation_feedback import (ValidationFeedback, build_validation_feedback,
+    feedback_is_current)
 from tracefix.runtime.verification import verification_binding
 from tracefix.runtime.effects import file_resource, make_operation_executor
 from tracefix.knowledge.assembler import ContextAssembler, ContextWindowError
@@ -109,23 +112,33 @@ class Engine:
         self.document_context = {}
         self._trace_sequences = {}
         self.skills = SkillCatalog(Path(__file__).resolve().parents[5] / 'skills')
+        self.skill_store = SkillStore(self.artifacts)
         self.graph = self._graph(checkpointer)
 
     def load_skill(self, s, name):
-        entry, content = self.skills.load_document(name, str(s.phase))
-        identity = {key: entry[key] for key in ('name', 'version', 'content_hash')}
-        if identity not in s.skills_loaded:
-            s.skills_loaded.append(identity)
+        prior = {(entry['name'], entry['version'], entry['content_hash']) for entry in s.skills_loaded}
+        result = self.skill_store.load(s, self.skills, name, str(s.phase))
+        identity = {key: result[key] for key in ('name', 'version', 'content_hash')}
+        if tuple(identity.values()) not in prior:
             self.store.save(s)
             self.event(s, 'skill.loaded', identity)
-        return {**identity, 'description': entry['description'], 'content': content}
+        return result
 
     def inject_skills(self, s, context):
         selection_context = {**context, 'files': list(self.source.get('files', {}))}
-        names = [entry['name'] for entry in self.skills.select(str(s.phase), selection_context)]
-        names = list(dict.fromkeys(names + list(context.get('load_skills', []))))
-        return {**context, 'skill_index': self.skills.summaries(str(s.phase)),
-                'skills': [self.load_skill(s, name) for name in names]}
+        prior = {(entry['name'], entry['version'], entry['content_hash']) for entry in s.skills_loaded}
+        result = self.skill_store.context(s, self.skills, str(s.phase), selection_context,
+            explicit=list(context.get('load_skills', [])), limit=6)
+        updated = False
+        for skill in result['skills']:
+            identity = {key: skill[key] for key in ('name', 'version', 'content_hash')}
+            if tuple(identity.values()) not in prior:
+                self.event(s, 'skill.loaded', identity)
+                prior.add(tuple(identity.values()))
+                updated = True
+        if updated:
+            self.store.save(s)
+        return {**context, **result}
 
     def _rule_snapshot(self, s):
         if not self.rule_resolver:
@@ -591,8 +604,14 @@ class Engine:
                    'runtime_error_details': s.error_details}
         if self.memory is not None:
             # 每次调用重新读取 L1/L2，让工具写入的新记忆立即生效；L2 按源码 manifest 隔离。
-            ctx['working_memory'] = self.memory.working_memory(s.scope_id, s.run_id)
-            ctx['job_memory'] = self.memory.job_memory(s.scope_id, s.job_id, s.source_manifest)
+            ctx['working_memory'] = self.memory.working_memory(
+                s.scope_id, s.run_id, query=s.goal, phase=s.phase,
+                source_manifest=s.source_manifest, patch_hash=s.patch_hash,
+                page_generation=getattr(s, 'page_generation', None))
+            ctx['job_memory'] = self.memory.job_memory(
+                s.scope_id, s.job_id, s.source_manifest,
+                cross_run=getattr(self.memory, 'cross_run', None), query=s.goal,
+                phase=s.phase, limit=6)
         budget = s.budget
 
         def attempt(model, request, attempt_number):
@@ -1488,8 +1507,14 @@ class Engine:
         self.workspace.check_frozen(self.source)
         overlay = s.source_manifest + (':' + s.patch_hash if s.patch_hash else '')
         await self.retriever.index(self.workspace, overlay)
-        code = await self.retriever.retrieve(s.goal, overlay, 'M1', 10)
-        recipes = await self.retriever.retrieve(s.goal, s.source_manifest, 'M3', 3)
+        readers = {
+            'artifact_exists': lambda ref: self.artifacts.exists(s.scope_id, s.run_id, ref),
+            'artifact_read': lambda ref: self.get(s, ref),
+        }
+        code = await self.retriever.retrieve(s.goal, overlay, 'M1', 10,
+            state=s, phase=s.phase)
+        recipes = await self.retriever.retrieve(s.goal, s.source_manifest, 'M3', 3,
+            state=s, phase=s.phase, allow_compatible=False, **readers)
         # 直接读取当前授权文件以核验检索卡片，并提供补丁校验所需的 before_hash。
         preferred = [json.loads(card['content']).get('path') for card in code if card.get('content', '').startswith('{')]
         cards = self.workspace.cards(limit_chars=60_000 * (s.diagnosis_retry_count + 1),
@@ -1529,14 +1554,15 @@ class Engine:
                 if observation_ref not in s.evidence_refs:
                     s.evidence_refs.append(observation_ref)
         context['available_evidence_refs'] = list(dict.fromkeys(context['available_evidence_refs'] + s.evidence_refs))
-        context.update(instruction='请诊断并返回最小化的完整文件替换内容。只能编辑当前允许的文件。引用已有证据；每个 before_hash 必须匹配已提供的文件。',
+        context.update(instruction='请诊断并提出最小局部补丁。优先 Read 取得当前 overlay_hash/revision，使用唯一 exact anchor 的 Edit(edits) 生成候选；检查真实 diff 后提交 staged_refs。运行时物化完整内容，模型无需重写未变全文。兼容旧 whole edits。只能编辑当前允许的文件并引用已有证据，失败按 error_code 重读/修正。',
                        allowed_files=self.workspace.allowed_files, repair_memory=recipes, retrieval_ids=[x['id'] for x in code],
                        failures=[self.get(s, r) for r in s.evidence_refs[-4 * (s.diagnosis_retry_count + 1):]],
                        previous_validation=validations, validation_observations=validation_observations,
                        replay_plan=self.get(s, s.replay_plan_ref) if s.replay_plan_ref else [],
                        current_workspace_diff=self.workspace.diff(),
                        diagnosis_retry_count=s.diagnosis_retry_count,
-                       diagnosis_feedback=[self.get(s, r) for r in s.diagnosis_feedback_refs[-self.DIAGNOSIS_RETRY_LIMIT:]])
+                       diagnosis_feedback=self.current_diagnosis_feedback(s),
+                       staged_candidates=list(s.staged_candidate_refs))
         if s.diagnosis_retry_count:
             context['instruction'] += (' 上一次未形成有效补丁。重新核对完整复现步骤、当前页面、失败断言与源码调用链；'
                                        '当前已补充更多源码和失败证据。只包含实际有改动的文件，'
@@ -1559,6 +1585,11 @@ class Engine:
             context['read_only_investigations'] = accepted
             self.store.save(s)
         patch = await self.model_call(s, PatchProposal, context)
+        try:
+            patch = materialize_patch_proposal(self, s, patch)
+        except (ValueError, PermissionError) as error:
+            raise ModelOutputError(str(error), category='output_validation',
+                                   details=getattr(error, 'details', {})) from error
         self.validate_rule_refs(s, patch.rule_refs)
         if not set(patch.evidence_refs) <= set(s.evidence_refs):
             invalid = sorted(set(patch.evidence_refs) - set(s.evidence_refs))
@@ -1566,15 +1597,17 @@ class Engine:
                 '补丁引用了不存在的证据：' + '、'.join(invalid),
                 category='output_validation',
                 details={'invalid_evidence_refs': invalid})
-        self.validate_patch_candidate(patch)
+        self.validate_patch_candidate(patch, state=s)
         ref = self.put(s, patch.model_dump(), name='补丁方案')
         s = self.changed(s, phase=Phase.PATCH, patch_ref=ref, hypothesis_refs=s.hypothesis_refs+[ref],
                          diagnosis_retry_count=0, error=None, error_details=None,
                          last_error_signature=None)
         return self.output(s, 'prelude')
 
-    def validate_patch_candidate(self, patch):
+    def validate_patch_candidate(self, patch, *, state=None):
         paths = [edit.path for edit in patch.edits]
+        if not paths:
+            raise ModelOutputError('候选必须先物化非空 edits', category='output_validation')
         if len(paths) != len(set(paths)):
             raise ModelOutputError('补丁包含重复的编辑路径', category='output_validation')
         for edit in patch.edits:
@@ -1589,13 +1622,16 @@ class Engine:
                 raise ModelOutputError(
                     '补丁基准哈希不匹配：' + edit.path,
                     category='output_validation',
-                    details={'path': edit.path, 'expected_before_hash': edit.before_hash,
-                             'actual_before_hash': digest(current)})
+                    details={'error_code': 'STALE_BASE', 'path': edit.path,
+                             'expected_before_hash': edit.before_hash, 'written': False,
+                             'actual_before_hash': digest(current),
+                             'next_step': '重新读取当前源码并重建局部候选，不能只更新 before_hash。'})
             if not edit.content.strip() or current == edit.content.encode('utf-8'):
                 raise ModelOutputError(
                     '补丁包含无实际改动的文件：' + edit.path,
                     category='output_validation',
-                    details={'path': edit.path, 'reason': 'no_effective_change',
+                    details={'error_code': 'NO_CHANGE', 'written': False,
+                             'path': edit.path, 'reason': 'no_effective_change',
                              'proposal_summary': patch.summary,
                              'proposed_paths': paths})
         try:
@@ -1603,6 +1639,50 @@ class Engine:
         except PermissionError as error:
             raise ModelOutputError('补丁不符合当前编辑约束：' + sanitize(error_message(error)),
                 category='output_validation', details=getattr(error, 'details', {})) from error
+        try:
+            self.workspace.validate_candidate_syntax(patch.edits)
+        except ValueError as error:
+            raise ModelOutputError(str(error), category='output_validation',
+                                   details=getattr(error, 'details', {})) from error
+        if state is not None:
+            fingerprint = self.candidate_fingerprint(patch)
+            for record in state.failed_candidate_signatures:
+                if (record.get('fingerprint') == fingerprint
+                        and record.get('source_manifest') == state.source_manifest
+                        and record.get('environment_digest') == state.environment_digest
+                        and record.get('test_spec_hash') == state.test_spec_hash):
+                    raise ModelOutputError('公开验证已经否定相同候选；请依据反证修正实际内容。',
+                        category='output_validation', details={'error_code': 'FAILED_CANDIDATE_REPEATED',
+                            'written': False, 'feedback_ref': record['feedback_ref'],
+                            'failed_patch_hash': record['patch_hash'],
+                            'next_step': '读取绑定失败反馈，修改实际候选后重新提交。'})
+
+    def candidate_fingerprint(self, patch=None):
+        replacements = {edit.path: edit.content.encode('utf-8') for edit in patch.edits} if patch else {}
+        changes = {}
+        for path, baseline_hash in self.source.get('files', {}).items():
+            current = replacements.get(path)
+            if current is None:
+                current = self.workspace.path(path).read_bytes()
+            current_hash = digest(current)
+            if current_hash != baseline_hash:
+                changes[path] = current_hash
+        return digest(changes)
+
+    def current_diagnosis_feedback(self, state):
+        records = []
+        plan_hash = self.verification_context(state)['plan_hash']
+        for ref in state.diagnosis_feedback_refs:
+            raw = self.get(state, ref)
+            if raw.get('type') == 'validation_feedback':
+                feedback = ValidationFeedback.model_validate(raw)
+                if not feedback_is_current(feedback, state, replay_plan_hash=plan_hash,
+                        artifact_exists=lambda item: self.artifacts.exists(state.scope_id, state.run_id, item),
+                        artifact_read=lambda item: self.get(state, item),
+                        artifact_read_bytes=lambda item: self.artifacts.read(state.scope_id, state.run_id, item)):
+                    continue
+            records.append(raw)
+        return records[-self.DIAGNOSIS_RETRY_LIMIT:]
 
     async def patch(self, s, _):
         self.scopes.assert_current(self.context)
@@ -1697,6 +1777,21 @@ class Engine:
         ref = self.put(s, validation.model_dump(), name=validation_name+'验证记录')
         s = self.changed(s, validation_refs=s.validation_refs+[ref], replay_index=0)
         if not validation.passed:
+            feedback = build_validation_feedback(s, validation,
+                artifact_exists=lambda item: self.artifacts.exists(s.scope_id, s.run_id, item),
+                artifact_read=lambda item: self.get(s, item),
+                artifact_read_bytes=lambda item: self.artifacts.read(s.scope_id, s.run_id, item),
+                replay_plan_hash=binding['plan_hash'], validation_ref=ref)
+            feedback_ref = self.put(s, feedback.model_dump(mode='json'), name='公开开发验证反馈')
+            failed = list(s.failed_candidate_signatures)
+            if (feedback.status == 'failed' and feedback.failed_candidate
+                    and feedback.failure_class in {'editing', 'counterevidence'}):
+                failed.append({'fingerprint': self.candidate_fingerprint(),
+                    'source_manifest': s.source_manifest, 'environment_digest': s.environment_digest,
+                    'test_spec_hash': s.test_spec_hash, 'patch_hash': s.patch_hash,
+                    'candidate_ref': s.patch_ref, 'feedback_ref': feedback_ref})
+            s = self.changed(s, diagnosis_feedback_refs=s.diagnosis_feedback_refs + [feedback_ref],
+                             failed_candidate_signatures=failed[-50:])
             self.event(s, 'gate.decided', {'validation': kind, 'passed': False})
             return self.output(self.changed(s, phase=Phase.DIAGNOSE), 'prelude')
         if s.validation_index < len(kinds)-1:

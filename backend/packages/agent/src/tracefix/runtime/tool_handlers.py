@@ -26,6 +26,16 @@ class MemorySearch(Contract):
     limit: int = Field(default=10, ge=1, le=50)
 
 
+class ReferenceExpand(Contract):
+    ref: str = Field(min_length=1, max_length=300)
+    start: int = Field(default=1, ge=1)
+    end: int | None = Field(default=None, ge=1)
+    channel: str = Field(default='snapshot', min_length=1, max_length=80)
+    expected_hash: str | None = Field(default=None, min_length=1)
+    max_lines: int = Field(default=200, ge=1, le=200)
+    max_chars: int = Field(default=16000, ge=1, le=16000)
+
+
 class StrictTestSpec(TestSpec):
     model_config = ConfigDict(extra='forbid')
 
@@ -56,6 +66,21 @@ class RuntimeTools:
 
 def _value(value):
     return value.model_dump(mode='json') if hasattr(value, 'model_dump') else value
+
+
+def materialize_patch_proposal(engine, state, proposal):
+    if not proposal.staged_refs:
+        return proposal
+    if state.mode != 'repair' or state.phase not in {Phase.DIAGNOSE, Phase.PATCH}:
+        raise ToolRejected('当前 Run 阶段不允许物化修复候选')
+    if engine.workspace.require_repository_snapshot()['scope_id'] != state.scope_id:
+        raise ToolRejected('候选工作区快照与当前 Run scope 不一致')
+    edits = engine.workspace.materialize_staged_candidates(
+        proposal.staged_refs, state=state, artifacts=engine.artifacts)
+    if proposal.edits and proposal.edits != edits:
+        raise ToolRejected('STALE_REF: 提交的完整内容与确认候选不一致；未接受补丁')
+    return PatchProposal.model_validate({**proposal.model_dump(mode='json'),
+                                        'edits': [edit.model_dump(mode='json') for edit in edits]})
 
 
 def build_runtime_tools(engine, state, schema, context=None, validate_output=None):
@@ -229,7 +254,8 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
             return await asyncio.to_thread(memory.search, arguments.query,
                 scope_id=state.scope_id, run_id=state.run_id,
                 job_id=getattr(state, 'job_id', None), source_manifest=state.source_manifest,
-                limit=arguments.limit)
+                limit=arguments.limit,
+                cross_run=getattr(memory, 'cross_run', None))
 
         async def memory_note(arguments, call_id):
             # 工作记忆只能引用当前 Run 的证据，不能凭空扩大可信证据集合。
@@ -250,6 +276,25 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
              MemorySearch, memory_search, phases=set(Phase))
         bind('memory.note', '写入当前 Run 工作记忆；不会晋升可信长期记忆或扩大权限。',
              MemoryNote, memory_note, phases=set(Phase), side_effect='write', parallel_safe=False)
+
+    async def expand_reference(arguments, call_id):
+        from tracefix.knowledge.workset import expand_reference as expand
+
+        try:
+            return expand(engine.artifacts, state.scope_id, state.run_id, arguments.ref,
+                start=arguments.start, end=arguments.end, channel=arguments.channel,
+                expected_hash=arguments.expected_hash, binding={
+                    'scope_id': state.scope_id, 'source_manifest': state.source_manifest,
+                    'patch_hash': state.patch_hash,
+                    'page_generation': getattr(state, 'page_generation', None),
+                    'environment_digest': state.environment_digest,
+                    'test_spec_hash': state.test_spec_hash,
+                }, max_lines=arguments.max_lines, max_chars=arguments.max_chars)
+        except (OSError, ValueError, PermissionError) as error:
+            raise ToolRejected(str(error)) from error
+
+    bind('context.expand', '在当前 Run 作用域内按 artifact 引用展开被省略的证据通道或行范围。',
+         ReferenceExpand, expand_reference, phases=set(Phase), output_limit_tokens=5000)
 
     submission = None
     if schema is TestSpec:
@@ -284,11 +329,16 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
                 if hasattr(value, 'evidence_refs') and not set(value.evidence_refs) <= allowed_evidence:
                     raise ToolRejected('提交引用了当前 Run 之外的证据')
                 if schema is PatchProposal:
-                    engine.validate_patch_candidate(value)
+                    value = materialize_patch_proposal(engine, state, value)
+                    engine.validate_patch_candidate(value, state=state)
             except Exception as error:
                 if (getattr(error, 'status', 'FAILED') != 'FAILED'
                         or getattr(error, 'details', {}).get('requires_manual_review')):
                     raise
+                if schema is PatchProposal and getattr(error, 'details', {}).get('error_code'):
+                    from tracefix.runtime.tools import ToolResult
+                    return ToolResult(call_id=call_id, name=name, isError=True,
+                        result=error.details, error={**error.details, 'message': str(error), 'executed': False})
                 raise ToolRejected(str(error)) from error
             submissions[name] = value
             return {'accepted': True, 'submission': name, 'value': value.model_dump(mode='json')}
