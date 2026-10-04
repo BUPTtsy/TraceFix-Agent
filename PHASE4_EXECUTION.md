@@ -2,6 +2,7 @@
 
 - BASE_SHA：`3bc8b6a7419eaa002a71029c538152ee55c1bc5e`。
 - 分支：`codex/phase4-20261005`；worktree：`C:/Users/tsy/.codex/worktrees/phase4-20261005/tracefix`。
+- 当前 HEAD：`b7aecc6`；工作区在本次记录更新前保持干净。
 - DESIGN_ROOT：`D:/tracefix`。隔离树中研究设计未跟踪，仅从原始 checkout 只读获取。
 - 原始树 index/tracked 文件无改动，存在未跟踪资料；没有复制它们的生产代码或未提交实验。
 - 已读用户目标附件。阶段四只负责 T01 恢复、T09 最终隔离、T10 消融/统计及精确集成验收。
@@ -14,13 +15,17 @@
 | --- | --- | --- | --- | --- |
 | S4-A/T01 | 主设计 §3 T01/T09、§4、§5 S4-A、§6；agent-loop §3—9/11；Claude audit §3—4 | 已有 loop signal 后按原因判定；episode 尝试与 deadline；可观察进展；取消/UNKNOWN；runtime/recovery.py 与 engine 恢复块 | 新 phase4 fixture + 原续跑/批次/操作测试；真实恢复待记录 | 新 Worker 平台、全局 token/费用硬限、无限继续、abort 回滚声明 |
 | S4-A/T09 | 主设计 T09/T10；memory-management §6/8；coding-aci §5；reader-evidence E01—E04 | evaluator 私有账本；恒定结算消息；挂载/执行面审查；候选 hash 绑定 | stdout/exit/report/path/copy/错候选 fixture；真实隔离待运行 | 最终分数回 Agent/记忆/cache、改 Oracle 断言、以注释证明隔离 |
-| S4-B/T10 | 主设计 T10/§4/S4-B；Hermes §6.2；OpenCode OC-06；context-governance §8；memory-management §6/8 | 独立四格 reset 与实际 model/memory trace；off 关闭跨 Run；各格独立候选；metrics 明确分母/coverage | 指标 5 测通过；runner/开关 fixture 待记录；真实结果待记录 | 固定修复答案、只改标签、infra 从主分母剔除、缺费用填零、mock 成绩 |
+| S4-B/T10 | 主设计 T10/§4/S4-B；Hermes §6.2；OpenCode OC-06；context-governance §8；memory-management §6/8 | 独立四格 reset 与实际 model/memory trace；off 关闭跨 Run；各格独立候选；metrics 明确分母/coverage | 指标 5 测通过；runner 与进程内开关 5 测通过；真实结果待记录 | 固定修复答案、只改标签、infra 从主分母剔除、缺费用填零、mock 成绩 |
 | CLI 集成验收 | Claude audit §3—4；目标附件 CLI 条款；已有阶段二/三交接日志 | 先精确 UI manifest/adapter，再 build/TTY/非TTY/流/取消/错误/resume/approval；删除前后 hash | 当前旧 UI 文件清单已取 hash；新 UI 尚未交付 | 重写第三套 UI、提前删旧壳、宣称用户源码为官方开源依赖 |
 
 ## 开发提交与定向验证
 
 1. `8b3a7d3f9c52d649c563521ba08ea880bb10a1ce`：首版恢复分类/episode 与引擎接缝。此提交是增量起点，真实动作/语义进展仍需后续修正，不作最终完成声明。
 2. `7a6f337`：独立指标、主/可评分成功率、false-success 分母、字段用量 coverage、fixture/real 区分；`py -3.12 -m pytest tests/test_phase4_metrics.py -q` → `5 passed`。
+3. `6e145a7`：T01 有界恢复、终态分离、continuation episode 预算与 unavailable 记录；`py -3.12 -m pytest tests/test_phase4_recovery.py -q` → `6 passed`。
+4. `23f94d8`：T09 Oracle 私有账本、恒定结算回执、候选/物化 patch hash 绑定和隔离边界；`py -3.12 -m pytest tests/test_phase4_oracle.py -q` → `31 passed`。
+5. `038e8d6`、`81b4796`、`b7aecc6`：T10 四格开关、循环指纹技术字段过滤、进程内 adapter 环境恢复与 fixture 约束；`py -3.12 -m pytest tests/test_phase4_runner.py -q` → `5 passed`。
+6. 当前阶段四定向组合：`py -3.12 -m pytest tests/test_phase4_metrics.py tests/test_phase4_runner.py tests/test_phase4_oracle.py tests/test_phase4_recovery.py -q` → `47 passed`；相关模块 `py_compile` 与 `git diff --check` 通过。
 
 普通 `python` 指向 WindowsApps 占位程序，退出无输出；使用实际 `py -3.12` 运行最小测试。没有执行全量 Python/Node 基线。
 
