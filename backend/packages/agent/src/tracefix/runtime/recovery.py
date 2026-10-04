@@ -46,13 +46,14 @@ class RecoveryDecision:
     can_continue: bool
     reason: str
     evidence: dict[str, Any]
+    episode_id: str | None = None
 
 
 _BUDGETS = {
-    RecoveryCause.WAIT: RecoveryBudget(max_attempts=1),
-    RecoveryCause.STALE: RecoveryBudget(max_attempts=1),
-    RecoveryCause.CONTEXT: RecoveryBudget(max_attempts=1),
-    RecoveryCause.REPEATED_NO_PROGRESS: RecoveryBudget(max_attempts=1),
+    RecoveryCause.WAIT: RecoveryBudget(max_attempts=1, deadline_seconds=60),
+    RecoveryCause.STALE: RecoveryBudget(max_attempts=1, deadline_seconds=30),
+    RecoveryCause.CONTEXT: RecoveryBudget(max_attempts=1, deadline_seconds=60),
+    RecoveryCause.REPEATED_NO_PROGRESS: RecoveryBudget(max_attempts=1, deadline_seconds=60),
     RecoveryCause.CANCELLED: RecoveryBudget(max_attempts=0),
     RecoveryCause.UNKNOWN: RecoveryBudget(max_attempts=0),
     RecoveryCause.ENVIRONMENT: RecoveryBudget(max_attempts=0),
@@ -62,7 +63,10 @@ _TECHNICAL_KEYS = {
     "attempt", "attempt_id", "attempts", "call", "call_id", "continuation",
     "continuation_id", "episode", "episode_id", "generation", "handle",
     "heartbeat", "id", "ref", "revision", "sequence", "step", "timestamp",
-    "token_count", "retry", "retry_count", "patch_hash", "new_patch_hash",
+    "token_count", "retry", "retry_count", "hash", "patch_hash", "new_patch_hash",
+    "phase", "validation_index", "replay_index", "diagnosis_retry_count",
+    "failure_signatures", "action_fingerprints", "loop_state_fingerprints",
+    "loop_error_signatures", "loop_no_progress_steps", "error_tail",
 }
 
 
@@ -133,20 +137,23 @@ def has_real_progress(before: Any, after: Any, evidence: Mapping[str, Any] | Non
     evidence = dict(evidence or {})
     for key in (
         "business_changed", "hypothesis_refuted", "verification_advanced",
-        "child_settled", "new_observation", "observation_changed", "receipt_confirmed",
+        "child_settled", "receipt_confirmed",
     ):
         if evidence.get(key) is True:
             return True
     if before is None or after is None:
         return False
     if isinstance(before, Mapping) and isinstance(after, Mapping):
-        keys = set(before) | set(after)
-        for key in keys:
-            if str(key).lower() in _TECHNICAL_KEYS:
-                continue
-            if before.get(key) != after.get(key):
-                return True
-        return False
+        def semantic(value):
+            if isinstance(value, Mapping):
+                return {str(key): semantic(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+                        if str(key).lower() not in _TECHNICAL_KEYS}
+            if isinstance(value, (list, tuple)):
+                return [semantic(item) for item in value]
+            if isinstance(value, str):
+                return value.replace("[ref=", "[")
+            return value
+        return semantic(before) != semantic(after)
     return before != after
 
 
@@ -181,10 +188,12 @@ class RecoveryController:
         *,
         now: float | None = None,
         evidence: Mapping[str, Any] | None = None,
+        episode_id: str | None = None,
     ) -> RecoveryDecision:
         cause = RecoveryCause(cause)
         budget = self.budget(cause)
-        entries = _entries(history, cause)
+        entries = [entry for entry in _entries(history, cause)
+                   if episode_id is None or entry.get("episode_id") == episode_id]
         attempt = len(entries) + 1
         now = monotonic() if now is None else now
         deadline_expired = bool(entries and budget.deadline_seconds is not None
@@ -201,7 +210,7 @@ class RecoveryController:
         else:
             reason = f"允许第 {attempt} 次有界恢复"
         return RecoveryDecision(cause, action, attempt, budget.max_attempts, can_continue,
-                                reason, dict(evidence or {}))
+                                reason, dict(evidence or {}), episode_id)
 
     def record(
         self,
@@ -223,6 +232,7 @@ class RecoveryController:
             "started_at": now,
             "reason": decision.reason,
             "evidence": decision.evidence,
+            "episode_id": decision.episode_id,
         }
         return [dict(item) for item in (history or [])] + [entry]
 
