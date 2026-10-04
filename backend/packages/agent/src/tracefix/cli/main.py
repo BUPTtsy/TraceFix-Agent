@@ -697,7 +697,13 @@ class Session:
             else:
                 self.render.text(f'当前项目 {self.scope} · {self.mode} · 暂无 Run')
         elif command == 'trace':
-            for e in self.store.trace(self.run_id, self.scope):
+            if len(args) > 1:
+                raise ValueError('用法：/trace [CURSOR]')
+            batch = self.engine.read_events(self.state(), args[0] if args else None)
+            if args or batch.snapshot is not None:
+                self.render.text(json.dumps(batch.as_dict(), ensure_ascii=False, default=str))
+                return batch.as_dict()
+            for e in batch.events:
                 self.render.event(e, replay=True)
         elif command == 'diff':
             patches=[e for e in self.store.trace(self.run_id,self.scope) if e['type']=='patch.applied']

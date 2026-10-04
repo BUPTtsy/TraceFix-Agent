@@ -145,8 +145,11 @@ class Gateway:
             'browser_press': ['observation_id', 'value'],
             'browser_snapshot': [],
         }.items():
-            properties = {field: copy.deepcopy(action_schema['properties'][field]) for field in fields}
-            for property_schema in properties.values():
+            optional_fields = ['page_generation', 'preconditions', 'postconditions', 'wait']
+            properties = {field: copy.deepcopy(action_schema['properties'][field])
+                          for field in fields + optional_fields}
+            for field in fields:
+                property_schema = properties[field]
                 property_schema.pop('default', None)
                 if 'anyOf' in property_schema:
                     property_schema.update(property_schema.pop('anyOf')[0])
