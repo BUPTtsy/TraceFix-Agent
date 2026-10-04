@@ -42,6 +42,7 @@
 - `tests/test_phase3_edit.py tests/test_phase3_engine.py tests/test_phase3_feedback.py tests/test_phase3_skills.py tests/test_phase3_workset.py tests/test_phase3_memory.py`：`60 passed`。
 - T07/T08 与既有 Skill/架构定向复核：`29 passed`、`79 passed, 1 skipped`；未运行完整基线。
 - 生产模块 `py_compile`、限定 diff `--check` 通过。
+- PostgreSQL 独立 schema `tracefix_s3check_final_92522e9839` 运行 `PostgresStore.setup()` 后核对 `memory_items`：`source_run_id`、`expires_at`、`applicability`、`revoked_*`、`evidence_refs`、`patch_hash`、`environment_digest`、`test_spec_hash`、`verification_refs` 全部存在；未写入共享 schema。
 
 ## 真实公开开发证据
 
