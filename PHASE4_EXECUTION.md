@@ -51,6 +51,18 @@
 
 ## 剩余验收输入与条件
 
+### 后续真实取证与窄修收口
+
+- `207989d` 保存首次真实公开 B01 与 read-denial probe；`a227036` 保留调用级部分 usage；`5c69e07` 修复已结算业务失败反馈/冻结验证；`053b976` 修复评测 Session 生命周期、实际 Gateway 配置/子 Agent 响应身份/provider usage。上述生产窄修经 `0d09464` 合入 main。
+- 新最小测试：native engine 23 passed、runner 29 passed、metrics 6 passed。batch_completion/phase3_feedback/phase4_recovery 相关组为 76 passed / 9 failed，9项均 batch；只对其中1项做修改前对照仍失败，其余8项尚未逐项归因。不能把该组写成通过，没有执行全量基线。
+- 公开 Run `run_697f2b5723094dc9b426fa5d150dcb82` 在 `f6cfd82` 上 FAILED/INFRA_FAILURE；有回执及业务失败观察，却被包装 UNKNOWN。窄修后新 Run `run_616fcdacb5864ce0aa21c75e3d86016f` 越过该接缝，9模型/5浏览器后本地完整请求预检超窗，仍 FAILED/INFRA_FAILURE，无候选或验证refs。详细原始路径与用量见 `PHASE4_PUBLIC_ACCEPTANCE.md`。
+- ContextAssembler 对 observation 的投影已生效；超限为 Gateway 协议/工具历史 `110486 > 109568`，环境使用 UTF-8 字节上界。第十次请求未发送，不是供应商窗口报错。工具历史有界投影尚未实施，不能将两次公开失败计入有效修复/M0/四格。
+- 宿主原 child WAIT、compact字段保护、UNKNOWN换ID拦截、cancel，以及独立 Docker/MCP stale→observe 取证完成。MemoryStore/无模型probe只证明指定接口与进程/文件/浏览器边界，真实业务恢复率/长期召回仍未测。见 `PHASE4_RECOVERY.md`。
+- 真实read-denial容器probe通过，但完整Agent执行面未隔离，Host Session仍拒绝held-out。受信runner/Bash/MCP能力入口与干净runtime/独立network/DB/cache/retrieval部署涉及跨模块修改，待用户按AGENTS第3条确认两批实施。见 `PHASE4_ISOLATION_READINESS.md`。
+- 真实运行和probe证据经 `cf40289` 合回 main；原项目两份进度文档已同步并明确完成边界，最新状态提交 `ca73d39`。没有push，保留用户未跟踪文件。
+
+五层状态仍为：模块/CLI/跨阶段代码接缝完成；真实全链路/held-out四格/长期效果未完成；唯一完整基线未运行。本目标保持 active，不以局部通过或失败取证标 complete。
+
 - 最终部署的受信 Agent launcher/容器、clean image digest、七类完整读回面及实际网络隔离。现有 DockerAgentBoundary 是核验接缝，默认 HostAgentBoundary 不能代替部署证据。
 - 原 child wait/reconnect、浏览器 observe 和 compact_context 接口均已核对存在；还需真实 WAIT/STALE/CONTEXT 效果及取消/UNKNOWN 不复活证据。
 - 真正 held-out Agent 执行面的隔离 launcher/容器清单、冻结初始经验/cache 来源证据。
