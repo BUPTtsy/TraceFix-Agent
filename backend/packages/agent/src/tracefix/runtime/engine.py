@@ -53,6 +53,14 @@ class GraphState(TypedDict):
     next_node: str
 
 
+class ActionBusinessFailure(ValueError):
+    def __init__(self, message, *, observation_ref, check, assertions):
+        super().__init__(message)
+        self.observation_ref = observation_ref
+        self.check = check
+        self.assertions = assertions
+
+
 def normalize_decision_evidence_refs(refs, known_refs, observation_ref, observation):
     aliases = {observation.get('id'): observation_ref,
                observation.get('screenshot_ref'): observation_ref}
@@ -1127,7 +1135,12 @@ class Engine:
                     return {'isError': True, 'error': {'type': type(exc).__name__,
                         'message': sanitize(str(exc)), 'executed': False},
                         'observation_ref': s.observation_ref, 'observation': observation}
-                ref = await self.act(s, action, tool_call_id=call_id)
+                business_failure = None
+                try:
+                    ref = await self.act(s, action, tool_call_id=call_id)
+                except ActionBusinessFailure as exc:
+                    business_failure = exc
+                    ref = exc.observation_ref
                 canonical = action.model_copy(update={'observation_id': None, 'element_ref': None,
                                                       'page_generation': None})
                 plan = self.get(s, s.replay_plan_ref) if s.replay_plan_ref else []
@@ -1142,6 +1155,14 @@ class Engine:
                 if self.rule_resolver:
                     ctx = self.inject_rules(s, {**ctx, 'observation': observation})
                 ctx = self.guidance_context(s, {**ctx, 'observation': observation}, logical_call)
+                if business_failure is not None:
+                    return {'isError': True, 'executed': True,
+                        'error': {'type': type(business_failure).__name__,
+                            'message': sanitize(str(business_failure)), 'executed': True,
+                            'category': 'business_assertion', 'check': business_failure.check},
+                        'business_outcome': {'status': 'failed', 'passed': False,
+                            'check': business_failure.check, 'assertions': business_failure.assertions},
+                        'observation_ref': ref, 'observation': observation}
                 return {'observation_ref': ref, 'observation': observation}
             validation['tool_executor'] = execute_tool
             validation['on_tool_result'] = tool_result
@@ -1311,8 +1332,11 @@ class Engine:
                 browser_action.update(business_status=status,
                                       business_observation_ref=current_ref,
                                       business_assertions=result['assertions'])
-            event_state = self.changed(s, observation_ref=current_ref) if persist else s
-            self.event(event_state, 'action.business.outcome', {
+            if persist:
+                updated = self.changed(s, observation_ref=current_ref)
+                for field in type(s).model_fields:
+                    setattr(s, field, getattr(updated, field))
+            self.event(s, 'action.business.outcome', {
                 'status': status,
                 'passed': result['passed'],
                 'check': check_kind,
@@ -1328,7 +1352,9 @@ class Engine:
             business_result, business_check = result, 'postconditions'
             if not result['passed']:
                 record_business_outcome(business_check, result, persist=True)
-                raise ValueError('动作后置断言不满足：' + json.dumps(result['assertions'], ensure_ascii=False))
+                raise ActionBusinessFailure(
+                    '动作后置断言不满足：' + json.dumps(result['assertions'], ensure_ascii=False),
+                    observation_ref=current_ref, check=business_check, assertions=result['assertions'])
         wait = action.wait
         if wait and wait.assertions:
             deadline = time.monotonic() + wait.timeout_seconds
@@ -1340,7 +1366,9 @@ class Engine:
                     break
                 if observations >= wait.max_observations or time.monotonic() >= deadline:
                     record_business_outcome(business_check, result, persist=True)
-                    raise ValueError('可观察等待超时：' + json.dumps(result['assertions'], ensure_ascii=False))
+                    raise ActionBusinessFailure(
+                        '可观察等待超时：' + json.dumps(result['assertions'], ensure_ascii=False),
+                        observation_ref=current_ref, check=business_check, assertions=result['assertions'])
                 await asyncio.sleep(min(wait.interval_seconds, max(0, deadline - time.monotonic())))
                 raw = await self.browser.action(BrowserAction(kind='observe'))
                 current_ref = await self.capture(s, raw)
@@ -1834,9 +1862,14 @@ class Engine:
         s = self.changed(s, observation_ref=ref, replay_plan_ref=plan_ref, step=s.step+1)
         return self.output(s, 'explore_gate')
 
-    def check(self, s, checks, *, kind='original', scenario=None, scenario_step=None):
+    def check(self, s, checks, *, kind='original', scenario=None, scenario_step=None,
+              business_failure=None):
         obs = self.get(s, s.observation_ref)
-        result = assertions(obs['snapshot'], checks)
+        result = ({'passed': False, 'assertions': business_failure.assertions,
+                   'business_check': business_failure.check, 'failure_category': 'counterevidence',
+                   'error_code': 'ACTION_POSTCONDITION_FAILED' if business_failure.check == 'postconditions'
+                   else 'ACTION_WAIT_FAILED'} if business_failure is not None else
+                  assertions(obs['snapshot'], checks))
         binding = self.verification_context(s)
         result.update(binding, type='validation_result', kind=kind,
                       observation_ref=s.observation_ref, observation_hash=digest(obs),
@@ -1898,23 +1931,29 @@ class Engine:
         if s.replay_index == 0:
             r = await self.reset(s)
             s = self.changed(s, observation_ref=r['observation_ref'], replay_index=1)
-        elif s.replay_index <= len(plan):
-            ref = await self.act(s, plan[s.replay_index-1], frozen=True)
-            s = self.changed(s, observation_ref=ref, replay_index=s.replay_index+1)
+            return self.output(s, 'prelude')
+        if s.replay_index <= len(plan):
+            try:
+                ref = await self.act(s, plan[s.replay_index-1], frozen=True)
+            except ActionBusinessFailure as exc:
+                r, ref = self.check(s, [], business_failure=exc)
+            else:
+                s = self.changed(s, observation_ref=ref, replay_index=s.replay_index+1)
+                return self.output(s, 'prelude')
         else:
             r, ref = self.check(s, self.spec(s).assertions)
-            signatures = s.failure_signatures + [digest(r['assertions']) if not r['passed'] else 'PASS']
-            trials = s.trial + 1
-            s = self.changed(s, trial=trials, replay_index=0, evidence_refs=s.evidence_refs+[ref], failure_signatures=signatures)
-            if trials == 3:
-                failures = Counter(value for value in signatures[-3:] if value != 'PASS')
-                stable = max(failures.values(), default=0) >= 2
-                if stable and s.mode == 'repair':
-                    s = self.changed(s, phase=Phase.DIAGNOSE, reproduced=True)
-                else:
-                    s = self.changed(s, phase=Phase.FINALIZE, reproduced=stable,
-                                     outcome=Outcome.BUG_CONFIRMED if stable else Outcome.INCONCLUSIVE,
-                                     error='已验证缺陷报告（仅测试模式）' if stable else '故障无法在三次试验中的至少两次复现')
+        signatures = s.failure_signatures + [digest(r['assertions']) if not r['passed'] else 'PASS']
+        trials = s.trial + 1
+        s = self.changed(s, trial=trials, replay_index=0, evidence_refs=s.evidence_refs+[ref], failure_signatures=signatures)
+        if trials == 3:
+            failures = Counter(value for value in signatures[-3:] if value != 'PASS')
+            stable = max(failures.values(), default=0) >= 2
+            if stable and s.mode == 'repair':
+                s = self.changed(s, phase=Phase.DIAGNOSE, reproduced=True)
+            else:
+                s = self.changed(s, phase=Phase.FINALIZE, reproduced=stable,
+                                 outcome=Outcome.BUG_CONFIRMED if stable else Outcome.INCONCLUSIVE,
+                                 error='已验证缺陷报告（仅测试模式）' if stable else '故障无法在三次试验中的至少两次复现')
         return self.output(s, 'prelude')
 
     def phase_observations(self, s, phase):
@@ -2334,10 +2373,17 @@ class Engine:
             if s.replay_index <= len(scenario.steps):
                 step_index = s.replay_index
                 step = scenario.steps[step_index - 1]
-                ref = await self.act(s, step.action, frozen=True)
-                s = self.changed(s, observation_ref=ref, replay_index=step_index + 1)
                 result = None
-                if step.assertions:
+                try:
+                    ref = await self.act(s, step.action, frozen=True)
+                except ActionBusinessFailure as exc:
+                    s = self.changed(s, replay_index=step_index + 1)
+                    result, ref = self.check(s, [], scenario=scenario, scenario_step=step_index,
+                                             business_failure=exc)
+                    s = self.changed(s, behavior_check_refs=s.behavior_check_refs + [ref])
+                else:
+                    s = self.changed(s, observation_ref=ref, replay_index=step_index + 1)
+                if result is None and step.assertions:
                     # 在下一动作覆盖页面状态前取证，才能区分每次转移与刷新后的持久化结果。
                     result, ref = self.check(s, step.assertions, scenario=scenario, scenario_step=step_index)
                     s = self.changed(s, behavior_check_refs=s.behavior_check_refs + [ref])
@@ -2360,9 +2406,14 @@ class Engine:
                 r = await self.reset(s)
                 return self.output(self.changed(s, observation_ref=r['observation_ref'], replay_index=1), 'prelude')
             if s.replay_index <= len(plan):
-                ref = await self.act(s, plan[s.replay_index-1], frozen=True)
-                return self.output(self.changed(s, observation_ref=ref, replay_index=s.replay_index+1), 'prelude')
-            result, _ = self.check(s, spec.assertions if kind == 'original' else spec.regression_assertions, kind=kind)
+                try:
+                    ref = await self.act(s, plan[s.replay_index-1], frozen=True)
+                except ActionBusinessFailure as exc:
+                    result, _ = self.check(s, [], kind=kind, business_failure=exc)
+                else:
+                    return self.output(self.changed(s, observation_ref=ref, replay_index=s.replay_index+1), 'prelude')
+            else:
+                result, _ = self.check(s, spec.assertions if kind == 'original' else spec.regression_assertions, kind=kind)
         else:
             async def run():
                 if kind == 'health':
