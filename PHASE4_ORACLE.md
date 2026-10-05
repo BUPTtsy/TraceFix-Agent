@@ -1,6 +1,6 @@
 # 阶段四 T09：最终 Oracle 外层隔离
 
-状态：开发中；逻辑 fixture 不代表真实 GUI 或已部署隔离验收。
+状态：✅ 外层接口与定向逻辑验收完成；真实 Docker Agent 部署隔离和 GUI Oracle 成绩待验收。
 
 - 工作基线：`3bc8b6a`，分支 `codex/phase4-20261005`。
 - 主设计来源：原始项目 `docs/agent-research-20261004/top10-development-plan.md` 第 3 节 T09/T10、第 4 节、第 5 节 S4-A、第 6 节。
@@ -53,3 +53,5 @@ Fixture 验证 stdout/stderr/exit/report 留私有、固定 Agent 返回、候�
 摘要、embedding、改写后的 Oracle 派生诀窍已被隔离；不能用它替代冻结初始经验与冷 cache。
 路径/挂载核对是评分前后的采样，trusted launcher 必须冻结它们，禁止评分中重新挂载或更改权限。
 普通 Python 对象封装、源码导出规则和 `final_scoring_only` 标签均不构成操作系统隔离。
+
+集成复核 `e5e195b`：只有实际 Docker boundary 核验通过才返回 `real_isolation=true`；runner 需要评分前/后两份证明，fixture 不可因 runtime_audit/gui_real 自报而提升为真实成绩。阶段四四文件组合 49 passed，其中 Oracle 31、runner 7；真实 launcher/AgentExposure 与冻结 cohort 配置尚未提供部署产物。
