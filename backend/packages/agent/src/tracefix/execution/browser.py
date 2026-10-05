@@ -16,8 +16,6 @@ ELEMENT = re.compile(r'^\s*- (?P<role>[\w-]+)(?: "(?P<name>(?:[^"\\]|\\.)*)")?(?
 UPSTREAM_TRUNCATION = re.compile(
     r'(?im)^\s*(?:\.{3}|…)?\s*(?:\[[^\n]*(?:truncat(?:ed|ion)|内容已省略)[^\n]*\]'
     r'|(?:snapshot|output|content|response)\s+(?:is\s+|was\s+)?truncated\b)')
-SNAPSHOT_LIMIT = 40000
-SNAPSHOT_OMISSION = '页面快照中间内容已省略'
 
 
 def elements(snapshot):
@@ -402,18 +400,6 @@ class MCPBrowser:
         text_blocks = [block for block in blocks if block.type == 'text']
         raw = '\n'.join(block.text for block in text_blocks)
         text = sanitize(raw)
-        collector_truncated = False
-        if len(text) > SNAPSHOT_LIMIT:
-            marker = f'\n{SNAPSHOT_OMISSION}\n'
-            available = SNAPSHOT_LIMIT - len(marker)
-            head_limit = available // 2
-            tail_limit = available - head_limit
-            head_end = text.rfind('\n', 0, head_limit)
-            head = text[:head_end + 1] if head_end >= 0 else text[:head_limit]
-            tail_start = text.find('\n', max(0, len(text) - tail_limit))
-            tail = text[tail_start + 1:] if tail_start >= 0 else text[-tail_limit:]
-            text = head + marker + tail
-            collector_truncated = True
         upstream_truncated = bool(UPSTREAM_TRUNCATION.search(raw))
         for block in text_blocks:
             metadata = getattr(block, 'meta', None) or getattr(block, '_meta', None) or {}
@@ -426,7 +412,7 @@ class MCPBrowser:
             'status': status, 'captured_at': captured_at,
             'content_version': digest(text) if text_blocks else None,
             'provider_characters': len(raw), 'collector_characters': len(text),
-            'upstream_truncated': upstream_truncated, 'collector_truncated': collector_truncated,
+            'upstream_truncated': upstream_truncated, 'collector_truncated': False,
         }
 
     async def _collect_snapshot(self):
@@ -566,21 +552,13 @@ class MCPBrowser:
             self._action_dispatched = True
             self._generation_invalidated = True
         elif action.kind in {'click', 'type', 'select'}:
-            if self.MAP['snapshot'] in self.tools:
-                observation = await self._collect_snapshot()
-            else:
-                observation = self.observation
-                if not observation:
-                    raise MCPConnectionError('MCP 动作缺少可用于定位的页面观测', details={
-                        'tool': self.MAP[action.kind], 'dispatched': False,
-                    })
+            observation = await self._collect_snapshot()
             try:
-                fresh_ref = resolve_action_locator(
-                    self._snapshot_guard or observation['snapshot'], action.locator)
+                fresh_ref = resolve_action_locator(self._snapshot_guard, action.locator)
             except ValueError as error:
                 raise PermissionError('MCP 新快照无法安全唯一重定位；请重新观测') from error
             self.last_action.update(grounding_observation_id=observation['id'],
-                                    grounding_page_generation=observation.get('page_generation'),
+                                    grounding_page_generation=observation['page_generation'],
                                     dispatched_element_ref=fresh_ref)
             args = {'element': f'{action.locator.role} {action.locator.name}', 'ref': fresh_ref}
             if action.kind == 'type':
@@ -596,7 +574,4 @@ class MCPBrowser:
                 self._generation_invalidated = True
         elif action.kind not in {'observe', 'finish'}:
             raise PermissionError('不支持的标准动作')
-        observer_override = self.__dict__.get('observe')
-        if observer_override is not None:
-            return await observer_override()
         return await self._observe()

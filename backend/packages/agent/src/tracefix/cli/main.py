@@ -699,22 +699,11 @@ class Session:
         elif command == 'trace':
             if len(args) > 1:
                 raise ValueError('用法：/trace [CURSOR]')
-            engine = getattr(self, 'engine', None)
-            if engine is not None and hasattr(engine, 'read_events'):
-                batch = engine.read_events(self.state(), args[0] if args else None)
-                if args or batch.snapshot is not None:
-                    self.render.text(json.dumps(batch.as_dict(), ensure_ascii=False, default=str))
-                    return batch.as_dict()
-                events = batch.events
-            else:
-                events = self.store.trace(self.run_id, self.scope)
-                if args:
-                    result = {'events': events, 'cursor': None, 'snapshot': None,
-                              'requires_new_observation': False,
-                              'high_watermark': events[-1].get('seq', 0) if events else 0}
-                    self.render.text(json.dumps(result, ensure_ascii=False, default=str))
-                    return result
-            for e in events:
+            batch = self.engine.read_events(self.state(), args[0] if args else None)
+            if args or batch.snapshot is not None:
+                self.render.text(json.dumps(batch.as_dict(), ensure_ascii=False, default=str))
+                return batch.as_dict()
+            for e in batch.events:
                 self.render.event(e, replay=True)
         elif command == 'diff':
             patches=[e for e in self.store.trace(self.run_id,self.scope) if e['type']=='patch.applied']

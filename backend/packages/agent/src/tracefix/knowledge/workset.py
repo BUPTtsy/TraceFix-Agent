@@ -183,10 +183,6 @@ def cluster_steps(steps, *, keep_recent=4, max_clusters=12):
             'last_step': record.get('last_step', record.get('step', index + 1)),
             'first_refs': record.get('first_refs', refs), 'last_refs': refs,
             'variant_refs': record.get('variant_refs', [])[-3:], 'fact': semantic})
-        if semantic.get('status') == 'failed':
-            for key in ('error', 'error_code', 'failure_class'):
-                if key in semantic and key not in cluster:
-                    cluster[key] = deepcopy(semantic[key])
         cluster['count'] += record.get('count', 1) if record.get('semantic_signature') else 1
         cluster['last_step'] = record.get('last_step', record.get('step', index + 1))
         cluster['last_refs'] = record.get('last_refs', refs)

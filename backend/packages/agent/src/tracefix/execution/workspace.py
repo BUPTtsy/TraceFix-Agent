@@ -238,7 +238,7 @@ class Workspace:
                 git(self.root, 'merge-base', '--is-ancestor', baseline, current['head'])
             except RuntimeError as error:
                 raise PermissionError('工作区 baseline 不是当前 HEAD 的祖先') from error
-            commits = git(self.root, 'rev-list', f'{baseline}..{current["head"]}').decode().splitlines()
+            commits = git(self.root, 'rev-list', f'{baseline}..{current["head"]}', '--').decode().splitlines()
             for commit in commits:
                 tree_files = {}
                 for record in git(self.root, 'ls-tree', '-rz', commit).split(b'\0'):
