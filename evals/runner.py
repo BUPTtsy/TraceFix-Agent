@@ -10,6 +10,7 @@ import contextlib
 import hashlib
 import inspect
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -50,13 +51,14 @@ def _copy_source(source: Path, revision: str, destination: Path) -> str:
     subprocess.run(['git', '-C', str(destination), 'config', 'user.email', 'tracefix-eval@example.invalid'], check=True)
     subprocess.run(['git', '-C', str(destination), 'config', 'user.name', 'TraceFix evaluator'], check=True)
     subprocess.run(['git', '-C', str(destination), 'add', '.'], check=True, capture_output=True)
-    subprocess.run(['git', '-C', str(destination), 'commit', '-qm', 'frozen evaluator source'], check=True)
+    subprocess.run(['git', '-C', str(destination), 'commit', '-qm', '冻结评测源码'], check=True)
     return _git(source, 'rev-parse', revision)
 
 
 def _tree_hash(root: Path) -> str:
     files = {path.relative_to(root).as_posix(): _sha256(path)
-             for path in sorted(root.rglob('*')) if path.is_file()}
+             for path in sorted(root.rglob('*'))
+             if path.is_file() and '.git' not in path.relative_to(root).parts}
     return digest(files)
 
 
@@ -146,9 +148,18 @@ class SessionAdapter:
         self.held_out = held_out
 
     def __call__(self, *, source, root, env, config, binding, **_kwargs):
-        if self.held_out:
+        if self.held_out or config.held_out:
             return {'status': 'isolation_error', 'outcome': 'INFRA_FAILURE',
-                    'infra_failure': True, 'isolation_error': 'Host Session cannot expose held-out Oracle'}
+                    'infra_failure': True, 'isolation_error': 'Host Session cannot expose held-out Oracle',
+                    'error': '宿主 Session 无法证明 held-out Oracle 隔离'}
+        if config.effort != 'provider-default':
+            return {'status': 'unavailable', 'outcome': 'INCONCLUSIVE',
+                    'error': 'Gateway 不支持配置 reasoning effort', 'trace': []}
+        memory_enabled = env.get('TRACEFIX_CROSS_RUN_MEMORY', 'on') == 'on'
+        experience = self._initial_experience(config.initial_experience, memory_enabled)
+        if experience['status'] == 'unavailable':
+            return {'status': 'unavailable', 'outcome': 'INCONCLUSIVE',
+                    'initial_experience': experience, 'error': experience['reason'], 'trace': []}
         if not env.get('TRACEFIX_DATABASE_URL') or not env.get('TRACEFIX_API_KEY'):
             return {'status': 'inconclusive', 'outcome': 'INFRA_FAILURE', 'infra_failure': True,
                     'error': 'TRACEFIX_DATABASE_URL/API_KEY 未配置'}
@@ -172,55 +183,275 @@ class SessionAdapter:
             goal=config.goal, mode='repair', plain=True, url=None, spec=str(config.spec),
             skills=str(config.skills_root), run=True, command=None, continue_run=None,
             instruction='', execution_mode='batch', parent_run=None, rule=None)
-        session = Session(args, None, None)
-
         async def execute():
-            await session.create()
-            trace = []
+            async with contextlib.AsyncExitStack() as resources:
+                session = Session(args, None, None)
+                session.runtime_stack = resources
+                trace = []
+                engines = []
+                original_bind = session.bind
 
-            instrument_memory_calls(session.engine.memory, trace)
-            while session.task:
-                task = session.task
-                await task
-                if session.task is task:
-                    break
-            state = session.state()
-            report = session.artifacts.json(state.scope_id, state.run_id, state.report_ref) if state.report_ref else {}
-            candidate = report.get('patch_diff_ref')
-            candidate_path = Path(root) / 'candidate.patch'
-            if candidate:
-                candidate_path.write_bytes(session.artifacts.read(state.scope_id, state.run_id, candidate))
-            events = session.store.trace(state.run_id, state.scope_id)
+                def bind(state, profile, workspace, source):
+                    original_bind(state, profile, workspace, source)
+                    engine = session.engine
+                    engines.append(engine)
+                    from tracefix.model.gateway import BrowserPolicyRouter, Gateway
+                    teacher = Gateway(text_model=config.model, vision_model=config.vision_model,
+                                      thinking=config.thinking, tool_mode=config.tool_mode)
+                    engine.model = BrowserPolicyRouter(teacher)
+                    engine.worker_model = None
+                    trace.append({'event': 'model.configuration', 'model_agent_id': state.run_id,
+                                  'model': teacher.text_model, 'vision_model': teacher.vision_model,
+                                  'thinking': teacher.thinking, 'tool_mode': teacher.tool_mode,
+                                  'effort': config.effort})
+                    instrument_memory_calls(engine.memory, trace)
+
+                session.bind = bind
+                try:
+                    async with asyncio.timeout(config.timeout_seconds):
+                        await session.create()
+                        while session.task:
+                            task = session.task
+                            await task
+                            if session.task is task:
+                                break
+                    state = session.state()
+                    report = session.artifacts.json(state.scope_id, state.run_id, state.report_ref) if state.report_ref else {}
+                    candidate = report.get('patch_diff_ref')
+                    candidate_path = Path(root) / 'candidate.patch'
+                    if candidate:
+                        candidate_path.write_bytes(session.artifacts.read(state.scope_id, state.run_id, candidate))
+                    trace.extend(self._collect_trace(session.store, state, session.artifacts))
+                    workspace = session.engine.workspace
+                    base = state.patch_base_commit or 'HEAD'
+                    return {'status': 'completed', 'outcome': str(state.outcome) if state.outcome else None,
+                            'internal_success': str(state.outcome) == 'FIX_VERIFIED',
+                            'candidate_patch': str(candidate_path) if candidate_path.is_file() else None,
+                            'materialized_patch_hash': digest(workspace.diff(base).encode()),
+                            'verify_candidate': lambda: digest(workspace.diff(base).encode()),
+                            'trace': trace, 'trace_origin': 'runtime_audit',
+                            'gui_real': self._gui_evidence(session.engine, state),
+                            'initial_experience': experience,
+                            'usage': self._usage(trace, state.budget.model_calls),
+                            'runtime_budget': state.budget.model_dump(mode='json'), 'run_id': state.run_id}
+                finally:
+                    await self._close_session(session, engines)
+        configured_env = dict(env)
+        configured_env.update({'TRACEFIX_TEXT_MODEL': config.model,
+                               'TRACEFIX_VISION_MODEL': config.vision_model,
+                               'TRACEFIX_THINKING': config.thinking,
+                               'TRACEFIX_TOOL_MODE': config.tool_mode})
+        for key in tuple(configured_env):
+            if key.startswith(('TRACEFIX_WORKER_', 'TRACEFIX_STUDENT_')):
+                configured_env.pop(key)
+        with FourCellRunner._environment_context(configured_env):
+            return asyncio.run(execute())
+
+    @staticmethod
+    def _initial_experience(path, enabled):
+        if not enabled:
+            return {'status': 'disabled', 'loaded': False}
+        try:
+            value = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError):
+            value = None
+        if value == {'items': []}:
+            return {'status': 'empty', 'loaded': False}
+        return {'status': 'unavailable', 'loaded': False,
+                'reason': 'MemoryLibrary 无安全的 frozen snapshot 导入接口'}
+
+    @staticmethod
+    def _collect_trace(store, state, artifacts=None):
+        pending = [(state.run_id, None)]
+        visited = set()
+        trace = []
+        while pending:
+            run_id, parent_id = pending.pop()
+            if run_id in visited:
+                continue
+            visited.add(run_id)
+            try:
+                child = store.load(run_id, state.scope_id)
+                if parent_id and child.parent_run_id != parent_id:
+                    raise PermissionError('child Run 父身份不匹配')
+                events = store.trace(run_id, state.scope_id)
+            except (KeyError, ValueError, PermissionError):
+                trace.append({'event': 'child_trace.unavailable', 'model_agent_id': run_id})
+                continue
+            responses = []
+            response_refs = set()
+            for event in events:
+                if event['type'] != 'model.response.persisted':
+                    continue
+                payload = event.get('payload') or {}
+                response_ref = payload.get('response_ref')
+                if response_ref and response_ref not in response_refs:
+                    response_refs.add(response_ref)
+                    responses.append(SessionAdapter._response_audit(
+                        artifacts, state.scope_id, run_id, payload))
+            audited = any(response['response_audited'] for response in responses)
+            requests = [event.get('payload') or {} for event in events
+                        if event['type'] == 'model.request.persisted']
+            matched_responses = set()
+            for request in requests:
+                response = next((item for item in responses
+                    if item['request_ref'] and item['request_ref'] == request.get('request_ref')), None)
+                if response:
+                    matched_responses.add(response['response_ref'])
+                trace.append({'event': 'model_exchange', 'model_agent_id': run_id,
+                              'request_ref': request.get('request_ref'),
+                              'response': response, 'source': 'runtime_audit'})
+            for response in responses:
+                if response['response_ref'] not in matched_responses:
+                    trace.append({'event': 'model_exchange', 'model_agent_id': run_id,
+                                  'request_ref': response['request_ref'],
+                                  'response': response, 'source': 'runtime_audit'})
             for event in events:
                 payload = event.get('payload') or {}
-                if event['type'] in {'model.called', 'model.started'}:
-                    trace.append({'event': 'model_call', 'model_agent_id': event.get('run_id') or
-                                  payload.get('model_revision') or payload.get('model') or 'unknown',
-                                  'source': 'runtime_audit'})
+                if event['type'] == 'model.called':
+                    trace.append({'event': 'model_call', 'model_agent_id': run_id,
+                                  'model_revision': payload.get('model_revision'),
+                                  'response_audits': [{key: value for key, value in response.items()
+                                      if key != 'usage'} for response in responses],
+                                  'response_audited': audited, 'source': 'runtime_audit'})
                 elif event['type'] in {'subtask.started', 'subtask.completed'}:
-                    trace.append({'event': event['type'], 'model_agent_id': payload.get('child_run_id'),
-                                  'source': 'runtime_audit'})
-                elif event['type'].startswith('memory.') or event['type'].startswith('knowledge.'):
+                    child_id = payload.get('child_run_id')
+                    trace.append({'event': event['type'], 'model_agent_id': child_id,
+                                  'parent_run_id': run_id, 'source': 'runtime_audit'})
+                    if child_id:
+                        pending.append((child_id, run_id))
+                elif event['type'].startswith(('memory.', 'knowledge.')):
                     trace.append({'event': event['type'], 'layer': payload.get('layer'),
                                   'cross_run': payload.get('cross_run')})
-            return {'status': 'completed', 'outcome': str(state.outcome) if state.outcome else None,
-                    'internal_success': str(state.outcome) == 'FIX_VERIFIED',
-                    'candidate_patch': str(candidate_path) if candidate_path.is_file() else None,
-                    'materialized_patch_hash': digest(session.engine.workspace.diff(state.patch_base_commit or 'HEAD').encode()),
-                    'verify_candidate': lambda: digest(session.engine.workspace.diff(state.patch_base_commit or 'HEAD').encode()),
-                    'trace': trace, 'trace_origin': 'runtime_audit', 'gui_real': True,
-                    'usage': state.budget.model_dump(mode='json'), 'run_id': state.run_id}
-        previous = {key: os.environ.get(key) for key in env
-                    if key.startswith('TRACEFIX_')}
+        return trace
+
+    @staticmethod
+    def _response_audit(artifacts, scope_id, run_id, payload):
+        result = {'request_ref': payload.get('request_ref'),
+                  'response_ref': payload.get('response_ref'), 'requested_model': None,
+                  'reported_model': None, 'http_status': None, 'response_audited': False,
+                  'status': 'unavailable', 'usage': None}
+        if artifacts is None:
+            return result
         try:
-            os.environ.update({key: str(value) for key, value in env.items() if key.startswith('TRACEFIX_')})
-            return asyncio.run(execute())
-        finally:
-            for key, value in previous.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
+            record = artifacts.json(scope_id, run_id, payload['response_ref'])
+            response = record.get('response') if isinstance(record, dict) else None
+            if not isinstance(response, dict):
+                return result
+            body = response.get('body')
+            body = body if isinstance(body, dict) else {}
+            requested = record.get('model')
+            request_ref = payload.get('request_ref')
+            if request_ref:
+                try:
+                    request_record = artifacts.json(scope_id, run_id, request_ref)
+                    request = request_record.get('request') if isinstance(request_record, dict) else None
+                    if isinstance(request, dict) and isinstance(request.get('json'), dict):
+                        requested = request['json'].get('model')
+                except (KeyError, OSError, ValueError, PermissionError):
+                    requested = None
+            result.update(requested_model=requested if isinstance(requested, str) else None,
+                          reported_model=body.get('model') if isinstance(body.get('model'), str) else None,
+                          http_status=response.get('http_status'), status='readable',
+                          usage=body.get('usage') if isinstance(body.get('usage'), dict) else None,
+                          response_audited=payload.get('http_status') == 200
+                              and response.get('http_status') == 200)
+        except (KeyError, OSError, ValueError, PermissionError):
+            pass
+        return result
+
+    @staticmethod
+    def _usage(trace, attempted_calls=0):
+        aliases = {
+            'input_tokens': ('input_tokens', 'prompt_tokens'),
+            'output_tokens': ('output_tokens', 'completion_tokens'),
+            'cache_read_tokens': ('cache_read_tokens', 'cache_read_input_tokens',
+                'prompt_cache_hit_tokens', 'input_tokens_details.cached_tokens',
+                'prompt_tokens_details.cached_tokens'),
+            'cache_write_tokens': ('cache_write_tokens', 'cache_creation_input_tokens'),
+            'total_tokens': ('total_tokens',), 'cost_usd': ('cost_usd',),
+        }
+        exchanges = [item for item in trace if item.get('event') == 'model_exchange']
+        called = sum(item.get('event') == 'model_call' for item in trace)
+        count = max(attempted_calls, len(exchanges), called)
+        trace_complete = not any(item.get('event') == 'child_trace.unavailable' for item in trace)
+        result = {'source': 'persisted_provider_responses', 'attempted_calls': count,
+                  'trace_complete': trace_complete, 'coverage': {}}
+        for field, names in aliases.items():
+            known = []
+            for exchange in exchanges:
+                usage = (exchange.get('response') or {}).get('usage') or {}
+                for name in names:
+                    value = usage
+                    for part in name.split('.'):
+                        value = value.get(part) if isinstance(value, dict) else None
+                    if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                            and math.isfinite(value) and value >= 0):
+                        known.append(value)
+                        break
+            complete = bool(count) and len(known) == count and trace_complete
+            known_sum = sum(known) if known else None
+            result[field] = known_sum if complete else None
+            result['coverage'][field] = {'known_sum': known_sum, 'known_calls': len(known),
+                'unknown_calls': count - len(known), 'coverage': len(known) / count if count else None,
+                'complete': complete, 'total': result[field]}
+        return result
+
+    @staticmethod
+    def _gui_evidence(engine, state):
+        from tracefix.execution.browser import MCPBrowser
+        from tracefix.execution.runner import DockerRunner
+        return (type(engine.runner) is DockerRunner and type(engine.browser) is MCPBrowser
+                and bool(state.observation_ref) and bool(engine.runner.resolved_image_ids))
+
+    @staticmethod
+    async def _close_session(session, engines):
+        errors = []
+        task = session.task
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as error:
+                errors.append(error)
+        if session.engine is not None and session.engine not in engines:
+            engines.append(session.engine)
+        for engine in reversed(engines):
+            runtime = getattr(engine, 'subagent_runtime', None)
+            if runtime:
+                parent_run_id = getattr(engine, 'current_run', session.run_id)
+                handles = tuple(getattr(runtime, '_browser_tasks', {}).get(parent_run_id, ()))
+                try:
+                    runtime.cancel(parent_run_id)
+                except Exception as error:
+                    errors.append(error)
+                pending_handles = [handle for handle in handles if handle is not asyncio.current_task()]
+                if pending_handles:
+                    for handle in pending_handles:
+                        handle.cancel()
+                    child_results = await asyncio.gather(*pending_handles, return_exceptions=True)
+                    errors.extend(error for error in child_results
+                                  if isinstance(error, Exception))
+                try:
+                    runtime.close()
+                except Exception as error:
+                    errors.append(error)
+                scheduler = getattr(runtime, 'scheduler', None)
+                executor = getattr(scheduler, 'executor', None)
+                if executor:
+                    try:
+                        await asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True)
+                    except Exception as error:
+                        errors.append(error)
+            for resource in (engine.browser, engine.runner):
+                try:
+                    await resource.close()
+                except Exception as error:
+                    errors.append(error)
+        if errors:
+            raise RuntimeError('Session 资源清理失败') from errors[0]
 
 
 class FourCellRunner:
@@ -266,6 +497,10 @@ class FourCellRunner:
             'TRACEFIX_HELD_OUT': '1' if self.config.held_out else '0',
             'TRACEFIX_MEMORY_FROZEN': '1' if self.config.held_out else '0',
             'TRACEFIX_EVAL_FIXED_INPUTS': json.dumps(fixed, sort_keys=True),
+            'TRACEFIX_TEXT_MODEL': self.config.model,
+            'TRACEFIX_VISION_MODEL': self.config.vision_model,
+            'TRACEFIX_THINKING': self.config.thinking,
+            'TRACEFIX_TOOL_MODE': self.config.tool_mode,
         })
         return env
 
@@ -291,7 +526,8 @@ class FourCellRunner:
             return {'evidence_kind': 'inconclusive', 'model_agent_ids': [],
                     'delegations': [], 'memory_calls': [], 'trace_proven': False}
         models = sorted({str(item.get('model_agent_id')) for item in trace
-                         if item.get('event') in {'model_call', 'model.called'} and item.get('model_agent_id')})
+                         if item.get('event') in {'model_call', 'model.called'}
+                         and item.get('model_agent_id') and item.get('response_audited') is True})
         delegations = [item for item in trace if item.get('event') in {'delegation', 'subtask.started'}]
         memory = [item for item in trace if str(item.get('event', '')).startswith('memory.')]
         layers = [item.get('layer') for item in memory if item.get('layer')]
@@ -303,6 +539,7 @@ class FourCellRunner:
             proven = proven and bool(delegations) and len(models) >= 2
         return {'evidence_kind': 'real' if proven else 'inconclusive',
                 'model_agent_ids': models, 'delegations': delegations,
+                'model_calls': [item for item in trace if item.get('event') == 'model_call'],
                 'memory_calls': memory, 'trace_proven': proven}
 
     def run_group(self, group: AblationGroup) -> dict[str, Any]:
@@ -323,6 +560,8 @@ class FourCellRunner:
             if content.count(self.config.mutation_before) != 1:
                 raise ValueError('缺陷注入 before 片段不存在')
             target.write_text(content.replace(self.config.mutation_before, self.config.mutation_after, 1), encoding='utf-8')
+            _git(source, 'add', '--', self.config.mutation_file)
+            _git(source, 'commit', '-qm', '冻结评测缺陷注入')
         source_hash = _tree_hash(source)
         environment_digest = fixed['environment_digest']
         binding = RunBinding(group.name, run_id, self.config.case_id, self.config.family,
@@ -378,13 +617,16 @@ class FourCellRunner:
         row = {'attempted': True, 'configuration': group.name, 'case_id': self.config.case_id,
                'family': self.config.family, 'run_id': run_id, 'agent_mode': group.agent_mode,
                'cross_run_memory': group.cross_run_memory, 'outcome': result.get('outcome'),
-               'status': result.get('status'), 'patch_hash': patch_hash,
+               'status': result.get('status'), 'error': result.get('error'),
+               'isolation_error': result.get('isolation_error'),
+               'initial_experience': result.get('initial_experience'), 'patch_hash': patch_hash,
                'oracle_patch_hash': (oracle_result or {}).get('candidate_patch_hash')
                    or (oracle_result or {}).get('materialized_patch_hash'),
                'oracle_passed': (oracle_result or {}).get('oracle_passed'),
                'oracle_status': (oracle_result or {}).get('status'),
                'infra_failure': bool(result.get('infra_failure')),
-               'usage': result.get('usage'), 'duration_seconds': time.monotonic() - started,
+               'usage': result.get('usage'), 'runtime_budget': result.get('runtime_budget'),
+               'duration_seconds': time.monotonic() - started,
                'recovery_attempted': bool(result.get('recovery_attempted')),
                'recovery_effective': bool(result.get('recovery_effective')),
                'internal_success': bool(result.get('internal_success')),
@@ -396,19 +638,18 @@ class FourCellRunner:
     @staticmethod
     @contextlib.contextmanager
     def _environment_context(env):
-        previous = {key: os.environ.get(key) for key in env if key.startswith('TRACEFIX_')}
+        previous = {key: value for key, value in os.environ.items() if key.startswith('TRACEFIX_')}
         try:
-            os.environ.update({key: str(value) for key, value in previous.items()
-                               if value is not None})
+            for key in previous:
+                os.environ.pop(key)
             os.environ.update({key: str(value) for key, value in env.items()
                                if key.startswith('TRACEFIX_')})
             yield
         finally:
-            for key, value in previous.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
+            for key in tuple(os.environ):
+                if key.startswith('TRACEFIX_'):
+                    os.environ.pop(key)
+            os.environ.update(previous)
 
     def _read_oracle_record(self, binding, acknowledgement):
         """Read score only from evaluator-private Oracle ledger."""

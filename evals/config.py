@@ -42,6 +42,7 @@ class EvaluationConfig:
     allowed_files: tuple[str, ...] = ('src/**', 'server/**')
     project: str = 'bugboard'
     effort: str = 'provider-default'
+    vision_model: str = ''
     thinking: str = 'disabled'
     tool_mode: str = 'native'
     held_out: bool = True
@@ -101,14 +102,15 @@ class EvaluationConfig:
             'protocol_hash': digest(self.public_protocol.read_bytes()),
             'skills_hash': digest(skills),
             'initial_experience_hash': digest(self.initial_experience.read_bytes()),
-            'model': self.model, 'effort': self.effort, 'thinking': self.thinking,
+            'model': self.model, 'vision_model': self.vision_model,
+            'effort': self.effort, 'thinking': self.thinking,
             'tool_mode': self.tool_mode, 'tools_hash': self.tools_hash,
             'recovery_rules_hash': self.recovery_rules_hash,
             'environment_digest': digest({
                 'profile_hash': digest(self.profile.read_bytes()),
                 'spec_hash': digest(self.spec.read_bytes()),
                 'tools_hash': self.tools_hash, 'skills_hash': digest(skills),
-                'model': self.model, 'effort': self.effort,
+                'model': self.model, 'vision_model': self.vision_model, 'effort': self.effort,
                 'thinking': self.thinking, 'tool_mode': self.tool_mode,
             }),
             'mutation_hash': digest([self.mutation_file, self.mutation_before, self.mutation_after]),

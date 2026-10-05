@@ -9,3 +9,17 @@
 核对的 Claude 边界包括 `query.ts` 的 tool result→下一轮、abort 与 compact guard，`toolExecution.ts` 的错误结果和 abort，`REPL.tsx` 的部分流式输出保留与 cancel，AgentTool transcript/resume，以及 session restore。TraceFix 只采用状态和反馈边界，不复制 provider、权限、账号或 CLI UI。
 
 当前 WorkerRuntime 暴露 `WorkerScheduler.handle()/wait()`，可在运行时挂载时等待原 child；未挂载时测试和报告明确 `child_wait` unavailable。真实 GUI、模型和跨进程副作用恢复仍需后续集成验收。
+
+## 真实 B01 工具反馈接缝
+
+T01/T09 的本批依据为主设计 `top10-development-plan.md` 第3节、`agent-loop-20261004.md` 第5/7/8/9节，以及 `claude-source-audit-20261005.md` 第3—4节。采纳 Claude `queryLoop` 的已结算工具错误结果进入下一轮边界；没有新增模型重试控制或修改最终 Oracle。
+
+真实公开 B01 失败 Run 为 `run_697f2b5723094dc9b426fa5d150dcb82`，证据在 `.tracefix/phase4-public-20261005T083107Z-9acfad7d986c/data/artifacts/bugboard/` 的该 Run 目录：`0030_收尾_完整事件数据.json` 的 seq 28 已保存 browser `tool.completed` 回执，seq 30 已记录相同 observation_ref 的 `action.business.outcome`、`passed=false`，seq 31 却将普通 ValueError 包装为 `UNKNOWN_OPERATION`，最终变为 `INFRA_FAILURE`。停掉真正未知操作符合原边界；把这次已有回执及失败观察的业务后置失败归为未知则是接缝缺陷。
+
+`runtime/engine.py` 仅在 operation 已有回执、最新 capture 成功而后置断言或可观察等待失败时抛出 `ActionBusinessFailure(ValueError)`。其观察持久化同时同步传入 RunState 的 revision；native tool executor 仍记录一次 canonical plan、step、fingerprint 并更新模型 context，返回 `isError=true`、`executed=true`、失败断言与最新观察。transport、capture 或无回执异常继续保留 UNKNOWN，不换 ID 重放。
+
+冻结计划继续保留原 postconditions/wait。`reproduce` 捕获该特定已结算失败，在失败处结束当次试验并计入真实失败签名；`verify` 的 original/regression/behavior 三路径保存 `passed=false` 的既有绑定结果和 public validation feedback，再沿既有诊断路线处理。失败断言和证据均保留，未修改 selection、最终验证器或通过条件。
+
+最小回归：`py -3.12 -m pytest tests/test_native_engine.py -q`，23 passed。覆盖 postconditions/wait 的 native result→下一轮、三次冻结复现失败计数、original/regression/behavior 失败反馈，以及 browser dispatch 后 capture 失败仍为 UNKNOWN 且只发一次动作。此处为确定性接缝证据，修补后的真实 B01/模型恢复效果仍由独立新 Run 验收，不能据此宣称真实修复率或长上下文召回已验收。
+
+补充相关回归 `py -3.12 -m pytest tests/test_batch_completion.py tests/test_phase3_feedback.py tests/test_phase4_recovery.py -q`：76 passed、9 failed。失败均为 batch_completion 的 FakeModel 全图在修补/验证/审批前已经 ABNORMAL（死循环），因而候选/验证列表为空；phase3_feedback 与 phase4_recovery 全部通过。对 `test_batch_fix_finishes_without_interactive_approval` 用 `git show HEAD:.../engine.py` 在独立 Python 进程内存载入 HEAD Engine 后单独运行，仍以相同死循环错误失败（1 failed），证实该项不是本次业务失败接缝引入。没有修改 fixture、跳过失败或重复全量基线；其余8项尚未逐项做 HEAD 差分，不称全部已证明既有失败。
