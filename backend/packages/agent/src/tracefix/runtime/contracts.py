@@ -358,6 +358,8 @@ class RunState(Contract):
     exploration_plan_ref: str | None = None
     reproduction_plan_frozen: bool = False
     skills_loaded: list[dict] = Field(default_factory=list)
+    task_board_ref: str | None = None
+    todo_list_ref: str | None = None
     observation_ref: str | None = None
     reproduction_binding_ref: str | None = None
     evidence_refs: list[str] = Field(default_factory=list)

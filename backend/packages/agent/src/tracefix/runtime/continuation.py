@@ -63,6 +63,8 @@ def derive_run(previous: RunState, *, goal: str | None = None, url: str | None =
         'exploration_plan_ref': None,
         'reproduction_plan_frozen': False,
         'skills_loaded': [],
+        'task_board_ref': None,
+        'todo_list_ref': None,
         'observation_ref': None,
         'evidence_refs': [],
         'hypothesis_refs': [],
