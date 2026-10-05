@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 from dataclasses import dataclass, field
@@ -82,6 +83,17 @@ def materialize_patch_proposal(engine, state, proposal):
         raise ToolRejected('STALE_REF: 提交的完整内容与确认候选不一致；未接受补丁')
     return PatchProposal.model_validate({**proposal.model_dump(mode='json'),
                                         'edits': [edit.model_dump(mode='json') for edit in edits]})
+
+
+def validate_patch_candidate(engine, value, state):
+    validator = engine.validate_patch_candidate
+    parameters = inspect.signature(validator).parameters
+    accepts_state = ('state' in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()))
+    if accepts_state:
+        return validator(value, state=state)
+    return validator(value)
 
 
 def build_runtime_tools(engine, state, schema, context=None, validate_output=None):
@@ -347,7 +359,7 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
                     raise ToolRejected('提交引用了当前 Run 之外的证据')
                 if schema is PatchProposal:
                     value = materialize_patch_proposal(engine, state, value)
-                    engine.validate_patch_candidate(value, state=state)
+                    validate_patch_candidate(engine, value, state)
             except Exception as error:
                 if (getattr(error, 'status', 'FAILED') != 'FAILED'
                         or getattr(error, 'details', {}).get('requires_manual_review')):
