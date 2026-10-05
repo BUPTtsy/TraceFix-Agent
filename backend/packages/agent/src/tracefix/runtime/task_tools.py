@@ -128,16 +128,9 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _field(state, name: str) -> str | None:
-    value = getattr(state, name, None)
-    if value is not None and not isinstance(value, str):
-        raise ToolRejected(f"{name} 不是有效的 artifact 引用")
-    return value
-
-
 def _state_ref(state, name: str) -> str | None:
-    value = _field(state, name)
-    if value and not value.strip():
+    value = getattr(state, name, None)
+    if value is not None and (not isinstance(value, str) or not value.strip()):
         raise ToolRejected(f"{name} 不是有效的 artifact 引用")
     return value
 
@@ -156,11 +149,14 @@ def _load_json(engine, state, field: str, default: dict):
         value.get("scope_id") != state.scope_id or value.get("run_id") != state.run_id
     ):
         raise ToolRejected(f"{field} artifact 不属于当前 Run")
+    if type(value.get("revision", 0)) is not int or value.get("revision", 0) < 0:
+        raise ToolRejected(f"{field} artifact revision 无效")
     return value
 
 
 def _save_json(engine, state, field: str, value, label: str):
     with apply_effect_receipt():
+        value = {**value, "revision": value.get("revision", 0) + 1}
         reference = engine.artifacts.put(
             state.scope_id, state.run_id, value, "json", label=label
         )
@@ -195,7 +191,7 @@ def _task_board(engine, state) -> dict:
     )
     if board.get("version") != 1 or board.get("scope_id") != state.scope_id or board.get("run_id") != state.run_id:
         raise ToolRejected("任务板 artifact 版本或归属无效")
-    if not isinstance(board.get("tasks"), dict) or not isinstance(board.get("create_calls", {}), dict):
+    if not isinstance(board.get("tasks"), dict) or not isinstance(board.get("create_calls"), dict):
         raise ToolRejected("任务板 artifact 结构无效")
     if len(board["tasks"]) > MAX_TASKS:
         raise ToolRejected("任务板超出任务数量上限")
@@ -266,7 +262,7 @@ def _planning_key(field: str, state, arguments) -> str:
 
 def register_task_tools(engine, state, context, bind):
     """Register supervisor-only Run planning tools."""
-    if (context or {}).get("worker_depth") == 1:
+    if (context or {}).get("worker_depth") == 1 or getattr(engine, "subagent_depth", 0) == 1:
         return
 
     async def task_create(arguments: TaskCreateInput, call_id: str):
@@ -411,6 +407,7 @@ def register_task_tools(engine, state, context, bind):
             "todo_list_ref",
             {
                 "version": 1,
+                "revision": old.get("revision", 0),
                 "scope_id": state.scope_id,
                 "run_id": state.run_id,
                 "items": [item.model_dump(mode="json") for item in new_items],

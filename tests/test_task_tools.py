@@ -62,6 +62,8 @@ def test_registration_permissions_and_output_models(task_runtime):
         assert spec.idempotency_key and spec.output_model
     assert not task_pipeline(engine, state, {'worker_depth': 1,
         'worker_write_enabled': True}).registry.specs
+    engine.subagent_depth = 1
+    assert not task_pipeline(engine, state).registry.specs
 
 
 @pytest.mark.asyncio
@@ -253,6 +255,9 @@ async def test_todo_restore_repeated_content_and_clear(task_runtime):
     assert clear.result == {'oldTodos': [todo], 'newTodos': []}
     written = await recovered.execute('TodoWrite', {'todos': [todo]}, 'again')
     assert written.result == {'oldTodos': [], 'newTodos': [todo]}
+    cleared_again = await recovered.execute('TodoWrite', {'todos': []}, 'clear-again')
+    assert cleared_again.result == {'oldTodos': [todo], 'newTodos': []}
+    assert engine.artifacts.json(state.scope_id, state.run_id, restored.todo_list_ref)['items'] == []
     after = state.model_dump(mode='json')
     assert {key: value for key, value in after.items() if key != 'todo_list_ref'} == {
         key: value for key, value in before.items() if key != 'todo_list_ref'}
