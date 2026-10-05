@@ -11,6 +11,7 @@ class FixtureChild extends EventEmitter {
     this.closed = false;
     this.projectId = String(args[args.indexOf('--project') + 1] || 'bugboard');
     this.databasePath = String(args[args.indexOf('--console-db') + 1]);
+    this.goal = args.includes('--goal') ? String(args[args.indexOf('--goal') + 1]) : '';
     this.stdout = new PassThrough();
     this.stderr = new PassThrough();
     this.stdin = new Writable({
@@ -87,8 +88,13 @@ class FixtureChild extends EventEmitter {
     this.updateRecord('running', {agentRunId: 'fixture-agent-run', pid: process.pid});
     this.event('run.started', {status: 'RUNNING', message: 'fixture run started'});
     this.stdoutText('fixture stdout：运行开始\n');
+    for (let index = 0; index < 36; index++) this.event('observation', {message: `fixture history-${String(index).padStart(2, '0')}`});
     setTimeout(() => {
       if (this.closed) return;
+      this.event('state.changed', {status: 'RUNNING', phase: 'RUNNING'});
+      this.event('state.changed', {status: 'RUNNING', phase: 'RUNNING'});
+      this.event('tool.started', {tool_name: 'fixture-event-only-tool', tool_call_id: 'fixture-call'});
+      this.event('tool.completed', {tool_name: 'fixture-event-only-tool', tool_call_id: 'fixture-call', observation_ref: 'fixture-event-only-observation'});
       this.event('tool.error', {error: 'fixture tool failed', error_code: 'UNKNOWN', operation_status: 'UNKNOWN'});
       this.stdoutText('fixture tool.error UNKNOWN\n');
     }, 120);
@@ -104,16 +110,24 @@ class FixtureChild extends EventEmitter {
       this.updateRecord('running', {agentRunId: 'fixture-agent-run'});
       this.stdoutText('fixture resume continuation\n');
     }, 420);
+    if (this.goal === 'fixture finish goal') setTimeout(() => {
+      if (this.closed) return;
+      this.event('gate.decided', {passed: true, evidence_ref: 'fixture-event-only-gate'});
+      this.event('run.finished', {status: 'COMPLETED', outcome: 'FIX_VERIFIED', error: null, error_details: null, cancelled: false, report_ref: 'fixture-event-only-report'}, 'completed');
+      setTimeout(() => this.close(0), 80);
+    }, 1500);
   }
 
   receive(text) {
     for (const line of text.split(/\r?\n/).map(value => value.trim()).filter(Boolean)) {
+      if (!line.startsWith('/')) this.goal = line;
       if (line === '/run') this.begin();
       if (line === '/interrupt' || line === '/cancel') {
         if (this.closed) continue;
         this.event('run.cancelled', {status: 'CANCELLED', message: 'fixture cancel acknowledged'}, 'cancelled');
         this.stdoutText('fixture cancel acknowledged\n');
-        setTimeout(() => this.close(0), 80);
+        this.started = false;
+        this.emit('close', 0);
       }
       if (line === '/quit') this.close(0);
     }

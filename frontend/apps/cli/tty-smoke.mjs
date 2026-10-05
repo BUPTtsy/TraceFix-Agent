@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import stripAnsi from 'strip-ansi';
 
 let pty;
 try { pty = await import('node-pty'); }
@@ -25,22 +26,93 @@ const waiters = [];
 const exited = new Promise(resolve => shell.onExit(resolve));
 let timeoutReject;
 const timeout = new Promise((_, reject) => {timeoutReject = reject;});
+let phase = 'startup';
 const timer = setTimeout(() => {
   shell.kill();
-  timeoutReject(new Error(`TTY_SMOKE_FAILED: interactive timeout, output=${JSON.stringify(output.slice(-500))}`));
-}, 15_000);
+  timeoutReject(new Error(`TTY_SMOKE_FAILED: ${phase} timeout, output=${JSON.stringify(output.slice(-1000))}`));
+}, 35_000);
 shell.onData(chunk => {
   output += chunk;
   for (const waiter of waiters.splice(0)) waiter();
 });
-const waitFor = async (pattern) => {
-  if (pattern.test(output)) return;
+const waitFor = async (pattern, start = 0) => {
+  if (pattern.test(stripAnsi(output.slice(start)))) return;
   await Promise.race([new Promise(resolve => waiters.push(resolve)), timeout]);
-  return waitFor(pattern);
+  return waitFor(pattern, start);
 };
+const writeKey = async (value) => {
+  shell.write(value);
+  await new Promise(resolve => setTimeout(resolve, 80));
+};
+const wheel = async (direction, times = 1) => {
+  const start = output.length;
+  for (let index = 0; index < times; index++) await writeKey(`\x1b[<${direction === 'up' ? 64 : 65};1;1M`);
+  return stripAnsi(output.slice(start));
+};
+const requireText = (value, pattern, label) => {
+  if (!pattern.test(value)) throw new Error(`TTY_SMOKE_FAILED: ${label}, output=${JSON.stringify(value.slice(-1200))}`);
+};
+const latestFrame = value => {
+  const plain = stripAnsi(value);
+  const prompt = plain.lastIndexOf('❯');
+  return prompt < 0 ? plain : plain.slice(Math.max(0, prompt - 3000), prompt + 120);
+};
+const submitEdit = async (value, keys, expected) => {
+  phase = value;
+  const start = output.length;
+  if (/[^\x00-\x7f]/.test(value)) {
+    for (const character of value) await writeKey(character);
+  } else {
+    shell.write(value);
+    await waitFor(new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), start);
+  }
+  for (const key of keys) await writeKey(key);
+  shell.write('\r');
+  try { await waitFor(expected, start); }
+  catch (error) {
+    if (error instanceof Error) error.message += `; edit=${JSON.stringify(stripAnsi(output.slice(start)))}`;
+    throw error;
+  }
+};
+try {
 await waitFor(/❯/);
+phase = 'help direct body and wheel';
+const helpStart = output.length;
 shell.write('/help\r');
-await waitFor(/项目与知识|别名：/);
+await waitFor(/别名：/, helpStart);
+if (/cli\.output:/.test(stripAnsi(output.slice(helpStart)))) throw new Error('TTY_SMOKE_FAILED: help is still wrapped in cli.output');
+const helpTop = await wheel('up', 25);
+requireText(helpTop, /会话|显示分组命令帮助/, 'help wheel must reveal first help rows');
+const helpTopBoundary = await wheel('up', 4);
+void helpTopBoundary;
+const helpBottom = await wheel('down', 25);
+requireText(helpBottom, /别名：/, 'help wheel must return to last help rows');
+const helpBottomBoundary = await wheel('down', 4);
+void helpBottomBoundary;
+await submitEdit('/mode chatx', ['\x7f'], /新 Run 模式：chat/);
+await submitEdit('/mode repairx', ['\b'], /新 Run 模式：repair/);
+await submitEdit('/mode teXst', ['\x1b[D', '\x1b[D', '\x1b[D', '\x1b[3~'], /新 Run 模式：test/);
+await submitEdit('/mode chXat', ['\x1b[D', '\x1b[D', '\x7f'], /新 Run 模式：chat/);
+await writeKey('\x03');
+await submitEdit('回归中文中', ['\x7f'], /目标已记录：回归中文/);
+await submitEdit('回归 emoji👩‍💻', ['\x7f'], /目标已记录：回归 emoji/);
+phase = 'ordinary history wheel';
+await writeKey('\x0c');
+for (let index = 0; index < 12; index++) {
+  const start = output.length;
+  shell.write(`history-wheel-${String(index).padStart(2, '0')}\r`);
+  await waitFor(new RegExp(`目标已记录：history-wheel-${String(index).padStart(2, '0')}`), start);
+}
+const ordinaryTop = await wheel('up', 18);
+requireText(ordinaryTop, /目标已记录：history-wheel-00/, 'wheel must reveal ordinary history start');
+const ordinaryTopBoundary = await wheel('up', 4);
+void ordinaryTopBoundary;
+const ordinaryBottom = await wheel('down', 18);
+requireText(ordinaryBottom, /目标已记录：history-wheel-11/, 'wheel must return to ordinary history end');
+const ordinaryBottomBoundary = await wheel('down', 4);
+void ordinaryBottomBoundary;
+await submitEdit('/mode test', [], /新 Run 模式：test/);
+phase = 'resize and error';
 shell.resize(100, 30);
 shell.write('/mode invalid\r');
 await waitFor(/用法：\/mode test\|repair\|chat/);
@@ -51,5 +123,12 @@ if (exit.exitCode !== 0 || !/项目与知识|别名：/.test(output) || !/用法
   console.error(`TTY_SMOKE_FAILED: exit=${exit.exitCode} output=${JSON.stringify(output.slice(-500))}`);
   process.exit(1);
 }
-console.log('TTY_SMOKE_PASSED: real node-pty ConPTY interactive help/error/resize/quit flow observed');
-process.exit(0);
+console.log('TTY_SMOKE_PASSED: real node-pty ConPTY direct help/DEL Backspace/BS Backspace/Forward Delete/middle caret/CJK/emoji/help wheel/history wheel/clamped viewport/error/resize/quit flow observed');
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+} finally {
+  clearTimeout(timer);
+  shell.kill();
+}
+process.exit(process.exitCode || 0);

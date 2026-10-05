@@ -1,12 +1,44 @@
-import React, {useEffect, useState} from 'react';
-import {Box, Text, useInput, useStdout, type BoxProps, type Key as InkKey} from 'ink';
+import React, {useEffect, useRef, useState} from 'react';
+import {Box, Text, useInput as useInkInput, useStdin, useStdout, type BoxProps} from 'ink';
 import stringWidth from 'string-width';
 import wrapAnsi from 'wrap-ansi';
 import {useDoublePress} from './useDoublePress.js';
 import {renderPlaceholder} from './renderPlaceholder.js';
+import {normalizeTerminalInput, type TerminalKey} from './terminalInput.js';
 
-export {Box, Text, useInput, stringWidth, wrapAnsi, useDoublePress, renderPlaceholder};
-export type Key = InkKey & {fn?: boolean; wheelUp?: boolean; wheelDown?: boolean};
+export {Box, Text, stringWidth, wrapAnsi, useDoublePress, renderPlaceholder};
+export type Key = TerminalKey;
+export function useInput(handler: (input: string, key: Key) => void, options: {isActive?: boolean} = {}) {
+  const {internal_eventEmitter} = useStdin();
+  const rawInput = useRef('');
+  useEffect(() => {
+    if (options.isActive === false) return;
+    const capture = (raw: string | Buffer) => {rawInput.current = String(raw);};
+    internal_eventEmitter.prependListener('input', capture);
+    return () => {internal_eventEmitter.removeListener('input', capture);};
+  }, [internal_eventEmitter, options.isActive]);
+  useInkInput((input, key) => {
+    const raw = rawInput.current || input;
+    rawInput.current = '';
+    for (const event of normalizeTerminalInput(raw, input, key)) handler(event.input, event.key);
+  }, options);
+}
+export function useTerminalMouse(enabled = true) {
+  const {stdout} = useStdout();
+  const {stdin} = useStdin();
+  useEffect(() => {
+    if (!enabled || !stdout.isTTY || !stdin.isTTY) return;
+    let restored = false;
+    const restore = () => {
+      if (restored) return;
+      restored = true;
+      stdout.write('\x1b[?1006l\x1b[?1000l');
+    };
+    stdout.write('\x1b[?1000h\x1b[?1006h');
+    process.once('exit', restore);
+    return () => {process.off('exit', restore); restore();};
+  }, [enabled, stdout, stdin]);
+}
 export type RGBColor = {r: number; g: number; b: number};
 export type RGBColorString = `rgb(${number},${number},${number})`;
 export type Theme = Record<string, string>;

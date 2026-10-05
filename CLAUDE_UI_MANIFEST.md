@@ -99,3 +99,17 @@
 - 当前 TraceFix React 版本与公开 Ink peer 不匹配，Claude 自有 Ink fork 与公开 Ink API/renderer 不同。复制前需由实现 agent 在 workspace 中固定并验证兼容依赖，或采用自有 TraceFix Ink adapter；不得静默猜版本。
 - 当前生产交互入口已接入上述复制叶子与 TraceFix adapter；非 TTY、`--command`、`--doctor` 仍使用既有确定性命令输出。旧 UI 文件的删除由主 agent 在所有指定验证通过后统一处理。当前子任务未提交 Git commit。
 - 定向验证已通过：CLI build；`frontend/apps/cli/test.mjs` 的 8 项事件/UTF-8/已构建非 TTY 测试。真实 TTY 验证由主 agent 的宿主终端执行；本子 agent 的直接 ConPTY 测试存在 `AttachConsole failed` 宿主限制，不能计为通过。
+
+## 2026-10-05 输入与滚轮接缝回归
+
+本次用户反馈确认公开 Ink 与 Claude fork 的 Backspace 解析差异：公开 `ink@6.3.1` 将 `0x7f`（以及 `ESC+0x7f`）解析为 `delete`，而 Claude 输入算法把它作为 `backspace`；行尾因此无法删除字符。修复限定在 TraceFix adapter 原始事件边界，未改 copied `useTextInput.ts` 或 `Cursor.ts`。
+
+| target | sha256 | 直接依赖/职责 |
+| --- | --- | --- |
+| `frontend/apps/cli/src/claude-ui/adapter.tsx` | `b6374a73b5c4a9b9d11ce6377431fc9231770076a53765a8af0208958a897e68` | 公开 Ink `useInput` 的 raw capture；DEL/BS/Home/End/SGR-X10 wheel 归一化；TTY mouse 1000/1006 生命周期。 |
+| `frontend/apps/cli/src/claude-ui/terminalInput.ts` | `2e67cf8630e9eb470a3c36bb7724ace4a7b672349230ab73e86278c761945976` | 纯终端输入边界模块；保留 `ESC[3~` forward delete，抑制点击/释放和非 wheel mouse，不复制 Claude fork parser。 |
+| `frontend/apps/cli/input-test.mjs` | `939341b22b748f5d8c49997a049f287364835ef8a7b4b9041baad3e058f6affa` | 4 项定向回归：DEL/Alt+DEL/BS/forward Delete、Home/End、SGR/X10 wheel、mouse/text 共块。 |
+
+`useTerminalMouse()` 只在 TTY 且 stdin/stdout 可用时写入 `1000` 与 `1006` 开关，卸载及进程 exit 恢复；未启用 move/drag reporting。`TraceFixUi` 通过 adapter 的 `wheelUp`/`wheelDown` 消费消息视口滚动，每次三行；真实 TTY smoke 由主 agent 的 `tty-smoke.mjs` 变更提供证据。
+
+该回归说明位于被仓库 `docs/*` 忽略的编排记录 `docs/agent-research-20261004/cli-input-regression-20261005.md`；若需提交，应由主 agent 使用 `git add -f` 明确纳入，避免覆盖既有用户未跟踪文档。
