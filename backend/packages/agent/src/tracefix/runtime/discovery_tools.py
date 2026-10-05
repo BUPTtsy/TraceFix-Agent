@@ -91,9 +91,12 @@ def register_discovery_tools(engine, state, context, registry, bind):
         return
 
     def skill(arguments, call_id):
+        prior = [dict(entry) for entry in state.skills_loaded]
         try:
             return engine.load_skill(state, arguments.skill)
         except (OSError, PermissionError, ValueError) as error:
+            if state.skills_loaded != prior:
+                raise
             raise ToolRejected(str(error)) from error
 
     bind('Skill', '加载当前阶段允许的 Skill 正文及声明引用并冻结为 Run 快照；'
