@@ -46,7 +46,7 @@
 
 `bed6758` 为初版接缝，`e3099ee` 完成其收紧：完整历史与 `completed_calls` 保留在内存和请求审计中，发送前按完整 payload 重新计量；组装器提前超窗时先尝试旧结果投影，序列化后的差额最多进行三次实测且单调下降的调整。只有当前 Run 原件校验通过、哈希一致、可按现有 `context.expand` 完整展开的已结算成功结果才可裁剪（最多 16000 字符、200 行）；保留最新完整工具批次，未知结构、失败和 UNKNOWN 全文不裁。投影只替换历史 browser snapshot 或成功 Bash output，原 refs、执行状态、call ID 和操作回执不变。恢复优先从未投影历史与经原件重核的引用重建，不能重执行已完成工具或绕过预算。
 
-最终七文件定向组合为 **127 passed**（112.60 秒），包含 Gateway/native tools/context/retry/streaming/native Engine 和首版六项上下文窄修回归；随后扩展的 `test_phase4_context.py` 为 **13 passed**（7.06 秒），另对生产回调原件展开检查 **1 passed**。这些批次重叠，不相加。它只修正发送历史接缝，不能把旧 `run_616fcdacb5864ce0aa21c75e3d86016f` 改写成成功；本轮按用户选择完成窄修归档，新真实 Run、有效候选补丁与原问题/逆向/刷新/正常业务效果保留待验收。
+最终七文件定向组合为 **127 passed**（112.60 秒），包含 Gateway/native tools/context/retry/streaming/native Engine 和首版六项上下文窄修回归；随后扩展的 `test_phase4_context.py` 为 **13 passed**（7.06 秒），另对生产回调原件展开检查 **1 passed**。这些批次重叠，不相加。它只修正发送历史接缝，不能把旧 `run_616fcdacb5864ce0aa21c75e3d86016f` 改写成成功；第三次真实 Run 已另开并归档，但仍因完整请求预检超窗失败，无有效候选补丁。原问题/逆向/刷新/正常业务效果、有效新 Run、held-out 隔离和四格成绩继续待验收。
 
 ### 超窗原因只读核查
 
