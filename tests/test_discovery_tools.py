@@ -95,3 +95,58 @@ def test_derived_run_does_not_inherit_planning_artifacts():
     child = derive_run(parent)
     assert child.task_board_ref is None and child.todo_list_ref is None
     assert parent.task_board_ref == '0001_任务板.json'
+
+
+@pytest.mark.asyncio
+async def test_unified_runtime_exposes_executable_tools_and_keeps_worker_scope(tmp_path, monkeypatch):
+    from tracefix.runtime.smoke import make_engine
+    from tracefix.runtime.tool_handlers import build_runtime_tools
+
+    monkeypatch.delenv('TRACEFIX_WEB_SEARCH_API_KEY', raising=False)
+    engine, state = make_engine(tmp_path / 'runtime')
+    state.phase = Phase.DIAGNOSE
+    engine.store.save(state)
+    runtime = build_runtime_tools(engine, state, None)
+    expected = {'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'TodoWrite',
+                'WebFetch', 'ToolSearch', 'Skill'}
+    assert all(runtime.registry.contains(name, state.phase) for name in expected)
+    assert not runtime.registry.contains('WebSearch')
+    assert all(spec.name in runtime.handlers for spec in runtime.registry.visible(state.phase))
+    pipeline = runtime.pipeline()
+    created = await pipeline.execute('TaskCreate', {'subject': '集成验证',
+        'description': '确认统一 runtime 已绑定处理器'}, 'create')
+    assert not created.is_error
+    assert (await pipeline.execute('TaskList', {}, 'list')).result['tasks'][0]['id'] == created.result['task']['id']
+    found = await pipeline.execute('ToolSearch', {'query': 'select:TaskCreate,WebFetch'}, 'discover')
+    assert {tool['name'] for tool in found.result['tools']} == {'TaskCreate', 'WebFetch'}
+    assert runtime.resource_resolver('TaskCreate', {}) == [f'run-tasks:{state.scope_id}:{state.run_id}']
+    worker = build_runtime_tools(engine, state, None, {'worker_depth': 1,
+        'worker_allowed_files': [], 'worker_allowed_tools': ['Read']})
+    assert not any(worker.registry.contains(name) for name in expected)
+
+
+@pytest.mark.asyncio
+async def test_skill_failure_after_loading_is_unknown_instead_of_unexecuted(tmp_path):
+    from tracefix.runtime.tools import ToolOperationUnknown
+
+    store = MemoryStore()
+    state = RunState(scope_id='scope', url='https://example.com', goal='验证', phase=Phase.DIAGNOSE)
+    store.save(state)
+
+    def load_skill(current, name):
+        current.skills_loaded.append({'name': name})
+        raise ValueError('保存快照后失败')
+
+    registry, handlers = ToolRegistry(), {}
+
+    def bind(name, description, model, handler, **options):
+        definition = build_tool(name, description, model, handler, **options)
+        registry.register(definition.spec)
+        handlers[name] = definition.handler
+
+    register_discovery_tools(SimpleNamespace(load_skill=load_skill), state, {}, registry, bind)
+    pipeline = ToolPipeline(registry, handlers, state.phase,
+                            operation=make_operation_executor(store, state))
+    with pytest.raises(ToolOperationUnknown):
+        await pipeline.execute('Skill', {'skill': 'test-plan'}, 'load')
+    assert next(iter(store.operations.values()))['status'] == 'UNKNOWN'
