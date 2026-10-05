@@ -290,11 +290,73 @@ class Gateway:
         except (TypeError, ValueError):
             return json.dumps({'result': sanitize(str(value))}, ensure_ascii=False)
 
+    @staticmethod
+    def _payload_tokens(counter, payload):
+        bounded = copy.deepcopy(payload)
+        image_count = 0
+        for message in bounded.get('messages', []):
+            content = message.get('content') if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict) or part.get('type') != 'image_url':
+                    continue
+                image_count += 1
+                part['image_url'] = {'url': '[IMAGE]'}
+        return counter.count(bounded) + image_count * 4096
+
+    @staticmethod
+    def _project_tool_message(message, metadata):
+        if not isinstance(message, dict) or message.get('role') != 'tool':
+            return False
+        reference = metadata.get('result_ref') if isinstance(metadata, dict) else None
+        content = message.get('content')
+        if not isinstance(reference, str) or not reference.strip() or not isinstance(content, str):
+            return False
+        try:
+            original = json.loads(content)
+        except (TypeError, ValueError):
+            original = {}
+        projected = {}
+        if isinstance(original, dict):
+            for key in ('isError', 'is_error', 'executed', 'error', 'business_outcome',
+                        'observation_ref', 'artifact_ref', 'result_ref', 'truncated'):
+                if key in original:
+                    projected[key] = original[key]
+        projected.update({
+            'projection': 'artifact_ref',
+            'artifact_ref': reference,
+            'artifact_channel': 'tool_content',
+            'content_hash': digest(content),
+            'content_length': len(content),
+            'expand_hint': 'context.expand',
+        })
+        message['content'] = json.dumps(projected, ensure_ascii=False, separators=(',', ':'))
+        return True
+
+    @classmethod
+    def _fit_tool_history(cls, payload, tool_result_refs, counter, available):
+        projected = []
+        candidate_indexes = [index for index, message in enumerate(payload.get('messages', []))
+                             if isinstance(message, dict) and message.get('role') == 'tool'
+                             and message.get('tool_call_id') in tool_result_refs]
+        candidate_indexes.sort()
+        for index in candidate_indexes:
+            message = payload['messages'][index]
+            call_id = message.get('tool_call_id')
+            if not cls._project_tool_message(message, tool_result_refs[call_id]):
+                continue
+            projected.append(call_id)
+            if cls._payload_tokens(counter, payload) <= available:
+                return projected
+        return projected if cls._payload_tokens(counter, payload) <= available else []
+
     async def generate(self, schema, context, image=None, agent_instructions=None,
                        on_attempt=None, on_response=None, on_error=None, on_usage=None,
                        validate_output=None, tool_executor=None, messages=None, on_tool_result=None,
                        context_provider=None, on_delta=None, tool_registry=None, tool_pipeline=None,
-                       context_assembler=None, on_context=None, preserve_resumed_request=False):
+                       context_assembler=None, on_context=None, preserve_resumed_request=False,
+                       tool_result_refs=None):
         # 重试和工具轮次共享消息历史；on_response 将每次响应交给运行时持久化。
         if not self.key:
             raise ModelError('未配置 TRACEFIX_API_KEY', status='FAILED', category='configuration',
@@ -367,12 +429,15 @@ class Gateway:
                                                     wire_names=True)
         except (ValueError, TypeError) as exc:
             raise ModelOutputError('工具历史无效：' + str(exc), category='tool_protocol') from exc
+        full_messages = copy.deepcopy(payload['messages'])
+        tool_result_refs = copy.deepcopy(tool_result_refs or {})
         tool_rounds = sum(message.get('role') == 'assistant' and bool(message.get('tool_calls'))
-                          for message in payload['messages'])
+                          for message in full_messages)
         resumed_tool_round = tool_rounds
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
             while attempt < self.max_attempts:
                 attempt += 1
+                payload['messages'] = copy.deepcopy(full_messages)
                 # 每次请求重新组装上下文；配置 provider 时同步最新引导、观测和记忆。
                 if (context_provider or messages is not None or context_assembler is not None) and not (preserve_resumed_request and messages is not None and tool_rounds == resumed_tool_round):
                     current_context = context_provider() if context_provider else context
@@ -430,12 +495,43 @@ class Gateway:
                         required_tokens = context_assembler.counter.count(bounded_payload) + image_count * 4096
                         manifest = {**assembly.manifest, 'request_tokens': required_tokens,
                                     'protocol_tokens': extra_tokens, 'image_tokens_reserved': image_count * 4096}
+                        projection = []
+                        if required_tokens > context_assembler.available:
+                            projection = self._fit_tool_history(payload, tool_result_refs,
+                                                                context_assembler.counter,
+                                                                context_assembler.available)
+                            required_tokens = self._payload_tokens(context_assembler.counter, payload)
+                            if projection:
+                                manifest['tool_history_projection'] = {
+                                    'call_ids': projection,
+                                    'coverage': 'artifact_ref',
+                                    'unprojected_call_ids': [call_id for call_id in tool_result_refs
+                                                             if call_id not in projection],
+                                }
+                                manifest['request_tokens'] = required_tokens
+                                manifest['tool_history_projected'] = True
                         if on_context:
-                            on_context(manifest, assembly.compacted)
+                            on_context(manifest, assembly.compacted or bool(projection if required_tokens <= context_assembler.available else []))
                         if required_tokens > context_assembler.available:
                             from tracefix.knowledge.assembler import ContextWindowError
                             raise ContextWindowError(required_tokens, context_assembler.available,
                                                      ['system', 'schema', 'tools', 'tool_history'])
+                elif context_assembler is not None:
+                    required_tokens = self._payload_tokens(context_assembler.counter, payload)
+                    projection = []
+                    if required_tokens > context_assembler.available:
+                        projection = self._fit_tool_history(payload, tool_result_refs,
+                                                            context_assembler.counter,
+                                                            context_assembler.available)
+                        required_tokens = self._payload_tokens(context_assembler.counter, payload)
+                    if on_context and projection:
+                        on_context({'request_tokens': required_tokens,
+                                    'tool_history_projection': {'call_ids': projection,
+                                        'coverage': 'artifact_ref'}}, True)
+                    if required_tokens > context_assembler.available:
+                        from tracefix.knowledge.assembler import ContextWindowError
+                        raise ContextWindowError(required_tokens, context_assembler.available,
+                                                 ['system', 'schema', 'tools', 'tool_history'])
                 can_retry = attempt < self.max_attempts
                 retry_delay = min(self.max_retry_delay, 2 ** min(attempt - 1, 30)) if can_retry else None
                 request_record = {'url': self.base_url + '/chat/completions',
@@ -443,6 +539,9 @@ class Gateway:
                                   'json': copy.deepcopy(payload),
                                   'logical_exchange_id': logical_exchange_id,
                                   'attempt': attempt, 'tool_round': tool_rounds}
+                if payload['messages'] != full_messages:
+                    request_record['unprojected_messages'] = copy.deepcopy(full_messages)
+                    request_record['tool_result_refs'] = copy.deepcopy(tool_result_refs)
                 exchange = None
                 if on_attempt:
                     exchange = on_attempt(model, request_record, attempt)
@@ -614,7 +713,7 @@ class Gateway:
                         raise ModelOutputError('模型工具协议校验失败：' + error['message'],
                                                category='tool_protocol', details=error) from exc
                     assistant_message = self.adapter.assistant_message(message, tool_calls=True)
-                    payload['messages'].append(assistant_message)
+                    full_messages.append(assistant_message)
                     batch_results = [None] * len(calls)
                     batch_images = {}
 
@@ -685,17 +784,21 @@ class Gateway:
                         result_content, reused = batch_results[index]
                         tool_message = {'role': 'tool', 'tool_call_id': call_id,
                                         'name': name, 'content': result_content}
-                        payload['messages'].append(tool_message)
+                        full_messages.append(tool_message)
                         if on_tool_result:
-                            on_tool_result(exchange, {'logical_exchange_id': logical_exchange_id,
+                            callback_result = on_tool_result(exchange, {'logical_exchange_id': logical_exchange_id,
                                 'tool_round': tool_rounds, 'attempt': attempt,
                                 'message': copy.deepcopy(tool_message), 'reused': reused})
+                            if isinstance(callback_result, str):
+                                tool_result_refs[call_id] = {'result_ref': callback_result}
+                            elif isinstance(callback_result, dict) and callback_result.get('result_ref'):
+                                tool_result_refs[call_id] = callback_result
                     for images in batch_images.values():
                         if self.vision_model:
                             payload['model'] = self.vision_model
-                            payload['messages'].append({'role': 'user', 'content': images})
+                            full_messages.append({'role': 'user', 'content': images})
                         else:
-                            payload['messages'].append({'role': 'user', 'content':
+                            full_messages.append({'role': 'user', 'content':
                                 'Read 返回了图片，但当前未配置 vision_model，无法分析图像内容。'})
                     if context.get('execution_mode') == 'batch':
                         for index, call in enumerate(validated_tools):
@@ -785,8 +888,8 @@ class Gateway:
                                                category='output_validation', details=error) from e
                     if isinstance(message, dict) and isinstance(message.get('content'), str):
                         rejected_message = self.adapter.assistant_message(message)
-                        payload['messages'].append(rejected_message)
-                    payload['messages'].append({'role': 'user', 'content':
+                        full_messages.append(rejected_message)
+                    full_messages.append({'role': 'user', 'content':
                         '上一次最终 JSON 未通过校验，其中的动作未被执行。已有工具结果仍然有效，不得重复执行。'
                         '请依据原始目标、最新工具结果、页面观测和 schema 重新输出完整 JSON。'
                         '不得改变目标或放宽断言来消除错误。具体校验错误：'+detail})

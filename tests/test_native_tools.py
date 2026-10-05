@@ -1,10 +1,12 @@
 import copy
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
+from tracefix.knowledge.assembler import ContextAssembler
 from tracefix.runtime.contracts import BrowserAction, Decision, PatchProposal
 
 
@@ -89,6 +91,35 @@ async def test_native_multiple_rounds_use_new_observation_and_deduplicate_ids(mo
     assert executed == ['call-1', 'click-1']
     assert [record['reused'] for record in records] == [False, False, True]
     assert requests[-1]['messages'][-1]['content'] == requests[-2]['messages'][-1]['content']
+
+
+async def test_tool_history_projection_preserves_full_result_for_reuse(monkeypatch):
+    requests = mock_completions(monkeypatch, [completion([tool_call()]), completion()])
+    executed, refs = [], []
+
+    async def execute(name, arguments, call_id):
+        executed.append(call_id)
+        return {'executed': True, 'observation': 'x' * 100000}
+
+    def on_tool_result(exchange, record):
+        refs.append(record['message']['tool_call_id'])
+        return {'result_ref': '0001_tool_result.json'}
+
+    assembler = ContextAssembler(context_window=60000, output_tokens=1000, overhead_tokens=1000)
+    assembler.available = 30000
+    assembler.assemble = lambda context, extra_tokens=0: SimpleNamespace(
+        context=context, manifest={'tokens_after': 0}, compacted=False)
+    await Gateway(key='ci').generate(BrowserAction, {}, tool_executor=execute,
+        on_tool_result=on_tool_result,
+        context_assembler=assembler)
+    assert executed == ['call-1']
+    assert refs == ['call-1']
+    assistant, tool = requests[1]['messages'][-2:]
+    assert assistant['tool_calls'] == [tool_call()]
+    projected = json.loads(tool['content'])
+    assert projected['projection'] == 'artifact_ref'
+    assert projected['artifact_ref'] == '0001_tool_result.json'
+    assert projected['content_length'] > 100000
 
 
 @pytest.mark.parametrize('bad_call', [

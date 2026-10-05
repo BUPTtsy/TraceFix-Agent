@@ -1072,7 +1072,13 @@ class Engine:
             self.event(s, 'model.usage', {'usage': u, 'cost_is_configured_estimate': False})
 
         def tool_result(exchange, raw):
-            record = {**(exchange or {}), 'tool_result': raw}
+            message = raw['message']
+            record = {**(exchange or {}), 'tool_result': raw,
+                      'tool_content': message.get('content'), 'scope_id': s.scope_id,
+                      'run_id': s.run_id, 'source_manifest': s.source_manifest,
+                      'patch_hash': s.patch_hash, 'page_generation': getattr(s, 'page_generation', None),
+                      'environment_digest': s.environment_digest,
+                      'test_spec_hash': s.test_spec_hash}
             result_ref = self.put(s, record, name=f'模型调用{logical_call:03d}_工具结果')
             s.model_exchange_refs.append(result_ref)
             self.store.save(s)
@@ -1080,6 +1086,7 @@ class Engine:
                 'result_ref': result_ref, 'tool_call_id': raw['message']['tool_call_id'],
                 'logical_exchange_id': raw['logical_exchange_id'], 'tool_round': raw['tool_round'],
                 'reused': raw['reused']})
+            return {'result_ref': result_ref}
 
         validation = {'validate_output': validate_output} if (original_validation or ctx['guidance_ack_required'] or
             (self.rule_resolver and getattr(selected_model, 'supports_tool_executor', False))) else {}
@@ -1103,10 +1110,11 @@ class Engine:
                     if (audit.get('schema') != schema.__name__
                             or request.get('logical_exchange_id') != failed_exchange_id):
                         continue
-                    history = request.get('json', {}).get('messages', [])
+                    history = request.get('unprojected_messages') or request.get('json', {}).get('messages', [])
                     if history:
                         validation['messages'] = history
                         validation['preserve_resumed_request'] = True
+                        validation['tool_result_refs'] = request.get('tool_result_refs', {})
                         for message in history:
                             if message.get('role') != 'user':
                                 continue
