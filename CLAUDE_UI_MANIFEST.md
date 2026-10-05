@@ -113,3 +113,15 @@
 `useTerminalMouse()` 只在 TTY 且 stdin/stdout 可用时写入 `1000` 与 `1006` 开关，卸载及进程 exit 恢复；未启用 move/drag reporting。`TraceFixUi` 通过 adapter 的 `wheelUp`/`wheelDown` 消费消息视口滚动，每次三行；真实 TTY smoke 由主 agent 的 `tty-smoke.mjs` 变更提供证据。
 
 该回归说明位于被仓库 `docs/*` 忽略的编排记录 `docs/agent-research-20261004/cli-input-regression-20261005.md`；若需提交，应由主 agent 使用 `git add -f` 明确纳入，避免覆盖既有用户未跟踪文档。
+
+## 2026-10-05 默认输出投影与选择复制回归
+
+本次从 `09e1e27` 继续修复用户反馈；未新增 Claude 复制文件或 npm 依赖。`toolProjection.ts` 是 TraceFix event/UI 边界的纯展示 adapter，依据真实 `logical_exchange_id`、`tool_round`、call/operation identity 与执行回执形成默认单行工具计数，不迁移主循环。内部 model 落盘事件与工具详细 ref/hash 保留在 `Ctrl+O` 公开详情。
+
+`presentation.ts` 保持 `appendUiMessage`、`messageLines` 等公开接口，并新增 `selectUiMessages`；`TraceFixUi.tsx` 消费投影供整个消息视口浏览。默认 tool summary 不输出工具参数或每个工具的“调用完成”。UNKNOWN、pending、明确拒绝、业务断言、审批与终态使用各自真实公开状态，工具 transport 成功不因业务断言未通过而反改。
+
+选择与鼠标输入改动限定于 TraceFix `adapter.tsx`、`terminalInput.ts` 和 UI 组合层；Claude 复制叶子的内容 hash 不变。`Ctrl+S` 进入选择模式，冻结消息/状态并关闭 1000/1006 鼠标报告，退出时回放期间缓存事件；本会话未实测真实 OS 拖拽或系统剪贴板。具体根因、strict alias 绑定、unbound operation ledger 与新回归证据记录在 `docs/agent-research-20261004/cli-output-selection-followup-20261005.md`。
+
+最终工作树 hash：`toolProjection.ts` `30544efc43268b040f4082a8dde47f0042118e9decc13e431854ce99f36b6b6f`；`presentation.ts` `bcc8c44c7f71d157f283ffab73690b4ae15f482ca0d2518311a58852f6604754`；`TraceFixUi.tsx` `6e3236dfddf7b24fcfde346cab29ea96de86ce9c520b278708e891fc4e5a185d`；稳定 `adapter.tsx` `01a550c04d7fabacf9d9315ed2eeebe33ce779ae5e5aa5bc2b7ebf1a2c0c6906`。本轮 build、输入/展示定向测试、CLI 事件/非 TTY 与 TTY smoke 已通过；production fixture 的默认输出/选择缓存/工具汇总/审批恢复/取消/门禁/终态均可达，但终态 `Ctrl+O` 在 ConPTY 中不稳定，不能报告完整 fixture PASS。
+
+共享 checkout 当前 `HEAD=3a9db06a0e9786968af0b6a39c3f2e11191ba69f`，其中包含其他会话的后端工具提交；本轮不将其纳入 CLI 输出/选择复制交付，最终提交应使用显式路径，只暂存本次 CLI、manifest 与强制纳入的回归记录。

@@ -1,7 +1,9 @@
 import wrapAnsi from 'wrap-ansi';
 import type {PublicRecord, TraceFixEvent, TraceFixMessage} from '../tracefix-events.js';
+import {detailOnly} from './toolProjection.js';
+export {selectUiMessages} from './toolProjection.js';
 
-export interface UiMessage extends TraceFixMessage {publicEvents?: TraceFixEvent[]}
+export interface UiMessage extends TraceFixMessage {publicEvents?: TraceFixEvent[]; compact?: boolean}
 
 const LABELS: Record<string, string> = {
   RUNNING: '正在执行', WAITING_INPUT: '等待输入', WAITING_APPROVAL: '等待审批', WAITING_NETWORK: '等待网络恢复',
@@ -24,11 +26,11 @@ function text(value: unknown): string {return typeof value === 'string' || typeo
 function label(value: unknown, code = false): string {const raw = text(value); return LABELS[raw.toUpperCase()] ? LABELS[raw.toUpperCase()] + (code ? `（${raw}）` : '') : raw;}
 function payload(message: TraceFixMessage): PublicRecord {return message.event?.payload || {};}
 function runIdentity(message: TraceFixMessage): string | null {const event = message.event; return event?.run_id ? `${event.scope_id || ''}:${event.run_id}` : null;}
-function toolIdentity(message: TraceFixMessage): string | null {const value = payload(message); const id = text(value.operation_id || value.tool_call_id); const run = runIdentity(message); return run && id ? `${run}:${id}` : null;}
 function status(message: TraceFixMessage): string {const value = payload(message); return text(value.status || value.run_status).toUpperCase();}
 function events(message: UiMessage): TraceFixEvent[] {return message.publicEvents || (message.event ? [message.event] : []);}
 
 export function appendUiMessage(messages: UiMessage[], next: UiMessage): UiMessage[] {
+  if (messages.some(message => message.id === next.id && runIdentity(message) === runIdentity(next))) return messages;
   const type = next.event?.type || '';
   const run = runIdentity(next);
   let index = -1;
@@ -36,8 +38,6 @@ export function appendUiMessage(messages: UiMessage[], next: UiMessage): UiMessa
     const latest = messages.findLastIndex(message => runIdentity(message) === run && (message.event?.type === 'state.changed' || message.event?.type === 'run.finished'));
     if (latest >= 0 && messages[latest].event?.type === 'state.changed' && status(messages[latest]) === status(next) && messages[latest].event?.phase === next.event?.phase) index = latest;
   }
-  const tool = toolIdentity(next);
-  if (type.startsWith('tool.') && tool) index = messages.findLastIndex(message => message.event?.type?.startsWith('tool.') && toolIdentity(message) === tool);
   if (index < 0) return [...messages, next];
   const previous = messages[index];
   const previousPayload = payload(previous);
@@ -88,6 +88,7 @@ export function messageText(message: TraceFixMessage): string {
   if (type === 'context.assembled' || type === 'context.compacted') return type === 'context.compacted' ? '上下文已压缩' : '上下文已组装';
   if (type.includes('feedback')) return `公开验证反馈${text(value.feedback_class || value.message) ? ` · ${text(value.feedback_class || value.message)}` : ''}`;
   if (type === 'run.error') return `运行错误：${text(value.error || value.message) || '请展开详情'}`;
+  if (type === 'model.error.persisted') {const details = record(value.details); const issue = text(details.message || details.type) || label(value.category); return `模型请求遇到问题${issue ? `：${issue}` : ''}${text(value.status || details.status) ? ` · ${label(value.status || details.status)}` : ''}`;}
   if (type === 'run.cancelled') return `运行已取消${text(value.message) ? ` · ${text(value.message)}` : ''}`;
   if (text(value.message)) return text(value.message);
   if (type.includes('observation')) return '已记录页面观察';
@@ -130,6 +131,8 @@ export function metadataLines(message: TraceFixMessage): string[] {
 }
 
 export function messageLines(message: UiMessage, width: number, expanded: boolean): string[] {
+  if (!expanded && detailOnly(message)) return [];
+  if (message.compact && !expanded) return wrapAnsi(message.text, Math.max(1, width), {hard: true, trim: false}).split('\n');
   const lines = [messageText(message), ...metadataLines(message).map(line => '  ' + line)];
   if (expanded) for (const event of events(message)) {
     lines.push(`公开事件：${event.type}`);

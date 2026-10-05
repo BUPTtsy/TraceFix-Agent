@@ -3,6 +3,9 @@ import {PassThrough, Writable} from 'node:stream';
 import {DatabaseSync} from 'node:sqlite';
 import childProcess from 'node:child_process';
 import {syncBuiltinESMExports} from 'node:module';
+import fs from 'node:fs';
+
+let fixtureRunCount = 0;
 
 class FixtureChild extends EventEmitter {
   constructor(args) {
@@ -12,6 +15,16 @@ class FixtureChild extends EventEmitter {
     this.projectId = String(args[args.indexOf('--project') + 1] || 'bugboard');
     this.databasePath = String(args[args.indexOf('--console-db') + 1]);
     this.goal = args.includes('--goal') ? String(args[args.indexOf('--goal') + 1]) : '';
+    this.signalFile = process.env.TRACEFIX_CLI_FIXTURE_SIGNAL || '';
+    this.selectionDelivered = false;
+    fixtureRunCount += 1;
+    this.agentRunId = `fixture-agent-run-${fixtureRunCount}`;
+    this.signalTimer = setInterval(() => {
+      if (!this.started || this.closed || this.selectionDelivered || !this.signalFile || !fs.existsSync(this.signalFile)) return;
+      if (fs.readFileSync(this.signalFile, 'utf8') !== 'selection') return;
+      this.selectionDelivered = true;
+      this.event('observation', {message: 'fixture event received while selecting', observation_ref: 'fixture-selection-observation'});
+    }, 40);
     this.stdout = new PassThrough();
     this.stderr = new PassThrough();
     this.stdin = new Writable({
@@ -59,7 +72,7 @@ class FixtureChild extends EventEmitter {
       ).get(state.id);
       const seq = Number(row.seq);
       const event = {
-        run_id: 'fixture-agent-run',
+        run_id: this.agentRunId,
         scope_id: this.projectId,
         seq,
         agentSeq: seq,
@@ -74,7 +87,7 @@ class FixtureChild extends EventEmitter {
     } finally {
       state.database.close();
     }
-    if (status) this.updateRecord(status, {agentRunId: 'fixture-agent-run'});
+    if (status) this.updateRecord(status, {agentRunId: this.agentRunId});
   }
 
   stdoutText(text) {
@@ -85,7 +98,7 @@ class FixtureChild extends EventEmitter {
   begin() {
     if (this.started || this.closed) return;
     this.started = true;
-    this.updateRecord('running', {agentRunId: 'fixture-agent-run', pid: process.pid});
+    this.updateRecord('running', {agentRunId: this.agentRunId, pid: process.pid});
     this.event('run.started', {status: 'RUNNING', message: 'fixture run started'});
     this.stdoutText('fixture stdout：运行开始\n');
     for (let index = 0; index < 36; index++) this.event('observation', {message: `fixture history-${String(index).padStart(2, '0')}`});
@@ -93,22 +106,33 @@ class FixtureChild extends EventEmitter {
       if (this.closed) return;
       this.event('state.changed', {status: 'RUNNING', phase: 'RUNNING'});
       this.event('state.changed', {status: 'RUNNING', phase: 'RUNNING'});
-      this.event('tool.started', {tool_name: 'fixture-event-only-tool', tool_call_id: 'fixture-call'});
-      this.event('tool.completed', {tool_name: 'fixture-event-only-tool', tool_call_id: 'fixture-call', observation_ref: 'fixture-event-only-observation'});
-      this.event('tool.error', {error: 'fixture tool failed', error_code: 'UNKNOWN', operation_status: 'UNKNOWN'});
-      this.stdoutText('fixture tool.error UNKNOWN\n');
+      const exchange = {logical_exchange_id: 'fixture-exchange-1', logical_call: 1, tool_round: 0, attempt: 1, model: 'fixture-model'};
+      this.event('model.started', exchange);
+      this.event('model.request.persisted', {...exchange, request_ref: 'fixture-request-1'});
+      this.event('model.reasoning.persisted', {...exchange, reasoning_ref: 'fixture-reasoning-1'});
+      this.event('model.response.persisted', {...exchange, response_ref: 'fixture-response-1'});
+      this.event('model.usage', {usage: {total_tokens: 22}});
+      this.event('tool.started', {tool_call_id: 'fixture-call', intent: {tool_name: 'fixture-event-only-tool', arguments: {path: 'fixture-file.ts'}}});
+      this.event('tool.completed', {tool_call_id: 'fixture-call', receipt: {call_id: 'fixture-call', name: 'fixture-event-only-tool', isError: false, observation_ref: 'fixture-event-only-observation'}});
+      this.event('tool.started', {tool_call_id: 'fixture-failed-call', intent: {tool_name: 'fixture-failing-tool'}});
+      this.event('tool.error', {tool_call_id: 'fixture-failed-call', receipt: {call_id: 'fixture-failed-call', name: 'fixture-failing-tool', isError: true, error: {message: 'fixture execution failed', executed: false}}});
+      this.event('tool.requested', {tool_call_id: 'fixture-unknown-call', intent: {tool_name: 'fixture-external-tool'}});
+      this.event('tool.started', {operation_id: 'fixture-operation', intent: {tool_name: 'fixture-external-tool'}});
+      this.event('tool.unknown', {operation_id: 'fixture-operation', reason: 'fixture acknowledgement unknown', resources: [{path: 'fixture-file.ts'}]});
+      this.event('model.error.persisted', {error_ref: 'fixture-unknown-error', category: 'tool', details: {status: 'UNKNOWN_OPERATION', tool_call_id: 'fixture-unknown-call', operation_id: 'fixture-operation', message: 'fixture acknowledgement unknown'}});
+      for (const tool_call_id of ['fixture-call', 'fixture-failed-call', 'fixture-unknown-call']) {
+        this.event('model.tool.result.persisted', {logical_exchange_id: 'fixture-exchange-1', tool_round: 1, tool_call_id, result_ref: `fixture-result-${tool_call_id}`, reused: false});
+      }
     }, 120);
     setTimeout(() => {
       if (this.closed) return;
       this.event('approval.requested', {approval_ref: 'fixture-approval', patch_hash: 'fixture-patch', status: 'WAITING_APPROVAL'});
-      this.updateRecord('waiting_approval', {agentRunId: 'fixture-agent-run'});
-      this.stdoutText('fixture WAITING_APPROVAL fixture-approval\n');
+      this.updateRecord('waiting_approval', {agentRunId: this.agentRunId});
     }, 260);
     setTimeout(() => {
       if (this.closed) return;
       this.event('run.continued', {continuation_ref: 'fixture-continuation', status: 'RUNNING'});
-      this.updateRecord('running', {agentRunId: 'fixture-agent-run'});
-      this.stdoutText('fixture resume continuation\n');
+      this.updateRecord('running', {agentRunId: this.agentRunId});
     }, 420);
     if (this.goal === 'fixture finish goal') setTimeout(() => {
       if (this.closed) return;
@@ -136,6 +160,7 @@ class FixtureChild extends EventEmitter {
   close(code = 0) {
     if (this.closed) return;
     this.closed = true;
+    clearInterval(this.signalTimer);
     this.stdin.destroy();
     this.stdout.end();
     this.stderr.end();

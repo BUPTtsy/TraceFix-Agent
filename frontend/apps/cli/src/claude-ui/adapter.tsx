@@ -1,4 +1,4 @@
-import React, {useEffect, useRef, useState} from 'react';
+import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {Box, Text, useInput as useInkInput, useStdin, useStdout, type BoxProps} from 'ink';
 import stringWidth from 'string-width';
 import wrapAnsi from 'wrap-ansi';
@@ -11,17 +11,20 @@ export type Key = TerminalKey;
 export function useInput(handler: (input: string, key: Key) => void, options: {isActive?: boolean} = {}) {
   const {internal_eventEmitter} = useStdin();
   const rawInput = useRef('');
+  const handlerRef = useRef(handler);
+  handlerRef.current = handler;
   useEffect(() => {
     if (options.isActive === false) return;
     const capture = (raw: string | Buffer) => {rawInput.current = String(raw);};
     internal_eventEmitter.prependListener('input', capture);
     return () => {internal_eventEmitter.removeListener('input', capture);};
   }, [internal_eventEmitter, options.isActive]);
-  useInkInput((input, key) => {
+  const handleInput = useCallback((input: string, key: Key) => {
     const raw = rawInput.current || input;
     rawInput.current = '';
-    for (const event of normalizeTerminalInput(raw, input, key)) handler(event.input, event.key);
-  }, options);
+    for (const event of normalizeTerminalInput(raw, input, key)) handlerRef.current(event.input, event.key);
+  }, []);
+  useInkInput(handleInput, options);
 }
 export function useTerminalMouse(enabled = true) {
   const {stdout} = useStdout();
@@ -76,13 +79,15 @@ export const HighlightedInput = ({text}: {text: string; highlights?: TextHighlig
 export function usePasteHandler({onInput}: {onInput: (input: string, key: Key) => void; onPaste?: unknown; onImagePaste?: unknown}) {
   return {wrappedOnInput: onInput, isPasting: false};
 }
-export function useWindowSize() {
+export function useWindowSize(enabled = true) {
   const {stdout} = useStdout();
   const [size, setSize] = useState(() => ({columns: Math.max(20, stdout.columns || 80), rows: Math.max(8, stdout.rows || 24)}));
   useEffect(() => {
+    if (!enabled) return;
     const resize = () => setSize({columns: Math.max(20, stdout.columns || 80), rows: Math.max(8, stdout.rows || 24)});
+    resize();
     stdout.on('resize', resize);
     return () => {stdout.off('resize', resize);};
-  }, [stdout]);
+  }, [enabled, stdout]);
   return size;
 }

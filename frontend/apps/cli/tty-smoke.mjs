@@ -40,6 +40,11 @@ const waitFor = async (pattern, start = 0) => {
   await Promise.race([new Promise(resolve => waiters.push(resolve)), timeout]);
   return waitFor(pattern, start);
 };
+const waitForRaw = async (pattern, start = 0) => {
+  if (pattern.test(output.slice(start))) return;
+  await Promise.race([new Promise(resolve => waiters.push(resolve)), timeout]);
+  return waitForRaw(pattern, start);
+};
 const writeKey = async (value) => {
   shell.write(value);
   await new Promise(resolve => setTimeout(resolve, 80));
@@ -76,6 +81,24 @@ const submitEdit = async (value, keys, expected) => {
 };
 try {
 await waitFor(/❯/);
+await waitForRaw(/\x1b\[\?1000h\x1b\[\?1006h/);
+phase = 'selection mode disables mouse and freezes frame';
+const selectionStart = output.length;
+await writeKey('\x13');
+await waitFor(/选择模式：拖拽选中/, selectionStart);
+await waitForRaw(/\x1b\[\?1006l\x1b\[\?1000l/, selectionStart);
+requireText(output.slice(selectionStart), /\x1b\[\?1006l\x1b\[\?1000l/, 'selection mode must release native terminal mouse tracking');
+await new Promise(resolve => setTimeout(resolve, 250));
+const frozenStart = output.length;
+await writeKey('should-not-edit');
+await writeKey('\x03');
+await new Promise(resolve => setTimeout(resolve, 300));
+if (output.length !== frozenStart) throw new Error(`TTY_SMOKE_FAILED: selection mode redrew after input, output=${JSON.stringify(output.slice(frozenStart))}`);
+const liveStart = output.length;
+await writeKey('\x13');
+await waitForRaw(/\x1b\[\?1000h\x1b\[\?1006h/, liveStart);
+requireText(output.slice(liveStart), /\x1b\[\?1000h\x1b\[\?1006h/, 'leaving selection mode must restore global wheel tracking');
+if (/should-not-edit/.test(stripAnsi(output.slice(liveStart)))) throw new Error('TTY_SMOKE_FAILED: selection-mode keyboard text leaked into input');
 phase = 'help direct body and wheel';
 const helpStart = output.length;
 shell.write('/help\r');
@@ -84,15 +107,16 @@ if (/cli\.output:/.test(stripAnsi(output.slice(helpStart)))) throw new Error('TT
 const helpTop = await wheel('up', 25);
 requireText(helpTop, /会话|显示分组命令帮助/, 'help wheel must reveal first help rows');
 const helpTopBoundary = await wheel('up', 4);
-void helpTopBoundary;
+if (helpTopBoundary.trim()) throw new Error(`TTY_SMOKE_FAILED: help top boundary moved, output=${JSON.stringify(helpTopBoundary.slice(-500))}`);
 const helpBottom = await wheel('down', 25);
 requireText(helpBottom, /别名：/, 'help wheel must return to last help rows');
 const helpBottomBoundary = await wheel('down', 4);
-void helpBottomBoundary;
+if (helpBottomBoundary.trim()) throw new Error(`TTY_SMOKE_FAILED: help bottom boundary moved, output=${JSON.stringify(helpBottomBoundary.slice(-500))}`);
 await submitEdit('/mode chatx', ['\x7f'], /新 Run 模式：chat/);
 await submitEdit('/mode repairx', ['\b'], /新 Run 模式：repair/);
 await submitEdit('/mode teXst', ['\x1b[D', '\x1b[D', '\x1b[D', '\x1b[3~'], /新 Run 模式：test/);
 await submitEdit('/mode chXat', ['\x1b[D', '\x1b[D', '\x7f'], /新 Run 模式：chat/);
+await writeKey('x');
 await writeKey('\x03');
 await submitEdit('回归中文中', ['\x7f'], /目标已记录：回归中文/);
 await submitEdit('回归 emoji👩‍💻', ['\x7f'], /目标已记录：回归 emoji/);
@@ -106,11 +130,11 @@ for (let index = 0; index < 12; index++) {
 const ordinaryTop = await wheel('up', 18);
 requireText(ordinaryTop, /目标已记录：history-wheel-00/, 'wheel must reveal ordinary history start');
 const ordinaryTopBoundary = await wheel('up', 4);
-void ordinaryTopBoundary;
+if (ordinaryTopBoundary.trim()) throw new Error(`TTY_SMOKE_FAILED: ordinary top boundary moved, output=${JSON.stringify(ordinaryTopBoundary.slice(-500))}`);
 const ordinaryBottom = await wheel('down', 18);
 requireText(ordinaryBottom, /目标已记录：history-wheel-11/, 'wheel must return to ordinary history end');
 const ordinaryBottomBoundary = await wheel('down', 4);
-void ordinaryBottomBoundary;
+if (ordinaryBottomBoundary.trim()) throw new Error(`TTY_SMOKE_FAILED: ordinary bottom boundary moved, output=${JSON.stringify(ordinaryBottomBoundary.slice(-500))}`);
 await submitEdit('/mode test', [], /新 Run 模式：test/);
 phase = 'resize and error';
 shell.resize(100, 30);
@@ -123,7 +147,7 @@ if (exit.exitCode !== 0 || !/项目与知识|别名：/.test(output) || !/用法
   console.error(`TTY_SMOKE_FAILED: exit=${exit.exitCode} output=${JSON.stringify(output.slice(-500))}`);
   process.exit(1);
 }
-console.log('TTY_SMOKE_PASSED: real node-pty ConPTY direct help/DEL Backspace/BS Backspace/Forward Delete/middle caret/CJK/emoji/help wheel/history wheel/clamped viewport/error/resize/quit flow observed');
+console.log('TTY_SMOKE_PASSED: real node-pty ConPTY selection mouse release/frame freeze/mouse restore/direct help/DEL Backspace/BS Backspace/Forward Delete/middle caret/CJK/emoji/help wheel/history wheel/clamped viewport/error/resize/quit observed; native OS drag and clipboard not exercised');
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   process.exitCode = 1;
