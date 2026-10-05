@@ -28,6 +28,21 @@ const assertCounts = (item, expected) => {
   }
 };
 
+test('对话正文增量更新同一条消息，结束与失败保留已输出正文', () => {
+  const chat = (type, payload) => ({id: 'chat:a', kind: type === 'chat.error' ? 'error' : 'event', text: '', metadata: {}, event: {type, scope_id: 'scope', run_id: 'chat:session:a', payload}});
+  let rows = appendUiMessage([], chat('chat.started', {}));
+  rows = appendUiMessage(rows, chat('chat.delta', {delta: '第一'}));
+  rows = appendUiMessage(rows, chat('chat.delta', {delta: '段中文'}));
+  assert.equal(rows.length, 1);
+  assert.equal(messageText(rows[0]), '第一段中文');
+  rows = appendUiMessage(rows, chat('chat.finished', {content: '第一段中文完整'}));
+  assert.equal(rows.length, 1);
+  assert.equal(messageText(rows[0]), '第一段中文完整');
+  rows = appendUiMessage(rows, chat('chat.error', {message: '连接断开'}));
+  assert.equal(rows.length, 1);
+  assert.match(messageText(rows[0]), /第一段中文完整\n对话失败：连接断开/);
+});
+
 test('状态重复合并且终态、门禁、context 和公开引用仍可读', () => {
   const running = message(1, 'state.changed', {status: 'RUNNING'});
   const duplicate = message(2, 'state.changed', {status: 'RUNNING'});

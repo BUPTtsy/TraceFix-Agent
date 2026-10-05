@@ -175,11 +175,11 @@ chmod +x tools/bootstrap/start.sh
 CLI 完整启动会安装锁定依赖和 Python 发行包，启动 PostgreSQL，构建 BugBoard 与 MCP 浏览器镜像，初始化 B01 缺陷工作区，构建 TypeScript CLI 后进入终端。已有演示工作区会被保留。使用网页操作时选择上方 `start-web.cmd` 入口。
 密钥从本地 `.env` 或环境变量加载。
 
-在终端输入：
+TypeScript CLI 默认进入新的 Chat 会话，直接输入消息即可流式对话，无需记录目标或先执行 `/run`。模型可以使用当前项目的 `Read`、`Grep`、`Glob` 与 `DocumentSearch` 只读工具辅助回答。测试或修复任务请显式切换模式后输入目标：
 
 ```text
+/mode repair
 把 Write project brief 标记为完成，重新加载页面，检查完成状态是否保留，失败则修复。
-/run
 ```
 
 成功到达 REVIEW 后，使用 `/diff` 和 `/report` 查看产物，使用 `/approve req_...` 或 `/reject req_...` 处理明确的本地 Commit 动作。**没有自动合并，也没有远程 PR 发布功能。** 审批拒绝时仍保留候选 diff 和已完成的验证。
@@ -314,7 +314,7 @@ Worker Gateway 路由已实现：无实际 `TRACEFIX_WORKER_*` 覆盖时复用 S
 
 | 命令 | 用途 |
 |---|---|
-| `/run`、`/mode test\|repair\|chat`、`/chat` | 开始任务、切换服务、模型咨询 |
+| `/mode test\|repair\|chat`、`/chat` | 切换服务，直接输入目标启动任务或发送对话 |
 | `/projects`、`/runs`、`/knowledge` | 与 Web 共用的项目、运行历史和知识文档管理 |
 | `/status`、`/trace` | 状态、用量和已提交事件 |
 | `/diff`、`/evidence REF`、`/model-log`、`/report` | 补丁内容、证据路径、模型调用产物索引和报告路径 |
@@ -325,7 +325,11 @@ Worker Gateway 路由已实现：无实际 `TRACEFIX_WORKER_*` 覆盖时复用 S
 | `/approve ID`、`/reject ID` | 与当前 Run/项目/补丁哈希绑定的一次性审批 |
 | `/help`、`/quit` | 帮助、退出 |
 
-TypeScript CLI 使用 Enter 提交命令，输入目标后通过 `/run` 执行；活动 Agent 可通过 `/pause`、`/cancel` 等命令控制。Python 兼容入口使用 `tools/bootstrap/launch.py`，其交互终端支持 Alt+Enter 换行与 Tab 补全，`--plain` 禁用颜色及动态终端控制。Python 的 `/skills` 读取 `backend/skills`；两种入口的完整命令以各自 `/help` 为准。
+TypeScript CLI 默认使用 Chat，Enter 直接发送消息，正文在同一条回复中逐段更新；工具调用按轮次显示成功、失败和未知数量。Chat 只允许在当前项目权限内查询文件和公开知识，`/chat --no-knowledge MESSAGE` 关闭本轮知识检索。使用 `/mode test` 或 `/mode repair` 后，普通输入目标会直接启动 Agent；`/run` 作为旧脚本兼容入口保留，活动 Agent 可通过 `/pause`、`/cancel` 等命令控制。
+
+每次启动 CLI 都创建空的新会话，历史 Run 仍保存在 `/runs` 中，界面不会自动加载最近一次 Run。显式 `/resume RUN_ID` 才绑定历史并由后端校验安全恢复条件；它不能绕过检查点、项目权限、环境或工作区校验。已结束 Run 使用 `/continue RUN_ID INSTRUCTION` 追加指令继续，`/approve ACTION_ID [RUN_ID]` 和 `/reject ACTION_ID [RUN_ID]` 处理审批。没有绑定 Run 时，`/status` 显示当前会话暂无 Run，`/trace`、`/context` 和产物命令不会隐式读取旧 Run。
+
+整个消息区可通过滚轮、PgUp/PgDn 浏览；Ctrl+S 冻结当前画面进入终端原生选择复制，Esc 或 Ctrl+S 返回并补显收到的内容。`--command` 与非 TTY 保留纯文本输出，对话完成后一次打印最终正文，不输出 JSONL 协议或逐段重绘。Python 兼容入口使用 `tools/bootstrap/launch.py`，其交互终端支持 Alt+Enter 换行与 Tab 补全，`--plain` 禁用颜色及动态终端控制。Python 的 `/skills` 读取 `backend/skills`；两种入口的完整命令以各自 `/help` 为准。
 非交互运行可使用 `--run --goal "..." --mode repair`，默认采用 `batch` 策略；非交互 `--continue-run RUN_ID` 也默认采用 `batch`，显式 `--execution-mode interactive` 才恢复人工暂停/审批。普通输出或补丁校验失败继续反馈模型并补充当前源码、失败断言、复现步骤和验证历史；连续三轮仍无有效补丁时以 `REPAIR_EXHAUSTED` 输出最终结果。重大模型错误、未知操作结果和死循环也会生成终态报告，不停留在等待人工恢复的状态。验证成功后直接输出结果与补丁，不创建提交。交互终端默认仍为 `interactive`。
 
 批处理结束时 stdout 包含 `BATCH_RESULT: {...}` JSON，提供 `run_status`、`outcome`、`report_ref`、`patch_diff_ref`、`patch_available`、`patch_verification`、`result_summary` 和错误原因；正常完成退出码为 0，失败、异常或取消为 1。最终报告总会导出一个 diff 文件；没有有效改动时为空，并明确标记 `patch_available=false`、`patch_verification=none`，不把空补丁当作修复成功。已有有效补丁在后续失败时仍会导出，并标记 `unverified`。

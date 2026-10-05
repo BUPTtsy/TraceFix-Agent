@@ -116,26 +116,9 @@ await submitEdit('/mode chatx', ['\x7f'], /新 Run 模式：chat/);
 await submitEdit('/mode repairx', ['\b'], /新 Run 模式：repair/);
 await submitEdit('/mode teXst', ['\x1b[D', '\x1b[D', '\x1b[D', '\x1b[3~'], /新 Run 模式：test/);
 await submitEdit('/mode chXat', ['\x1b[D', '\x1b[D', '\x7f'], /新 Run 模式：chat/);
-await writeKey('x');
-await writeKey('\x03');
-await submitEdit('回归中文中', ['\x7f'], /目标已记录：回归中文/);
-await submitEdit('回归 emoji👩‍💻', ['\x7f'], /目标已记录：回归 emoji/);
-phase = 'ordinary history wheel';
-await writeKey('\x0c');
-for (let index = 0; index < 12; index++) {
-  const start = output.length;
-  shell.write(`history-wheel-${String(index).padStart(2, '0')}\r`);
-  await waitFor(new RegExp(`目标已记录：history-wheel-${String(index).padStart(2, '0')}`), start);
-}
-const ordinaryTop = await wheel('up', 18);
-requireText(ordinaryTop, /目标已记录：history-wheel-00/, 'wheel must reveal ordinary history start');
-const ordinaryTopBoundary = await wheel('up', 4);
-if (ordinaryTopBoundary.trim()) throw new Error(`TTY_SMOKE_FAILED: ordinary top boundary moved, output=${JSON.stringify(ordinaryTopBoundary.slice(-500))}`);
-const ordinaryBottom = await wheel('down', 18);
-requireText(ordinaryBottom, /目标已记录：history-wheel-11/, 'wheel must return to ordinary history end');
-const ordinaryBottomBoundary = await wheel('down', 4);
-if (ordinaryBottomBoundary.trim()) throw new Error(`TTY_SMOKE_FAILED: ordinary bottom boundary moved, output=${JSON.stringify(ordinaryBottomBoundary.slice(-500))}`);
 await submitEdit('/mode test', [], /新 Run 模式：test/);
+await submitEdit('/projects list 回归中文中', ['\x7f'], /bugboard/);
+await submitEdit('/projects list 👩‍💻x', ['\x7f'], /bugboard/);
 phase = 'resize and error';
 shell.resize(100, 30);
 shell.write('/mode invalid\r');
@@ -147,7 +130,7 @@ if (exit.exitCode !== 0 || !/项目与知识|别名：/.test(output) || !/用法
   console.error(`TTY_SMOKE_FAILED: exit=${exit.exitCode} output=${JSON.stringify(output.slice(-500))}`);
   process.exit(1);
 }
-console.log('TTY_SMOKE_PASSED: real node-pty ConPTY selection mouse release/frame freeze/mouse restore/direct help/DEL Backspace/BS Backspace/Forward Delete/middle caret/CJK/emoji/help wheel/history wheel/clamped viewport/error/resize/quit observed; native OS drag and clipboard not exercised');
+console.log('TTY_SMOKE_PASSED: real node-pty ConPTY selection mouse release/frame freeze/mouse restore/direct help/DEL Backspace/BS Backspace/Forward Delete/middle caret/CJK/emoji/help wheel/command editing/clamped viewport/error/resize/quit observed; native OS drag and clipboard not exercised');
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   process.exitCode = 1;

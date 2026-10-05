@@ -25,7 +25,7 @@ const database = path.join(data, 'console.sqlite3');
 const signalFile = path.join(data, 'fixture-signal');
 const child = pty.spawn(process.execPath, [
   '--import', `file://${preload.replace(/\\/g, '/')}`,
-  cli, '--data', data, '--console-db', database,
+  cli, '--data', data, '--console-db', database, '--mode', 'test',
 ], {
   name: 'xterm-256color',
   cols: 100,
@@ -88,8 +88,6 @@ try {
   phase = 'streaming public event presentation';
   const runStart = output.length;
   child.write('fixture controlled goal\r');
-  await waitFor(/目标已记录：fixture controlled goal/, runStart);
-  child.write('/run\r');
   await waitFor(/fixture stdout/);
   await waitFor(/本次调用了3个工具，成功数1，失败数1，未知数1/, runStart);
   await waitFor(/fixture-approval/, runStart);
@@ -145,8 +143,7 @@ try {
   phase = 'verified gate and final event';
   await new Promise(resolve => setTimeout(resolve, 200));
   child.write('fixture finish goal\r');
-  await waitFor(/目标已记录：fixture finish goal/, finishStart);
-  child.write('/run\r');
+  await waitFor(/fixture stdout/, finishStart);
   await waitFor(/fixture-event-only-gate/, finishStart);
   await waitFor(/验证门禁 · 通过/, finishStart);
   await waitFor(/修复已验证/, finishStart);

@@ -22,8 +22,8 @@ export function banner(info: BannerInfo, colors: Palette, columns: number): stri
   const facts = colors.grey('project ') + colors.cyan(info.projectId) +
     colors.grey('  mode ') + colors.cyan(info.mode) +
     colors.grey('  node ') + colors.grey(info.node);
-  const tip = colors.grey('输入 ') + colors.bold('/') + colors.grey(' 查看命令，直接输入文字记录目标，') +
-    colors.bold('/run') + colors.grey(' 启动。');
+  const tip = colors.grey('默认直接输入消息对话；test/repair 模式直接输入目标启动 Run，') +
+    colors.bold('/') + colors.grey(' 查看命令。');
   const rule = colors.grey('─'.repeat(Math.min(limit, 56)));
   return [rule, title, facts, tip, rule, ''].map(line =>
     displayWidth(line) > limit ? truncate(line, limit) : line);
@@ -61,5 +61,5 @@ export function help(colors: Palette, columns: number, commands: CommandSpec[] =
 export const PLAIN_HELP = [
   '/projects list|show|use  /knowledge list|show|search|new|import|edit|enable|disable|export',
   '/runs list|show|logs|trace|sources|export|remember|continue  /remote show|set|clear',
-  '/mode test|repair|chat  /run  /continue  /status  /chat  /resume  /approve  /reject  /quit',
+  '/mode test|repair|chat  /run（兼容入口）  /continue  /status  /chat  /resume  /approve  /reject  /quit',
 ];

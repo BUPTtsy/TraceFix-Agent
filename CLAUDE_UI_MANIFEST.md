@@ -4,8 +4,8 @@
 
 ## 基线与状态
 
-- `BASE_SHA`: `3bc8b6a7419eaa002a71029c538152ee55c1bc5e`（当前 `HEAD`）。
-- 阶段三相关提交链：`47f9a34`（阶段三精准修补与阶段二诊断/观察兼容）、`2b7236b`、`ec1d405`、`8728ede`、`73585c5`、`1023f3f`、`36f3dd7`、`f645a3b`、`6f3274b`。
+- `BASE_SHA`: `a3d54158a4dd7226a58cc9d72c23fd0a28b48273`（本轮最终复核前共享 `HEAD`；本地提交后会前进）。
+- 阶段三相关提交链：`35736a00cb6f72e12ec662ff6e23f05020d2529f`（阶段三既有 Ink CLI 与公开事件接缝）、`47f9a34`（阶段三精准修补与阶段二诊断/观察兼容）、`2b7236b`、`ec1d405`、`8728ede`、`73585c5`、`1023f3f`、`36f3dd7`、`f645a3b`、`6f3274b`。
 - 审计时工作树已有两个未跟踪项：`ARCHITECTURE_REVIEW_SUMMARY.md`、`research/claude-code-analysis/`。本清单及后续 UI 工作不覆盖、不删除、不重写它们。
 - 旧 CLI 定向构建由主 agent 记录为已通过；本清单没有重复运行完整 Python/Node 基线。
 
@@ -29,14 +29,14 @@
 | `ink.ts` | 3887 | `e2c0463ef56c61433441447197dd90f3dde4b4de7ee645b88cad17eadba9ac4e` | `react`; `./components/design-system/*`; `./ink/*` | `react`; Claude 自有 Ink fork | 作为 TraceFix `claude-ui/ink.ts` facade 候选；需将 `ThemeProvider` 配置读写替换为静态/adapter theme。 |
 | `ink/components/Box.tsx` | 21652 | `224284d27b0c500a380b921db7f61fda4b22f7db55b0fb34859e98bfc6d1cc13` | React compiler runtime；`type-fest`; fork DOM/styles/events | `react`, `react-reconciler`, `type-fest` | 可复制候选；依赖自有 renderer，不能单独与公开 Ink 混用。 |
 | `ink/components/Text.tsx` | 16811 | `ce7d804c916696ac5eb77ea5ecb77a99d54f46114d7fb45343ac2d80a7060667` | React compiler runtime；fork styles | `react`, `react-reconciler` | 可复制候选；需同一 renderer 版本。 |
-| `ink/components/ScrollBox.tsx` | 31814 | `62eaf7266fcf23914fc0a297654c72a35c820665995779f4027589dc61f25ed2` | `type-fest`; fork `dom/reconciler/Box`；`bootstrap/state` | `react`, `react-reconciler`, `type-fest` | 未复制；依赖自有 renderer，公开 Ink 不提供该组件。 |
+| `ink/components/ScrollBox.tsx` | 31814 | `62eaf7266fcf23914fc0a297654c72a35c8206657799f4027589dc61f25ed2` | `type-fest`; fork `dom/reconciler/Box`；`bootstrap/state` | `react`, `react-reconciler`, `type-fest` | 未复制；依赖自有 renderer，公开 Ink 不提供该组件。 |
 | `ink/components/TerminalSizeContext.tsx` | 983 | `6a9e0509e6183c8aa22a8abb4805724f922998c113359d7404c5983a18f06457` | `react` | `react` | 可直接复制候选；由 TraceFix 终端 resize adapter 提供 context。 |
 | `components/design-system/ThemedBox.tsx` | 18043 | `7fe462efe37a67e5166241b1befe8474f9685e60b4261f7a193a7582051f6c43` | fork Box/DOM/styles/events；`utils/theme`; `ThemeProvider` | `react`, fork Ink | 可复制候选；theme 读取改为 TraceFix adapter。 |
 | `components/design-system/ThemedText.tsx` | 13877 | `f0610f967cc61a897f911538dc7b9afec3e66a3bbadaa505ca0acca3bf897967` | fork Text/styles；`utils/theme`; `ThemeProvider` | `react`, fork Ink | 可复制候选；不复制配置/主题业务。 |
 | `components/design-system/Divider.tsx` | 11094 | `9b252f641ac9c5c825e6f4b12769fdf6c17053fdd40ec8d46b7b6b649d443b27` | `useTerminalSize`; fork `stringWidth`; `ink`; `utils/theme` | `react`, fork Ink | 消息/状态分隔符候选。 |
-| `components/BaseTextInput.tsx` | 19313 | `0c1271a7f2d068859af4e9877115b1b54a3083db333930cb06f516b0e6698d5` | `renderPlaceholder`; `usePasteHandler`; declared cursor; `ink`; text input types | `react`, `strip-ansi`（间接） | 输入渲染候选；TraceFix command/submit/cancel 通过 props adapter 注入。 |
+| `components/BaseTextInput.tsx` | 19313 | `0c1271a7f2d068859af4e9877115b1b54a3083dbe333930cb06f516b0e6698d5` | `renderPlaceholder`; `usePasteHandler`; declared cursor; `ink`; text input types | `react`, `strip-ansi`（间接） | 输入渲染候选；TraceFix command/submit/cancel 通过 props adapter 注入。 |
 | `components/PromptInput/ShimmeredInput.tsx` | 16680 | `bb685e15de7b32f3e19d67991c16d8c7de1e7f9668ca2e5017d1ec34ecbf3e6e` | `ink`; text highlighting; `Spinner/ShimmerChar` | `react` | 输入高亮候选；不复制 voice/analytics。 |
-| `hooks/useInputBuffer.ts` | 3386 | `b464f6af6ef808d387f895ac3328d93421e774e815eafa06ba9bcf52a1fbe128` | `react`; config type | `react` | 可复制候选；改为纯 TraceFix pasted-content 类型。 |
+| `hooks/useInputBuffer.ts` | 3386 | `b46482ef6af808d387f895ac3328d93421e774e815eafa06ba9bcf52a1fbe128` | `react`; config type | `react` | 可复制候选；改为纯 TraceFix pasted-content 类型。 |
 | `hooks/useTerminalSize.ts` | 354 | `e05c47c49d34d6aea5c206100b86a37f4fe91dbb22c47680f9ea09b084c1ae7c` | `react`; `TerminalSizeContext` | `react` | 可复制候选。 |
 | `hooks/useDoublePress.ts` | 1651 | `5fff6c665a90e5902c1ecee4e50584ba7fcc2d7cbe75a6a2bd84f9cabd1bdbb8` | `react` | `react` | 可复制候选；用于 Escape/取消节流。 |
 | `hooks/useVirtualScroll.ts` | 35122 | `d27382b007c98ab3af5e2940b0d1f6db041ccbe2897963ce19f63afb340ea4b7` | fork ScrollBox/DOM；React | `react`, fork Ink | 未复制；依赖 Claude fork ScrollBox/DOM，当前 TraceFix 消息 viewport 由窄 adapter 管理。 |
@@ -67,12 +67,12 @@
 
 | source | target | source sha256 | target sha256 | 适配 |
 | --- | --- | --- | --- | --- |
-| `ink/components/TerminalSizeContext.tsx` | `frontend/apps/cli/src/claude-ui/TerminalSizeContext.tsx` | `6a9e0509e6183c8aa22a8abb4805724f922998c113359d7404c5983a18f06457` | `52b92578f4d5a0b393a5a10ecc34a3f74a3c8ae30616633eb76a981671dd1376` | 相对路径保留。 |
-| `hooks/useTerminalSize.ts` | `frontend/apps/cli/src/claude-ui/useTerminalSize.ts` | `e05c47c49d34d6aea5c206100b86a37f4fe91dbb22c47680f9ea09b084c1ae7c` | `d73b129175402ec03b27a97e55205c2a5aaa5b4c20f207726a309528a8584147` | `src/` import 改为同目录。 |
-| `hooks/useDoublePress.ts` | `frontend/apps/cli/src/claude-ui/useDoublePress.ts` | `5fff6c665a90e5902c1ecee4e50584ba7fcc2d7cbe75a6a2bd84f9cabd1bdbb8` | `720150d2d923cc164a70b1b7af2ce53bda8a2953589d8cdd7c04b29f0d50a2da` | React hook 原样保留。 |
-| `utils/Cursor.ts` | `frontend/apps/cli/src/claude-ui/Cursor.ts` | `59ee2d4de288ecdc5141b61e27ab80bef0cc1e4db8ace3a2b972ddf9765bff31` | `29728789f15259a5a810b657c27cd4547d4130f4b492f7805dff27c2dce243db` | string width/wrap import 指向 adapter。 |
-| `hooks/useTextInput.ts` | `frontend/apps/cli/src/claude-ui/useTextInput.ts` | `c1af1104ade4de40d29c782598c8fd2be3e5be4d70f4cd2b4dcbb3a4af607d491` | `c558ba97a748ff86ef34eca51ed81a106f053204eafbe183ba792f1551d09265` | Claude 输入状态/kill ring 原样，业务 hooks 由 adapter 提供。 |
-| `components/BaseTextInput.tsx` | `frontend/apps/cli/src/claude-ui/BaseTextInput.tsx` | `0c1271a7f2d068859af4e9877115b1b54a3083db333930cb06f516b0e6698d5` | `c2a662075280765082ac5dc9bf3b8f54e22d2276237a57c51322fbe1b3b6b775` | Ink cursor/paste imports 改为 adapter。 |
+| `ink/components/TerminalSizeContext.tsx` | `frontend/apps/cli/src/claude-ui/TerminalSizeContext.tsx` | `6a9e0509e6183c8aa22a8abb4805724f922998c113359d7404c5983a18f06457` | `df78bc0466c2b4e06b99e53d54a1e5e4915ef2cb2f8c3163710bd3a102a0fa4f` | 相对路径保留。 |
+| `hooks/useTerminalSize.ts` | `frontend/apps/cli/src/claude-ui/useTerminalSize.ts` | `e05c47c49d34d6aea5c206100b86a37f4fe91dbb22c47680f9ea09b084c1ae7c` | `b9ecf0b79ba9dc599be7c09d29a60b558c367274420bcb5e0bd4930e7d6d244d` | `src/` import 改为同目录。 |
+| `hooks/useDoublePress.ts` | `frontend/apps/cli/src/claude-ui/useDoublePress.ts` | `5fff6c665a90e5902c1ecee4e50584ba7fcc2d7cbe75a6a2bd84f9cabd1bdbb8` | `5fff6c665a90e5902c1ecee4e50584ba7fcc2d7cbe75a6a2bd84f9cabd1bdbb8` | React hook 原样保留。 |
+| `utils/Cursor.ts` | `frontend/apps/cli/src/claude-ui/Cursor.ts` | `59ee2d4de288ecdc5141b61e27ab80bef0cc1e4db8ace3a2b972ddf9765bff31` | `c11ea527429618351aeead892fe00774300a02cba8f718d4c08039c689df099f` | string width/wrap import 指向 adapter。 |
+| `hooks/useTextInput.ts` | `frontend/apps/cli/src/claude-ui/useTextInput.ts` | `c1af1104ade4de40d29c782598c8fd2be3e5be4d70f4cd2b4dcb3a4af607d491` | `90019e0cec5a94f96f6e7e2d4bacc610a30ff2fd04a9f82a11ac1c6b16734bc6` | Claude 输入状态/kill ring 原样，业务 hooks 由 adapter 提供。 |
+| `components/BaseTextInput.tsx` | `frontend/apps/cli/src/claude-ui/BaseTextInput.tsx` | `0c1271a7f2d068859af4e9877115b1b54a3083dbe333930cb06f516b0e6698d5` | `aca7eb5b30fcc76ce5913a938e0b5eef13ad4a4253651559917358e847fdc0a8` | Ink cursor/paste imports 改为 adapter。 |
 | `components/Spinner/SpinnerGlyph.tsx` | `frontend/apps/cli/src/claude-ui/SpinnerGlyph.tsx` | `ffcf3adf302bba11d7e3c404f50955b3df4acb020261fa5d092b5b4200ddd55c` | `83d73ca49c42125a8c082de6bc2c0acc11c91c960eb65fe42441a403b18f7650` | spinner glyph/frame 原样，theme adapter。 |
 | `components/Spinner/utils.ts` | `frontend/apps/cli/src/claude-ui/spinner-utils.ts` | `d7a7be7ffcae7ccad6a0c57e9a1196c149524543bf62de155b4d385f68350c2e` | `be0ba2a29d68f9c45ce9f009734edcf6029aaa4b1627ca2f2635de1d9c1468e1` | RGB/types import 改为 adapter。 |
 | `components/MessageResponse.tsx` | `frontend/apps/cli/src/claude-ui/MessageResponse.tsx` | `18eff40130bbf3fdd5bbc340a8cb13087f6edf3b80ea912d79369ad1e8600afa` | `527be6ed139d712bd1ee5d693c87bdabe112e6c6f48455ed0eb6d61c980e88fe` | `Ratchet`/Ink 依赖为 adapter。 |
@@ -122,6 +122,29 @@
 
 选择与鼠标输入改动限定于 TraceFix `adapter.tsx`、`terminalInput.ts` 和 UI 组合层；Claude 复制叶子的内容 hash 不变。`Ctrl+S` 进入选择模式，冻结消息/状态并关闭 1000/1006 鼠标报告，退出时回放期间缓存事件；本会话未实测真实 OS 拖拽或系统剪贴板。具体根因、strict alias 绑定、unbound operation ledger 与新回归证据记录在 `docs/agent-research-20261004/cli-output-selection-followup-20261005.md`。
 
-最终工作树 hash：`toolProjection.ts` `30544efc43268b040f4082a8dde47f0042118e9decc13e431854ce99f36b6b6f`；`presentation.ts` `bcc8c44c7f71d157f283ffab73690b4ae15f482ca0d2518311a58852f6604754`；`TraceFixUi.tsx` `6e3236dfddf7b24fcfde346cab29ea96de86ce9c520b278708e891fc4e5a185d`；稳定 `adapter.tsx` `01a550c04d7fabacf9d9315ed2eeebe33ce779ae5e5aa5bc2b7ebf1a2c0c6906`。本轮 build、输入/展示定向测试、CLI 事件/非 TTY 与 TTY smoke 已通过；production fixture 的默认输出/选择缓存/工具汇总/审批恢复/取消/门禁/终态均可达，但终态 `Ctrl+O` 在 ConPTY 中不稳定，不能报告完整 fixture PASS。
+最终工作树 hash：`toolProjection.ts` `30544efc43268b040f4082a8dde47f0042118e9decc13e431854ce99f36b6b6f`；`presentation.ts` `ee636c5440368481a28a7d5e70f13829191552cec8b812dcf222964ade42a19e`；`TraceFixUi.tsx` `7a2af4e7c9eb12ddf94ad0472ada6420faa7d33ba6e1899601ea0c024576f2af`；稳定 `adapter.tsx` `01a550c04d7fabacf9d9315ed2eeebe33ce779ae5e5aa5bc2b7ebf1a2c0c6906`。本轮 build、输入/展示定向测试、CLI 事件/非 TTY 与 TTY smoke 已通过；production fixture 的默认输出/选择缓存/工具汇总/审批恢复/取消/门禁/终态均可达，但终态 `Ctrl+O` 在 ConPTY 中不稳定，不能报告完整 fixture PASS。
 
-共享 checkout 当前 `HEAD=3a9db06a0e9786968af0b6a39c3f2e11191ba69f`，其中包含其他会话的后端工具提交；本轮不将其纳入 CLI 输出/选择复制交付，最终提交应使用显式路径，只暂存本次 CLI、manifest 与强制纳入的回归记录。
+共享 checkout 在本轮最终复核前为 `HEAD=a3d54158a4dd7226a58cc9d72c23fd0a28b48273`，其中包含其他会话的后端工具提交；本轮不将其重新包装为 CLI/Chat 功能，最终提交使用显式路径，只暂存本次 CLI、Chat adapter、manifest 与强制纳入的回归记录。
+
+## 2026-10-05 Chat、正文流式与新会话后续修改
+
+本轮基线为 `BASE_SHA=519f9f9f3e17d0ef2afd02e8bb1cb4b6921883d4`（`修复 CLI 选择复制与事件输出`），阶段三现有提交为 `47f9a34c41d9a1f641585821106ced5f588a7243`。开始时只有 `ARCHITECTURE_REVIEW_SUMMARY.md`、`_orchestration_notes.md`、`research/claude-code-analysis/` 三项未跟踪内容；不覆盖、不删除或提交这些既有内容。共享 checkout 后续出现其他会话的 `a521e3d`，其并发兼容修改不计入本次 Chat 交付。用户已授权开发验证完成后创建中文说明的本地 commit，禁止 push。
+
+本轮没有新增 Claude 复制文件、npm 依赖或版本变更。已复制叶子保持原字节 hash；只调整 TraceFix command/event/backend adapter：普通启动默认 `chat`，普通消息立即执行，TTY 将一条正文消息随 `chat.delta` 更新；新的 CLI 进程不继承 Chat history，也不自动订阅最新历史 Run。已有 `/resume RUN_ID` 仍按当前后端检查点约束执行，显式绑定该 Run 后消费其公开事件。
+
+新增 Python 长驻 `--chat-jsonl --chat-session ID` 边界，stdin 为 `message/cancel/clear/quit` JSONL，stdout 为带 `scope_id/session_id/message_id` 的 `chat.started/delta/finished/error/cancelled` 和公开 `tool.*` 元数据。正文来源为现有 `ChatCompletionsAdapter`/`CompletionStream` 的 `content` 通道；reasoning 只保存在独立审计记录，不进入 CLI 事件。`stream_tool_chat` 使用现有 `ToolRegistry`/`ToolPipeline`，只开放当前项目的 `Read/Grep/Glob/DocumentSearch`，保持作用域、路径、参数和结果上限。完整 `assistant.tool_calls` 与配对 `role=tool` 正文参与下一次请求；历史按完整回合裁剪，取消或未完整结束的回合不加入续话历史。
+
+当前 adapter 文件原始字节 SHA-256：
+
+| target | sha256 | 直接 imports / 边界职责 |
+| --- | --- | --- |
+| `frontend/apps/cli/src/cli.ts` | `b56eb125237af239d7863c8c4f8865f7b0d143fc876c967100ccc3f2671ba77c` | 既有 Node/console-service imports，加 `cli-session`；启动 Python JSONL、取消/退出、显式 Run 绑定和非 TTY 最终正文。 |
+| `frontend/apps/cli/src/cli-session.ts` | `a2ec9b723902f70ec12ac55ee65dd13d55fb950a2d11c63b8c7efeab3a20582e` | `node:crypto`、`tracefix-events`；新会话 UUID、Run 绑定、scope/session 校验与公开消息映射。 |
+| `frontend/apps/cli/src/registry.ts` | `09d5c41f32bca69620500677cda18d66babc692a418f075d54aaf4a0ba443c51` | 既有命令描述；说明 Chat 直接对话与辅助只读工具。 |
+| `frontend/apps/cli/src/claude-ui/TraceFixUi.tsx` | `7a2af4e7c9eb12ddf94ad0472ada6420faa7d33ba6e1899601ea0c024576f2af` | 既有 `react/ink/chalk` 与 Claude 叶子/adapter；Chat 就绪、输入和取消提示。 |
+| `frontend/apps/cli/src/claude-ui/presentation.ts` | `ee636c5440368481a28a7d5e70f13829191552cec8b812dcf222964ade42a19e` | `wrap-ansi`、`tracefix-events`、`toolProjection`；同 ID 正文增量与终态合并，保留部分正文。 |
+| `backend/packages/agent/src/tracefix/model/chat.py` | `76a15c140657f1e4c05829360e65e2d5b337c0699246ace9dc1f5bca63df6942` | 标准库、已有 `httpx`、`ChatCompletionsAdapter`、`_public`；新增受控工具文本会话，保留原 `stream_chat` 接口。 |
+| `backend/packages/agent/src/tracefix/model/chat_tools.py` | `9dcbc2166303674d028babd966ab62af8210319fcd295aa4b973265f783524f9` | 标准库、已有 `pydantic`、`Workspace/LocalTools/ToolRegistry/ToolPipeline/_public`；复用只读工具与 scope 检查。 |
+| `backend/packages/agent/src/tracefix/cli/main.py` | `d57265450fa8c5d6f73e1bc6d35d5706d7edb2da931c87f1c808d3daaaf146c6` | 既有 imports 加 `stream_tool_chat` 和惰性 `build_chat_tools`；JSONL 并发读取/取消、完整回合 history。 |
+
+当前已通过 build、CLI 定向 27 项、Python 定向 98 项和实际 TTY/Chat smoke。production fixture 前置过滤/工具计数/选择缓存/审批恢复/取消/门禁终态可达，但最终 `Ctrl+O` 仍 timeout，不能报告完整通过；真实 OS 拖拽与系统剪贴板、真实 provider/network 未验证。详细证据和本轮实际修改边界记录在 `docs/agent-research-20261004/cli-chat-stream-followup-20261005.md`。

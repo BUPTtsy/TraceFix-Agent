@@ -144,7 +144,10 @@ class FixtureChild extends EventEmitter {
 
   receive(text) {
     for (const line of text.split(/\r?\n/).map(value => value.trim()).filter(Boolean)) {
-      if (!line.startsWith('/')) this.goal = line;
+      if (!line.startsWith('/')) {
+        this.goal = line;
+        this.begin();
+      }
       if (line === '/run') this.begin();
       if (line === '/interrupt' || line === '/cancel') {
         if (this.closed) continue;

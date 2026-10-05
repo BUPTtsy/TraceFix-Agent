@@ -30,6 +30,20 @@ function status(message: TraceFixMessage): string {const value = payload(message
 function events(message: UiMessage): TraceFixEvent[] {return message.publicEvents || (message.event ? [message.event] : []);}
 
 export function appendUiMessage(messages: UiMessage[], next: UiMessage): UiMessage[] {
+  const chatType = next.event?.type || '';
+  if (chatType.startsWith('chat.') && chatType !== 'chat.user') {
+    const index = messages.findIndex(message => message.id === next.id && runIdentity(message) === runIdentity(next));
+    const previous = index >= 0 ? messages[index] : null;
+    const previousPayload = previous ? payload(previous) : {};
+    const nextPayload = payload(next);
+    const previousText = text(previousPayload.content);
+    const content = chatType === 'chat.delta' ? previousText + text(nextPayload.delta) :
+      nextPayload.content !== undefined ? text(nextPayload.content) : previousText;
+    const combined: UiMessage = {...next, text: content, metadata: {...previous?.metadata, ...next.metadata},
+      event: next.event ? {...next.event, payload: {...previousPayload, ...nextPayload, content}} : undefined};
+    if (index < 0) return [...messages, combined];
+    return messages.map((message, position) => position === index ? combined : message);
+  }
   if (messages.some(message => message.id === next.id && runIdentity(message) === runIdentity(next))) return messages;
   const type = next.event?.type || '';
   const run = runIdentity(next);
@@ -58,6 +72,13 @@ function toolSummary(value: PublicRecord): string {
 export function messageText(message: TraceFixMessage): string {
   const value = payload(message);
   const type = message.event?.type || '';
+  if (type === 'chat.user') return `你：${text(value.message)}`;
+  if (type.startsWith('chat.')) {
+    const content = text(value.content);
+    if (type === 'chat.error') return `${content}${content ? '\n' : ''}对话失败：${text(value.message || value.error) || '响应未完成'}`;
+    if (type === 'chat.cancelled') return `${content}${content ? '\n' : ''}对话已取消`;
+    return content || (type === 'chat.started' || type === 'chat.sources' ? '正在回答…' : '');
+  }
   if (type === 'cli.output' || type === 'cli.error') return text(value.message).replace(/\n$/, '');
   if (type === 'run.finished') {
     const result = label(value.outcome, true);

@@ -202,7 +202,7 @@ def main(argv=None):
     parser.add_argument('--dev', action='store_true', help='Web 模式使用 Vite 开发服务（5173），默认提供构建后的页面（3000）')
     parser.add_argument('--skip-install', action='store_true', help='复用已安装的环境')
     parser.add_argument('--skip-build', action='store_true', help='复用现有沙箱镜像')
-    parser.add_argument('--default-mode', choices=['test', 'repair'], default='repair', help=argparse.SUPPRESS)
+    parser.add_argument('--default-mode', choices=['chat', 'test', 'repair'], default='chat', help=argparse.SUPPRESS)
     options, agent_args = parser.parse_known_args(argv)
     web = options.web or options.console_only
     if options.dev and not web:
