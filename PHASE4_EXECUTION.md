@@ -54,11 +54,11 @@
 ### 后续真实取证与窄修收口
 
 - `207989d` 保存首次真实公开 B01 与 read-denial probe；`a227036` 保留调用级部分 usage；`5c69e07` 修复已结算业务失败反馈/冻结验证；`053b976` 修复评测 Session 生命周期、实际 Gateway 配置/子 Agent 响应身份/provider usage。上述生产窄修经 `0d09464` 合入 main。
-- 新最小测试：native engine 23 passed、runner 29 passed、metrics 6 passed。batch_completion/phase3_feedback/phase4_recovery 相关组为 76 passed / 9 failed，9项均 batch；只对其中1项做修改前对照仍失败，其余8项尚未逐项归因。不能把该组写成通过，没有执行全量基线。
+- 新最小测试：native engine 23 passed、runner 29 passed、metrics 6 passed；工具历史初版 `bed6758` 后经 `e3099ee` 收紧，七文件 Gateway/native/context 组合 127 passed（112.60 秒），扩展上下文定向 13 passed（7.06 秒）及生产回调原件展开 1 passed，批次重叠不相加。batch_completion/phase3_feedback/phase4_recovery 相关组仍为 76 passed / 9 failed，9 项均 batch；其中 8 项已在独立进程与修改前 Engine 做逐项差分，8/8 失败路径和事件计数完全一致，见 `PHASE4_BATCH_DIFFERENCE.md`。该组仍不能写成通过，没有执行全量基线。
 - 公开 Run `run_697f2b5723094dc9b426fa5d150dcb82` 在 `f6cfd82` 上 FAILED/INFRA_FAILURE；有回执及业务失败观察，却被包装 UNKNOWN。窄修后新 Run `run_616fcdacb5864ce0aa21c75e3d86016f` 越过该接缝，9模型/5浏览器后本地完整请求预检超窗，仍 FAILED/INFRA_FAILURE，无候选或验证refs。详细原始路径与用量见 `PHASE4_PUBLIC_ACCEPTANCE.md`。
-- ContextAssembler 对 observation 的投影已生效；超限为 Gateway 协议/工具历史 `110486 > 109568`，环境使用 UTF-8 字节上界。第十次请求未发送，不是供应商窗口报错。工具历史有界投影尚未实施，不能将两次公开失败计入有效修复/M0/四格。
+- ContextAssembler 对 observation 的投影已生效；旧公开 Run 超限为 Gateway 协议/工具历史 `110486 > 109568`，环境使用 UTF-8 字节上界，第十次请求未发送，不是供应商窗口报错。`bed6758`→`e3099ee` 在 Gateway 接入完整 payload 计量与有界单调调整、保留 assistant/tool 配对与 completed cache；当前 Run 原件/哈希/展开能力核验通过后仅投影旧成功 snapshot/Bash output，保留最新批次和失败/UNKNOWN 全文。恢复优先读取未投影历史并重新校验引用，定向测试通过。旧 Run 不续写，新真实 Run 尚未重跑，不能把该窄修计入有效修复/M0/四格。
 - 宿主原 child WAIT、compact字段保护、UNKNOWN换ID拦截、cancel，以及独立 Docker/MCP stale→observe 取证完成。MemoryStore/无模型probe只证明指定接口与进程/文件/浏览器边界，真实业务恢复率/长期召回仍未测。见 `PHASE4_RECOVERY.md`。
-- 真实read-denial容器probe通过，但完整Agent执行面未隔离，Host Session仍拒绝held-out。受信runner/Bash/MCP能力入口与干净runtime/独立network/DB/cache/retrieval部署涉及跨模块修改，待用户按AGENTS第3条确认两批实施。见 `PHASE4_ISOLATION_READINESS.md`。
+- 真实read-denial容器probe通过，但完整Agent执行面未隔离，Host Session仍拒绝held-out。用户本轮选择先完成窄修与证据归档，暂不实施受信 runner/Bash/MCP 能力入口、干净 runtime、独立 network/DB/cache/retrieval；完整隔离与四格保留待后续明确授权。见 `PHASE4_ISOLATION_READINESS.md`。
 - 真实运行和probe证据经 `cf40289` 合回 main；原项目两份进度文档已同步并明确完成边界，最新状态提交 `ca73d39`。没有push，保留用户未跟踪文件。
 
 五层状态仍为：模块/CLI/跨阶段代码接缝完成；真实全链路/held-out四格/长期效果未完成；唯一完整基线未运行。本目标保持 active，不以局部通过或失败取证标 complete。
@@ -68,3 +68,12 @@
 - 真正 held-out Agent 执行面的隔离 launcher/容器清单、冻结初始经验/cache 来源证据。
 - 全链路及四格真实原始记录、恢复/长上下文/经验作用证据、最终验收交接。
 - 最终完整基线前确认其它会话没有执行本轮全量；前置真实证据尚不齐备，因此本轮未运行四条完整命令。
+
+### 工具历史窄修收口与用户选择
+
+- 设计溯源：主设计 §3 T01/T08、context-governance §4—5、Claude audit 的 tool_result/compact/transcript 边界；仅复用阶段三原件展开，不另建上下文或恢复平台。
+- 写集：Gateway 的发送预算/投影与 Router 可选能力；Engine.model_call 的成功 executed 回执、工具原件保存/核验和恢复引用；定向测试。未修改 assembler、冻结规范、窗口、模型计量和执行 fence。
+- 接口：新增可选 `tool_result_refs=None` 与 `supports_tool_history_projection`；旧 callback 返回 None/旧模型保持不投影。工具结果记录新增 `tool_content`、scope/run/source/patch/env/spec；返回值仅含实际原件 ref、哈希、binding 和可展开标志。原件超 16000 字符/200 行或失效时不可裁，保留有限失败。
+- 初版 `bed6758` 不作为最终完成树；生产窄修校正提交为 `e3099ee`。本轮直接在用户指定 main 最终集成树实现该窄修，阶段四旧 worktree 的原始真实证据保持原状；未改其它阶段 checkout，也未重放历史提交。
+- 定向命令：`py -3.12 -m pytest tests/test_phase4_context.py tests/test_native_tools.py tests/test_context_memory.py tests/test_gateway.py tests/test_gateway_retries.py tests/test_gateway_streaming.py tests/test_native_engine.py -q -p no:cacheprovider` → 127 passed；随后扩展 `test_phase4_context.py` → 13 passed，原生回调原件展开单项 → 1 passed。py_compile/git diff --check 通过。没有新增全量测试记录。
+- 用户已明确选择“先完成当前窄修与证据归档，文档标记已完成项，保留完整隔离和四格为待验收”。两份进度文档按该范围同步，完整 goal 不标 complete，完整基线仍未运行。

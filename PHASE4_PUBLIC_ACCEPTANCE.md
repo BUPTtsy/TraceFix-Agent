@@ -42,12 +42,18 @@
 
 这次结果说明业务失败反馈接缝已能让模型继续执行，但完整请求预算仍有真实阻塞；不能通过放宽冻结规范、删除保护字段或简单扩大模型窗口伪造成功。
 
+### 后续窄修：工具历史有界投影
+
+`bed6758` 为初版接缝，`e3099ee` 完成其收紧：完整历史与 `completed_calls` 保留在内存和请求审计中，发送前按完整 payload 重新计量；组装器提前超窗时先尝试旧结果投影，序列化后的差额最多进行三次实测且单调下降的调整。只有当前 Run 原件校验通过、哈希一致、可按现有 `context.expand` 完整展开的已结算成功结果才可裁剪（最多 16000 字符、200 行）；保留最新完整工具批次，未知结构、失败和 UNKNOWN 全文不裁。投影只替换历史 browser snapshot 或成功 Bash output，原 refs、执行状态、call ID 和操作回执不变。恢复优先从未投影历史与经原件重核的引用重建，不能重执行已完成工具或绕过预算。
+
+最终七文件定向组合为 **127 passed**（112.60 秒），包含 Gateway/native tools/context/retry/streaming/native Engine 和首版六项上下文窄修回归；随后扩展的 `test_phase4_context.py` 为 **13 passed**（7.06 秒），另对生产回调原件展开检查 **1 passed**。这些批次重叠，不相加。它只修正发送历史接缝，不能把旧 `run_616fcdacb5864ce0aa21c75e3d86016f` 改写成成功；本轮按用户选择完成窄修归档，新真实 Run、有效候选补丁与原问题/逆向/刷新/正常业务效果保留待验收。
+
 ### 超窗原因只读核查
 
 最终 `0081_探索_上下文组装清单.json` 的 context `input_limit=19305`、`tokens_after=17051`，其中 protected 合计 `12634`，observation 已投影到 `3905`。随后 Gateway 对完整 payload 预检，`required_tokens=110486 > available_tokens=109568`，差 `918`，保护标签为 system/schema/tools/tool_history。第十次请求没有发送，不能声称供应商报告真实窗口已满。
 
 同一逻辑调用的 messages 从 `2` 增至 `18`，协议估算从 `33685` 增至 `90263`。旧 browser/Bash/Grep 的完整工具消息持续累积，位于 context dict 的投影之外。环境没有 tiktoken，manifest 为 `utf8_upper_bound / exact_tokenizer=false`；最后一次已发送请求本地估算 `103440`，供应商实际 prompt tokens `30243`。保守计量放大了历史问题，估算不能改称供应商精确 tokens。
 
-阶段三 observation 投影已生效，阶段四 WAITING_NETWORK 恢复未触发。后续最小兼容适配应覆盖完整协议预算和有界工具历史投影，保持 assistant/tool 配对、call IDs、失败/UNKNOWN 与完整 artifact 引用；已执行工具不能因摘要化重放。该适配尚未实施，不以本次失败作为已验收效果。
+该次运行时阶段三 observation 投影已生效，阶段四 WAITING_NETWORK 恢复未触发，工具历史适配尚未实施。后续 `e3099ee` 的实施与定向证据见前节；不能把本次历史失败或定向通过写成真实修复成功。
 
 首次新 Run 启动前另有一次基础设施配置失败：`.tracefix/phase4-public-20261005T090458Z-7d0cc8d16bf1/` 未生成业务 Run，隔离 schema 的 search_path 缺少 pgvector type 所在 public。改为独立 schema 优先、public 只用于已有扩展解析后，才启动本节真实业务 Run；该基础设施记录保留，不算修复成绩。
