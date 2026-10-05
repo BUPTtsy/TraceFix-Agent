@@ -103,5 +103,5 @@ def register_discovery_tools(engine, state, context, registry, bind):
          'Skill 只是指导，不会增加工具、文件、浏览器权限或改变验证门禁。',
          SkillInput, skill, phases=set(Phase), side_effect='write', parallel_safe=False,
          output_model=SkillOutput, output_limit_tokens=10000,
-         idempotency_key=lambda arguments: digest([str(state.phase), arguments]),
+         idempotency_key=lambda arguments: digest([str(state.phase), arguments.model_dump(mode='json')]),
          search_hint='load staged workflow instructions 技能 工作流指导')
