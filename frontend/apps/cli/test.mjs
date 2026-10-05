@@ -30,6 +30,39 @@ test('公开事件保留 Run/tool/error/cancel/resume/approval/unknown 与 T04-T
   assert.equal(messages[5].ref, 'skill-1');
   assert.equal(intake.after, 6);
 });
+test('阶段二 run.finished 可空错误字段保留成功、取消和失败事实', () => {
+  const intake = new EventIntake('scope-a', 'run-a');
+  const messages = intake.accept({contract_version: 'tracefix-cli/1', events: [
+    row(1, 'run.finished', {status: 'COMPLETED', outcome: 'FIX_VERIFIED', error: null, error_details: null, cancelled: false}),
+    row(2, 'run.finished', {status: 'CANCELLED', outcome: 'INCONCLUSIVE', error: '用户已取消', error_details: null, cancelled: true}),
+    row(3, 'run.finished', {status: 'FAILED', outcome: 'INFRA_FAILURE', error: '业务验证失败', error_details: {requires_manual_review: true}, cancelled: false}),
+  ], cursor: cursor('scope-a', 'run-a', 3), high_watermark: 3});
+
+  assert.deepEqual(messages.map(message => message.kind), ['run', 'cancel', 'error']);
+  assert.equal(messages[0].metadata.outcome, 'FIX_VERIFIED');
+  assert.equal(messages[0].text, 'run.finished: COMPLETED');
+  assert.equal(messages[1].event.payload.cancelled, true);
+  assert.equal(messages[2].event.payload.error_details.requires_manual_review, true);
+});
+
+test('工具完成后业务断言失败仍显示独立失败事实并保留观察引用', () => {
+  const intake = new EventIntake('scope-a', 'run-a');
+  const observationRef = '0002_页面观察.json';
+  const assertions = [{condition: 'checked', passed: false}];
+  const messages = intake.accept([
+    row(1, 'tool.completed', {receipt: {observation_ref: observationRef}}),
+    row(2, 'action.business.outcome', {status: 'failed', passed: false, check: 'postconditions',
+      observation_ref: observationRef, assertions, tool_call_id: 'call-1'}),
+  ]);
+
+  assert.equal(messages.length, 2);
+  assert.equal(messages[0].kind, 'tool');
+  assert.equal(messages[1].text, 'action.business.outcome: failed');
+  assert.equal(messages[1].event.payload.passed, false);
+  assert.equal(messages[1].event.payload.observation_ref, messages[0].event.payload.receipt.observation_ref);
+  assert.deepEqual(messages[1].event.payload.assertions, assertions);
+});
+
 test('nested receipt/result and T08 workset metadata remain visible without artifact reads', () => {
   const intake = new EventIntake('scope-a', 'run-a');
   const [message] = intake.accept([row(1, 'tool.completed', {

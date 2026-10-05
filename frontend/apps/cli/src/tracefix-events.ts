@@ -15,6 +15,7 @@ export interface TraceFixEvent {
   [key: string]: unknown;
 }
 export interface EventBatch {
+  contract_version?: string;
   events: unknown[];
   cursor?: string | null;
   high_watermark?: number;
@@ -154,7 +155,7 @@ function eventKind(type: string, payload: PublicRecord): TraceFixMessage['kind']
   if (lower.includes('approval') || lower === 'patch.proposed' || status === 'waiting_approval') return 'approval';
   if (lower.includes('cancel') || status === 'cancelled' || status === 'canceled') return 'cancel';
   if (lower.includes('resume') || lower.includes('continuation') || lower.includes('continued')) return 'resume';
-  if (lower.includes('error') || lower.includes('failed') || payload.error !== undefined) return 'error';
+  if (lower.includes('error') || lower.includes('failed') || (payload.error !== undefined && payload.error !== null)) return 'error';
   if (lower.startsWith('tool.')) return 'tool';
   if (lower.startsWith('skill.') || lower.includes('skill')) return 'skill';
   if (lower.includes('validation') || lower.includes('feedback') || lower === 'gate.decided') return 'feedback';
