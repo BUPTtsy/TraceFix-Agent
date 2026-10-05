@@ -56,10 +56,10 @@
 - `207989d` 保存首次真实公开 B01 与 read-denial probe；`a227036` 保留调用级部分 usage；`5c69e07` 修复已结算业务失败反馈/冻结验证；`053b976` 修复评测 Session 生命周期、实际 Gateway 配置/子 Agent 响应身份/provider usage。上述生产窄修经 `0d09464` 合入 main。
 - 新最小测试：native engine 23 passed、runner 29 passed、metrics 6 passed；工具历史初版 `bed6758` 后经 `e3099ee` 收紧，七文件 Gateway/native/context 组合 127 passed（112.60 秒），扩展上下文定向 13 passed（7.06 秒）及生产回调原件展开 1 passed，批次重叠不相加。batch_completion/phase3_feedback/phase4_recovery 相关组仍为 76 passed / 9 failed，9 项均 batch；其中 8 项已在独立进程与修改前 Engine 做逐项差分，8/8 失败路径和事件计数完全一致，见 `PHASE4_BATCH_DIFFERENCE.md`。该组仍不能写成通过，没有执行全量基线。
 - 公开 Run `run_697f2b5723094dc9b426fa5d150dcb82` 在 `f6cfd82` 上 FAILED/INFRA_FAILURE；有回执及业务失败观察，却被包装 UNKNOWN。窄修后新 Run `run_616fcdacb5864ce0aa21c75e3d86016f` 越过该接缝，9模型/5浏览器后本地完整请求预检超窗，仍 FAILED/INFRA_FAILURE，无候选或验证refs。详细原始路径与用量见 `PHASE4_PUBLIC_ACCEPTANCE.md`。
-- ContextAssembler 对 observation 的投影已生效；旧公开 Run 超限为 Gateway 协议/工具历史 `110486 > 109568`，环境使用 UTF-8 字节上界，第十次请求未发送，不是供应商窗口报错。`bed6758`→`e3099ee` 在 Gateway 接入完整 payload 计量与有界单调调整、保留 assistant/tool 配对与 completed cache；当前 Run 原件/哈希/展开能力核验通过后仅投影旧成功 snapshot/Bash output，保留最新批次和失败/UNKNOWN 全文。恢复优先读取未投影历史并重新校验引用，定向测试通过。旧 Run 不续写，新真实 Run 尚未重跑，不能把该窄修计入有效修复/M0/四格。
+- ContextAssembler 对 observation 的投影已生效；旧公开 Run 超限为 Gateway 协议/工具历史 `110486 > 109568`，环境使用 UTF-8 字节上界，第十次请求未发送，不是供应商窗口报错。`bed6758`→`e3099ee` 在 Gateway 接入完整 payload 计量与有界单调调整、保留 assistant/tool 配对与 completed cache；当前 Run 原件/哈希/展开能力核验通过后仅投影旧成功 snapshot/Bash output，保留最新批次和失败/UNKNOWN 全文。恢复优先读取未投影历史并重新校验引用，定向测试通过。第三次公开 Run `run_a42d6bd27a364b33b3c0d716357548bc` 已在当前 main 重跑，但以 `110889 > 109568` 的完整请求预检失败，仍无候选补丁；不能把该 Run 计入有效修复/M0/四格。
 - 宿主原 child WAIT、compact字段保护、UNKNOWN换ID拦截、cancel，以及独立 Docker/MCP stale→observe 取证完成。MemoryStore/无模型probe只证明指定接口与进程/文件/浏览器边界，真实业务恢复率/长期召回仍未测。见 `PHASE4_RECOVERY.md`。
 - 真实read-denial容器probe通过，但完整Agent执行面未隔离，Host Session仍拒绝held-out。用户本轮选择先完成窄修与证据归档，暂不实施受信 runner/Bash/MCP 能力入口、干净 runtime、独立 network/DB/cache/retrieval；完整隔离与四格保留待后续明确授权。见 `PHASE4_ISOLATION_READINESS.md`。
-- 真实运行和probe证据经 `cf40289` 合回 main；原项目两份进度文档已同步并明确完成边界，最新状态提交 `ca73d39`。没有push，保留用户未跟踪文件。
+- 真实运行和 probe 证据经 `cf40289` 合回 main；第三次公开 Run 的原始证据保存在 `.tracefix/phase4-public-20261005T110518Z-f27aec3f1467/`，本次仅归档证据，不修改生产实现。原项目两份进度文档已同步并明确完成边界。没有 push，保留用户未跟踪文件。
 
 五层状态仍为：模块/CLI/跨阶段代码接缝完成；真实全链路/held-out四格/长期效果未完成；唯一完整基线未运行。本目标保持 active，不以局部通过或失败取证标 complete。
 

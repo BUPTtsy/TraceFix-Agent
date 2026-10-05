@@ -57,3 +57,14 @@
 该次运行时阶段三 observation 投影已生效，阶段四 WAITING_NETWORK 恢复未触发，工具历史适配尚未实施。后续 `e3099ee` 的实施与定向证据见前节；不能把本次历史失败或定向通过写成真实修复成功。
 
 首次新 Run 启动前另有一次基础设施配置失败：`.tracefix/phase4-public-20261005T090458Z-7d0cc8d16bf1/` 未生成业务 Run，隔离 schema 的 search_path 缺少 pgvector type 所在 public。改为独立 schema 优先、public 只用于已有扩展解析后，才启动本节真实业务 Run；该基础设施记录保留，不算修复成绩。
+
+### 第三次运行：工具历史窄修后的真实公开复核
+
+- 运行目录：`.tracefix/phase4-public-20261005T110518Z-f27aec3f1467/`；Run：`run_a42d6bd27a364b33b3c0d716357548bc`；独立 schema：`tracefix_s4public_f27aec3f1467`。
+- 运行代码：当前 main `695e1dc3878ba31b3862142fde3ce8a0c0c88acb`；目标模板 revision：`e7a9c04002a2d51a14d37da1f4808c2ee4695c57`；冻结规范 JSON 内容与原规范一致，复用原件 SHA256 `db7d8d6e3d1a173c6ced14118a8e964f4a2b2fcea7015b20d2c3a24d07ef86f1`；single、跨 Run 经验 off、`held_out=false`。
+- 真实 Docker 应用、Playwright 浏览器和模型接口均已进入执行；固定镜像 ID 为 `tracefix-bugboard:1.0=sha256:2b034389428ca94c2c7ed013549fb7e1ca71488c11adc7860152c236608fa96c`、`tracefix-browser:1.0=sha256:b725ec0933cd7cc1abb13c156f6e95717b8d5fcb9fe38d1f517f195ed7e8499c`。
+- 终态：进程退出 `1`，`FAILED / INFRA_FAILURE`；6 次模型调用、7 次浏览器动作；第 6 次模型响应后完整请求预检失败，`required_tokens=110889 > available_tokens=109568`，失败类别为 `context_window`。没有发送下一次请求。
+- 无候选补丁、`patch_available=false`、`patch_verification=none`、`validation_refs=[]`；页面业务观察再次捕获 `POST /api/tasks/1` 返回 404，未取得有效修复。
+- 供应商 usage：input `150369`、output `4475`、total `154844`、cache read `80384`；cache write 和费用为 unknown。`implementation-before.json` 与 `implementation-after.json` 一致，生产实现未被运行修改。
+
+该 Run 证明 `e3099ee` 窄修后的真实链路仍可进入模型、浏览器和完整请求计量，但工具历史投影仍未在本业务路径上取得有效候选；本 Run 不计入 M0、独立有效修复或四格成绩。原问题、逆向、刷新和正常业务闭环仍待新的有效 Run；held-out 隔离与真实四格仍按用户选择保留待验收。
