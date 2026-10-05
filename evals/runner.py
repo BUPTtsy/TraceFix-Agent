@@ -370,6 +370,11 @@ class FourCellRunner:
                 verify_candidate=verify_candidate if callable(verify_candidate)
                 else lambda: materialized_hash)
             oracle_result = self._read_oracle_record(binding, oracle_result)
+        isolation_proven = all((oracle_result or {}).get(field, {}).get('real_isolation') is True
+                               for field in ('boundary', 'boundary_after'))
+        summary['oracle_isolation_proven'] = isolation_proven
+        if not isolation_proven or result.get('infra_failure'):
+            summary['evidence_kind'] = 'inconclusive'
         row = {'attempted': True, 'configuration': group.name, 'case_id': self.config.case_id,
                'family': self.config.family, 'run_id': run_id, 'agent_mode': group.agent_mode,
                'cross_run_memory': group.cross_run_memory, 'outcome': result.get('outcome'),

@@ -161,7 +161,8 @@ class DockerAgentBoundary:
                 mounted.append(source)
         _check_copies((*roots, *mounted), private_files)
         fingerprint = hashlib.sha256(json.dumps(records, sort_keys=True).encode()).hexdigest()
-        return {'kind': 'docker_container_inspect', 'container_ids': list(self.exposure.container_ids),
+        return {'kind': 'docker_container_inspect', 'real_isolation': True,
+                'container_ids': list(self.exposure.container_ids),
                 'inspect_hash': fingerprint, 'surfaces': sorted(self.exposure.roots),
                 'mounted_sources': [str(path) for path in mounted],
                 'network_boundary_evidence': self.exposure.network_boundary_evidence,

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from evals.config import EvaluationConfig, GROUPS
+from evals.oracle_bridge import OracleBridge
 from evals.runner import CommandAdapter, FourCellRunner, instrument_memory_calls
 from tracefix.knowledge.memory import MemoryLibrary
 
@@ -122,7 +123,9 @@ def test_runner_single_off_sets_environment_used_by_real_memory_store(tmp_path):
                 'trace_origin': 'runtime_audit', 'gui_real': True}
 
     row = FourCellRunner(config, tmp_path / 'runs', adapter=adapter).run_group(GROUPS[0])
-    assert row['evidence_kind'] == 'real'
+    assert row['evidence_kind'] == 'inconclusive'
+    assert row['trace_summary']['trace_proven'] is True
+    assert row['trace_summary']['oracle_isolation_proven'] is False
     assert [item['event'] for item in calls] == [
         'memory.note', 'memory.save_job_memory', 'memory.job_memory']
 
@@ -134,3 +137,36 @@ def test_command_adapter_parses_batch_result_line(tmp_path):
         group=None)
     assert result['outcome'] == 'FIX_VERIFIED'
     assert result['internal_success'] is True
+
+
+def test_fixture_oracle_never_promotes_audited_trace_to_real(tmp_path):
+    source = _source(tmp_path)
+    config = _config(tmp_path, source)
+    private = tmp_path / 'evaluator'
+    private.mkdir()
+    script = private / 'oracle.py'
+    script.write_text('print(\'{"case_id":"B01","passed":true}\')\n', encoding='utf-8')
+
+    class FixtureBoundary:
+        def verify(self, private_root, private_files):
+            return {'kind': 'fixture_only', 'real_isolation': False}
+
+    oracle = OracleBridge(private, (sys.executable, str(script)), script,
+                          boundary=FixtureBoundary())
+
+    def adapter(**kwargs):
+        candidate = kwargs['root'] / 'candidate.patch'
+        candidate.write_bytes(b'fixture candidate\n')
+        from tracefix.runtime.contracts import digest
+        return {'candidate_patch': str(candidate),
+                'verify_candidate': lambda: digest(candidate.read_bytes()),
+                'trace': [{'event': 'model_call', 'model_agent_id': 'fixture'}],
+                'trace_origin': 'runtime_audit', 'gui_real': True}
+
+    runner = FourCellRunner(config, tmp_path / 'runs', adapter=adapter, oracle=oracle)
+    row = runner.run_group(GROUPS[0])
+    assert row['oracle_passed'] is True
+    assert row['evidence_kind'] == 'inconclusive'
+    assert row['trace_summary']['trace_proven'] is True
+    assert row['trace_summary']['oracle_isolation_proven'] is False
+    assert not list(runner.root.rglob('row.json'))

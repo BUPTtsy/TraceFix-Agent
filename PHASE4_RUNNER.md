@@ -4,7 +4,9 @@
 独立的源码导出、data、artifact、cache、browser、session 目录，并通过环境变量
 接入已有 runtime 开关：`TRACEFIX_AGENT_MODE` 控制 single/multi，
 `TRACEFIX_CROSS_RUN_MEMORY` 控制跨 Run L2/L3 读写。single 不会通过 runner 派发
-模型子 Agent；multi 只有 trace 明确出现委派时才被标记为真实证据。
+模型子 Agent；multi 需要 trace 明确出现委派，且模型身份满足分组要求。
+`real` 同时要求 runtime audit/GUI 证据和 evaluator 私有账本中 Oracle 前后
+均为 `real_isolation=true`；缺失隔离证明或基础设施失败均保留 `inconclusive`。
 
 每一组会生成 `RunBinding`，绑定 source revision/tree hash、environment、seed、
 spec/protocol、model/effort、tools/skills、初始经验、恢复规则和本组 patch hash。
