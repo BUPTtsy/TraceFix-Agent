@@ -23,3 +23,11 @@ T01/T09 的本批依据为主设计 `top10-development-plan.md` 第3节、`agent
 最小回归：`py -3.12 -m pytest tests/test_native_engine.py -q`，23 passed。覆盖 postconditions/wait 的 native result→下一轮、三次冻结复现失败计数、original/regression/behavior 失败反馈，以及 browser dispatch 后 capture 失败仍为 UNKNOWN 且只发一次动作。此处为确定性接缝证据，修补后的真实 B01/模型恢复效果仍由独立新 Run 验收，不能据此宣称真实修复率或长上下文召回已验收。
 
 补充相关回归 `py -3.12 -m pytest tests/test_batch_completion.py tests/test_phase3_feedback.py tests/test_phase4_recovery.py -q`：76 passed、9 failed。失败均为 batch_completion 的 FakeModel 全图在修补/验证/审批前已经 ABNORMAL（死循环），因而候选/验证列表为空；phase3_feedback 与 phase4_recovery 全部通过。对 `test_batch_fix_finishes_without_interactive_approval` 用 `git show HEAD:.../engine.py` 在独立 Python 进程内存载入 HEAD Engine 后单独运行，仍以相同死循环错误失败（1 failed），证实该项不是本次业务失败接缝引入。没有修改 fixture、跳过失败或重复全量基线；其余8项尚未逐项做 HEAD 差分，不称全部已证明既有失败。
+
+## 独立宿主恢复证据
+
+`py -3.12 .tracefix/recovery_probe.py` 运行通过，Run `run_01adbd1ed231457bb2c6588c52785d14`；原始证据为 `.tracefix/phase4-recovery-probe-c4113c0b13c1/report.json`、`trace.json` 与隔离 artifacts。现有 WorkerScheduler 只登记一个 task、只启动一个真实 Python child（PID 25364），恢复先等待其原 future，再得到 exit_code=0 与 stdout=settled；没有创建替代 child。
+
+实际 `compact_context` 前后12个冻结/权限/episode字段及 pending UNKNOWN fence 相同；实际临时文件写入后丢失 acknowledgment，再换 idempotency key仍被原 UNKNOWN资源fence拦截，dispatch_count=1。人工取消经现有 prelude 进入 finalize，外部文件仍存在，不把取消说成副作用撤销。
+
+该脚本仅为本地证据，复用现有 Engine/WorkerScheduler，使用隔离 MemoryStore，未创建新的评测平台。公开源码只读导出自已知干净 B01 target 的 `be76d56`（Application baseline），在探针独立目录建立源码/workspace/guidance/artifacts；未继承原 Run 的模型结果、记忆或缓存。worktree 的 bugboard/target 是未初始化 gitlink，直接通过 Workspace.export 不可用，因此没有以修改仓库信任校验绕过该限制。此证据只证明宿主接口与真实进程/文件护栏；生产持久化数据库恢复、模型输入投影/长上下文召回、真实业务进展和 Docker/MCP stale 恢复仍需独立验收，model_recovery_rate 保持未测。
