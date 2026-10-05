@@ -1,9 +1,45 @@
+import json
 from pathlib import Path
 import runpy
 from types import SimpleNamespace
 from urllib.parse import unquote, urlsplit
 
 import pytest
+
+
+@pytest.mark.parametrize('api_key', ['', '   '])
+def test_real_e2e_required_preflight_reports_missing_secret(tmp_path, monkeypatch, capsys, api_key):
+    module = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'tools/checks/verify_real_e2e.py'))
+    main = module['main']
+    monkeypatch.setenv('TRACEFIX_API_KEY', api_key)
+    monkeypatch.setenv('TRACEFIX_BASE_URL', 'https://api.deepseek.com')
+    monkeypatch.setenv('TRACEFIX_TEXT_MODEL', 'deepseek-chat')
+    monkeypatch.setitem(main.__globals__, 'load_local_env', lambda: None)
+    monkeypatch.setattr(module['shutil'], 'which', lambda name: name)
+    monkeypatch.setitem(main.__globals__, 'command', lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout='linux'))
+    output = tmp_path / 'report.json'
+
+    assert main(['--required', '--preflight-only', '--output', str(output)]) == 2
+
+    report = json.loads(output.read_text(encoding='utf-8'))
+    assert report['status'] == 'failed'
+    assert report['missing'] == ['TRACEFIX_API_KEY']
+    assert 'Repository secret' in report['message']
+    assert 'Repository secret' in capsys.readouterr().out
+
+
+def test_real_e2e_preflight_does_not_run_flow(tmp_path, monkeypatch, capsys):
+    module = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'tools/checks/verify_real_e2e.py'))
+    main = module['main']
+    monkeypatch.setitem(main.__globals__, 'load_local_env', lambda: None)
+    monkeypatch.setitem(main.__globals__, 'prerequisites', lambda: [])
+    monkeypatch.setitem(main.__globals__, 'run_flow', lambda *args: pytest.fail('preflight must not launch real E2E'))
+    output = tmp_path / 'report.json'
+
+    assert main(['--required', '--preflight-only', '--output', str(output)]) == 0
+
+    assert json.loads(output.read_text(encoding='utf-8'))['status'] == 'ready'
+    assert 'REAL_E2E: READY' in capsys.readouterr().out
 
 
 def test_real_e2e_uses_postgres_password_for_compose_and_dsn(monkeypatch):

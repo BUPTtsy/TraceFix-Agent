@@ -13,6 +13,10 @@
 
 ## 真实 E2E 验收
 
+GitHub 夜间流水线需要在 **Settings → Secrets and variables → Actions → Secrets → New repository secret** 中配置 `TRACEFIX_API_KEY`，值为有效的模型 API 密钥。当前默认供应商为 DeepSeek，因此默认配置需要 DeepSeek API 密钥。仓库本地 `.env` 不会自动传入 GitHub Actions，Actions 的 Variables 也不能替代工作流引用的同名 Secret。Organization secret 必须授权当前仓库；Environment secret 只有在 job 配置了对应 `environment` 时才可读取，当前工作流未绑定 environment，建议使用 Repository secret。
+
+可选的 `TRACEFIX_BASE_URL` 和 `TRACEFIX_TEXT_MODEL` 使用 Actions Variables，默认分别为 `https://api.deepseek.com` 和 `deepseek-chat`。密钥配置后可在 Actions 页面手动重新运行失败的 workflow。工作流在安装项目依赖前通过 `--required --preflight-only` 检查前置条件，缺项时保留失败报告并输出配置提示；检查就绪仅表示可以开始执行，不代表真实 E2E 已通过。日志显示 `REAL_E2E: FAILED — TRACEFIX_API_KEY` 时说明密钥未注入或为空，尚未调用模型。
+
 Windows 在项目根目录运行：
 
 ```powershell

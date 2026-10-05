@@ -67,7 +67,7 @@ def postgres_connection_config() -> tuple[str, str]:
 
 def prerequisites() -> list[str]:
     missing = []
-    if not os.getenv("TRACEFIX_API_KEY"):
+    if not os.getenv("TRACEFIX_API_KEY", "").strip():
         missing.append("TRACEFIX_API_KEY")
     if not os.getenv("TRACEFIX_BASE_URL"):
         missing.append("TRACEFIX_BASE_URL")
@@ -281,6 +281,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="TraceFix 真实模型 + Docker + MCP E2E 验收")
     parser.add_argument("--case", default="B01", choices=[f"B{i:02d}" for i in range(1, 13)])
     parser.add_argument("--required", action="store_true", help="缺少真实环境时以失败退出（CI 使用）")
+    parser.add_argument("--preflight-only", action="store_true", help="仅检查前置条件，不执行真实修复")
     parser.add_argument("--spec", type=Path, default=ROOT / "profiles/persistence.spec.json",
                         help="在初始化和修复源码前保存快照的验收规范")
     parser.add_argument("--output", type=Path, default=ROOT / "artifacts/real-e2e/report.json")
@@ -291,9 +292,22 @@ def main(argv=None) -> int:
         status = "failed" if args.required else "skipped"
         report = {"status": status, "case": args.case, "missing": missing,
                   "message": "未使用 Fake 替代真实环境；请补齐前置条件后重试。"}
+        if "TRACEFIX_API_KEY" in missing:
+            report["message"] += (
+                " TRACEFIX_API_KEY 为空：GitHub Actions 请在仓库 Settings > Secrets and variables"
+                " > Actions 中添加名为 TRACEFIX_API_KEY 的 Repository secret，值为有效的模型 API 密钥。"
+                "若使用 Organization secret，请授权当前仓库；若使用 Environment secret，"
+                "请为 workflow job 配置对应 environment。本地运行请设置环境变量或项目根目录 .env。"
+            )
         write_json(args.output, report)
         print(f"REAL_E2E: {status.upper()} — " + "；".join(missing))
+        print(report["message"])
         return 2 if args.required else 0
+    if args.preflight_only:
+        write_json(args.output, {"status": "ready", "case": args.case,
+                                 "message": "前置条件已就绪；尚未执行真实 E2E。"})
+        print("REAL_E2E: READY — 前置条件已就绪；尚未执行真实 E2E")
+        return 0
     print("REAL_E2E: RUNNING — 使用真实模型、Docker 应用和 Playwright MCP")
     return run_flow(args, args.output)
 

@@ -24,6 +24,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      - name: Check real E2E prerequisites
+        run: python tools/checks/verify_real_e2e.py --required --preflight-only --case B01 --output artifacts/real-e2e/report.json
       - uses: actions/setup-node@v5
         with:
           node-version: '22'
