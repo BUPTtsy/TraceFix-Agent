@@ -10,7 +10,7 @@ from pydantic import ConfigDict, Field
 
 from tracefix.runtime.contracts import (BrowserAction, Contract, Decision, PatchProposal,
                                        Phase, TestSpec, digest)
-from tracefix.runtime.tools import ToolPipeline, ToolRegistry, ToolRejected, ToolSpec
+from tracefix.runtime.tools import ToolPipeline, ToolRegistry, ToolRejected, build_tool
 from tracefix.runtime.effects import file_resource, make_operation_executor, run_effect
 
 
@@ -109,19 +109,27 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
         return True
 
     def bind(name, description, input_model, handler, *, phases, side_effect='read',
-             parallel_safe=True, submission=False, output_limit_tokens=4000, timeout_s=45):
+             parallel_safe=False, submission=False, output_limit_tokens=4000, timeout_s=45,
+             output_model=None, aliases=(), search_hint='', enabled=True, idempotency_key=None):
         if not worker_tool_allowed(name, side_effect):
             return
-        registry.register(ToolSpec(name, description, input_model,
+        definition = build_tool(name, description, input_model, handler,
             output_limit_tokens=output_limit_tokens, side_effect=side_effect,
             timeout_s=timeout_s,
             phases=frozenset(phases), parallel_safe=parallel_safe,
-            idempotency_key=digest if side_effect in {'write', 'external'} else None,
+            idempotency_key=(idempotency_key or digest) if side_effect in {'write', 'external'} else None,
             submission=submission, submission_schema=schema if submission else None,
-            category=name.split('.')[0]))
-        handlers[name] = handler
+            category=name.split('.')[0], output_model=output_model, aliases=aliases,
+            search_hint=search_hint, enabled=enabled)
+        registry.register(definition.spec)
+        handlers[name] = definition.handler
 
     register_local_tools(engine, state, context, bind)
+    from tracefix.runtime.task_tools import register_task_tools
+    from tracefix.runtime.web_tools import register_web_tools
+
+    register_task_tools(engine, state, context, bind)
+    register_web_tools(engine, state, context, bind)
 
     if not worker_mode and os.getenv('TRACEFIX_AGENT_MODE', '').lower() != 'single':
         from tracefix.workers.contracts import WorkerResult, WorkerTask
@@ -153,6 +161,7 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
                 'rule_snapshot_hash': '',
                 'reasoning_refs': [], 'compaction_refs': [], 'working_memory_ref': None,
                 'baseline_validation_refs': [], 'diagnosis_feedback_refs': [],
+                'task_board_ref': None, 'todo_list_ref': None,
                 'inherited_evidence_refs': []})
 
             copied_artifacts = {}
@@ -231,7 +240,8 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
 
         delegate_spec = supervisor_tools()[0]
         bind('agent.delegate', delegate_spec.description, delegate_spec.input_model, delegate,
-             phases=set(Phase), side_effect='write', parallel_safe=False, timeout_s=86_400)
+             phases=set(Phase), side_effect='write', parallel_safe=False, timeout_s=86_400,
+             aliases=('Agent',), search_hint='delegate scoped worker subagent task')
 
     async def rules_applicable(arguments, call_id):
         return {'rules': [_value(rule) for rule in engine.active_rules(state)]}
@@ -299,6 +309,10 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
     bind('context.expand', '在当前 Run 作用域内按 artifact 引用展开被省略的证据通道或行范围。',
          ReferenceExpand, expand_reference, phases=set(Phase), output_limit_tokens=5000)
 
+    from tracefix.runtime.discovery_tools import register_discovery_tools
+
+    register_discovery_tools(engine, state, context, registry, bind)
+
     submission = None
     if schema is TestSpec:
         submission = ('submit_test_spec', StrictTestSpec, Phase.PREPARE)
@@ -360,6 +374,10 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
             paths = arguments.get('writable_files') or []
             return ([file_resource(engine.workspace.root / path) for path in paths]
                     if paths else ['delegation:' + state.run_id])
+        if name in {'TaskCreate', 'TaskUpdate', 'TodoWrite'}:
+            return ['run-tasks:' + state.scope_id + ':' + state.run_id]
+        if name == 'Skill':
+            return ['run-skills:' + state.scope_id + ':' + state.run_id]
         return ['*']
 
     store = getattr(engine, 'store', None)
