@@ -31,3 +31,12 @@
 ## 完成口径
 
 首次公开运行和失败根因取证已完成；有效修复、真实恢复收益和独立业务验收仍未完成。该公开运行不能证明 held-out 隔离，也不是四格实验。受信隔离入口与部署缺口另见 `PHASE4_ISOLATION_READINESS.md`；完整基线尚未运行。
+## 第二次运行：业务失败反馈接缝后的新阻塞
+
+- 运行目录：.tracefix/phase4-public-20261005T090557Z-0a2c53e450dd/；Run：run_616fcdacb5864ce0aa21c75e3d86016f；独立 schema：tracefix_s4public_0a2c53e450dd。
+- 运行代码：阶段四窄修提交 053b9762ef3637721df4e626dc832620138686aa；冻结规范 SHA256 仍为 db7d8d6e3d1a173c6ced14118a8e964f4a2b2fcea7015b20d2c3a24d07ef86f1；single、跨 Run 经验 off、held_out=false。
+- 真实链路已越过第一次运行的已结算业务断言/UNKNOWN 接缝：9 次模型调用、5 次浏览器动作均有持久化响应/观察，未生成补丁。
+- 终态：进程退出 1，FAILED / INFRA_FAILURE，原因是 ContextWindowError（受保护上下文超过模型窗口）；无 validation refs、无候选补丁，不能计入 M0 或四格成绩。
+- 供应商实际累计 usage：input 232031、output 3223、total 235254、cache read 157184；cache write 与费用均 unknown。usage 证据由持久化 provider response 汇总，未知字段未填零。
+
+这次结果说明业务失败反馈接缝已能让模型继续执行，但长上下文/保护区治理仍有真实阻塞；不能通过放宽冻结规范、删除保护字段或简单扩大模型窗口伪造成功。应先核查 context manifest、投影预算和压缩证据，再开新的独立 Run。
