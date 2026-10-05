@@ -77,3 +77,4 @@
 - 初版 `bed6758` 不作为最终完成树；生产窄修校正提交为 `e3099ee`。本轮直接在用户指定 main 最终集成树实现该窄修，阶段四旧 worktree 的原始真实证据保持原状；未改其它阶段 checkout，也未重放历史提交。
 - 定向命令：`py -3.12 -m pytest tests/test_phase4_context.py tests/test_native_tools.py tests/test_context_memory.py tests/test_gateway.py tests/test_gateway_retries.py tests/test_gateway_streaming.py tests/test_native_engine.py -q -p no:cacheprovider` → 127 passed；随后扩展 `test_phase4_context.py` → 13 passed，原生回调原件展开单项 → 1 passed。py_compile/git diff --check 通过。没有新增全量测试记录。
 - 用户已明确选择“先完成当前窄修与证据归档，文档标记已完成项，保留完整隔离和四格为待验收”。两份进度文档按该范围同步，完整 goal 不标 complete，完整基线仍未运行。
+- 最终独立只读复核对 `e3099ee` 的 Gateway/Engine/上下文回归补丁返回 `passed / findings=[]`。本轮文档及八项 batch 差分归档提交为 `bd1f531`；原有三个未跟踪项保留，未 push。
