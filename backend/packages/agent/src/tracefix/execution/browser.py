@@ -566,9 +566,17 @@ class MCPBrowser:
             self._action_dispatched = True
             self._generation_invalidated = True
         elif action.kind in {'click', 'type', 'select'}:
-            observation = await self._collect_snapshot()
+            if self.MAP['snapshot'] in self.tools:
+                observation = await self._collect_snapshot()
+            else:
+                observation = self.observation
+                if not observation:
+                    raise MCPConnectionError('MCP 动作缺少可用于定位的页面观测', details={
+                        'tool': self.MAP[action.kind], 'dispatched': False,
+                    })
             try:
-                fresh_ref = resolve_action_locator(self._snapshot_guard, action.locator)
+                fresh_ref = resolve_action_locator(
+                    self._snapshot_guard or observation['snapshot'], action.locator)
             except ValueError as error:
                 raise PermissionError('MCP 新快照无法安全唯一重定位；请重新观测') from error
             self.last_action.update(grounding_observation_id=observation['id'],
@@ -588,4 +596,7 @@ class MCPBrowser:
                 self._generation_invalidated = True
         elif action.kind not in {'observe', 'finish'}:
             raise PermissionError('不支持的标准动作')
+        observer_override = self.__dict__.get('observe')
+        if observer_override is not None:
+            return await observer_override()
         return await self._observe()
