@@ -1,13 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {spawn} from 'node:child_process';
-import readline from 'node:readline/promises';
 import {fileURLToPath} from 'node:url';
 import {createConsoleService} from '@tracefix/console-service/dispatch';
 import {DataError} from '@tracefix/console-service/database';
 import {configureProject, createProject} from '@tracefix/console-service/config';
-import {capabilities, palette} from './terminal.js';
-import {banner, help as helpLines, PLAIN_HELP} from './render.js';
+import {capabilities} from './terminal.js';
+import {help as helpLines, PLAIN_HELP} from './render.js';
 import {suggest} from './registry.js';
 import {ChunkedTextDecoder, EventIntake, type PublicRecord, type TraceFixMessage} from './tracefix-events.js';
 import {chatMessage, CliSession} from './cli-session.js';
@@ -52,23 +51,12 @@ function argumentsOf(args: string[]): {options: Record<string, string | boolean>
   return {options, positionals};
 }
 
-/**
- * 交互期间的行编辑器。非 TTY 路径下始终为 null，
- * 因此 print / 错误输出与改造前完全一致（纯文本、直写 stdout）。
- */
-let editor: {external: (write: () => void) => void} | null = null;
 let uiOutput: ((text: string, error?: boolean) => void) | null = null;
 let uiPublish: ((message: TraceFixMessage) => void) | null = null;
 
-/** 输出前先擦掉输入行，输出后重绘，避免流式输出冲掉用户正在敲的内容。 */
-function emit(write: () => void): void {
-  if (editor) editor.external(write);
-  else write();
-}
-
 function print(value: any): void {
   const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
-  if (uiOutput) uiOutput(text + '\n'); else emit(() => process.stdout.write(text + '\n'));
+  if (uiOutput) uiOutput(text + '\n'); else process.stdout.write(text + '\n');
 }
 
 function pythonCommand(): [string, string[]] {
@@ -127,7 +115,6 @@ const dataRoot = option('data', process.env.TRACEFIX_DATA || '.tracefix');
 const databasePath = option('console-db', process.env.TRACEFIX_CONSOLE_DB || path.join(dataRoot, 'console.sqlite3'));
 const dispatch = createConsoleService({projectsPath, dataRoot, databasePath});
 const terminal = capabilities();
-const colors = palette(terminal.color);
 let projectId = option('project', 'bugboard');
 let mode = option('mode', cliArgs.includes('--run') ? 'test' : 'chat');
 let goal = option('goal');
@@ -255,21 +242,21 @@ function interactiveAgent(args: string[], environment: Record<string, string>, r
   const stderrDecoder = new ChunkedTextDecoder();
   child.stdout?.on('data', chunk => {
     if (uiOutput) stdoutDecoder.push(chunk).forEach(line => uiOutput?.(line + '\n'));
-    else emit(() => process.stdout.write(chunk));
+    else process.stdout.write(chunk);
   });
   child.stderr?.on('data', chunk => {
     if (uiOutput) stderrDecoder.push(chunk).forEach(line => uiOutput?.(line + '\n', true));
-    else emit(() => process.stderr.write(chunk));
+    else process.stderr.write(chunk);
   });
-  child.stdin?.on('error', error => uiOutput ? uiOutput(error.message + '\n', true) : emit(() => process.stderr.write(error.message + '\n')));
-  child.once('error', error => uiOutput ? uiOutput(error.message + '\n', true) : emit(() => process.stderr.write(error.message + '\n')));
+  child.stdin?.on('error', error => uiOutput ? uiOutput(error.message + '\n', true) : process.stderr.write(error.message + '\n'));
+  child.once('error', error => uiOutput ? uiOutput(error.message + '\n', true) : process.stderr.write(error.message + '\n'));
   child.once('close', code => {
     stdoutDecoder.flush().forEach(line => uiOutput?.(line + '\n'));
     stderrDecoder.flush().forEach(line => uiOutput?.(line + '\n', true));
     activeAgent = null;
     if (code && cliArgs.includes('--command')) process.exitCode = code;
     try { dispatch('run.ended', {id: recordId, exitCode: code}); }
-    catch (error) { emit(() => process.stderr.write(String(error) + '\n')); }
+    catch (error) { process.stderr.write(String(error) + '\n'); }
   });
   for (const command of commands) child.stdin?.write(command + '\n');
   const monitor = setInterval(() => {
@@ -300,7 +287,7 @@ async function execute(text: string): Promise<boolean> {
       return true;
     }
     goal = text.trim();
-    await startRun(Boolean(editor));
+    await startRun(Boolean(uiPublish));
     return true;
   }
   const args = tokens(input);
@@ -308,9 +295,7 @@ async function execute(text: string): Promise<boolean> {
   const {options, positionals} = argumentsOf(args);
   if (command === 'quit') { stopChat(); if (activeAgent) activeAgent.stdin?.write('/quit\n'); return false; }
   if (command === 'help') {
-    // 只有真正的交互会话（editor 已启动）才用分组帮助；
-    // --command / 管道等非交互路径保持改造前的三行纯文本。
-    const lines = editor ? helpLines(colors, process.stdout.columns || terminal.columns) : PLAIN_HELP;
+    const lines = uiPublish ? helpLines() : PLAIN_HELP;
     for (const line of lines) print(line);
     return true;
   }
@@ -450,7 +435,7 @@ async function execute(text: string): Promise<boolean> {
     session.bindRun(projectId, target.id);
     const commands = command === 'resume' ? [`/resume ${target.agentRunId}`] :
       [`/resume ${target.agentRunId}`, `/${command} ${positionals[0]}`];
-    if (editor) {
+    if (uiPublish) {
       interactiveAgent(['--project', projectId, '--projects', projectsPath, '--data', dataRoot],
         {...agentEnvironment(), TRACEFIX_CONSOLE_RUN_ID: target.id}, target.id, commands);
       return true;
@@ -499,10 +484,9 @@ async function execute(text: string): Promise<boolean> {
     await executeChat(message, !options['no-knowledge']);
     return true;
   }
-  // 交互下额外给出最接近的命令建议；错误消息本身保持原文不变。
-  if (editor) {
+  if (uiPublish) {
     const near = suggest(command);
-    if (near.length) print(colors.grey('最接近的命令：') + near.map(name => colors.cyan('/' + name)).join(colors.grey('、')));
+    if (near.length) print('最接近的命令：' + near.map(name => '/' + name).join('、'));
   }
   throw new DataError('未知命令；请输入 /help 查看帮助');
 }
@@ -564,18 +548,22 @@ async function main(): Promise<void> {
   return basic();
 }
 
-/** 改造前的朴素交互路径：非 TTY、NO_COLOR、TERM=dumb 时使用，输出逐字保持原样。 */
 async function basic(): Promise<void> {
-  const input = readline.createInterface({input: process.stdin, output: process.stdout});
+  const decoder = new ChunkedTextDecoder();
   print(`TraceFix · ${projectId} · ${mode} · 输入 /help 查看命令`);
+  process.stdout.write('TraceFix > ');
+  const consume = async (line: string): Promise<boolean> => {
+    try {if (!await execute(line)) return false;}
+    catch (error) {process.stderr.write((error instanceof Error ? error.message : String(error)) + '\n');}
+    process.stdout.write('TraceFix > ');
+    return true;
+  };
   try {
-    while (true) {
-      let line: string;
-      try { line = await input.question('TraceFix > '); } catch { break; }
-      try { if (!await execute(line)) break; }
-      catch (error) { process.stderr.write((error instanceof Error ? error.message : String(error)) + '\n'); }
+    for await (const chunk of process.stdin) {
+      for (const line of decoder.push(chunk)) if (!await consume(line)) return;
     }
-  } finally {input.close(); stopChat();}
+    for (const line of decoder.flush()) if (!await consume(line)) return;
+  } finally {stopChat();}
 }
 
 /** TTY 交互路径：横幅、状态行、斜杠菜单、行编辑与历史。 */
@@ -617,7 +605,6 @@ async function interactive(): Promise<void> {
       pendingOutput.splice(0).forEach(push);
     }
   }), {exitOnCtrlC: false});
-  editor = {external: write => write()};
   const poll = setInterval(() => {
     try {
       const id = session.currentRunId(projectId);
@@ -640,7 +627,6 @@ async function interactive(): Promise<void> {
   stopChat();
   uiPublish = null;
   uiOutput = null;
-  editor = null;
 }
 
 main().catch(error => {stopChat(); process.stderr.write((error instanceof Error ? error.message : String(error)) + '\n'); process.exitCode = 2;});
