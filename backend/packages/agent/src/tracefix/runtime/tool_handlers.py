@@ -109,7 +109,7 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
         return True
 
     def bind(name, description, input_model, handler, *, phases, side_effect='read',
-             parallel_safe=False, submission=False, output_limit_tokens=4000, timeout_s=45,
+             parallel_safe=True, submission=False, output_limit_tokens=4000, timeout_s=45,
              output_model=None, aliases=(), search_hint='', enabled=True, idempotency_key=None):
         if not worker_tool_allowed(name, side_effect):
             return
