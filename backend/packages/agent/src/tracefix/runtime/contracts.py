@@ -398,6 +398,8 @@ class RunState(Contract):
     loop_no_progress_steps: int = 0
     loop_warnings: list[dict] = Field(default_factory=list)
     loop_evidence: dict | None = None
+    loop_cause: str | None = None
+    recovery_episodes: list[dict] = Field(default_factory=list)
     last_error_signature: str | None = None
     baseline_validation_refs: list[str] = Field(default_factory=list)
     model_exchange_refs: list[str] = Field(default_factory=list)

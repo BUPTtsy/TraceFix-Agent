@@ -153,8 +153,7 @@ class FixtureChild extends EventEmitter {
         if (this.closed) continue;
         this.event('run.cancelled', {status: 'CANCELLED', message: 'fixture cancel acknowledged'}, 'cancelled');
         this.stdoutText('fixture cancel acknowledged\n');
-        this.started = false;
-        this.emit('close', 0);
+        this.close(0);
       }
       if (line === '/quit') this.close(0);
     }

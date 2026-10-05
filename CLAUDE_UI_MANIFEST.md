@@ -148,3 +148,23 @@
 | `backend/packages/agent/src/tracefix/cli/main.py` | `d57265450fa8c5d6f73e1bc6d35d5706d7edb2da931c87f1c808d3daaaf146c6` | 既有 imports 加 `stream_tool_chat` 和惰性 `build_chat_tools`；JSONL 并发读取/取消、完整回合 history。 |
 
 当前已通过 build、CLI 定向 27 项、Python 定向 98 项和实际 TTY/Chat smoke。production fixture 前置过滤/工具计数/选择缓存/审批恢复/取消/门禁终态可达，但最终 `Ctrl+O` 仍 timeout，不能报告完整通过；真实 OS 拖拽与系统剪贴板、真实 provider/network 未验证。详细证据和本轮实际修改边界记录在 `docs/agent-research-20261004/cli-chat-stream-followup-20261005.md`。
+
+## 2026-10-05 阶段四集成复核与旧入口清理
+
+用户确认 `main@6ada74a` 后，阶段四在隔离树通过 `b81c1d9` 合并该基线，按阶段二→三→四复核。来源复制叶子没有修改；仅调整 TraceFix 入口/组合层与 fixture 生命周期。
+
+此前 production fixture 的最后阶段标签为“expanded public event details”，但输入追踪显示 `Ctrl+O` 已展开，详情断言已通过且已发送 `/quit`。真正阻塞退出的是取消的 `FixtureChild` 只发出 close 事件，没有清除 selection 轮询计时器。取消统一调用已有 `close()` 后，计时器、stdin/stdout/stderr 均收尾；保留全部原断言与 40 秒超时。组合层展开/收起详情时将 scroll 归零，以最近消息为浏览起点。
+
+新 UI 验收后清除 `cli.ts` 的 readline import、占位 editor、external/emit 包装与 dead banner import；非 TTY 输入复用既有 `ChunkedTextDecoder`，覆盖连续命令、UTF-8、CRLF、quit 与 EOF。旧 `render.ts` 的 ANSI banner/配色/截断表格已移除，只保留纯文本帮助数据；`terminal.ts` 只保留 capabilities，旧 palette/光标/显示宽度 renderer 已移除。Ink/Claude adapter 是唯一交互 UI。
+
+| 文件 | 集成前 SHA-256（b81c1d9） | 清理后 SHA-256 |
+| --- | --- | --- |
+| `frontend/apps/cli/src/cli.ts` | `b56eb125237af239d7863c8c4f8865f7b0d143fc876c967100ccc3f2671ba77c` | `595370260160b7a2483523437fd66628592995d83d1c8afb95ea5eb26e21d9cd` |
+| `frontend/apps/cli/src/render.ts` | `268579312f99a3abfc6143c34f5da1a9b5073069f4a0b64ce5951dee1d77de05` | `7e40bb2afde92fb43969995ea21a50726d55b63ff908711576be78c8b8917787` |
+| `frontend/apps/cli/src/terminal.ts` | `45aed6c5bb75f7ad414bdcdb2fcbd714beb09bdecc78e11ec9c9d13d9fbbea30` | `b2201f077b8851c2011f7d8094f9d2427b65b669f95f73f99f5b2735245db88d` |
+| `frontend/apps/cli/src/claude-ui/TraceFixUi.tsx` | `7a2af4e7c9eb12ddf94ad0472ada6420faa7d33ba6e1899601ea0c024576f2af` | `483e4bd626af500e7fecb260d3798631937b5556545c3d025c297fa0874b2b87` |
+| `frontend/apps/cli/production-fixture-preload.mjs` | `74ad8fbdf13d8f6bb29c6e4b75c5e7a9462b4cd2271aebc29ef70670bf0185e8` | `14c3ea99614af316bcafcf0e11e36070ffdff727a6f6ce1d3c1d8f6de2ccbcae` |
+
+普通 CLI build、`node --test test.mjs input-test.mjs cli-session-test.mjs presentation-test.mjs`（33 passed）、`tty-smoke.mjs`（TTY_SMOKE_PASSED）、`chat-smoke.mjs`（CHAT_SMOKE_PASSED）和 `production-fixture-smoke.mjs`（PRODUCTION_FIXTURE_PASSED）均通过。Chat 证据目录为 `C:\Users\tsy\AppData\Local\Temp\tracefix-chat-smoke-cynWDV`。生产入口/package/build 检索未发现 LineEditor、node:readline 或旧 ANSI renderer 的调用；esbuild 的 `banner` 选项和 Claude `Cursor` 输入算法仍是各自正常用途。
+
+production fixture 使用真实 ConPTY、SQLite 和公开事件接线，Agent 事件由 fixture 子进程提供；Chat 使用真实 Python JSONL 与本地 HTTP fixture。两者不等于真实 provider/network、真实修复或 held-out 成绩；OS 拖拽/系统剪贴板仍待验证。

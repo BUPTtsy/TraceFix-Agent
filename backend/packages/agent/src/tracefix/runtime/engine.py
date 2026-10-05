@@ -37,6 +37,7 @@ from tracefix.runtime.validation_feedback import (ValidationFeedback, build_vali
 from tracefix.runtime.verification import verification_binding
 from tracefix.runtime.effects import file_resource, make_operation_executor
 from tracefix.runtime.event_adapter import EventAdapter, EventCursor
+from tracefix.runtime.recovery import RecoveryAction, RecoveryController, classify_cause, has_real_progress
 from tracefix.runtime.diagnosis import (DiagnosisDraft, DiagnosisReport, binding_from_observation,
     symptom_query, validate_report)
 from tracefix.knowledge.assembler import ContextAssembler, ContextWindowError
@@ -227,6 +228,7 @@ class Engine:
         self.document_context = {}
         self._trace_sequences = {}
         self.event_adapter = EventAdapter(store)
+        self.recovery = RecoveryController()
         self.skills = SkillCatalog(Path(__file__).resolve().parents[5] / 'skills')
         self.skill_store = SkillStore(self.artifacts)
         self.graph = self._graph(checkpointer)
@@ -661,12 +663,35 @@ class Engine:
     def changed(self, s, **delta):
         persisted = self.store.load(s.run_id, s.scope_id)
         if 'loop_no_progress_steps' not in delta:
-            progress_fields = {
-                'phase', 'observation_ref', 'evidence_refs', 'failure_signatures',
-                'validation_index', 'patch_hash', 'reproduced', 'source_aligned',
+            explicit = bool(delta.pop('_semantic_progress', False))
+            progressed = explicit
+            meaningful_fields = {
+                'validation_refs', 'behavior_check_refs', 'reproduced', 'source_aligned',
             }
-            progressed = any(field in delta and delta[field] != getattr(s, field)
-                             for field in progress_fields)
+            progressed = progressed or any(
+                field in delta and delta[field] != getattr(s, field)
+                for field in meaningful_fields
+            )
+            if not progressed and 'observation_ref' in delta and delta['observation_ref'] != s.observation_ref:
+                before = self.get(s, s.observation_ref) if s.observation_ref else None
+                after = self.get(s, delta['observation_ref']) if delta['observation_ref'] else None
+                if before and after:
+                    progressed = has_real_progress(
+                        {'snapshot': stable_snapshot(before.get('snapshot', '')),
+                         'assertions': before.get('assertions'),
+                         'business_state': before.get('business_state')},
+                        {'snapshot': stable_snapshot(after.get('snapshot', '')),
+                         'assertions': after.get('assertions'),
+                         'business_state': after.get('business_state')},
+                    )
+            if not progressed:
+                for field in ('reproduced', 'source_aligned'):
+                    if field in delta and delta[field] is True and delta[field] != getattr(s, field):
+                        progressed = True
+                        break
+            if not progressed and 'validation_refs' in delta:
+                progressed = (delta['validation_refs'] != s.validation_refs
+                              and bool(delta['validation_refs']))
             delta['loop_no_progress_steps'] = 0 if progressed else s.loop_no_progress_steps + 1
         new = reduce_state(s, persisted.revision, **delta)
         self.store.save(new)
@@ -679,10 +704,9 @@ class Engine:
         pending = s.pending_action
         if isinstance(pending, dict):
             pending = {key: value for key, value in pending.items()
-                       if key not in {'observation_id', 'element_ref'}}
-        return digest([str(s.phase), s.trial, s.validation_index, s.replay_index,
-                       s.diagnosis_retry_count,
-                       snapshot, pending, s.patch_hash,
+                       if key not in {'observation_id', 'element_ref', 'page_generation',
+                                      'generation', 'call_id', 'tool_call_id', 'attempt_id'}}
+        return digest([snapshot, pending,
                        s.last_error_signature or (s.failure_signatures[-1]
                                                   if s.failure_signatures else None)])
 
@@ -734,25 +758,108 @@ class Engine:
             warnings.append({'kind': 'no_progress', 'steps': s.loop_no_progress_steps})
         return fingerprint, warnings, signals
 
-    def _mark_loop(self, s, fingerprint, warnings, signals):
+    async def _recovery_action(self, s, decision):
+        if decision.action.value == 'await_child':
+            pending = s.pending_action if isinstance(s.pending_action, dict) else {}
+            task_id = pending.get('child_task_id') or pending.get('task_id')
+            runtime = getattr(self, 'subagent_runtime', None)
+            scheduler = getattr(runtime, 'scheduler', None)
+            if not task_id or scheduler is None:
+                return False, {'status': 'unavailable', 'interface': 'child_wait'}
+            try:
+                handle = scheduler.handle(task_id)
+                result = await scheduler.wait(handle, timeout=decision.evidence.get('deadline_seconds', 60))
+                return True, {'status': str(getattr(result, 'status', 'settled')), 'task_id': task_id,
+                              'child_settled': True}
+            except Exception as error:
+                return False, {'status': 'unavailable', 'interface': 'child_wait',
+                               'error': sanitize(error_message(error))[:300]}
+        if decision.action.value == 'refresh_observation':
+            observe = getattr(self.browser, 'observe', None)
+            if not callable(observe):
+                return False, {'status': 'unavailable', 'interface': 'browser.observe'}
+            try:
+                ref = await self.capture(s, await observe())
+                return True, {'status': 'observed', 'observation_ref': ref, 'observation_changed': True}
+            except Exception as error:
+                return False, {'status': 'unavailable', 'interface': 'browser.observe',
+                               'error': sanitize(error_message(error))[:300]}
+        if decision.action.value == 'compact_context':
+            try:
+                ref = self.compact_context(s, reason='recovery')
+                return True, {'status': 'compacted', 'compaction_ref': ref}
+            except Exception as error:
+                return False, {'status': 'unavailable', 'interface': 'context.compact',
+                               'error': sanitize(error_message(error))[:300]}
+        return True, {'status': 'scheduled'}
+
+    async def _mark_loop(self, s, fingerprint, warnings, signals):
+        cause = classify_cause(error=s.error, error_details=s.error_details,
+                               signals=signals, pending_action=s.pending_action,
+                               cancelled=s.error == '用户已取消')
         evidence = {'signals': signals, 'state_fingerprint': fingerprint,
                     'state_tail': (s.loop_state_fingerprints + [fingerprint])[-12:],
                     'action_tail': s.action_fingerprints[-12:],
                     'error_tail': s.loop_error_signatures[-12:],
-                    'step': s.step}
+                    'step': s.step, 'cause': cause.value}
+        episode_key = digest([cause.value, fingerprint,
+                              s.last_error_signature,
+                              s.pending_action.get('kind') if isinstance(s.pending_action, dict) else None])
+        evidence['semantic_repeat_key'] = episode_key
+        decision = self.recovery.decide(cause, s.recovery_episodes, evidence=evidence,
+                                        episode_id=episode_key)
+        evidence['recovery'] = {'action': decision.action.value, 'attempt': decision.attempt,
+                                'max_attempts': decision.max_attempts,
+                                'can_continue': decision.can_continue, 'reason': decision.reason,
+                                'deadline_seconds': self.recovery.budget(cause).deadline_seconds}
+        if decision.can_continue:
+            available, action_evidence = await self._recovery_action(s, decision)
+            evidence['recovery'].update(action_evidence)
+            if not available:
+                decision = dataclasses.replace(decision, action=RecoveryAction.STOP, can_continue=False,
+                                               reason='恢复接口不可用，保持基线终态')
+                evidence['recovery'].update(action='stop', can_continue=False,
+                                            reason=decision.reason)
+        episodes = self.recovery.record(
+            s.recovery_episodes, decision,
+            status='continued' if decision.can_continue else 'settled')
+        if decision.can_continue:
+            target_phase = s.phase
+            if (decision.action.value == 'correct_strategy'
+                    and s.phase in {Phase.PATCH, Phase.VERIFY}):
+                target_phase = Phase.DIAGNOSE
+            delta = {
+                'loop_state_fingerprints': [], 'loop_error_signatures': [],
+                'loop_no_progress_steps': 0, 'loop_warnings': s.loop_warnings + warnings,
+                'loop_evidence': evidence, 'loop_cause': cause.value,
+                'recovery_episodes': episodes, 'last_error_signature': None,
+                'error': None, 'error_details': {'recovery': evidence['recovery'], 'cause': cause.value},
+                'pending_action': None, 'abnormal_termination': False,
+            }
+            if action_evidence.get('observation_ref'):
+                delta['observation_ref'] = action_evidence['observation_ref']
+            if action_evidence.get('child_settled') or action_evidence.get('observation_changed'):
+                delta['_semantic_progress'] = True
+            if target_phase != s.phase:
+                delta['phase'] = target_phase
+            s = self.changed(s, **delta)
+            self.event(s, 'recovery.started', evidence)
+            return s
         s = self.changed(s, loop_state_fingerprints=s.loop_state_fingerprints + [fingerprint],
                          loop_warnings=s.loop_warnings + warnings,
-                         loop_evidence=evidence, abnormal_termination=True,
+                         loop_evidence=evidence, loop_cause=cause.value,
+                         recovery_episodes=episodes, abnormal_termination=True,
                          phase=Phase.FINALIZE, outcome=Outcome.LOOP_DETECTED,
                          run_status=RunStatus.RUNNING, pending_action=None,
                          error='检测到死循环')
         self.event(s, 'loop.detected', evidence)
         return s
 
-    def _record_loop_boundary(self, s):
+    async def _record_loop_boundary(self, s):
         fingerprint, warnings, signals = self._loop_assessment(s)
         if signals:
-            return self._mark_loop(s, fingerprint, warnings, signals), True
+            marked = await self._mark_loop(s, fingerprint, warnings, signals)
+            return marked, marked.outcome == Outcome.LOOP_DETECTED
         history = s.loop_state_fingerprints + [fingerprint]
         if warnings:
             s = self.changed(s, loop_state_fingerprints=history,
@@ -1317,8 +1424,8 @@ class Engine:
                     if (loop_signals and not diagnostic_feedback
                             and not (isinstance(e, (ModelError, MCPConnectionError, MCPActionUnknown))
                             and e.status in {'UNKNOWN_OPERATION', 'WAITING_NETWORK'})):
-                        s = self._mark_loop(s, self._loop_state_fingerprint(s), [], loop_signals)
-                        return self.output(s, 'finalize')
+                        s = await self._mark_loop(s, self._loop_state_fingerprint(s), [], loop_signals)
+                        return self.output(s, 'finalize' if s.outcome == Outcome.LOOP_DETECTED else 'prelude')
                     error_details = None
                     if isinstance(e, (ModelError, MCPConnectionError, MCPActionUnknown)):
                         error_details = redact({**e.details, 'status': e.status,
@@ -1488,7 +1595,7 @@ class Engine:
             s = self.changed(s, run_status=RunStatus.PAUSED)
             return self.output(s, 'paused')
         if s.phase != Phase.FINALIZE and (s.phase != Phase.PREPARE or s.last_error_signature):
-            s, looped = self._record_loop_boundary(s)
+            s, looped = await self._record_loop_boundary(s)
             if looped:
                 return self.output(s, 'finalize')
         if self.notes:

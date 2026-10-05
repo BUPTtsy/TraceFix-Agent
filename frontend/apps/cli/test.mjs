@@ -158,3 +158,38 @@ test('已构建 CLI 的非 TTY --command 保留纯文本帮助与错误码', () 
   assert.equal(error.status, 2);
   assert.match(error.stderr, /未知命令/);
 });
+
+test('非 TTY 连续命令保留 UTF-8、CRLF 与 quit 边界', () => {
+  const cli = path.join(root, 'dist', 'cli.mjs');
+  const projectRoot = path.resolve(root, '../../..');
+  const data = fs.mkdtempSync(path.join(os.tmpdir(), 'tracefix-cli-pipe-'));
+  const result = spawnSync(process.execPath, [cli, '--data', data], {
+    cwd: projectRoot,
+    encoding: 'utf8',
+    input: '/mode repair\r\n/中文命令\r\n/help\r\n/quit\r\n/mode chat\n',
+    timeout: 10_000,
+    env: {...process.env, TRACEFIX_CLI_PLAIN: '1'},
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /新 Run 模式：repair/);
+  assert.match(result.stdout, /\/projects list\|show\|use/);
+  assert.match(result.stderr, /未知命令/);
+  assert.doesNotMatch(result.stdout, /新 Run 模式：chat|\ufffd|\x1b\[/);
+});
+
+test('非 TTY EOF 处理没有末尾换行的命令', () => {
+  const cli = path.join(root, 'dist', 'cli.mjs');
+  const projectRoot = path.resolve(root, '../../..');
+  const data = fs.mkdtempSync(path.join(os.tmpdir(), 'tracefix-cli-eof-'));
+  const result = spawnSync(process.execPath, [cli, '--data', data], {
+    cwd: projectRoot,
+    encoding: 'utf8',
+    input: '/mode test\n/help',
+    timeout: 10_000,
+    env: {...process.env, NO_COLOR: '1'},
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /新 Run 模式：test/);
+  assert.match(result.stdout, /\/projects list\|show\|use/);
+  assert.doesNotMatch(result.stdout, /\x1b\[/);
+});
