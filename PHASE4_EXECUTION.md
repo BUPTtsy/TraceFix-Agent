@@ -78,3 +78,4 @@
 - 定向命令：`py -3.12 -m pytest tests/test_phase4_context.py tests/test_native_tools.py tests/test_context_memory.py tests/test_gateway.py tests/test_gateway_retries.py tests/test_gateway_streaming.py tests/test_native_engine.py -q -p no:cacheprovider` → 127 passed；随后扩展 `test_phase4_context.py` → 13 passed，原生回调原件展开单项 → 1 passed。py_compile/git diff --check 通过。没有新增全量测试记录。
 - 用户已明确选择“先完成当前窄修与证据归档，文档标记已完成项，保留完整隔离和四格为待验收”。两份进度文档按该范围同步，完整 goal 不标 complete，完整基线仍未运行。
 - 最终独立只读复核对 `e3099ee` 的 Gateway/Engine/上下文回归补丁返回 `passed / findings=[]`。本轮文档及八项 batch 差分归档提交为 `bd1f531`；原有三个未跟踪项保留，未 push。
+- 第三次公开 B01 离线重放与原清单的 context hash 和 `110889` 请求计量完全一致；三个旧成功结果已经投影，两个失败结果及最新批次完整保留。12 个可选上下文预算探针中，成功组装的最低实测请求为 `110169 > 109568`；更小探针预算被现有组装器拒绝。证据为该 Run 根目录 `budget-replay-audit.json`；不发送模型请求，不改变生产代码，不能将调整投影顺序宣称为已解决真实超窗。可选观察预算下界及序列化开销仍需后续验证。
