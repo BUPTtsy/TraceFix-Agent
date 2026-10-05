@@ -16,6 +16,8 @@ ELEMENT = re.compile(r'^\s*- (?P<role>[\w-]+)(?: "(?P<name>(?:[^"\\]|\\.)*)")?(?
 UPSTREAM_TRUNCATION = re.compile(
     r'(?im)^\s*(?:\.{3}|…)?\s*(?:\[[^\n]*(?:truncat(?:ed|ion)|内容已省略)[^\n]*\]'
     r'|(?:snapshot|output|content|response)\s+(?:is\s+|was\s+)?truncated\b)')
+SNAPSHOT_LIMIT = 40000
+SNAPSHOT_OMISSION = '页面快照中间内容已省略'
 
 
 def elements(snapshot):
@@ -400,6 +402,18 @@ class MCPBrowser:
         text_blocks = [block for block in blocks if block.type == 'text']
         raw = '\n'.join(block.text for block in text_blocks)
         text = sanitize(raw)
+        collector_truncated = False
+        if len(text) > SNAPSHOT_LIMIT:
+            marker = f'\n{SNAPSHOT_OMISSION}\n'
+            available = SNAPSHOT_LIMIT - len(marker)
+            head_limit = available // 2
+            tail_limit = available - head_limit
+            head_end = text.rfind('\n', 0, head_limit)
+            head = text[:head_end + 1] if head_end >= 0 else text[:head_limit]
+            tail_start = text.find('\n', max(0, len(text) - tail_limit))
+            tail = text[tail_start + 1:] if tail_start >= 0 else text[-tail_limit:]
+            text = head + marker + tail
+            collector_truncated = True
         upstream_truncated = bool(UPSTREAM_TRUNCATION.search(raw))
         for block in text_blocks:
             metadata = getattr(block, 'meta', None) or getattr(block, '_meta', None) or {}
@@ -412,7 +426,7 @@ class MCPBrowser:
             'status': status, 'captured_at': captured_at,
             'content_version': digest(text) if text_blocks else None,
             'provider_characters': len(raw), 'collector_characters': len(text),
-            'upstream_truncated': upstream_truncated, 'collector_truncated': False,
+            'upstream_truncated': upstream_truncated, 'collector_truncated': collector_truncated,
         }
 
     async def _collect_snapshot(self):
