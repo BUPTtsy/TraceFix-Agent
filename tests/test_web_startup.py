@@ -51,6 +51,16 @@ def test_full_web_prepares_agent_and_starts_services(tmp_path, monkeypatch):
     assert not any('frontend/apps/cli/dist/cli.mjs' in command for command in calls)
 
 
+@pytest.mark.parametrize('agent_arguments', [
+    [], ['--mode', 'test'], ['--mode', 'repair', '--spec', 'profiles/persistence.spec.json'],
+    ['--run', '--goal', 'batch task'],
+])
+def test_cli_startup_uses_new_default_without_overriding_explicit_task(tmp_path, monkeypatch, agent_arguments):
+    module, calls, _ = bootstrap_fixture(tmp_path, monkeypatch)
+    assert module.main(['--skip-install', '--skip-build', *agent_arguments]) == 0
+    assert calls[-1] == ['node', 'frontend/apps/cli/dist/cli.mjs', *agent_arguments]
+
+
 def test_console_only_does_not_require_docker_or_key(tmp_path, monkeypatch):
     module, calls, prerequisites = bootstrap_fixture(tmp_path, monkeypatch)
     (tmp_path / '.env').unlink()

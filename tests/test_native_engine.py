@@ -8,7 +8,7 @@ import pytest
 
 from tracefix.execution.browser import MCPActionUnknown, MCPBrowser
 from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
-from tracefix.runtime.contracts import BrowserAction, Decision, Phase, digest
+from tracefix.runtime.contracts import Assertion, BrowserAction, Decision, Locator, Phase, digest
 from tracefix.runtime.smoke import PNG, make_engine
 
 
@@ -80,6 +80,35 @@ async def test_native_actions_update_observations_receipts_replay_and_audit(tmp_
     assert [engine.get(state, event['result_ref'])['tool_result']['message']['tool_call_id']
             for event in audits] == call_ids
     assert [record['tool_round'] for record in records if 'request' in record] == [0, 1, 2]
+    exchange_kinds = ['request' if 'request' in record else 'tool_result'
+                      for record in records if 'request' in record or 'tool_result' in record]
+    assert exchange_kinds == ['request', 'tool_result', 'request', 'tool_result', 'request']
+
+
+async def test_action_business_failure_keeps_latest_observation_and_separates_receipt(tmp_path):
+    engine, state = await prepare_engine(tmp_path)
+    initial = engine.get(state, state.observation_ref)
+    action = BrowserAction(
+        kind='click',
+        observation_id=initial['id'],
+        element_ref='e2',
+        locator=Locator(role='checkbox', name='Complete task'),
+        postconditions=[Assertion(locator=Locator(role='checkbox', name='Complete task'),
+                                  condition='checked')],
+    )
+
+    with pytest.raises(ValueError, match='后置断言'):
+        await engine.act(state, action)
+
+    persisted = engine.store.load(state.run_id, state.scope_id)
+    assert persisted.observation_ref != initial['id']
+    assert engine.get(persisted, persisted.observation_ref)['id'] != initial['id']
+    trace = engine.store.trace(state.run_id, state.scope_id)
+    completed = next(event for event in trace if event['type'] == 'tool.completed')
+    business = next(event for event in trace if event['type'] == 'action.business.outcome')
+    assert completed['payload']['receipt']['observation_ref'] == business['payload']['observation_ref']
+    assert business['payload']['status'] == 'failed'
+    assert business['payload']['passed'] is False
 
 
 @pytest.mark.parametrize('violation', ['stale', 'unauthorized', 'origin', 'missing-locator'])

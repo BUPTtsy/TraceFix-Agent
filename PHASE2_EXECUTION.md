@@ -49,3 +49,13 @@
 - 共享逻辑块仅：engine init/observe capture与投影/act/reset/freeze/diagnose/model_call窄接线/notify-read_events/discover single门禁；contracts可选字段；tool_handlers single门禁。其它阶段需要review语义合并，不宜整文件覆盖。
 - 跨阶段stage3/4、console服务SSE reconnect仍未集成验收；本轮仅Engine/CLI历史消费，不能把gateway/chat直播当Run历史续传已联通。长期Run完整history读取性能待后续窄化；child历史缺口显式标不完整。
 - 本地提交顺序由下述commit记录确定；不push、不自动合并其它阶段，完整基线留最终统一集成树一次运行。
+
+## Claude 接缝与 `cli_contract`
+
+本轮只给阶段三 TypeScript CLI 一个窄的非 TTY JSON 投影，不新增事件存储或 Gateway。`EventBatch.as_dict()` 的 `contract_version` 固定为 `tracefix-cli/1`，其余字段保持 `events`、`cursor`、`high_watermark`、`snapshot` 和 `requires_new_observation`；事件数组按 `seq` 严格递增，事件自身保留 `scope_id`、`run_id`、`phase`、`revision`、`type`、`at` 和 `payload`。客户端必须原样保存 opaque cursor，遇到 `cursor_invalid`、`cursor_ahead`、`cursor_expired` 或 `durable_gap` 只消费 snapshot 并重新获取 observation，不派生替代 child 或换 ID 重放。
+
+事件顺序映射为 `model.called`/请求 artifact → `tool.requested` 或 `tool.started` → `tool.completed`、`tool.error` 或 `tool.unknown` → `model.tool.result.persisted` → 下一次 `model.called`。工具结果 artifact 由 `result_ref`、`tool_call_id`、`logical_exchange_id` 和 `tool_round` 绑定，不能把 `tool.completed` 或进程退出当作业务成功。浏览器后置条件和可观察等待会追加 `action.business.outcome`，其中 `status=passed|failed`、`passed`、`observation_ref` 和断言明细独立于工具回执；失败路径先把最新 observation 写回 RunState，再发该事件。
+
+Run 身份使用 `scope_id`、`run_id`、可选 `parent_run_id`，子任务事件中的 `child_run_id`/`task_id` 不得被合并成父 Run。`run.finished` 同时给出 `status`、`outcome`、`error`、`error_details` 和 `cancelled`；取消只说明用户取消，不能说明副作用已撤销。副作用回执 `tool.unknown` 仍携带 operation identity/resource fence，并要求人工核对；`UNKNOWN_OPERATION`、`WAITING_NETWORK`、未确认 `executed` 和取消后的 pending operation 都不可自动换 ID 重放。
+
+观察与来源引用保持同一事实链：`observation_ref` → `screenshot_ref`/`raw_refs`/channel status → `artifact_ref`；源码片段额外带 `relative_path`、line range、`content_version`、`source_revision`、`overlay` 和 `truncated`。`unavailable`、`truncated`、`stale` 必须作为状态保留，不能用有界模型视图覆盖原件。当前 `console-service` 的 `console_events`/数值 `after` 仍是旧缓存消费，尚未桥接本契约；阶段三接入时必须保留上述 Python cursor/snapshot 语义。

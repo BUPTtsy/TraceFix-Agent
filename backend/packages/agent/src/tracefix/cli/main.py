@@ -25,7 +25,7 @@ from tracefix.knowledge.retrieval import EmbeddingAdapter, Retriever
 from tracefix.knowledge.memory import MemoryLibrary
 from tracefix.knowledge.scope import ScopeResolver
 from tracefix.model.gateway import BrowserPolicyRouter, Gateway
-from tracefix.model.chat import stream_chat
+from tracefix.model.chat import stream_chat, stream_tool_chat
 from tracefix.messages import ChineseArgumentParser, error_message
 from tracefix.runtime.contracts import Outcome, Phase, RunState, RunStatus, TestSpec, digest, new_id
 from tracefix.runtime.engine import Engine
@@ -892,6 +892,155 @@ async def application(args):
         return 0
 
 
+async def chat_jsonl(args):
+    """运行无历史继承的长驻 Chat JSONL 边界，供 Ink CLI 消费。"""
+    documents = DocumentLibrary(getattr(args, 'console_db', None))
+    turns = []
+    active = None
+    output_lock = asyncio.Lock()
+    session_id = getattr(args, 'chat_session', None) or new_id()
+    scopes = ScopeResolver(load_projects(Path(args.projects)), Path(args.projects))
+    context = scopes.context(args.project)
+    artifacts = Artifacts(Path(args.data) / 'artifacts')
+
+    async def emit(value):
+        async with output_lock:
+            value = {'session_id': session_id, 'scope_id': args.project, **value}
+            sys.stdout.write(json.dumps(value, ensure_ascii=False, separators=(',', ':')) + '\n')
+            sys.stdout.flush()
+
+    async def answer(request):
+        message_id = str(request.get('id') or new_id())
+        message = request.get('message')
+        if not isinstance(message, str) or not message.strip():
+            await emit({'type': 'chat.error', 'session_id': session_id,
+                        'message_id': message_id, 'error': '请输入非空消息'})
+            return
+        use_knowledge = request.get('use_knowledge', True)
+        if type(use_knowledge) is not bool:
+            use_knowledge = True
+        await emit({'type': 'chat.started', 'session_id': session_id,
+                    'message_id': message_id, 'scope_id': args.project})
+        answer_text = ''
+        sources = []
+        turn_messages = None
+        tool_round = 0
+
+        async def tool_event(kind, payload):
+            receipt = payload.get('receipt') or {}
+            intent = payload.get('intent') or {}
+            metadata = {'logical_exchange_id': message_id, 'tool_round': tool_round,
+                        'tool_call_id': payload.get('tool_call_id'),
+                        'tool_name': payload.get('tool_name') or intent.get('tool_name') or receipt.get('name')}
+            if kind == 'tool.started':
+                metadata['intent'] = {'tool_name': metadata['tool_name'], 'side_effect': intent.get('side_effect')}
+            if kind in {'tool.completed', 'tool.error'}:
+                metadata['receipt'] = {key: receipt[key] for key in
+                    ('name', 'isError', 'executed', 'artifact_ref', 'truncated', 'error') if key in receipt}
+                if payload.get('error'):
+                    metadata['error'] = payload['error']
+            await emit({'type': kind, 'session_id': session_id, 'scope_id': args.project,
+                        'message_id': message_id, 'payload': redact(metadata)})
+
+        try:
+            from tracefix.model.chat_tools import build_chat_tools
+            pipeline = build_chat_tools(scopes, context, documents, artifacts, session_id,
+                                        emit=tool_event, use_knowledge=use_knowledge)
+            history = [item for turn in turns for item in turn]
+            async for event in stream_tool_chat(message, history, args.project, documents, pipeline, use_knowledge):
+                if event.get('sources'):
+                    sources = event['sources']
+                    await emit({'type': 'chat.sources', 'session_id': session_id,
+                                'message_id': message_id, 'references': sources})
+                delta = event.get('delta')
+                if isinstance(delta, str) and delta:
+                    answer_text += delta
+                    await emit({'type': 'chat.delta', 'session_id': session_id,
+                                'message_id': message_id, 'delta': delta})
+                if event.get('turn_messages') is not None:
+                    turn_messages = event['turn_messages']
+                if 'tool_round' in event:
+                    tool_round = event['tool_round'] + 1
+            if turn_messages is None:
+                raise ValueError('对话未完成，不能追加会话历史')
+            turns.append(turn_messages)
+            del turns[:-10]
+            await emit({'type': 'chat.finished', 'session_id': session_id,
+                        'message_id': message_id, 'content': answer_text,
+                        'references': sources})
+        except asyncio.CancelledError:
+            await emit({'type': 'chat.cancelled', 'session_id': session_id,
+                        'message_id': message_id})
+            raise
+        except Exception as error:
+            await emit({'type': 'chat.error', 'session_id': session_id,
+                        'message_id': message_id, 'error': error_message(error)})
+
+    async def read_input():
+        return await asyncio.to_thread(sys.stdin.readline)
+
+    await emit({'type': 'chat.ready', 'session_id': session_id, 'scope_id': args.project})
+    try:
+        while True:
+            raw = await read_input()
+            if not raw:
+                break
+            try:
+                request = json.loads(raw)
+            except (TypeError, ValueError):
+                await emit({'type': 'chat.error', 'session_id': session_id,
+                            'error': 'Chat 输入必须是 JSON 对象'})
+                continue
+            if not isinstance(request, dict):
+                await emit({'type': 'chat.error', 'session_id': session_id,
+                            'error': 'Chat 输入必须是 JSON 对象'})
+                continue
+            command = request.get('type', 'message')
+            if command == 'clear':
+                if active and not active.done():
+                    await emit({'type': 'chat.error', 'session_id': session_id,
+                                'error': '回答进行中不能清空会话'})
+                    continue
+                turns.clear()
+                await emit({'type': 'chat.cleared', 'session_id': session_id})
+                continue
+            if command == 'cancel':
+                if request.get('id') and active and getattr(active, 'message_id', None) != str(request['id']):
+                    await emit({'type': 'chat.error', 'session_id': session_id,
+                                'message_id': request['id'], 'error': '取消请求与当前回答不匹配'})
+                    continue
+                if active and not active.done():
+                    active.cancel()
+                    try:
+                        await active
+                    except asyncio.CancelledError:
+                        pass
+                    active = None
+                else:
+                    await emit({'type': 'chat.cancelled', 'session_id': session_id,
+                                'message_id': request.get('id')})
+                continue
+            if command == 'quit':
+                break
+            if command not in {'message', ''}:
+                await emit({'type': 'chat.error', 'session_id': session_id,
+                            'message_id': request.get('id'), 'error': '未知 Chat 事件'})
+                continue
+            if active and not active.done():
+                await emit({'type': 'chat.error', 'session_id': session_id,
+                            'message_id': request.get('id'), 'error': '已有回答进行中'})
+                continue
+            active = asyncio.create_task(answer(request))
+            active.message_id = str(request.get('id') or '')
+    finally:
+        if active and not active.done():
+            active.cancel()
+            try:
+                await active
+            except asyncio.CancelledError:
+                pass
+
+
 def main():
     if sys.platform == 'win32':
         for stream in (sys.stdout, sys.stderr):
@@ -915,6 +1064,8 @@ def main():
     execution.add_argument('--run',action='store_true',help='执行一次批处理运行并输出最终报告与补丁；不创建提交')
     execution.add_argument('--command',action='append',help='执行斜杠命令后退出；可重复指定，知识管理无需启动后端')
     execution.add_argument('--continue-run', help='继续原任务，保留任务 ID 和完整轨迹')
+    execution.add_argument('--chat-jsonl', action='store_true', help='Chat stdin/stdout JSONL 交互接口')
+    parser.add_argument('--chat-session', default=None, help='本次 Chat 会话标识')
     parser.add_argument('--instruction', default='', help='本次继续执行的指令')
     parser.add_argument('--parent-run', default=None, help='派生自指定 Run；继承其规则快照')
     parser.add_argument('--rule', action='append', default=[], help='派生 Run 追加规则 ID；可重复指定')
@@ -922,6 +1073,14 @@ def main():
     parser.add_argument('--preview',action='store_true',help='离线界面预览；使用明确标记的演示数据，不连接外部服务')
     parser.add_argument('--smoke',action='store_true',help='显式使用 Fake 模型/工具的 CI Smoke 测试')
     args=parser.parse_args()
+    if args.chat_jsonl:
+        try:
+            asyncio.run(chat_jsonl(args))
+        except (ValueError, RuntimeError, PermissionError, OSError) as error:
+            print(json.dumps({'type': 'chat.error', 'fatal': True, 'scope_id': args.project,
+                              'session_id': args.chat_session, 'error': error_message(error)}, ensure_ascii=False), flush=True)
+            raise SystemExit(2)
+        return
     if args.preview:
         from tracefix.cli.preview import preview
         asyncio.run(preview(args))

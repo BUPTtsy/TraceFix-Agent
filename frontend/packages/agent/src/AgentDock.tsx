@@ -9,6 +9,7 @@ export function AgentDock({project, agent, onStarted, onRun, onDocument, report}
   const [goal, setGoal] = useState(''), [busy, setBusy] = useState(false), [useKnowledge, setUseKnowledge] = useState(true);
   const [stopping, setStopping] = useState(false);
   const stopPending = useRef(false);
+  const submitPending = useRef(false);
   const [messages, setMessages] = useState<Record<string, ChatMessage[]>>({}), [streamingProject, setStreamingProject] = useState('');
   const viewport = useRef<HTMLDivElement>(null), projectKey = project?.id || 'workspace';
   const conversation = messages[projectKey] || [];
@@ -23,7 +24,8 @@ export function AgentDock({project, agent, onStarted, onRun, onDocument, report}
   useEffect(() => {viewport.current?.scrollTo({top: viewport.current.scrollHeight});}, [conversation.length, conversation.at(-1)?.content, conversation.at(-1)?.reasoning]);
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (busy || !goal.trim()) return;
+    if (submitPending.current || !services.length || !goal.trim() || (service !== 'chat' && (agent.running || !project?.ready))) return;
+    submitPending.current = true;
     const text = goal.trim(), key = projectKey, history = messages[key] || [], selectedService = service;
     const assistantIndex = history.length + 1;
     setBusy(true); setStreamingProject(key);
@@ -44,7 +46,7 @@ export function AgentDock({project, agent, onStarted, onRun, onDocument, report}
       report(error);
       update(items => items.map((item, index) => index === assistantIndex ? {...item, content: item.content + '\n请求未完成，请查看错误提示后重试。'} : item));
       setGoal(current => current || text);
-    } finally {setBusy(false); setStreamingProject('');}
+    } finally {submitPending.current = false; setBusy(false); setStreamingProject('');}
   }
   return <aside className="assistant-dock" aria-label="Agent 对话面板"><div className="dock-heading"><span className="ai-mark" aria-hidden="true">✦</span><div><h2>与 TraceFix 协作</h2><span>常驻助手 · {project?.id || '未选择项目'}</span></div></div>
     <div className="service-tabs" role="group" aria-label="服务模式">{services.map(item => <button key={item.id} type="button" className={service === item.id ? 'selected' : ''} onClick={() => setService(item.id)} disabled={busy} aria-pressed={service === item.id}>{item.label.split(' ')[0]}<small>{item.label.split(' ')[1]}</small></button>)}</div>
@@ -53,7 +55,7 @@ export function AgentDock({project, agent, onStarted, onRun, onDocument, report}
     {!!agent.id && <div className="active-run"><button type="button" onClick={onRun}><i className={agent.running ? 'pulse' : ''} aria-hidden="true"/><span>{agent.projectId} · {statusLabel(agent.status || '')}<small>{agent.phase ? phaseLabel(agent.phase) : '等待进程反馈'}</small></span>↗</button>{agent.running && <button className="text-button danger" disabled={busy || stopping || !agent.canStop} title={agent.stopUnavailableReason} onClick={stop}>{stopping || agent.status === 'stopping' ? '停止中…' : '停止'}</button>}</div>}
     {agent.running && agent.stopUnavailableReason && agent.status !== 'stopping' && <small className="dock-footnote">{agent.stopUnavailableReason}</small>}
     {agent.stopError && <small className="dock-footnote" role="alert">{agent.stopError}</small>}
-    <form className="run-composer" onSubmit={submit}><label htmlFor="run-goal">{service === 'chat' ? '发送消息' : '新的运行目标'}</label><textarea id="run-goal" value={goal} onChange={event => setGoal(event.target.value)} maxLength={service === 'chat' ? 8000 : 4000} placeholder={service === 'chat' ? '向 TraceFix 提问…' : '例如：勾选完成后刷新，状态却丢失…'}/><div className="composer-footer"><span>{goal.length} / {service === 'chat' ? 8000 : 4000}</span><button className="primary" disabled={busy || !services.length || !goal.trim() || (service !== 'chat' && (agent.running || !project?.ready))}>{busy ? '处理中…' : service === 'chat' ? '发送 ↑' : '启动 Run ↑'}</button></div></form>
+    <form className="run-composer" onSubmit={submit}><label htmlFor="run-goal">{service === 'chat' ? '发送消息' : '新的运行目标'}</label><textarea id="run-goal" value={goal} onChange={event => setGoal(event.target.value)} onKeyDown={event => {if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {event.preventDefault(); event.currentTarget.form?.requestSubmit();}}} maxLength={service === 'chat' ? 8000 : 4000} placeholder={service === 'chat' ? '向 TraceFix 提问…' : '输入目标后按 Enter 直接启动；Shift+Enter 换行'}/><div className="composer-footer"><span>{goal.length} / {service === 'chat' ? 8000 : 4000} · Enter 发送 · Shift+Enter 换行</span><button className="primary" disabled={busy || !services.length || !goal.trim() || (service !== 'chat' && (agent.running || !project?.ready))}>{busy ? '处理中…' : service === 'chat' ? '发送 ↑' : '启动 Run ↑'}</button></div></form>
     {service === 'chat' ? <label className="knowledge-toggle"><input type="checkbox" checked={useKnowledge} onChange={event => setUseKnowledge(event.target.checked)}/>使用当前项目与全局知识</label> : <small className="dock-footnote">检索仅加入相关片段；修复结论由验证结果决定。</small>}
   </aside>;
 }

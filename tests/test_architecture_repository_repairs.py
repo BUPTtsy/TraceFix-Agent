@@ -209,7 +209,12 @@ def test_git_environment_and_execution_extensions_are_isolated(tmp_path, monkeyp
     assert (root / '.git/config').read_bytes() == before
 
 
-def test_legal_continuation_retains_bound_baseline(tmp_path):
+@pytest.mark.parametrize('nested', [False, True])
+def test_legal_continuation_retains_bound_baseline(tmp_path, nested):
+    if nested:
+        padding = max(1, 190 - len(str((tmp_path / 'workspace').resolve())) - 1)
+        tmp_path = tmp_path / ('x' * padding)
+        tmp_path.mkdir()
     root, scopes, ctx, workspace, snapshot = exported(tmp_path)
     baseline = workspace.head()
     (workspace.root / 'src/value.ts').write_text('export const value = true;\n')

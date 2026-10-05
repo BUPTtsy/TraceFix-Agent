@@ -7,9 +7,10 @@ import {createConsoleService} from '@tracefix/console-service/dispatch';
 import {DataError} from '@tracefix/console-service/database';
 import {configureProject, createProject} from '@tracefix/console-service/config';
 import {capabilities, palette} from './terminal.js';
-import {LineEditor} from './editor.js';
 import {banner, help as helpLines, PLAIN_HELP} from './render.js';
 import {suggest} from './registry.js';
+import {ChunkedTextDecoder, EventIntake, type PublicRecord, type TraceFixMessage} from './tracefix-events.js';
+import {chatMessage, CliSession} from './cli-session.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..');
 process.chdir(root);
@@ -55,7 +56,9 @@ function argumentsOf(args: string[]): {options: Record<string, string | boolean>
  * 交互期间的行编辑器。非 TTY 路径下始终为 null，
  * 因此 print / 错误输出与改造前完全一致（纯文本、直写 stdout）。
  */
-let editor: LineEditor | null = null;
+let editor: {external: (write: () => void) => void} | null = null;
+let uiOutput: ((text: string, error?: boolean) => void) | null = null;
+let uiPublish: ((message: TraceFixMessage) => void) | null = null;
 
 /** 输出前先擦掉输入行，输出后重绘，避免流式输出冲掉用户正在敲的内容。 */
 function emit(write: () => void): void {
@@ -65,7 +68,7 @@ function emit(write: () => void): void {
 
 function print(value: any): void {
   const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
-  emit(() => process.stdout.write(text + '\n'));
+  if (uiOutput) uiOutput(text + '\n'); else emit(() => process.stdout.write(text + '\n'));
 }
 
 function pythonCommand(): [string, string[]] {
@@ -126,16 +129,120 @@ const dispatch = createConsoleService({projectsPath, dataRoot, databasePath});
 const terminal = capabilities();
 const colors = palette(terminal.color);
 let projectId = option('project', 'bugboard');
-let mode = option('mode', 'test');
+let mode = option('mode', cliArgs.includes('--run') ? 'test' : 'chat');
 let goal = option('goal');
 let activeAgent: ReturnType<typeof spawn> | null = null;
-const chatHistory = new Map<string, Array<{role: string; content: string}>>();
+const session = new CliSession();
+let chatAgent: ReturnType<typeof spawn> | null = null;
+let chatScope = '';
+let chatSequence = 0;
+let chatPending: {id: string; resolve: () => void; reject: (error: Error) => void} | null = null;
 const sessionRemote = new Map<string, Record<string, any>>();
 const agentEnvironment = () => ({
   TRACEFIX_CONSOLE_DB: path.resolve(databasePath),
   TRACEFIX_DATA: path.resolve(dataRoot),
   ...(sessionRemote.has(projectId) ? {TRACEFIX_SESSION_REMOTE: JSON.stringify(sessionRemote.get(projectId))} : {}),
 });
+
+function stopChat(): void {
+  const child = chatAgent;
+  chatAgent = null;
+  chatScope = '';
+  if (chatPending) {
+    chatPending.reject(new DataError('对话已结束'));
+    chatPending = null;
+  }
+  child?.stdin?.end(JSON.stringify({type: 'quit'}) + '\n');
+}
+
+function ensureChatAgent(): ReturnType<typeof spawn> {
+  if (chatAgent && chatScope === projectId) return chatAgent;
+  stopChat();
+  const [python, prefix] = pythonCommand();
+  const scope = projectId;
+  const child = spawn(python, [...prefix, 'tools/bootstrap/launch.py', '--plain', '--console-db', databasePath,
+    '--project', scope, '--projects', projectsPath, '--data', dataRoot, '--mode', 'chat',
+    '--chat-jsonl', '--chat-session', session.id], {
+    cwd: root, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env: {...process.env, ...agentEnvironment()},
+  });
+  chatAgent = child;
+  chatScope = scope;
+  const decoder = new ChunkedTextDecoder();
+  const errors = new ChunkedTextDecoder();
+  const failProtocol = () => {
+    if (!chatPending) return;
+    const pending = chatPending;
+    chatPending = null;
+    pending.reject(new DataError('对话事件格式或会话绑定无效，响应未完成'));
+    stopChat();
+  };
+  const consume = (line: string) => {
+    if (chatAgent !== child) return;
+    if (!line.trim()) return;
+    let value: PublicRecord;
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('chat event');
+      value = parsed as PublicRecord;
+    } catch {failProtocol(); return;}
+    if (typeof value.type !== 'string') {failProtocol(); return;}
+    if (chatPending && value.message_id && chatPending.id !== value.message_id) {failProtocol(); return;}
+    chatSequence += 1;
+    let message: TraceFixMessage | null;
+    try {message = chatMessage(value, scope, session.id, chatSequence);} catch {failProtocol(); return;}
+    if (['chat.started', 'chat.delta', 'chat.finished', 'chat.cancelled'].includes(value.type) && !value.message_id) {failProtocol(); return;}
+    if (message && uiPublish) uiPublish(message);
+    if (value.type === 'chat.finished' && !uiPublish) print(String(value.content || ''));
+    if (value.type === 'chat.cancelled' && !uiPublish) print('对话已取消。');
+    if (['chat.finished', 'chat.error', 'chat.cancelled'].includes(value.type) && chatPending &&
+        (chatPending.id === value.message_id || (value.type === 'chat.error' && !value.message_id))) {
+      const pending = chatPending;
+      chatPending = null;
+      if (value.type === 'chat.error' && !uiPublish) pending.reject(new DataError(String(value.message || value.error || '对话失败')));
+      else pending.resolve();
+    }
+  };
+  child.stdout?.on('data', chunk => decoder.push(chunk).forEach(consume));
+  child.stderr?.on('data', chunk => errors.push(chunk).forEach(line => uiOutput ? uiOutput(line + '\n', true) : process.stderr.write(line + '\n')));
+  const ended = (error?: Error) => {
+    if (chatAgent !== child) return;
+    decoder.flush().forEach(consume);
+    errors.flush().forEach(line => uiOutput ? uiOutput(line + '\n', true) : process.stderr.write(line + '\n'));
+    chatAgent = null;
+    chatScope = '';
+    if (chatPending) {
+      const pending = chatPending;
+      chatPending = null;
+      pending.reject(error || new DataError('对话进程提前结束，响应未完成'));
+    }
+  };
+  child.once('error', error => ended(error));
+  child.once('close', code => ended(code ? new DataError(`Chat 进程退出码：${code}`) : undefined));
+  child.stdin?.on('error', error => ended(error));
+  return child;
+}
+
+async function executeChat(message: string, useKnowledge = true): Promise<void> {
+  if (activeAgent) throw new DataError('已有 Agent Run 正在执行');
+  if (chatPending) throw new DataError('正在回答上一条消息；可用 /cancel 取消');
+  if (!message.trim()) throw new DataError('请输入消息');
+  const child = ensureChatAgent();
+  const id = `message-${++chatSequence}`;
+  if (uiPublish) uiPublish({id: `chat-user:${session.id}:${id}`, kind: 'event', text: message, metadata: {},
+    event: {type: 'chat.user', scope_id: projectId, payload: {message}}});
+  await new Promise<void>((resolve, reject) => {
+    chatPending = {id, resolve, reject};
+    child.stdin?.write(JSON.stringify({type: 'message', id, message, use_knowledge: useKnowledge}) + '\n', error => {
+      if (error && chatPending?.id === id) {chatPending = null; reject(error);}
+    });
+  });
+}
+
+function currentRun(): any {
+  const id = session.currentRunId(projectId);
+  if (!id) throw new DataError('当前会话没有 Run；使用 /resume RUN_ID 恢复，或 /runs 查看历史');
+  return dispatch('run', {id});
+}
 
 function interactiveAgent(args: string[], environment: Record<string, string>, recordId: string, commands: string[]): void {
   if (activeAgent) throw new DataError('已有 Agent Run 正在执行');
@@ -144,11 +251,21 @@ function interactiveAgent(args: string[], environment: Record<string, string>, r
     cwd: root, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env: {...process.env, ...environment},
   });
   activeAgent = child;
-  child.stdout?.on('data', chunk => emit(() => process.stdout.write(chunk)));
-  child.stderr?.on('data', chunk => emit(() => process.stderr.write(chunk)));
-  child.stdin?.on('error', error => emit(() => process.stderr.write(error.message + '\n')));
-  child.once('error', error => emit(() => process.stderr.write(error.message + '\n')));
+  const stdoutDecoder = new ChunkedTextDecoder();
+  const stderrDecoder = new ChunkedTextDecoder();
+  child.stdout?.on('data', chunk => {
+    if (uiOutput) stdoutDecoder.push(chunk).forEach(line => uiOutput?.(line + '\n'));
+    else emit(() => process.stdout.write(chunk));
+  });
+  child.stderr?.on('data', chunk => {
+    if (uiOutput) stderrDecoder.push(chunk).forEach(line => uiOutput?.(line + '\n', true));
+    else emit(() => process.stderr.write(chunk));
+  });
+  child.stdin?.on('error', error => uiOutput ? uiOutput(error.message + '\n', true) : emit(() => process.stderr.write(error.message + '\n')));
+  child.once('error', error => uiOutput ? uiOutput(error.message + '\n', true) : emit(() => process.stderr.write(error.message + '\n')));
   child.once('close', code => {
+    stdoutDecoder.flush().forEach(line => uiOutput?.(line + '\n'));
+    stderrDecoder.flush().forEach(line => uiOutput?.(line + '\n', true));
     activeAgent = null;
     if (code && cliArgs.includes('--command')) process.exitCode = code;
     try { dispatch('run.ended', {id: recordId, exitCode: code}); }
@@ -175,21 +292,21 @@ function findRun(id: string): any {
 }
 
 async function execute(text: string): Promise<boolean> {
-  const args = tokens(text.trim());
-  if (!args.length) return true;
-  if (!args[0].startsWith('/')) {
+  const input = text.trim();
+  if (!input) return true;
+  if (!input.startsWith('/')) {
+    if (mode === 'chat') {
+      await executeChat(text.trim());
+      return true;
+    }
     goal = text.trim();
-    // 非交互路径保持原样的一行文本；交互下额外回显记录到的目标。
-    if (editor) {
-      print(colors.grey('目标已记录：') + colors.bold(goal));
-      print(colors.grey('输入 ') + colors.bold('/run') + colors.grey(' 开始，或 ') +
-        colors.bold('/mode') + colors.grey(' 切换模式。'));
-    } else print('目标已记录。输入 /run 开始。');
+    await startRun(Boolean(editor));
     return true;
   }
+  const args = tokens(input);
   const command = args.shift()!.slice(1);
   const {options, positionals} = argumentsOf(args);
-  if (command === 'quit') { if (activeAgent) activeAgent.stdin?.write('/quit\n'); return false; }
+  if (command === 'quit') { stopChat(); if (activeAgent) activeAgent.stdin?.write('/quit\n'); return false; }
   if (command === 'help') {
     // 只有真正的交互会话（editor 已启动）才用分组帮助；
     // --command / 管道等非交互路径保持改造前的三行纯文本。
@@ -198,7 +315,7 @@ async function execute(text: string): Promise<boolean> {
     return true;
   }
   if (command === 'mode') { if (!['test', 'repair', 'chat'].includes(positionals[0])) throw new DataError('用法：/mode test|repair|chat');
-    mode = positionals[0]; print(`新 Run 模式：${mode}`); return true; }
+    mode = positionals[0]; if (mode === 'chat') goal = ''; print(`新 Run 模式：${mode}`); return true; }
   if (command === 'projects' || command === 'scope') {
     const [action = 'list', id] = positionals;
     if (action === 'create') {
@@ -215,6 +332,10 @@ async function execute(text: string): Promise<boolean> {
     const projects = dispatch('projects');
     if (action === 'use') {
       if (!projects.some((project: any) => project.id === id)) throw new DataError('未注册的项目');
+      if (activeAgent || chatPending) throw new DataError('正在执行期间不能切换项目；请先取消');
+      stopChat();
+      session.clearRun();
+      goal = '';
       projectId = id; print(`当前项目：${id}`);
     } else if (action === 'show') print(projects.find((project: any) => project.id === (id || projectId)) || '未注册的项目');
     else if (action === 'list') print(projects);
@@ -269,11 +390,13 @@ async function execute(text: string): Promise<boolean> {
     else throw new DataError('未知运行记录命令');
     return true;
   }
-  if (command === 'status') { print(dispatch('runs', {projectId})[0] || '暂无 Run'); return true; }
+  if (command === 'status') {
+    const id = session.currentRunId(projectId);
+    print(id ? dispatch('run', {id}) : `当前项目 ${projectId} · ${mode} · 当前会话暂无 Run`);
+    return true;
+  }
   if (command === 'trace' || command === 'diff' || command === 'report' || command === 'evidence' || command === 'model-log' || command === 'context') {
-    const latest = dispatch('runs', {projectId})[0];
-    if (!latest) throw new DataError('当前没有 Run');
-    const run = dispatch('run', {id: latest.id});
+    const run = currentRun();
     if (command === 'trace') print(dispatch('run.trace', {id: run.id}));
     else if (command === 'context') print({goal: run.goal, phase: run.phase, knowledge: run.knowledge, outcome: run.outcome});
     else if (command === 'model-log') print((run.artifacts || []).filter((item: any) => /模型|请求|响应/.test(item.label)));
@@ -305,13 +428,33 @@ async function execute(text: string): Promise<boolean> {
     .filter(item => item.isDirectory()).map(item => item.name)); return true; }
   if (command === 'run') { await startRun(!cliArgs.includes('--command')); return true; }
   if (command === 'continue') { await continueRun(positionals[0], positionals.slice(1).join(' '), !cliArgs.includes('--command')); return true; }
-  if (['pause', 'cancel', 'interrupt', 'approve', 'reject', 'resume'].includes(command) && activeAgent) {
+  if (['pause', 'cancel', 'interrupt'].includes(command) && chatPending) {
+    chatAgent?.stdin?.write(JSON.stringify({type: 'cancel', id: chatPending.id}) + '\n');
+    return true;
+  }
+  if (['pause', 'cancel', 'interrupt'].includes(command) && activeAgent) {
     activeAgent.stdin?.write('/' + command + (positionals.length ? ' ' + positionals.map(value => JSON.stringify(value)).join(' ') : '') + '\n');
     return true;
   }
   if (command === 'resume' || command === 'approve' || command === 'reject') {
-    const commands = command === 'resume' ? [`/resume ${findRun(positionals[0]).agentRunId}`] :
-      [`/resume ${findRun(positionals[1] || dispatch('runs', {projectId})[0]?.id).agentRunId}`, `/${command} ${positionals[0]}`];
+    const requested = command === 'resume' ? positionals[0] : positionals[1] || session.currentRunId(projectId);
+    if (!requested) throw new DataError(`用法：/${command} ${command === 'resume' ? 'RUN_ID' : 'ACTION_ID [RUN_ID]'}`);
+    const target = findRun(requested);
+    if (activeAgent) {
+      if (session.currentRunId(projectId) !== target.id) throw new DataError('活动 Run 与指定 Run 不匹配');
+      const argument = command === 'resume' ? target.agentRunId : positionals[0];
+      activeAgent.stdin?.write('/' + command + ' ' + JSON.stringify(argument) + '\n');
+      return true;
+    }
+    if (chatPending) throw new DataError('正在回答消息；请先取消');
+    session.bindRun(projectId, target.id);
+    const commands = command === 'resume' ? [`/resume ${target.agentRunId}`] :
+      [`/resume ${target.agentRunId}`, `/${command} ${positionals[0]}`];
+    if (editor) {
+      interactiveAgent(['--project', projectId, '--projects', projectsPath, '--data', dataRoot],
+        {...agentEnvironment(), TRACEFIX_CONSOLE_RUN_ID: target.id}, target.id, commands);
+      return true;
+    }
     const code = await agent(['--project', projectId, '--projects', projectsPath, '--data', dataRoot,
       ...commands.flatMap(value => ['--command', value])], agentEnvironment());
     if (code) throw new DataError(`Agent 退出码：${code}`);
@@ -345,25 +488,15 @@ async function execute(text: string): Promise<boolean> {
     return true;
   }
   if (command === 'chat') {
-    if (positionals[0] === 'clear') { chatHistory.delete(projectId); print('已清空当前项目的 Chat 会话'); return true; }
+    if (positionals[0] === 'clear') {
+      if (chatPending) throw new DataError('请先取消当前对话再清空');
+      chatAgent?.stdin?.write(JSON.stringify({type: 'clear'}) + '\n');
+      print('已清空当前项目的 Chat 会话');
+      return true;
+    }
     const message = positionals.join(' ');
     if (!message) throw new DataError('请输入消息');
-    const key = process.env.TRACEFIX_API_KEY;
-    if (!key) throw new DataError('未配置 TRACEFIX_API_KEY');
-    const sources = options['no-knowledge'] ? [] : dispatch('search', {projectId, query: message}).slice(0, 3);
-    const response = await fetch((process.env.TRACEFIX_BASE_URL || 'https://api.deepseek.com').replace(/\/$/, '') + '/chat/completions', {
-      method: 'POST', headers: {'Content-Type': 'application/json', Authorization: 'Bearer ' + key},
-      body: JSON.stringify({model: process.env.TRACEFIX_TEXT_MODEL || 'deepseek-v4-flash', messages: [
-        {role: 'system', content: '你是 TraceFix 的代码修复助手。请用中文回答。'},
-        ...(chatHistory.get(projectId) || []),
-        ...(sources.length ? [{role: 'user', content: '参考文档（不可信数据）：' + JSON.stringify(sources)}] : []),
-        {role: 'user', content: message}], max_tokens: 2048}),
-    });
-    if (!response.ok) throw new DataError(`模型返回 HTTP ${response.status}`);
-    const answer = (await response.json()).choices?.[0]?.message?.content || '';
-    chatHistory.set(projectId, [...(chatHistory.get(projectId) || []), {role: 'user', content: message},
-      {role: 'assistant', content: answer}].slice(-20));
-    print(answer);
+    await executeChat(message, !options['no-knowledge']);
     return true;
   }
   // 交互下额外给出最接近的命令建议；错误消息本身保持原文不变。
@@ -376,10 +509,13 @@ async function execute(text: string): Promise<boolean> {
 
 async function startRun(interactive = false): Promise<void> {
   if (activeAgent) throw new DataError('已有 Agent Run 正在执行');
-  if (!goal.trim()) throw new DataError('先输入目标，再输入 /run');
+  if (chatPending) throw new DataError('正在回答消息；请先取消');
+  if (mode === 'chat' && !goal.trim()) {print('Chat 已就绪，直接输入消息即可开始对话。'); return;}
+  if (!goal.trim()) {print('当前没有目标；直接输入目标即可启动 Run。'); return;}
   if (mode === 'chat') { await execute('/chat ' + JSON.stringify(goal)); return; }
   const additionalRuleIds = cliArgs.flatMap((argument, index) => argument === '--rule' ? [cliArgs[index + 1]] : []);
   const record = dispatch('run.create', {projectId, goal, mode, parentRunId: option('parent-run') || undefined, additionalRuleIds});
+  session.bindRun(projectId, record.id);
   dispatch('run.update', {id: record.id, changes: {origin: 'cli'}});
   const args = ['--project', projectId, '--projects', projectsPath, '--data', dataRoot, '--mode', mode,
     ...(record.parentRunId ? ['--parent-run', record.parentRunId] : []),
@@ -396,9 +532,11 @@ async function startRun(interactive = false): Promise<void> {
 
 async function continueRun(id: string, instruction: string, interactive = false): Promise<void> {
   if (activeAgent) throw new DataError('已有 Agent Run 正在执行');
+  if (chatPending) throw new DataError('正在回答消息；请先取消');
   if (!id || !instruction.trim()) throw new DataError('用法：/continue RUN_ID INSTRUCTION');
   const run = findRun(id);
   const record = dispatch('run.continue', {id: run.id, instruction});
+  session.bindRun(projectId, record.id);
   if (interactive) {
     interactiveAgent(['--project', projectId, '--projects', projectsPath, '--data', dataRoot],
       {...agentEnvironment(), TRACEFIX_CONSOLE_RUN_ID: record.id, TRACEFIX_CONTINUATION_ID: record.continuationId},
@@ -419,9 +557,9 @@ async function main(): Promise<void> {
       api_key_configured: Boolean(process.env.TRACEFIX_API_KEY), database_configured: Boolean(process.env.TRACEFIX_DATABASE_URL)});
     return;
   }
-  if (cliArgs.includes('--run')) { await startRun(); return; }
+  if (cliArgs.includes('--run')) {try {await startRun();} finally {stopChat();} return; }
   if (cliArgs.includes('--continue-run')) { await continueRun(option('continue-run'), option('instruction')); return; }
-  if (commands.length) { for (const command of commands) await execute(command); return; }
+  if (commands.length) { try {for (const command of commands) await execute(command);} finally {stopChat();} return; }
   if (terminal.rich) return interactive();
   return basic();
 }
@@ -437,38 +575,72 @@ async function basic(): Promise<void> {
       try { if (!await execute(line)) break; }
       catch (error) { process.stderr.write((error instanceof Error ? error.message : String(error)) + '\n'); }
     }
-  } finally { input.close(); }
+  } finally {input.close(); stopChat();}
 }
 
 /** TTY 交互路径：横幅、状态行、斜杠菜单、行编辑与历史。 */
 async function interactive(): Promise<void> {
-  const session = new LineEditor(terminal, colors,
-    {projectId: () => projectId, mode: () => mode, running: () => Boolean(activeAgent), goal: () => goal},
-    {interrupt: () => {
+  (globalThis as {self?: unknown}).self ??= globalThis;
+  const {default: React} = await import('react');
+  const {render: inkRender} = await import('ink');
+  const {TraceFixUi} = await import('./claude-ui/TraceFixUi.js');
+  let runIntake = new EventIntake(projectId);
+  let runKey = '';
+  let outputSequence = 0;
+  let pushOutput: ((message: TraceFixMessage) => void) | null = null;
+  const pendingOutput: TraceFixMessage[] = [];
+  const publish = (message: TraceFixMessage) => {
+    if (pushOutput) pushOutput(message);
+    else pendingOutput.push(message);
+  };
+  uiPublish = publish;
+  let finish!: () => void;
+  const done = new Promise<void>(resolve => {finish = resolve;});
+  uiOutput = (text, error = false) => {
+    outputSequence += 1;
+    const rows = new EventIntake(projectId).accept([{type: error ? 'cli.error' : 'cli.output', scope_id: projectId, payload: {message: text}}]);
+    rows.forEach(row => publish({...row, id: `cli-output-${outputSequence}`}));
+  };
+  const renderInstance = await inkRender(React.createElement(TraceFixUi, {state: () => ({projectId, mode, goal, running: Boolean(activeAgent || chatPending), chatting: Boolean(chatPending)}),
+    onSubmit: async line => {try {if (!await execute(line)) finish(); return true;} catch (error) {
+      uiOutput?.((error instanceof Error ? error.message : String(error)) + '\n', true);
+      return true;
+    }},
+    onCancel: () => {
+      if (chatPending) {chatAgent?.stdin?.write(JSON.stringify({type: 'cancel', id: chatPending.id}) + '\n'); return true;}
       if (!activeAgent) return false;
       activeAgent.stdin?.write('/interrupt\n');
       return true;
-    }},
-    dataRoot);
-  editor = session;
-  for (const line of banner({projectId, mode, node: process.version, version: '0.1.1'}, colors, terminal.columns)) {
-    process.stdout.write(line + '\n');
-  }
-  session.start();
-  try {
-    while (true) {
-      const line = await session.read();
-      if (line === null) break;
-      try { if (!await execute(line)) break; }
-      catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        session.external(() => process.stderr.write(colors.red(message) + '\n'));
-      }
+    },
+    registerOutput: push => {
+      pushOutput = push;
+      pendingOutput.splice(0).forEach(push);
     }
-  } finally {
-    session.stop();
-    editor = null;
-  }
+  }), {exitOnCtrlC: false});
+  editor = {external: write => write()};
+  const poll = setInterval(() => {
+    try {
+      const id = session.currentRunId(projectId);
+      if (!id) return;
+      const latestKey = `${projectId}:${id}`;
+      if (runKey !== latestKey) {
+        runKey = latestKey;
+        runIntake = new EventIntake(projectId);
+      }
+      const messages = runIntake.accept(dispatch('run.trace', {id, after: runIntake.after}));
+      messages.forEach(publish);
+    } catch (error) {
+      publish({id: `poll-error-${Date.now()}`, kind: 'error', text: error instanceof Error ? error.message : String(error), metadata: {}});
+    }
+  }, 500);
+  poll.unref();
+  await done;
+  clearInterval(poll);
+  renderInstance.unmount();
+  stopChat();
+  uiPublish = null;
+  uiOutput = null;
+  editor = null;
 }
 
-main().catch(error => { process.stderr.write((error instanceof Error ? error.message : String(error)) + '\n'); process.exitCode = 2; });
+main().catch(error => {stopChat(); process.stderr.write((error instanceof Error ? error.message : String(error)) + '\n'); process.exitCode = 2;});

@@ -114,7 +114,31 @@ async def test_explore_rule_category_and_workspace_paths_reach_request(tmp_path,
     loaded = next(item for item in context['skills'] if item['name'] == 'empty-state-accessibility')
     assert hashlib.sha256(loaded['content'].encode('utf-8')).hexdigest() == loaded['content_hash']
     assert events(engine, state, 'skills.injected')[0]['skills'] == [
-        {key: item[key] for key in ('name', 'version', 'content_hash')} for item in context['skills']]
+        engine._skill_event_identity(item) for item in context['skills']]
+
+
+async def test_skill_events_bind_snapshot_and_reference_metadata_without_content(tmp_path, monkeypatch):
+    engine, state = await skill_engine(tmp_path)
+    skill = tmp_path / 'skills/referenced/SKILL.md'
+    reference = skill.parent / 'references/checklist.md'
+    reference.parent.mkdir(parents=True)
+    skill.write_text('---\nname: referenced\nversion: "2.0.0"\n'
+                     'description: 带引用的测试 Skill。\nphases: [EXPLORE]\n'
+                     'references: [references/checklist.md]\n---\n正文。', encoding='utf-8')
+    reference.write_text('引用正文。', encoding='utf-8')
+    engine.skills = SkillCatalog(skill.parent.parent)
+    state.phase = Phase.EXPLORE
+    engine.store.save(state)
+    result = engine.load_skill(state, 'referenced')
+    event = next(item for item in events(engine, state, 'skill.loaded') if item['name'] == 'referenced')
+    assert event['snapshot_ref'] == result['snapshot_ref']
+    assert event['references'] == [{
+        key: result['references'][0][key]
+        for key in ('path', 'content_hash', 'byte_count', 'source_hash',
+                    'frozen_source_hash', 'source_redacted')
+        if key in result['references'][0]
+    }]
+    assert 'content' not in event['references'][0]
 
 
 async def test_planning_and_patch_proposal_receive_workflow_skills(tmp_path, monkeypatch):
@@ -257,7 +281,7 @@ async def test_each_attempt_audits_actual_skills_but_run_loads_once(tmp_path, mo
     assert injections[2]['logical_exchange_id'] != injections[0]['logical_exchange_id']
     for injection, request in zip(injections, requests, strict=True):
         assert injection['phase'] == 'EXPLORE'
-        assert injection['skills'] == [{key: item[key] for key in ('name', 'version', 'content_hash')}
+        assert injection['skills'] == [engine._skill_event_identity(item)
                                        for item in request_context(request)['skills']]
         persisted = engine.get(state, injection['request_ref'])
         assert persisted['request']['json'] == request
@@ -320,7 +344,7 @@ async def test_resume_preserves_latest_skill_request_then_refreshes_after_tool(t
     assert injections[1]['skills'] == injections[2]['skills']
     assert injections[1]['logical_exchange_id'] != injections[2]['logical_exchange_id']
     for injection, request in zip(injections, requests, strict=True):
-        assert injection['skills'] == [{key: item[key] for key in ('name', 'version', 'content_hash')}
+        assert injection['skills'] == [engine._skill_event_identity(item)
                                        for item in request_context(request)['skills']]
 
 

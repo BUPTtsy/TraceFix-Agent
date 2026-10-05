@@ -44,12 +44,12 @@ export const COMMANDS: CommandSpec[] = [
     actions: [
       {name: 'test', summary: '只复现并取证，不改代码'},
       {name: 'repair', summary: '复现后尝试生成修复补丁'},
-      {name: 'chat', summary: '/run 直接转为模型对话，不启动 Agent'},
+      {name: 'chat', summary: '直接对话，可用工具辅助回答，默认模式'},
     ],
   },
   {
     name: 'run', hint: '', group: '任务',
-    summary: '用当前目标与模式启动一次 Run',
+    summary: '兼容旧脚本入口；直接输入目标会自动启动 Run',
   },
   {
     name: 'continue', hint: 'RUN_ID INSTRUCTION', group: '任务',
@@ -57,7 +57,7 @@ export const COMMANDS: CommandSpec[] = [
   },
   {
     name: 'status', hint: '', group: '任务',
-    summary: '查看当前项目最近一次 Run 的状态',
+    summary: '查看当前会话绑定 Run 的状态',
   },
   {
     name: 'chat', hint: '[--no-knowledge] MESSAGE | clear', group: '任务',
@@ -118,15 +118,15 @@ export const COMMANDS: CommandSpec[] = [
   },
   {
     name: 'trace', hint: '', group: '产物与诊断',
-    summary: '查看最近一次 Run 的审计事件轨迹',
+    summary: '查看当前会话 Run 的审计事件轨迹',
   },
   {
     name: 'diff', hint: '', group: '产物与诊断',
-    summary: '打印最近一次 Run 的补丁内容',
+    summary: '打印当前会话 Run 的补丁内容',
   },
   {
     name: 'report', hint: '', group: '产物与诊断',
-    summary: '打印最近一次 Run 的静态报告文件路径',
+    summary: '打印当前会话 Run 的静态报告文件路径',
   },
   {
     name: 'evidence', hint: 'REF', group: '产物与诊断',
@@ -134,11 +134,11 @@ export const COMMANDS: CommandSpec[] = [
   },
   {
     name: 'model-log', hint: '', group: '产物与诊断',
-    summary: '列出最近一次 Run 的模型请求与响应产物',
+    summary: '列出当前会话 Run 的模型请求与响应产物',
   },
   {
     name: 'context', hint: '', group: '产物与诊断',
-    summary: '查看最近一次 Run 的目标、阶段、知识与结论',
+    summary: '查看当前会话 Run 的目标、阶段、知识与结论',
   },
   {
     name: 'remote', hint: 'show|set|clear', group: '项目与知识',

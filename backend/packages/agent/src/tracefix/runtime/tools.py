@@ -9,7 +9,7 @@ import math
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Awaitable, Generic, Literal, Protocol, TypeVar
 
 import jsonschema
 from pydantic import BaseModel, ConfigDict, Field
@@ -24,6 +24,21 @@ class ToolProtocolError(ValueError):
 
 class ToolRejected(ValueError):
     """执行器能够确定副作用没有发生时返回的可恢复错误。"""
+
+
+class ToolOutputError(ValueError):
+    """工具处理器返回值不符合注册的输出契约。"""
+
+
+InputT = TypeVar('InputT', bound=BaseModel)
+OutputT = TypeVar('OutputT')
+InputContraT = TypeVar('InputContraT', bound=BaseModel, contravariant=True)
+OutputCoT = TypeVar('OutputCoT', covariant=True)
+
+
+class ToolHandler(Protocol[InputContraT, OutputCoT]):
+    def __call__(self, arguments: InputContraT, call_id: str
+                 ) -> OutputCoT | ToolResult | Awaitable[OutputCoT | ToolResult]: ...
 
 
 class ToolOperationUnknown(RuntimeError):
@@ -61,6 +76,10 @@ class ToolSpec:
     category: str = 'general'
     submission: bool = False
     submission_schema: type[BaseModel] | None = None
+    output_model: type[BaseModel] | dict | None = None
+    aliases: tuple[str, ...] = ()
+    search_hint: str = ''
+    enabled: bool = True
 
     def __post_init__(self):
         # 保留旧版第三个位置参数作为并行标记的调用兼容性。
@@ -110,11 +129,44 @@ class ToolSpec:
                 not isinstance(self.submission_schema, type) or
                 not issubclass(self.submission_schema, BaseModel)):
             raise ValueError('提交输出模型无效')
+        if self.output_model is not None:
+            if isinstance(self.output_model, dict):
+                jsonschema.Draft202012Validator.check_schema(self.output_model)
+                if (self.output_model.get('type') != 'object'
+                        or self.output_model.get('additionalProperties') is not False):
+                    raise ValueError('工具输出 schema 必须为禁止额外字段的对象')
+                object.__setattr__(self, 'output_model', copy.deepcopy(self.output_model))
+            elif (not isinstance(self.output_model, type)
+                  or not issubclass(self.output_model, BaseModel)
+                  or self.output_model.model_config.get('extra') != 'forbid'):
+                raise ValueError('工具输出模型必须禁止额外字段')
+        if (not isinstance(self.aliases, tuple)
+                or any(not isinstance(alias, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', alias)
+                       for alias in self.aliases)
+                or len(set(self.aliases)) != len(self.aliases)):
+            raise ValueError('工具显式别名无效')
+        if not isinstance(self.search_hint, str) or len(self.search_hint) > 200:
+            raise ValueError('工具搜索提示无效')
+        if type(self.enabled) is not bool:
+            raise ValueError('工具启用标记必须为布尔值')
 
     @property
     def parameters(self):
         return (copy.deepcopy(self.input_model) if isinstance(self.input_model, dict)
                 else self.input_model.model_json_schema())
+
+    def validate_output(self, value):
+        if self.output_model is None:
+            return value
+        try:
+            if isinstance(self.output_model, dict):
+                if isinstance(value, BaseModel):
+                    value = value.model_dump(mode='json')
+                jsonschema.validate(value, self.output_model)
+                return value
+            return self.output_model.model_validate(value, strict=True)
+        except (ValueError, TypeError, jsonschema.ValidationError) as error:
+            raise ToolOutputError('工具输出校验失败：' + sanitize(str(error))[:2000]) from error
 
     @property
     def parallel(self):
@@ -138,6 +190,23 @@ class ToolSpec:
             return self.input_model.model_validate(arguments, strict=True)
         except (ValueError, TypeError, jsonschema.ValidationError) as error:
             raise ToolProtocolError('工具参数校验失败：' + sanitize(str(error))[:2000]) from error
+
+
+@dataclass(frozen=True)
+class ToolDefinition(Generic[InputT, OutputT]):
+    spec: ToolSpec
+    handler: ToolHandler[InputT, OutputT]
+
+    def __post_init__(self):
+        if not isinstance(self.spec, ToolSpec) or not callable(self.handler):
+            raise TypeError('工具定义必须包含有效规格和可调用处理器')
+
+
+def build_tool(name: str, description: str, input_model: type[InputT] | dict,
+               handler: ToolHandler[InputT, OutputT], *, output_model: type[OutputT] | dict | None = None,
+               **spec_options) -> ToolDefinition[InputT, OutputT]:
+    return ToolDefinition(ToolSpec(name, description, input_model,
+                                  output_model=output_model, **spec_options), handler)
 
 
 @dataclass(frozen=True)
@@ -172,20 +241,24 @@ class ToolRegistry:
         self._specs = {}
         self._wire_specs = {}
         self._legacy_specs = {}
+        self._lookup_specs = {}
         for spec in specs:
             self.register(spec)
 
     def register(self, spec: ToolSpec):
-        if not isinstance(spec, ToolSpec) or spec.name in self._specs:
-            raise ValueError('工具注册类型无效或名称重复')
-        if spec.wire_name in self._wire_specs:
-            raise ValueError('工具模型接口别名重复：' + spec.wire_name)
-        self._specs[spec.name] = spec
-        self._wire_specs[spec.wire_name] = spec
+        if not isinstance(spec, ToolSpec):
+            raise ValueError('工具注册类型无效')
         legacy = spec.name.replace('.', '_')
         if len(legacy) > 64:
             legacy = legacy[:47] + '_' + digest(spec.name)[:16]
+        names = {spec.name, spec.wire_name, legacy, *spec.aliases}
+        for name in names:
+            if name in self._lookup_specs:
+                raise ValueError('工具名称或别名重复：' + name)
+        self._specs[spec.name] = spec
+        self._wire_specs[spec.wire_name] = spec
         self._legacy_specs[legacy] = spec
+        self._lookup_specs.update({name: spec for name in names})
         return spec
 
     @property
@@ -193,29 +266,29 @@ class ToolRegistry:
         return tuple(self._specs.values())
 
     def contains(self, name, phase=None):
-        spec = self._specs.get(name) or self._wire_specs.get(name) or self._legacy_specs.get(name)
-        return spec is not None and (phase is None or Phase(phase) in spec.phases)
+        spec = self._lookup_specs.get(name)
+        return spec is not None and spec.enabled and (phase is None or Phase(phase) in spec.phases)
 
     def contains_wire(self, name, phase=None):
         spec = self._wire_specs.get(name)
-        return spec is not None and (phase is None or Phase(phase) in spec.phases)
+        return spec is not None and spec.enabled and (phase is None or Phase(phase) in spec.phases)
 
     def visible(self, phase):
         phase = Phase(phase)
-        return tuple(spec for spec in self._specs.values() if phase in spec.phases)
+        return tuple(spec for spec in self._specs.values() if spec.enabled and phase in spec.phases)
 
     def native_tools(self, phase):
         return [spec.to_native() for spec in self.visible(phase)]
 
     def get(self, name, phase=None):
-        spec = self._specs.get(name) or self._wire_specs.get(name) or self._legacy_specs.get(name)
-        if spec is None or phase is not None and Phase(phase) not in spec.phases:
+        spec = self._lookup_specs.get(name)
+        if spec is None or not spec.enabled or phase is not None and Phase(phase) not in spec.phases:
             raise ToolProtocolError('未知或当前阶段未授权的工具：' + str(name))
         return spec
 
     def get_wire(self, name, phase=None):
         spec = self._wire_specs.get(name)
-        if spec is None or phase is not None and Phase(phase) not in spec.phases:
+        if spec is None or not spec.enabled or phase is not None and Phase(phase) not in spec.phases:
             raise ToolProtocolError('未知或当前阶段未授权的工具别名：' + str(name))
         return spec
 
@@ -335,7 +408,10 @@ class ToolPipeline:
                 async with asyncio.timeout(call.spec.timeout_s):
                     value = await _resolve(handler(call.input, call.call_id))
                 if isinstance(value, ToolResult):
+                    if not value.is_error:
+                        value = value.model_copy(update={'result': call.spec.validate_output(value.result)})
                     return value.model_dump(mode='json', by_alias=True)
+                value = call.spec.validate_output(value)
                 if isinstance(value, BaseModel):
                     value = value.model_dump(mode='json')
                 images = []
