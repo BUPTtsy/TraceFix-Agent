@@ -2,7 +2,6 @@ import asyncio
 import socket
 import time
 from types import SimpleNamespace
-
 import httpcore
 import httpx
 import pytest
@@ -419,4 +418,3 @@ def test_web_models_reject_evidence_and_prompt_claims():
         WebSearchOutput(results=[], evidence_refs=["external-reference"])
     with pytest.raises(ValueError):
         WebFetchInput(url="https://example.com", unexpected="value")
-
