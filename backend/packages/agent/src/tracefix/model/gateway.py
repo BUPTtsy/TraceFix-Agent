@@ -73,6 +73,7 @@ class Gateway:
     supports_tool_executor = True
     supports_streaming = True
     supports_context_assembler = True
+    supports_tool_history_projection = True
 
     def __init__(self, base_url=None, key=None, text_model=None, vision_model=None,
                  max_output_tokens=20480, timeout=None, max_attempts=None,
@@ -305,51 +306,214 @@ class Gateway:
                 part['image_url'] = {'url': '[IMAGE]'}
         return counter.count(bounded) + image_count * 4096
 
-    @staticmethod
-    def _project_tool_message(message, metadata):
+    @classmethod
+    def _protected_tool_result(cls, value):
+        if isinstance(value, list):
+            return any(cls._protected_tool_result(item) for item in value)
+        if not isinstance(value, dict):
+            return False
+        if (value.get('error') or value.get('isError') or value.get('is_error')
+                or value.get('passed') is False or value.get('executed') is False):
+            return True
+        for field in ('status', 'operation_status', 'business_outcome'):
+            status = value.get(field)
+            if isinstance(status, str) and any(marker in status.casefold() for marker in
+                    ('unknown', 'waiting', 'pending', 'running', 'failed', 'cancelled', 'canceled')):
+                return True
+        return any(cls._protected_tool_result(item) for item in value.values())
+
+    @classmethod
+    def _project_tool_message(cls, message, metadata):
         if not isinstance(message, dict) or message.get('role') != 'tool':
             return False
         reference = metadata.get('result_ref') if isinstance(metadata, dict) else None
         content = message.get('content')
-        if not isinstance(reference, str) or not reference.strip() or not isinstance(content, str):
+        binding = metadata.get('binding') if isinstance(metadata, dict) else None
+        if (not isinstance(reference, str) or not reference.strip() or not isinstance(content, str)
+                or metadata.get('expandable') is not True
+                or metadata.get('content_hash') != digest(content)
+                or len(content) > 16000 or len(content.splitlines()) > 200
+                or not isinstance(binding, dict)
+                or not {'scope_id', 'source_manifest', 'patch_hash', 'environment_digest',
+                        'test_spec_hash'}.issubset(binding)):
             return False
         try:
             original = json.loads(content)
         except (TypeError, ValueError):
-            original = {}
-        projected = {}
-        if isinstance(original, dict):
-            for key in ('isError', 'is_error', 'executed', 'error', 'business_outcome',
-                        'observation_ref', 'artifact_ref', 'result_ref', 'truncated'):
-                if key in original:
-                    projected[key] = original[key]
-        projected.update({
-            'projection': 'artifact_ref',
-            'artifact_ref': reference,
-            'artifact_channel': 'tool_content',
-            'content_hash': digest(content),
-            'content_length': len(content),
-            'expand_hint': 'context.expand',
-        })
+            return False
+        if not isinstance(original, dict) or cls._protected_tool_result(original):
+            return False
+        projected = copy.deepcopy(original)
+        name = message.get('name', '')
+        browser_fields = {'isError', 'is_error', 'executed', 'error', 'business_outcome',
+                          'observation_ref', 'observation', 'receipt', 'operation_id',
+                          'status', 'operation_status', 'artifact_ref', 'result_ref', 'truncated'}
+        result_fields = {'call_id', 'name', 'result', 'isError', 'is_error', 'executed',
+                         'error', 'artifact_ref', 'truncated'}
+        if name in {'BrowserNavigate', 'BrowserClick', 'BrowserType', 'BrowserSelect',
+                    'BrowserPress', 'BrowserSnapshot'}:
+            observation = original.get('observation')
+            if (not set(original).issubset(browser_fields) or original.get('executed') is not True
+                    or not isinstance(observation, dict)
+                    or not isinstance(observation.get('snapshot'), str)):
+                return False
+            projected['observation']['snapshot'] = '[历史观测正文已投影；按 tool_history_ref 展开，已结算动作不得重放]'
+            omitted_fields = ['observation.snapshot']
+        elif name == 'Bash':
+            result = original.get('result')
+            if (not set(original).issubset(result_fields)
+                    or original.get('call_id') != message.get('tool_call_id')
+                    or model_tool_name(str(original.get('name', ''))) != name
+                    or original.get('executed') is not True or not isinstance(result, dict)
+                    or not set(result).issubset({'passed', 'exit_code', 'output', 'files_changed',
+                                                'discarded_changes', 'cwd'})
+                    or result.get('passed') is not True or result.get('exit_code') != 0
+                    or not isinstance(result.get('output'), str)):
+                return False
+            projected['result']['output'] = '[历史命令正文已投影；按 tool_history_ref 展开，已结算动作不得重放]'
+            omitted_fields = ['result.output']
+        else:
+            return False
+        projected['tool_history_ref'] = {
+            'result_ref': reference, 'channel': 'tool_content',
+            'content_hash': digest(content), 'content_length': len(content),
+            'coverage': 'projected', 'omitted_fields': omitted_fields,
+            'binding': copy.deepcopy(binding),
+            'lookup_hint': {'tool': 'context.expand', 'ref': reference,
+                            'channel': 'tool_content', 'max_chars': 16000}}
         message['content'] = json.dumps(projected, ensure_ascii=False, separators=(',', ':'))
         return True
 
+    @staticmethod
+    def _tool_history_candidates(messages):
+        groups = []
+        pending = set()
+        indexes = []
+        for index, message in enumerate(messages):
+            if message.get('role') == 'assistant' and message.get('tool_calls'):
+                if pending:
+                    return []
+                pending = {call['id'] for call in message['tool_calls']}
+                indexes = []
+            elif message.get('role') == 'tool':
+                call_id = message.get('tool_call_id')
+                if call_id not in pending:
+                    return []
+                pending.remove(call_id)
+                indexes.append(index)
+                if not pending:
+                    groups.append(indexes)
+            elif pending:
+                return []
+        if pending:
+            return []
+        return [index for group in groups[:-1] for index in group]
+
     @classmethod
-    def _fit_tool_history(cls, payload, tool_result_refs, counter, available):
-        projected = []
-        candidate_indexes = [index for index, message in enumerate(payload.get('messages', []))
-                             if isinstance(message, dict) and message.get('role') == 'tool'
-                             and message.get('tool_call_id') in tool_result_refs]
-        candidate_indexes.sort()
-        for index in candidate_indexes:
+    def _project_next_tool(cls, payload, tool_result_refs, counter, candidates):
+        before = cls._payload_tokens(counter, payload)
+        while candidates:
+            index = candidates.pop(0)
             message = payload['messages'][index]
             call_id = message.get('tool_call_id')
-            if not cls._project_tool_message(message, tool_result_refs[call_id]):
+            original_content = message.get('content')
+            if not cls._project_tool_message(message, tool_result_refs.get(call_id)):
                 continue
+            if cls._payload_tokens(counter, payload) < before:
+                return call_id
+            message['content'] = original_content
+        return None
+
+    @staticmethod
+    def _replace_context(messages, text):
+        for message in messages:
+            if message.get('role') != 'user':
+                continue
+            content = message.get('content')
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get('type') == 'text':
+                        part['text'] = text
+                        return
+            else:
+                message['content'] = text
+                return
+
+    @classmethod
+    def _protocol_tokens(cls, payload, schema, counter):
+        overhead = copy.deepcopy(payload)
+        cls._replace_context(overhead['messages'], '')
+        overhead['response_json_schema'] = schema.model_json_schema()
+        return cls._payload_tokens(counter, overhead)
+
+    @classmethod
+    def _budget_payload(cls, payload, schema, context, assembler, tool_result_refs,
+                        can_expand, *, preserve=False):
+        from tracefix.knowledge.assembler import ContextWindowError
+
+        counter = assembler.counter
+        before = cls._payload_tokens(counter, payload)
+        candidates = cls._tool_history_candidates(payload['messages']) if can_expand else []
+        projected = []
+        assembly = None
+        extra_tokens = cls._protocol_tokens(payload, schema, counter)
+        if not preserve:
+            while True:
+                try:
+                    assembly = assembler.assemble(context, extra_tokens=extra_tokens)
+                    break
+                except ContextWindowError:
+                    call_id = cls._project_next_tool(payload, tool_result_refs, counter, candidates)
+                    if call_id is None:
+                        raise
+                    projected.append(call_id)
+                    extra_tokens = cls._protocol_tokens(payload, schema, counter)
+            cls._replace_context(payload['messages'], serialize_request(schema, assembly.context))
+            for correction in range(3):
+                required = cls._payload_tokens(counter, payload)
+                if required <= assembler.available:
+                    break
+                adjusted_extra = extra_tokens + required - assembler.available
+                try:
+                    adjusted = assembler.assemble(context, extra_tokens=adjusted_extra)
+                except ContextWindowError:
+                    break
+                proposal = copy.deepcopy(payload)
+                cls._replace_context(proposal['messages'], serialize_request(schema, adjusted.context))
+                if cls._payload_tokens(counter, proposal) >= required:
+                    break
+                payload['messages'] = proposal['messages']
+                assembly = adjusted
+                extra_tokens = adjusted_extra
+        required = cls._payload_tokens(counter, payload)
+        while required > assembler.available:
+            call_id = cls._project_next_tool(payload, tool_result_refs, counter, candidates)
+            if call_id is None:
+                break
             projected.append(call_id)
-            if cls._payload_tokens(counter, payload) <= available:
-                return projected
-        return projected if cls._payload_tokens(counter, payload) <= available else []
+            required = cls._payload_tokens(counter, payload)
+        if assembly is not None:
+            manifest = copy.deepcopy(assembly.manifest)
+        else:
+            manifest = {'version': 'tracefix/context/1', 'counter': counter.name,
+                        'exact_tokenizer': counter.exact, 'context_window': assembler.context_window,
+                        'input_limit': assembler.available, 'tokens_before': before,
+                        'tokens_after': required, 'context_hash': digest(context),
+                        'blocks': [], 'workset': {}}
+        manifest.update(request_tokens=required,
+                        protocol_tokens=cls._protocol_tokens(payload, schema, counter),
+                        image_tokens_reserved=sum(4096 for message in payload['messages']
+                            if isinstance(message.get('content'), list) for part in message['content']
+                            if isinstance(part, dict) and part.get('type') == 'image_url'))
+        if projected:
+            manifest['tool_history_projection'] = {
+                'call_ids': projected, 'coverage': 'artifact_ref',
+                'result_refs': {call_id: tool_result_refs[call_id]['result_ref'] for call_id in projected},
+                'unprojected_call_ids': [message['tool_call_id'] for message in payload['messages']
+                    if message.get('role') == 'tool' and message['tool_call_id'] not in projected]}
+            manifest['tool_history_projected'] = True
+        compacted = bool(projected) or bool(assembly and assembly.compacted)
+        return manifest, compacted
 
     async def generate(self, schema, context, image=None, agent_instructions=None,
                        on_attempt=None, on_response=None, on_error=None, on_usage=None,
@@ -439,7 +603,10 @@ class Gateway:
                 attempt += 1
                 payload['messages'] = copy.deepcopy(full_messages)
                 # 每次请求重新组装上下文；配置 provider 时同步最新引导、观测和记忆。
-                if (context_provider or messages is not None or context_assembler is not None) and not (preserve_resumed_request and messages is not None and tool_rounds == resumed_tool_round):
+                preserve = (preserve_resumed_request and messages is not None
+                            and tool_rounds == resumed_tool_round)
+                current_context = context
+                if (context_provider or messages is not None or context_assembler is not None) and not preserve:
                     current_context = context_provider() if context_provider else context
                     current_system = system_instructions(schema, current_context,
                         agent_instructions=agent_instructions, native_tools=bool(native_tools))
@@ -449,89 +616,20 @@ class Gateway:
                         if system_message.get('role') == 'system':
                             system_message['content'] = current_system
                             break
-                    if context_assembler is not None:
-                        overhead = copy.deepcopy(payload)
-                        context_removed = False
-                        image_count = 0
-                        for overhead_message in overhead['messages']:
-                            is_context = overhead_message.get('role') == 'user' and not context_removed
-                            if is_context:
-                                context_removed = True
-                            message_content = overhead_message.get('content')
-                            if isinstance(message_content, list):
-                                for part in message_content:
-                                    if part.get('type') == 'image_url':
-                                        image_count += 1
-                                        part['image_url'] = {'url': '[IMAGE]'}
-                                    elif is_context and part.get('type') == 'text':
-                                        part['text'] = ''
-                            elif is_context:
-                                overhead_message['content'] = ''
-                        overhead['response_json_schema'] = schema.model_json_schema()
-                        extra_tokens = context_assembler.counter.count(overhead) + image_count * 4096
-                        assembly = context_assembler.assemble(current_context, extra_tokens=extra_tokens)
-                        current_context = assembly.context
-                    current_text = serialize_request(schema, current_context)
-                    for context_message in payload['messages']:
-                        if context_message.get('role') != 'user':
-                            continue
-                        message_content = context_message.get('content')
-                        if isinstance(message_content, list):
-                            for part in message_content:
-                                if part.get('type') == 'text':
-                                    part['text'] = current_text
-                                    break
-                        else:
-                            context_message['content'] = current_text
-                        break
-                    if context_assembler is not None:
-                        bounded_payload = copy.deepcopy(payload)
-                        for bounded_message in bounded_payload['messages']:
-                            bounded_content = bounded_message.get('content')
-                            if isinstance(bounded_content, list):
-                                for part in bounded_content:
-                                    if part.get('type') == 'image_url':
-                                        part['image_url'] = {'url': '[IMAGE]'}
-                        required_tokens = context_assembler.counter.count(bounded_payload) + image_count * 4096
-                        manifest = {**assembly.manifest, 'request_tokens': required_tokens,
-                                    'protocol_tokens': extra_tokens, 'image_tokens_reserved': image_count * 4096}
-                        projection = []
-                        if required_tokens > context_assembler.available:
-                            projection = self._fit_tool_history(payload, tool_result_refs,
-                                                                context_assembler.counter,
-                                                                context_assembler.available)
-                            required_tokens = self._payload_tokens(context_assembler.counter, payload)
-                            if projection:
-                                manifest['tool_history_projection'] = {
-                                    'call_ids': projection,
-                                    'coverage': 'artifact_ref',
-                                    'unprojected_call_ids': [call_id for call_id in tool_result_refs
-                                                             if call_id not in projection],
-                                }
-                                manifest['request_tokens'] = required_tokens
-                                manifest['tool_history_projected'] = True
-                        if on_context:
-                            on_context(manifest, assembly.compacted or bool(projection if required_tokens <= context_assembler.available else []))
-                        if required_tokens > context_assembler.available:
-                            from tracefix.knowledge.assembler import ContextWindowError
-                            raise ContextWindowError(required_tokens, context_assembler.available,
-                                                     ['system', 'schema', 'tools', 'tool_history'])
-                elif context_assembler is not None:
-                    required_tokens = self._payload_tokens(context_assembler.counter, payload)
-                    projection = []
-                    if required_tokens > context_assembler.available:
-                        projection = self._fit_tool_history(payload, tool_result_refs,
-                                                            context_assembler.counter,
-                                                            context_assembler.available)
-                        required_tokens = self._payload_tokens(context_assembler.counter, payload)
-                    if on_context and projection:
-                        on_context({'request_tokens': required_tokens,
-                                    'tool_history_projection': {'call_ids': projection,
-                                        'coverage': 'artifact_ref'}}, True)
-                    if required_tokens > context_assembler.available:
+                    self._replace_context(payload['messages'], serialize_request(schema, current_context))
+                if context_assembler is not None:
+                    manifest, compacted = self._budget_payload(payload, schema, current_context,
+                        context_assembler, tool_result_refs,
+                        offered_registry.contains('context.expand', phase), preserve=preserve)
+                    if on_context and (not preserve or compacted):
+                        on_context(manifest, compacted)
+                    if manifest['request_tokens'] > context_assembler.available:
                         from tracefix.knowledge.assembler import ContextWindowError
-                        raise ContextWindowError(required_tokens, context_assembler.available,
+                        raise ContextWindowError(manifest['request_tokens'], context_assembler.available,
                                                  ['system', 'schema', 'tools', 'tool_history'])
+                for index, wire_message in enumerate(payload['messages']):
+                    if wire_message.get('role') in {'system', 'user'}:
+                        full_messages[index] = copy.deepcopy(wire_message)
                 can_retry = attempt < self.max_attempts
                 retry_delay = min(self.max_retry_delay, 2 ** min(attempt - 1, 30)) if can_retry else None
                 request_record = {'url': self.base_url + '/chat/completions',
@@ -541,6 +639,7 @@ class Gateway:
                                   'attempt': attempt, 'tool_round': tool_rounds}
                 if payload['messages'] != full_messages:
                     request_record['unprojected_messages'] = copy.deepcopy(full_messages)
+                if tool_result_refs:
                     request_record['tool_result_refs'] = copy.deepcopy(tool_result_refs)
                 exchange = None
                 if on_attempt:
@@ -789,10 +888,10 @@ class Gateway:
                             callback_result = on_tool_result(exchange, {'logical_exchange_id': logical_exchange_id,
                                 'tool_round': tool_rounds, 'attempt': attempt,
                                 'message': copy.deepcopy(tool_message), 'reused': reused})
-                            if isinstance(callback_result, str):
-                                tool_result_refs[call_id] = {'result_ref': callback_result}
-                            elif isinstance(callback_result, dict) and callback_result.get('result_ref'):
-                                tool_result_refs[call_id] = callback_result
+                            if (isinstance(callback_result, dict) and callback_result.get('result_ref')
+                                    and callback_result.get('expandable') is True
+                                    and callback_result.get('content_hash') == digest(result_content)):
+                                tool_result_refs[call_id] = copy.deepcopy(callback_result)
                     for images in batch_images.values():
                         if self.vision_model:
                             payload['model'] = self.vision_model
@@ -917,6 +1016,11 @@ class BrowserPolicyRouter:
         return getattr(self.teacher, 'supports_context_assembler', False)
 
     @property
+    def supports_tool_history_projection(self):
+        return any(getattr(model, 'supports_tool_history_projection', False)
+                   for model in (self.teacher, self.student))
+
+    @property
     def vision_model(self):
         return getattr(self.teacher, 'vision_model', None)
 
@@ -924,11 +1028,21 @@ class BrowserPolicyRouter:
     def supports_streaming(self):
         return any(getattr(model, 'supports_streaming', False) for model in (self.teacher, self.student))
 
+    @staticmethod
+    def _generation_kwargs(model, kwargs):
+        adapted = dict(kwargs)
+        if not getattr(model, 'supports_tool_history_projection', False):
+            adapted.pop('tool_result_refs', None)
+        if not getattr(model, 'supports_streaming', False):
+            adapted.pop('on_delta', None)
+        return adapted
+
     async def generate(self, schema, context, **kwargs):
         from tracefix.runtime.contracts import Decision, BrowserAction
         if schema is Decision and self.student and getattr(self.student, 'tool_mode', None) == 'json':
             try:
-                result = await self.student.generate(BrowserAction, context, **kwargs)
+                result = await self.student.generate(BrowserAction, context,
+                    **self._generation_kwargs(self.student, kwargs))
                 action = result.value
                 if action.locator:
                     from tracefix.execution.browser import resolve_locator
@@ -948,6 +1062,5 @@ class BrowserPolicyRouter:
                     raise
                 # Let the host log the externally checkable reason, never confidence.
                 context = {**context, 'student_fallback_reason': str(error)}
-        if not getattr(self.teacher, 'supports_streaming', False):
-            kwargs.pop('on_delta', None)
-        return await self.teacher.generate(schema, context, **kwargs)
+        return await self.teacher.generate(schema, context,
+            **self._generation_kwargs(self.teacher, kwargs))

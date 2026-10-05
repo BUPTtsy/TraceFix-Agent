@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from tracefix.execution.browser import MCPActionUnknown, MCPBrowser
+from tracefix.knowledge.workset import expand_reference
 from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
 from tracefix.runtime.contracts import (Assertion, BehaviorScenario, BehaviorStep, BrowserAction,
     Decision, FileEdit, Locator, ObservableWait, PatchProposal, Phase, RunState, digest)
@@ -81,6 +82,14 @@ async def test_native_actions_update_observations_receipts_replay_and_audit(tmp_
     assert [event['tool_call_id'] for event in audits] == call_ids
     assert [engine.get(state, event['result_ref'])['tool_result']['message']['tool_call_id']
             for event in audits] == call_ids
+    for event in audits:
+        record = engine.get(state, event['result_ref'])
+        assert record['tool_content'] == record['tool_result']['message']['content']
+        assert record['scope_id'] == state.scope_id and record['run_id'] == state.run_id
+        assert record['source_manifest'] == state.source_manifest
+        expanded = expand_reference(engine.artifacts, state.scope_id, state.run_id,
+                                    event['result_ref'], channel='tool_content')
+        assert expanded['text'] == record['tool_content']
     assert [record['tool_round'] for record in records if 'request' in record] == [0, 1, 2]
     exchange_kinds = ['request' if 'request' in record else 'tool_result'
                       for record in records if 'request' in record or 'tool_result' in record]

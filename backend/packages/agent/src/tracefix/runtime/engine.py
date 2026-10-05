@@ -1071,6 +1071,30 @@ class Engine:
             self.store.save(s)
             self.event(s, 'model.usage', {'usage': u, 'cost_is_configured_estimate': False})
 
+        def tool_history_reference(reference, call_id, content):
+            from tracefix.knowledge.workset import applicability, public_record
+
+            try:
+                record = self.get(s, reference)
+            except (OSError, ValueError, PermissionError):
+                return None
+            if (not isinstance(record, dict) or record.get('scope_id') != s.scope_id
+                    or record.get('run_id') != s.run_id or not public_record(record)):
+                return None
+            message = record.get('tool_result', {}).get('message', {})
+            stored = record.get('tool_content')
+            if (message.get('tool_call_id') != call_id or stored != content
+                    or not isinstance(stored, str) or len(stored) > 16000
+                    or len(stored.splitlines()) > 200):
+                return None
+            binding = {'scope_id': s.scope_id, 'source_manifest': s.source_manifest,
+                       'patch_hash': s.patch_hash, 'environment_digest': s.environment_digest,
+                       'test_spec_hash': s.test_spec_hash}
+            if applicability(record, binding):
+                return None
+            return {'result_ref': reference, 'content_hash': digest(stored),
+                    'expandable': True, 'binding': binding}
+
         def tool_result(exchange, raw):
             message = raw['message']
             record = {**(exchange or {}), 'tool_result': raw,
@@ -1086,7 +1110,7 @@ class Engine:
                 'result_ref': result_ref, 'tool_call_id': raw['message']['tool_call_id'],
                 'logical_exchange_id': raw['logical_exchange_id'], 'tool_round': raw['tool_round'],
                 'reused': raw['reused']})
-            return {'result_ref': result_ref}
+            return tool_history_reference(result_ref, message['tool_call_id'], message.get('content'))
 
         validation = {'validate_output': validate_output} if (original_validation or ctx['guidance_ack_required'] or
             (self.rule_resolver and getattr(selected_model, 'supports_tool_executor', False))) else {}
@@ -1114,7 +1138,18 @@ class Engine:
                     if history:
                         validation['messages'] = history
                         validation['preserve_resumed_request'] = True
-                        validation['tool_result_refs'] = request.get('tool_result_refs', {})
+                        if getattr(selected_model, 'supports_tool_history_projection', False):
+                            restored_refs = {}
+                            for message in history:
+                                call_id = message.get('tool_call_id')
+                                metadata = request.get('tool_result_refs', {}).get(call_id, {})
+                                if message.get('role') != 'tool' or not metadata.get('result_ref'):
+                                    continue
+                                restored = tool_history_reference(metadata['result_ref'], call_id,
+                                                                  message.get('content'))
+                                if restored:
+                                    restored_refs[call_id] = restored
+                            validation['tool_result_refs'] = restored_refs
                         for message in history:
                             if message.get('role') != 'user':
                                 continue
@@ -1171,7 +1206,7 @@ class Engine:
                         'business_outcome': {'status': 'failed', 'passed': False,
                             'check': business_failure.check, 'assertions': business_failure.assertions},
                         'observation_ref': ref, 'observation': observation}
-                return {'observation_ref': ref, 'observation': observation}
+                return {'executed': True, 'observation_ref': ref, 'observation': observation}
             validation['tool_executor'] = execute_tool
             validation['on_tool_result'] = tool_result
         runtime_tools = build_runtime_tools(self, s, schema, ctx, validate_output=validate_output)
