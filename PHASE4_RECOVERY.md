@@ -39,3 +39,11 @@ T01/T09 的本批依据为主设计 `top10-development-plan.md` 第3节、`agent
 初始导航保存 `old_ref=0008_探索_页面观察.json`、generation=1；导航到 `http://app:3000/?recoveryprobe=stale` 后 generation=2，再调用现有 `Engine._recovery_action(STALE)` 得 `fresh_ref=0010_探索_页面观察.json`、generation=2。旧 observation/action binding 被 Policy 以“浏览器观测已过期”拒绝。去掉页面 URL 行后两次 DOM 相同，因此 `same_dom_after_refresh=true`、`same_state_is_semantic_progress=false`、`new_ref_only_is_semantic_progress=false`；新 ref 和 generation 变化只证明 stale 已重新观察，不冒充业务进展。
 
 该 probe 不使用模型、不共享公开 B01 Run 的浏览器/数据库/缓存，也不计算业务恢复率；只证明独立 Docker/MCP stale→observe 与旧绑定拒绝边界。
+
+## CI 正常复现被误判为循环的修复
+
+`6e145a7` 从循环状态指纹中移除了阶段、复现轮次、验证门禁位置和冻结计划位置。相同 DOM 在正常的三轮复现或逐步验证中因此累计成同一重复状态，在补丁、验证或审批前被终止为 `ABNORMAL/LOOP_DETECTED`。
+
+状态指纹恢复上述运行时执行位置，用于区分有界流程的不同检查点；这些位置变化不会重置 `loop_no_progress_steps`，也不构成业务进展。补丁 hash、诊断重试次数、revision、step 和工具绑定引用仍不能区分重复状态；同一执行位置再次出现、动作循环、重复错误和长期无进展仍受原门限约束。
+
+新增6个定向回归用例覆盖执行位置区分、技术字段变化无效和无进展计数保留；与审批、批处理及错误定位器循环路径组合验证为 `16 passed`。

@@ -8,7 +8,7 @@ from tracefix.runtime.recovery import (
     classify_cause,
     has_real_progress,
 )
-from tracefix.runtime.contracts import Outcome, RunStatus
+from tracefix.runtime.contracts import Outcome, Phase, RunStatus
 from tracefix.runtime.smoke import make_engine
 
 
@@ -25,6 +25,54 @@ def test_real_progress_ignores_technical_churn():
     assert not has_real_progress(before, after)
     assert has_real_progress(before, {**after, 'business': 'passed'})
     assert has_real_progress({}, {}, {'verification_advanced': True})
+
+
+@pytest.mark.parametrize('position', [
+    {'phase': Phase.DIAGNOSE},
+    {'trial': 1},
+    {'validation_index': 1},
+    {'replay_index': 1},
+])
+def test_loop_fingerprint_distinguishes_workflow_positions(tmp_path, position):
+    engine, state = make_engine(tmp_path)
+    state.phase = Phase.REPRODUCE
+    fingerprint = engine._loop_state_fingerprint(state)
+    state.loop_state_fingerprints = [fingerprint] * (engine.LOOP_STATE_LIMIT - 1)
+    advanced = state.model_copy(update=position)
+    assert engine._loop_state_fingerprint(advanced) != fingerprint
+    assert not engine._loop_assessment(advanced)[2]
+    assert any(signal['kind'] == 'state_repeated'
+               for signal in engine._loop_assessment(state)[2])
+
+
+def test_loop_fingerprint_ignores_retry_and_binding_churn(tmp_path):
+    engine, state = make_engine(tmp_path)
+    state.phase = Phase.DIAGNOSE
+    state.pending_action = {'kind': 'observe', 'observation_id': 'old',
+                            'element_ref': 'e1', 'page_generation': 1,
+                            'generation': 1, 'call_id': 'old',
+                            'tool_call_id': 'old', 'attempt_id': 'old'}
+    fingerprint = engine._loop_state_fingerprint(state)
+    state.loop_state_fingerprints = [fingerprint] * (engine.LOOP_STATE_LIMIT - 1)
+    changed = state.model_copy(update={
+        'revision': 10, 'step': 10, 'diagnosis_retry_count': 2, 'patch_hash': 'new',
+        'pending_action': {key: 'new' if key != 'kind' else value
+                           for key, value in state.pending_action.items()},
+    })
+    assert engine._loop_state_fingerprint(changed) == fingerprint
+    assert any(signal['kind'] == 'state_repeated'
+               for signal in engine._loop_assessment(changed)[2])
+
+
+def test_workflow_positions_do_not_reset_no_progress_detection(tmp_path):
+    engine, state = make_engine(tmp_path)
+    state.phase = Phase.REPRODUCE
+    state.loop_no_progress_steps = engine.LOOP_NO_PROGRESS_LIMIT - 1
+    engine.store.save(state)
+    advanced = engine.changed(state, trial=1, replay_index=1)
+    assert advanced.loop_no_progress_steps == engine.LOOP_NO_PROGRESS_LIMIT
+    assert any(signal['kind'] == 'no_progress'
+               for signal in engine._loop_assessment(advanced)[2])
 
 
 def test_episode_budget_is_bound_to_same_semantic_episode():

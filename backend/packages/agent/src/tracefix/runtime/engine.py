@@ -714,7 +714,8 @@ class Engine:
             pending = {key: value for key, value in pending.items()
                        if key not in {'observation_id', 'element_ref', 'page_generation',
                                       'generation', 'call_id', 'tool_call_id', 'attempt_id'}}
-        return digest([snapshot, pending,
+        return digest([str(s.phase), s.trial, s.validation_index, s.replay_index,
+                       snapshot, pending,
                        s.last_error_signature or (s.failure_signatures[-1]
                                                   if s.failure_signatures else None)])
 
