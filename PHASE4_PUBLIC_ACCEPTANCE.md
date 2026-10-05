@@ -31,3 +31,23 @@
 ## 完成口径
 
 首次公开运行和失败根因取证已完成；有效修复、真实恢复收益和独立业务验收仍未完成。该公开运行不能证明 held-out 隔离，也不是四格实验。受信隔离入口与部署缺口另见 `PHASE4_ISOLATION_READINESS.md`；完整基线尚未运行。
+
+## 第二次运行：业务失败反馈接缝后的新阻塞
+
+- 运行目录：.tracefix/phase4-public-20261005T090557Z-0a2c53e450dd/；Run：run_616fcdacb5864ce0aa21c75e3d86016f；独立 schema：tracefix_s4public_0a2c53e450dd。
+- 运行代码：阶段四窄修提交 053b9762ef3637721df4e626dc832620138686aa；冻结规范 SHA256 仍为 db7d8d6e3d1a173c6ced14118a8e964f4a2b2fcea7015b20d2c3a24d07ef86f1；single、跨 Run 经验 off、held_out=false。
+- 真实链路已越过第一次运行的已结算业务断言/UNKNOWN 接缝：9 次模型调用、5 次浏览器动作均有持久化响应/观察，未生成补丁。
+- 终态：进程退出 1，FAILED / INFRA_FAILURE，原因是 ContextWindowError（受保护上下文超过模型窗口）；无 validation refs、无候选补丁，不能计入 M0 或四格成绩。
+- 供应商实际累计 usage：input 232031、output 3223、total 235254、cache read 157184；cache write 与费用均 unknown。usage 证据由持久化 provider response 汇总，未知字段未填零。
+
+这次结果说明业务失败反馈接缝已能让模型继续执行，但完整请求预算仍有真实阻塞；不能通过放宽冻结规范、删除保护字段或简单扩大模型窗口伪造成功。
+
+### 超窗原因只读核查
+
+最终 `0081_探索_上下文组装清单.json` 的 context `input_limit=19305`、`tokens_after=17051`，其中 protected 合计 `12634`，observation 已投影到 `3905`。随后 Gateway 对完整 payload 预检，`required_tokens=110486 > available_tokens=109568`，差 `918`，保护标签为 system/schema/tools/tool_history。第十次请求没有发送，不能声称供应商报告真实窗口已满。
+
+同一逻辑调用的 messages 从 `2` 增至 `18`，协议估算从 `33685` 增至 `90263`。旧 browser/Bash/Grep 的完整工具消息持续累积，位于 context dict 的投影之外。环境没有 tiktoken，manifest 为 `utf8_upper_bound / exact_tokenizer=false`；最后一次已发送请求本地估算 `103440`，供应商实际 prompt tokens `30243`。保守计量放大了历史问题，估算不能改称供应商精确 tokens。
+
+阶段三 observation 投影已生效，阶段四 WAITING_NETWORK 恢复未触发。后续最小兼容适配应覆盖完整协议预算和有界工具历史投影，保持 assistant/tool 配对、call IDs、失败/UNKNOWN 与完整 artifact 引用；已执行工具不能因摘要化重放。该适配尚未实施，不以本次失败作为已验收效果。
+
+首次新 Run 启动前另有一次基础设施配置失败：`.tracefix/phase4-public-20261005T090458Z-7d0cc8d16bf1/` 未生成业务 Run，隔离 schema 的 search_path 缺少 pgvector type 所在 public。改为独立 schema 优先、public 只用于已有扩展解析后，才启动本节真实业务 Run；该基础设施记录保留，不算修复成绩。
