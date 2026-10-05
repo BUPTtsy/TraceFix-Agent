@@ -580,7 +580,7 @@ class MCPBrowser:
             except ValueError as error:
                 raise PermissionError('MCP 新快照无法安全唯一重定位；请重新观测') from error
             self.last_action.update(grounding_observation_id=observation['id'],
-                                    grounding_page_generation=observation['page_generation'],
+                                    grounding_page_generation=observation.get('page_generation'),
                                     dispatched_element_ref=fresh_ref)
             args = {'element': f'{action.locator.role} {action.locator.name}', 'ref': fresh_ref}
             if action.kind == 'type':
