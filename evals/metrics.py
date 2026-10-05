@@ -29,10 +29,25 @@ def _usage_value(row, names):
 
 
 def _coverage(rows, names):
-    values = [_usage_value(row, names) for row in rows]
+    values = []
+    partial_values = []
+    for row in rows:
+        usage = row.get('usage')
+        coverage = usage.get('coverage') if isinstance(usage, dict) else None
+        field = coverage.get(names[0]) if isinstance(coverage, dict) else None
+        if isinstance(field, dict) and field.get('complete') is False:
+            values.append(None)
+            known_calls = field.get('known_calls')
+            if (_number(field.get('known_sum')) and _number(known_calls)
+                    and known_calls > 0):
+                partial_values.append(field['known_sum'])
+        else:
+            values.append(_usage_value(row, names))
     known = [value for value in values if value is not None]
     complete = bool(rows) and len(known) == len(rows)
-    return {'known_sum': sum(known) if known else None, 'known_runs': len(known),
+    observed = known + partial_values
+    return {'known_sum': sum(observed) if observed else None, 'known_runs': len(known),
+            'partially_known_runs': len(partial_values),
             'unknown_runs': len(rows) - len(known), 'coverage': ratio(len(known), len(rows)),
             'complete': complete, 'total': sum(known) if complete else None}
 

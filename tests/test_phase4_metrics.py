@@ -71,6 +71,31 @@ def test_zero_denominator_and_no_effective_fix_are_na():
     assert failed['cost_per_effective_fix_usd'] is None
 
 
+def test_partial_call_usage_is_counted_without_becoming_a_complete_run_total():
+    result = aggregate([
+        {'usage': {'input_tokens': None, 'cost_usd': 0,
+                   'coverage': {
+                       'input_tokens': {'known_sum': 10, 'known_calls': 1,
+                                        'unknown_calls': 1, 'complete': False},
+                       'cost_usd': {'known_sum': None, 'known_calls': 0,
+                                    'unknown_calls': 2, 'complete': False}}}},
+        {'usage': {'input_tokens': 20, 'cost_usd': .02}},
+        {},
+    ])
+    inputs = result['usage']['input_tokens']
+    assert inputs['known_sum'] == 30
+    assert inputs['known_runs'] == 1
+    assert inputs['partially_known_runs'] == 1
+    assert inputs['unknown_runs'] == 2
+    assert inputs['coverage'] == pytest.approx(1 / 3)
+    assert inputs['total'] is None
+    costs = result['usage']['cost_usd']
+    assert costs['known_sum'] == .02
+    assert costs['known_runs'] == 1
+    assert costs['partially_known_runs'] == 0
+    assert costs['total'] is None
+
+
 def test_fixture_is_never_labelled_real_and_recovery_requires_independent_validity():
     result = aggregate([
         {'evidence_kind': 'fixture', 'oracle_passed': False,
