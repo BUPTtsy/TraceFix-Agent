@@ -3,10 +3,10 @@
 - BASE_SHA：`3bc8b6a7419eaa002a71029c538152ee55c1bc5e`。
 - 分支：`codex/phase4-20261005`；worktree：`C:/Users/tsy/.codex/worktrees/phase4-20261005/tracefix`。
 - DESIGN_ROOT：`D:/tracefix`。隔离树中研究设计未跟踪，仅从原始 checkout 只读获取。
-- 启动时原始树 index/tracked 文件无改动；后续用户指定的两份进度文档已有未提交修改，将在验收记录整理后基于其现有内容同步更新。没有复制其它阶段的未提交生产代码或实验。
+- 启动时原始树 index/tracked 文件无改动；后续用户指定的两份进度文档已有未提交修改，验收后保留原内容同步更新并提交为 89e33fb。没有复制其它阶段未提交生产代码或实验。
 - 已读用户目标附件。阶段四只负责 T01 恢复、T09 最终隔离、T10 消融/统计及精确集成验收。
 - 用户已确认以 `main@6ada74a15c1fef4227a055490439d439cf2b1094` 为最终集成基线，按阶段二→三→四验收。阶段四在本隔离树执行无冲突 `git merge --no-ff main`，生成 `b81c1d9`；保留本阶段全部历史，没有重复 cherry-pick 已包含提交。
-- 阶段二/三 BASE 为 `6f3274b7eeaf01a3ba3d453a8c42af2d243c076e`，阶段四从后续合并树 `3bc8b6a` 开始。用户已确认后续 main 基线，无 reset/stash 或整块 ours/theirs。阶段四成果尚未回写原始 main 的生产代码。
+- 阶段二/三 BASE 为 `6f3274b7eeaf01a3ba3d453a8c42af2d243c076e`，阶段四从后续合并树 `3bc8b6a` 开始。按用户确认的 main 最终集成树，407ab5ecd2f8346dec0ddd84bd8486aa9b8dca21 无冲突合入阶段四至 d83bdb5 的全部历史，并保留原始 main 的 89e33fb 进度文档。没有 reset/stash、重复 cherry-pick 或整块 ours/theirs。
 
 ## 每批设计清单
 
@@ -39,11 +39,13 @@
 
 接缝组命令为 `py -3.12 -m pytest tests/test_phase2_cli_contract.py tests/test_phase2_events.py tests/test_phase3_engine.py tests/test_phase3_feedback.py tests/test_phase3_workset.py -q` → 93 passed。阶段二→三→四按接口和依赖复核，未将公开 fixture 的 FIX_VERIFIED 当作 held-out 通过。
 
+最终 main@407ab5e 的生产文件与 ff21fe7 在 backend/evals/frontend/tests 无差异。最小九文件组合（上述五文件 + test_phase4_metrics.py/test_phase4_runner.py/test_phase4_oracle.py/test_phase4_recovery.py）→ 142 passed, 1 warning in 18.40s；warning 为既有 .pytest_cache/nodeids 写权限，不影响测试结果。该树 CLI build 和 33 项 Node 定向通过。没有执行四条完整基线命令。
+
 ## 五层验收状态
 
 - 阶段四模块：✅ T01/T09/T10 代码、接缝和定向逻辑验收完成；实际恢复效果和隔离部署仍待验收。
 - CLI 迁移/删除：✅ 精确 manifest、adapter、旧入口清理和定向交互验收完成；真实 provider/network、OS 拖拽/剪贴板未测。
-- 跨阶段集成：✅ 用户确认 main@6ada74a 后在阶段四树完成 b81c1d9 合并和 93 项接缝验证；代码交付 ff21fe7。原始 main 未包含阶段四生产代码。
+- 跨阶段集成：✅ 用户确认 main@6ada74a 后在阶段四树完成 b81c1d9 合并和 93 项接缝验证；代码交付 ff21fe7。407ab5e 已将阶段四合回指定的最终 main 树，该树九文件 142 passed、CLI build/33 Node 定向通过。
 - 真实效果：未完成。Docker 实际返回 29.4.0/linux，但现有 Host Session 无法隔离 held-out，默认拒绝。没有已登记 AgentExposure/受信隔离 launcher 或冻结四格实验配置产物，不能报告真实 held-out/四格成绩。WAIT/STALE/CONTEXT、长上下文/记忆收益与符合原 M0 不变量的新 B01 均待取证。
 - 唯一完整基线：未运行。须三阶段最终集成、定向/真实/CLI证据齐备、本轮不再改代码且交接最终验收后才运行一次，并确认其它会话没有执行。
 

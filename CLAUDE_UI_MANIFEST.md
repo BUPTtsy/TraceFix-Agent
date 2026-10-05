@@ -168,3 +168,5 @@
 普通 CLI build、`node --test test.mjs input-test.mjs cli-session-test.mjs presentation-test.mjs`（33 passed）、`tty-smoke.mjs`（TTY_SMOKE_PASSED）、`chat-smoke.mjs`（CHAT_SMOKE_PASSED）和 `production-fixture-smoke.mjs`（PRODUCTION_FIXTURE_PASSED）均通过。Chat 证据目录为 `C:\Users\tsy\AppData\Local\Temp\tracefix-chat-smoke-cynWDV`。生产入口/package/build 检索未发现 LineEditor、node:readline 或旧 ANSI renderer 的调用；esbuild 的 `banner` 选项和 Claude `Cursor` 输入算法仍是各自正常用途。
 
 production fixture 使用真实 ConPTY、SQLite 和公开事件接线，Agent 事件由 fixture 子进程提供；Chat 使用真实 Python JSONL 与本地 HTTP fixture。两者不等于真实 provider/network、真实修复或 held-out 成绩；OS 拖拽/系统剪贴板仍待验证。
+
+最终集成 main@407ab5e 已合入阶段四至 d83bdb5 的全部历史，并保留进度文档 89e33fb。生产代码与上述 ff21fe7 一致；在指定 main 树重新验证 CLI build 和 33 项 Node 定向通过，阶段二/三/四九文件 Python 142 passed（1 项既有 cache 权限 warning）。完整基线和真实效果验收仍待前置条件齐备。
