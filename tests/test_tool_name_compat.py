@@ -255,7 +255,7 @@ async def test_native_batch_noop_submissions_refresh_context_and_produce_valid_p
     engine.model = NativePatches()
     await engine.run(state)
     finished = engine.store.load(state.run_id, state.scope_id)
-    assert finished.run_status == RunStatus.COMPLETED, finished.error
+    assert finished.run_status == RunStatus.COMPLETED, (finished.error, finished.error_details)
     assert finished.outcome == Outcome.FIX_VERIFIED
     assert len(requests) == len(contexts) == 3
     assert [context['diagnosis_retry_count'] for context in contexts] == [0, 1, 2]

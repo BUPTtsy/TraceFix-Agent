@@ -234,6 +234,9 @@ class RequestBoundary:
                'tool_round': self.tool_round, 'message_history': copy.deepcopy(self.last_history),
                'tool_results': copy.deepcopy(self.tool_records),
                'usage': copy.deepcopy(self.usage), 'raw_usage': copy.deepcopy(self.raw_usage)}
+        if cause is not None:
+            raw['cause_type'] = type(cause).__name__
+            raw['cause_message'] = str(cause)
         if 'request_status' not in raw:
             raw['request_status'] = 'response_received' if self.responses else 'unknown'
         raw['billing_status'] = 'known' if self.raw_usage else 'unknown'
