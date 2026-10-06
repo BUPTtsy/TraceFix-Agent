@@ -161,6 +161,47 @@ async def test_readonly_tool_uses_injected_sync_port_and_preserves_receipt(fake_
     assert finished['result'] == receipt
 
 
+async def test_completed_tool_receipt_is_reused_without_reexecution(fake_pydantic_ai):
+    calls, results = [], []
+
+    def port(name, arguments, call_id):
+        calls.append(call_id)
+        return {'evidence_ref': 'reused-evidence'}
+
+    async def on_result(_, payload):
+        results.append(payload['reused'])
+
+    async def model(agent, prompt, history, handler):
+        assert await execute_tool(agent) == {'evidence_ref': 'reused-evidence'}
+        assert await execute_tool(agent) == {'evidence_ref': 'reused-evidence'}
+        return completion()
+
+    await PydanticAIAdapter(model).generate(BrowserAction, {}, tools=(readonly_tool(),),
+        tool_executor=port, on_tool_result=on_result)
+
+    assert calls == ['read-1']
+    assert results == [False, True]
+
+
+async def test_tool_call_id_cannot_change_arguments_after_completion(fake_pydantic_ai):
+    calls = []
+
+    def port(name, arguments, call_id):
+        calls.append(call_id)
+        return {'evidence_ref': 'first-evidence'}
+
+    async def model(agent, prompt, history, handler):
+        await execute_tool(agent, arguments={'path': 'src/app.py'})
+        await execute_tool(agent, arguments={'path': 'src/other.py'})
+
+    with pytest.raises(PydanticAIAdapterError) as raised:
+        await PydanticAIAdapter(model).generate(BrowserAction, {}, tools=(readonly_tool(),),
+            tool_executor=port)
+
+    assert raised.value.category == 'tool_protocol'
+    assert calls == ['read-1']
+
+
 async def test_async_port_and_event_callback_are_awaited(fake_pydantic_ai):
     calls, events = [], []
 
