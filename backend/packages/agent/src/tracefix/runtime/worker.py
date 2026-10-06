@@ -41,7 +41,7 @@ class ReadOnlyWorker:
                     totals[metric] += payload['delta'][metric]
                 child.budget = Usage(**totals)
             reference = self.engine.put(child, {'framework': 'deepagents', 'kind': kind, **payload},
-                                        name='DeepAgents 调查模型' + kind)
+                                        name='DeepAgents_调查模型_' + kind)
             child.model_exchange_refs.append(reference)
             self.engine.store.save(child)
             events = {'request': 'model.request.persisted', 'response': 'model.response.persisted',
