@@ -21,7 +21,7 @@ from tracefix.runtime.worker import SubtaskResult
 
 def _relative_path(path: str, *, pattern: bool = False) -> str:
     if (not isinstance(path, str) or not path or '\\' in path or ':' in path
-            or any(ord(character) < 32 for character in path)
+            or any(ord(character) < 32 or ord(character) == 127 for character in path)
             or any(part in {'', '.', '..'} for part in path.split('/'))
             or (not pattern and any(character in path for character in '*?[]'))):
         raise ValueError('仅接受规范的项目相对路径')
