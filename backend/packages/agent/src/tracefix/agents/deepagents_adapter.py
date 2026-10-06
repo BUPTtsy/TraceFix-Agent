@@ -28,6 +28,7 @@ try:
     from langchain_core.callbacks import BaseCallbackHandler
     from langchain_core.language_models import BaseChatModel
     from langchain_core.messages import get_buffer_string
+    from langchain_core.runnables.config import ensure_config
     from langchain_core.tools import InjectedToolCallId, StructuredTool
     from langchain_openai import ChatOpenAI
 except (ImportError, AttributeError) as error:
@@ -366,11 +367,12 @@ class DeepAgentsReadonlyAdapter:
                 PatchToolCallsMiddleware(), _ReadonlyBoundary(tools)],
             response_format=ToolStrategy(schema=SubtaskResult, handle_errors=False),
             checkpointer=None, store=None, interrupt_before=None, interrupt_after=None)
+        invocation = ensure_config({'callbacks': [audit], 'recursion_limit': self._max_model_calls * 3 + 10})
+        if self._thread_id is not None:
+            invocation['configurable']['thread_id'] = self._thread_id
         try:
             answer = await agent.ainvoke({'messages': [{'role': 'user', 'content':
-                json.dumps(request.model_dump(mode='json'), ensure_ascii=False)}]},
-                {'callbacks': [audit], 'recursion_limit': self._max_model_calls * 3 + 10,
-                 'configurable': {'thread_id': self._thread_id} if self._thread_id is not None else {}})
+                json.dumps(request.model_dump(mode='json'), ensure_ascii=False)}]}, invocation)
             tools.check()
             raw = answer.get('structured_response')
             if isinstance(raw, SubtaskResult):
