@@ -376,7 +376,7 @@ async def test_worker_direct_deepagents_keeps_child_identity_usage_and_trace(tmp
     assert started['generation'] == spec.generation and started['source_manifest'] == state.source_manifest
     assert started['parent_step_id'] == completed['parent_step_id'] == f'{state.run_id}:{state.revision}'
     child_events = engine.store.trace(child.run_id, state.scope_id)
-    assert any(event['type'] == 'tool.result' for event in child_events)
+    assert any(event['type'] == 'tool.completed' for event in child_events)
     finished = next(event['payload'] for event in child_events if event['type'] == 'subtask.finished')
     assert finished['parent_run_id'] == state.run_id and finished['status'] == 'completed'
     assert engine.get(child, completed['trace_ref']) == child_events
@@ -403,6 +403,94 @@ async def test_worker_failure_and_cancel_merge_all_observed_usage(tmp_path, fail
     assert not any(event['type'] == 'subtask.completed'
                    for event in engine.store.trace(state.run_id, state.scope_id))
     assert engine.store.load(child_id, state.scope_id).budget.model_calls == 2
+    assert engine.store.load(state.run_id, state.scope_id).budget == state.budget
+    assert engine.store.locked == set()
+
+
+async def test_worker_external_cancel_propagates_with_usage_and_queryable_trace(tmp_path):
+    model = ScriptedModel()
+    engine, state, spec = worker_fixture(tmp_path, model)
+    entered = asyncio.Event()
+    async def pending(messages):
+        entered.set()
+        await asyncio.Event().wait()
+    model.steps = [calls(('Read', {'path': 'src/value.ts'}, 'read-1')), pending]
+    task = asyncio.create_task(ReadOnlyWorker(engine).run(state, spec))
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert state.budget.model_calls == 2 and state.budget.tokens == 5
+    assert state.budget.cost_usd == 0.01
+    parent_events = engine.store.trace(state.run_id, state.scope_id)
+    child_id = next(event['payload']['child_run_id'] for event in parent_events
+                    if event['type'] == 'subtask.started')
+    assert not any(event['type'] == 'subtask.completed' for event in parent_events)
+    child = engine.store.load(child_id, state.scope_id)
+    child_events = engine.store.trace(child_id, state.scope_id)
+    assert child.parent_run_id == state.run_id and child.budget.model_calls == 2
+    assert any(event['type'] == 'model.error.persisted' for event in child_events)
+    assert not any(event['type'] == 'subtask.finished' for event in child_events)
+    assert engine.store.load(state.run_id, state.scope_id).budget == state.budget
+    assert engine.store.locked == set()
+
+
+async def test_worker_group_is_concurrent_and_preserves_failed_result_protocol(tmp_path):
+    model = ScriptedModel()
+    engine, state, spec = worker_fixture(tmp_path, model)
+    ready = asyncio.Event()
+    active = []
+    async def investigate(messages):
+        status = 'completed' if not active else 'failed'
+        active.append(status)
+        if len(active) == 2:
+            ready.set()
+        await asyncio.wait_for(ready.wait(), 5)
+        assert len(engine.store.locked) == 2
+        return submit({**worker_payload(state, spec.allowed_artifacts[0]), 'status': status})
+    model.steps = [investigate, investigate]
+    reviewer = SubtaskSpec(spec.goal, 'evidence-reviewer', spec.generation,
+                          spec.allowed_files, spec.allowed_artifacts)
+    outputs = await ReadOnlyWorker(engine).group(state, [spec, reviewer])
+    assert {output.status for output in outputs} == {'completed', 'failed'}
+    assert len({output.worker_id for output in outputs}) == 2
+    assert state.budget.subtasks == 2 and state.budget.model_calls == 2
+    assert state.budget.tokens == 10 and state.budget.cost_usd == 0.02
+    events = engine.store.trace(state.run_id, state.scope_id)
+    finished = [event for event in events if event['type'] in {'subtask.completed', 'subtask.failed'}]
+    assert len(finished) == 2
+    for output in outputs:
+        child = engine.store.load(output.worker_id, state.scope_id)
+        event = next(event for event in finished if event['payload']['child_run_id'] == child.run_id)
+        assert child.parent_run_id == state.run_id
+        assert event['type'] == ('subtask.completed' if output.status == 'completed' else 'subtask.failed')
+        assert engine.get(child, event['payload']['trace_ref']) == engine.store.trace(child.run_id, state.scope_id)
+    assert engine.store.locked == set()
+
+
+async def test_worker_group_framework_failure_cancels_sibling_and_merges_usage(tmp_path):
+    model = ScriptedModel()
+    engine, state, spec = worker_fixture(tmp_path, model)
+    entered = asyncio.Event()
+    async def failed(messages):
+        await asyncio.wait_for(entered.wait(), 5)
+        raise RuntimeError('provider disconnected')
+    async def pending(messages):
+        entered.set()
+        await asyncio.Event().wait()
+    model.steps = [failed, pending]
+    with pytest.raises(ExceptionGroup) as caught:
+        await ReadOnlyWorker(engine).group(state, [spec, spec])
+    assert all(isinstance(error, DeepAgentsError) for error in caught.value.exceptions)
+    assert state.budget.model_calls == 2 and state.budget.tokens == 0
+    events = engine.store.trace(state.run_id, state.scope_id)
+    assert not any(event['type'] == 'subtask.completed' for event in events)
+    assert any(event['type'] == 'subtask.failed' for event in events)
+    child_ids = [event['payload']['child_run_id'] for event in events if event['type'] == 'subtask.started']
+    assert len(child_ids) == 2
+    for child_id in child_ids:
+        assert any(event['type'] == 'model.error.persisted'
+                   for event in engine.store.trace(child_id, state.scope_id))
     assert engine.store.load(state.run_id, state.scope_id).budget == state.budget
     assert engine.store.locked == set()
 

@@ -165,11 +165,13 @@ class ReadOnlyWorker:
                                                              'usage': child.budget.model_dump()})
         finally:
             async with self._usage_lock:
-                usage = state.budget.model_dump()
+                saved = self.engine.store.load(state.run_id, state.scope_id)
+                usage = saved.budget.model_dump()
                 for metric in ('model_calls', 'browser_actions', 'tokens', 'cost_usd'):
                     usage[metric] += getattr(child.budget, metric)
                 state.budget = Usage(**usage)
-                self.engine.store.save(state)
+                saved.budget = state.budget
+                self.engine.store.save(saved)
         check()
         references = (set(result.evidence_refs) | set(result.support_refs)
                       | set(result.counterevidence_refs) | set(result.artifact_refs))
