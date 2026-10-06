@@ -14,6 +14,47 @@ from tracefix.storage.artifacts import sanitize
 
 class ModelProtocol:
     @staticmethod
+    def message_history(messages):
+        result = []
+        for message in messages:
+            if isinstance(message, dict) or not hasattr(message, 'parts'):
+                result.append(copy.deepcopy(message))
+                continue
+            if message.kind == 'response':
+                item = {'role': 'assistant', 'content': None}
+                for part in message.parts:
+                    if part.part_kind == 'text':
+                        item['content'] = (item['content'] or '') + part.content
+                    elif part.part_kind == 'thinking':
+                        item['reasoning_content'] = item.get('reasoning_content', '') + part.content
+                    elif part.part_kind == 'tool-call':
+                        arguments = part.args if isinstance(part.args, str) else json.dumps(part.args, ensure_ascii=False)
+                        item.setdefault('tool_calls', []).append({'id': part.tool_call_id,
+                            'type': 'function', 'function': {'name': part.tool_name, 'arguments': arguments}})
+                result.append(item)
+            else:
+                for part in message.parts:
+                    if part.part_kind in {'system-prompt', 'user-prompt'}:
+                        content = part.content
+                        if not isinstance(content, str):
+                            import base64
+                            content = [{'type': 'text', 'text': item} if isinstance(item, str)
+                                else {'type': 'image_url', 'image_url': {'url': 'data:' + item.media_type
+                                    + ';base64,' + base64.b64encode(item.data).decode()}}
+                                for item in content]
+                        result.append({'role': 'system' if part.part_kind == 'system-prompt' else 'user',
+                                       'content': content})
+                    elif part.part_kind in {'tool-return', 'retry-prompt'}:
+                        content = part.content if isinstance(part.content, str) else json.dumps(
+                            part.content, ensure_ascii=False, default=str)
+                        if getattr(part, 'tool_name', None):
+                            result.append({'role': 'tool', 'tool_call_id': part.tool_call_id,
+                                           'name': part.tool_name, 'content': content})
+                        else:
+                            result.append({'role': 'user', 'content': content})
+        return result
+
+    @staticmethod
     def _native_tools(schema):
         # 工具 schema 只声明动作格式；实际执行仍受运行时策略控制。
         from tracefix.runtime.contracts import BrowserAction, Decision

@@ -54,6 +54,7 @@ class _RunTrace:
         return snapshot
 
     def failure(self, category, message, cause=None, **details):
+        from tracefix.model.history import ModelProtocol
         if self.context is not None:
             self.observe(self.context)
         selected = next((error for error in _causes(cause)
@@ -65,9 +66,11 @@ class _RunTrace:
         if category == 'stream_interrupted':
             status = 'UNKNOWN_OPERATION'
         return PydanticAIAdapterError(message, category=category, status=status,
-            details={**inherited, 'message_history': copy.deepcopy(self.messages),
-                     'tool_calls': copy.deepcopy(self.tool_calls),
-                     'retry_context': copy.deepcopy(self.retry_context), **details})
+            details=json.loads(to_json({**inherited,
+                     'message_history': ModelProtocol.message_history(self.messages),
+                     'tool_calls': self.tool_calls,
+                     'retry_context': self.retry_context, **details}, bytes_mode='base64',
+                     fallback=lambda value: vars(value) if hasattr(value, '__dict__') else str(value))))
 
 
 async def _resolve(value):
