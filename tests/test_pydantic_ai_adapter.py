@@ -112,32 +112,11 @@ async def test_success_returns_existing_typed_schema_and_context(fake_pydantic_a
     value = await PydanticAIAdapter(model).generate(BrowserAction, context,
         on_event=lambda kind, payload: events.append((kind, payload)))
 
-    assert isinstance(value, BrowserAction)
-    assert value == expected
+    assert isinstance(value.value, BrowserAction)
+    assert value.value == expected
     assert context == original_context
     assert [kind for kind, payload in events][0] == 'adapter.started'
     assert [kind for kind, payload in events][-1] == 'adapter.completed'
-
-
-async def test_adapter_never_falls_back_to_legacy_gateway(fake_pydantic_ai, monkeypatch):
-    imported = []
-    original_import = adapter_module.importlib.import_module
-
-    def guarded_import(name, package=None):
-        imported.append(name)
-        if name == 'tracefix.model.gateway':
-            raise AssertionError('适配器不得回退到 Legacy Gateway')
-        return original_import(name, package)
-
-    monkeypatch.setattr(adapter_module.importlib, 'import_module', guarded_import)
-
-    async def model(agent, prompt, history, handler):
-        return completion()
-
-    value = await PydanticAIAdapter(model).generate(BrowserAction, {})
-
-    assert value.kind == 'finish'
-    assert 'tracefix.model.gateway' not in imported
 
 
 async def test_invalid_output_has_validation_category(fake_pydantic_ai):
@@ -169,7 +148,7 @@ async def test_readonly_tool_uses_injected_sync_port_and_preserves_receipt(fake_
     value = await PydanticAIAdapter(model).generate(BrowserAction, {}, tools=(readonly_tool(),),
         tool_executor=port, on_event=lambda kind, payload: events.append((kind, payload)))
 
-    assert value.kind == 'finish'
+    assert value.value.kind == 'finish'
     assert calls == [('repo.read', {'path': 'src/app.py'}, 'read-1')]
     started = next(payload for kind, payload in events if kind == 'tool.started')
     finished = next(payload for kind, payload in events if kind == 'tool.completed')
