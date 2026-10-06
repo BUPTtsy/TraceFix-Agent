@@ -311,12 +311,17 @@ class PydanticAIAdapter:
                     return result.model_dump(mode='json', by_alias=True)
                 return result.to_content() if hasattr(result, 'to_content') else result
 
-            tool = tool_library.Tool.from_schema(execute, name=spec.wire_name,
-                description=spec.description, json_schema=spec.parameters,
-                takes_ctx=True)
+            sequential = not (spec.parallel_safe and spec.side_effect in {'none', 'read'})
+            try:
+                tool = tool_library.Tool.from_schema(execute, name=spec.wire_name,
+                    description=spec.description, json_schema=spec.parameters,
+                    takes_ctx=True, sequential=sequential)
+            except TypeError:
+                tool = tool_library.Tool.from_schema(execute, name=spec.wire_name,
+                    description=spec.description, json_schema=spec.parameters,
+                    takes_ctx=True)
             tool.max_retries = 0
-            if hasattr(tool, 'sequential'):
-                tool.sequential = not (spec.parallel_safe and spec.side_effect in {'none', 'read'})
+            tool.sequential = sequential
             return tool
 
         submission_spec = next((spec for spec in tools if spec.submission
