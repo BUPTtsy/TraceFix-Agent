@@ -105,6 +105,13 @@ class RequestBoundary:
                                 message[field] = copy.deepcopy(assistant[field])
                         break
         self.last_history = copy.deepcopy(payload['messages'])
+        tool_names = {}
+        for message in payload['messages']:
+            for call in message.get('tool_calls', ()):
+                tool_names[call['id']] = call['function']['name']
+            if message.get('role') == 'tool' and message.get('tool_call_id') in tool_names:
+                message.setdefault('name', tool_names[message['tool_call_id']])
+        self.last_history = copy.deepcopy(payload['messages'])
         assembler = self.options.get('context_assembler')
         if assembler is not None:
             manifest, compacted = self.gateway._budget_payload(payload, self.schema,

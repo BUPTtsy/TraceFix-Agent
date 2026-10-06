@@ -9,6 +9,7 @@ import pytest
 from tracefix.cli.main import chat_jsonl
 from tracefix.model.chat import stream_tool_chat
 from tracefix.model import protocol
+from tracefix.agents.pydantic_ai_adapter import PydanticAIAdapterError
 from tracefix.runtime.contracts import Phase
 from tracefix.runtime.tools import ToolPipeline, ToolRegistry, ToolSpec
 
@@ -103,12 +104,13 @@ async def test_chat_does_not_execute_unfinished_tool_stream(monkeypatch):
     async def read(arguments, call_id):
         pytest.fail('incomplete stream must not execute a tool')
 
-    with pytest.raises(ValueError, match='响应未完成'):
+    with pytest.raises(PydanticAIAdapterError, match='响应未完成') as raised:
         async for event in stream_tool_chat('read', [], 'scope', None, pipeline(read), False):
             assert 'turn_messages' not in event
+    assert raised.value.status == 'UNKNOWN_OPERATION'
 
 
-async def test_chat_tool_failure_body_reaches_next_model_request(monkeypatch):
+async def test_chat_tool_failure_receipt_is_terminal_and_preserved(monkeypatch):
     calls = [{'index': 0, 'id': 'read-1', 'type': 'function',
               'function': {'name': 'Read', 'arguments': '{}'}}]
     requests = transport(monkeypatch, [
@@ -118,10 +120,14 @@ async def test_chat_tool_failure_body_reaches_next_model_request(monkeypatch):
     async def read(arguments, call_id):
         raise PermissionError('read blocked')
 
-    events = [event async for event in stream_tool_chat('read', [], 'scope', None, pipeline(read), False)]
+    events = []
+    with pytest.raises(PydanticAIAdapterError) as raised:
+        async for event in stream_tool_chat('read', [], 'scope', None, pipeline(read), False):
+            events.append(event)
     assert any(event.get('failed') == 1 for event in events)
-    assert json.loads(requests[1]['messages'][-1]['content'])['isError'] is True
-    assert 'read blocked' in requests[1]['messages'][-1]['content']
+    assert len(requests) == 1
+    assert raised.value.category == 'tool_execution'
+    assert 'read blocked' in str(raised.value.details)
 
 
 async def test_chat_filters_hidden_retrieval_records_from_refs_and_model_request(monkeypatch):
@@ -140,7 +146,7 @@ async def test_chat_filters_hidden_retrieval_records_from_refs_and_model_request
 
 async def test_chat_rejects_empty_final_response(monkeypatch):
     transport(monkeypatch, [reply([sse(finish='stop'), b'data: [DONE]\n\n'])])
-    with pytest.raises(ValueError, match='未返回正文'):
+    with pytest.raises(PydanticAIAdapterError, match='未返回正文'):
         async for event in stream_tool_chat('question', [], 'scope', None, pipeline(lambda *args: {}), False):
             assert 'turn_messages' not in event
 

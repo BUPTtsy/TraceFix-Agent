@@ -169,7 +169,7 @@ async def test_streamed_tool_arguments_execute_only_after_complete_usage_and_don
         tool_executor=execute, on_usage=usages.append)
 
     assert result.value.kind == 'finish'
-    assert executed == [('browser_navigate', {'value': 'https://example.test'}, 'navigate-1')]
+    assert executed == [('browser.navigate', {'value': 'https://example.test'}, 'navigate-1')]
     assistant, tool = requests[1]['messages'][-2:]
     assert assistant['reasoning_content'] == 'inspect page'
     assert assistant['tool_calls'][0]['function']['arguments'] == '{"value":"https://example.test"}'

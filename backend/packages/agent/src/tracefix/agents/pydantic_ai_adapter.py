@@ -382,7 +382,7 @@ class PydanticAIAdapter:
                 max_retries=0)]
             framework_output_tool_names.update({'final_result', submission_spec.wire_name})
         elif schema is not str and hasattr(library, 'PromptedOutput'):
-            output_type = library.PromptedOutput(schema)
+            output_type = library.PromptedOutput(schema, template=False)
         elif schema is not str:
             framework_output_tool_names.add('final_result')
 
