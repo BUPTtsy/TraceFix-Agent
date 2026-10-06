@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 
 from tracefix.model.contracts import ModelError, ModelOutputError, ModelResult
 from tracefix.model.history import ModelProtocol
+from tracefix.runtime.tools import ToolSpec
 
 
 class Gateway(ModelProtocol):
