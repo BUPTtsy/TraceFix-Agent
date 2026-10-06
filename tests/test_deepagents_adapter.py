@@ -458,7 +458,7 @@ async def test_worker_keeps_inherited_checkpoint_identity_without_loading_legacy
     child = engine.store.load(output['child_run_id'], state.scope_id)
     assert child.parent_run_id == state.run_id
     assert list(saver.list({'configurable': {'thread_id': child.run_id}}))
-    assert saver.get_tuple({'configurable': {'thread_id': state.run_id}}).checkpoint['channel_values'] == output
+    assert saver.get_tuple({'configurable': {'thread_id': state.run_id}}).checkpoint['channel_values']['__root__'] == output
     assert saver.get_tuple(legacy) == before
     assert engine.store.load(state.run_id, state.scope_id).budget.model_calls == 1
 
@@ -548,7 +548,7 @@ async def test_worker_group_framework_failure_cancels_sibling_and_merges_usage(t
     assert engine.store.locked == set()
 
 
-@pytest.mark.parametrize('drift', ['source', 'generation', 'saved_generation', 'manifest', 'evidence'])
+@pytest.mark.parametrize('drift', ['source', 'generation', 'saved_generation', 'manifest', 'saved_manifest', 'evidence'])
 async def test_worker_refuses_investigation_drift(tmp_path, drift):
     model = ScriptedModel()
     engine, state, spec = worker_fixture(tmp_path, model)
@@ -565,6 +565,10 @@ async def test_worker_refuses_investigation_drift(tmp_path, drift):
         elif drift == 'evidence':
             state.evidence_refs = []
             engine.store.save(state)
+        elif drift == 'saved_manifest':
+            saved = engine.store.load(state.run_id, state.scope_id)
+            saved.source_manifest = 'new-manifest'
+            engine.store.save(saved)
         else:
             state.source_manifest = 'new-manifest'
             engine.store.save(state)
@@ -576,7 +580,74 @@ async def test_worker_refuses_investigation_drift(tmp_path, drift):
     assert state.budget.model_calls == 1
     assert not any(event['type'] == 'subtask.completed'
                    for event in engine.store.trace(state.run_id, state.scope_id))
+    saved = engine.store.load(state.run_id, state.scope_id)
+    if drift == 'saved_generation':
+        assert saved.revision == spec.generation + 1
+    elif drift == 'saved_manifest':
+        assert saved.source_manifest == 'new-manifest'
     assert engine.store.locked == set()
+
+
+@pytest.mark.parametrize('violation', ['tool', 'file', 'artifact', 'nested_evidence', 'result_generation'])
+async def test_worker_scope_rejection_is_a_failed_event_without_success(tmp_path, violation):
+    model = ScriptedModel()
+    engine, state, spec = worker_fixture(tmp_path, model)
+    payload = worker_payload(state, spec.allowed_artifacts[0])
+    if violation == 'artifact':
+        payload['artifact_refs'] = ['unauthorized.json']
+    elif violation == 'nested_evidence':
+        payload['hypotheses'] = [dict(id='candidate', summary='未授权证据',
+                                    support_refs=['unauthorized.json'])]
+    elif violation == 'result_generation':
+        payload['worker_generation'] = spec.generation + 1
+    step = (calls(('Write', {}, 'denied')) if violation == 'tool'
+            else calls(('Read', {'path': 'src/secret.ts'}, 'denied')) if violation == 'file'
+            else submit(payload))
+    model.steps = [step]
+    output = await ReadOnlyWorker(engine).run(state, spec)
+    assert output.status == 'rejected'
+    assert output.files == output.evidence_refs == output.artifact_refs == output.hypotheses == []
+    assert output.worker_generation == spec.generation and output.source_manifest == state.source_manifest
+    assert state.budget.model_calls == output.usage['model_calls'] == 1
+    assert engine.store.operations == {}
+    events = engine.store.trace(state.run_id, state.scope_id)
+    assert not any(event['type'] == 'subtask.completed' for event in events)
+    failed = next(event['payload'] for event in events if event['type'] == 'subtask.failed')
+    assert failed['status'] == 'rejected' and failed['child_run_id'] == output.worker_id
+    child = engine.store.load(output.worker_id, state.scope_id)
+    assert engine.get(child, failed['trace_ref']) == engine.store.trace(child.run_id, state.scope_id)
+    assert engine.store.locked == set()
+
+
+async def test_worker_rejects_stale_candidate_content_version_without_success(tmp_path):
+    model = ScriptedModel()
+    engine, state, spec = worker_fixture(tmp_path, model)
+    payload = worker_payload(state, spec.allowed_artifacts[0])
+    payload['hypotheses'] = [dict(id='candidate', summary='过期候选',
+        support_refs=[spec.allowed_artifacts[0]], candidate_paths=[
+            dict(path='src/value.ts', content_version='old-source-version')])]
+    model.steps = [submit(payload)]
+    with pytest.raises(ValueError, match='源码版本'):
+        await ReadOnlyWorker(engine).run(state, spec)
+    assert state.budget.model_calls == 1 and state.budget.tokens == 5
+    assert not any(event['type'] == 'subtask.completed'
+                   for event in engine.store.trace(state.run_id, state.scope_id))
+    assert engine.store.locked == set()
+
+
+async def test_worker_authorized_review_uses_same_readonly_boundary(tmp_path):
+    model = ScriptedModel()
+    engine, state, spec = worker_fixture(tmp_path, model)
+    state.phase = Phase.REVIEW
+    engine.store.save(state)
+    spec = SubtaskSpec(spec.goal, 'patch-reviewer', spec.generation,
+                      spec.allowed_files, spec.allowed_artifacts)
+    model.steps = [submit(worker_payload(state, spec.allowed_artifacts[0]))]
+    output = await ReadOnlyWorker(engine).run(state, spec)
+    assert output.status == 'completed'
+    assert json.loads(model.calls[0][0][-1].content)['phase'] == 'REVIEW'
+    assert engine.store.load(output.worker_id, state.scope_id).phase == Phase.REVIEW
+    assert state.phase == Phase.REVIEW and state.patch_ref is None
 
 
 async def test_unknown_resource_fence_blocks_host_tools_and_propagates(tmp_path):
