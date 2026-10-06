@@ -314,12 +314,18 @@ class PydanticAIAdapter:
                 completed_results[call_id] = {'identity': identity, 'result': copy.deepcopy(result)}
                 callback = runtime_options.get('on_tool_result')
                 if callback is not None:
-                    await _resolve(callback(None, {
-                        'message': {'role': 'tool', 'tool_call_id': call_id,
-                                    'name': spec.wire_name,
-                                    'content': (result.to_content() if hasattr(result, 'to_content')
-                                                else json.dumps(receipt, ensure_ascii=False, default=str))},
-                        'tool_call_id': call_id, 'receipt': receipt, 'reused': record['reused']}))
+                    try:
+                        await _resolve(callback(None, {
+                            'message': {'role': 'tool', 'tool_call_id': call_id,
+                                        'name': spec.wire_name,
+                                        'content': (result.to_content() if hasattr(result, 'to_content')
+                                                    else json.dumps(receipt, ensure_ascii=False, default=str))},
+                            'tool_call_id': call_id, 'receipt': receipt,
+                            'reused': record['reused']}))
+                    except Exception as error:
+                        raise trace.failure('event_callback', '工具结果回调失败', error,
+                            event_kind='tool.completed', tool_call_id=call_id,
+                            tool_name=spec.name, result=copy.deepcopy(result)) from error
                 await emit('tool.completed', record)
                 if isinstance(result, BaseModel):
                     return result.model_dump(mode='json', by_alias=True)
