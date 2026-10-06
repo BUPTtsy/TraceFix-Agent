@@ -147,15 +147,17 @@ class PydanticAIAdapter:
                     side_effect='external', idempotency_key=digest,
                     phases=frozenset({context.get('phase') or 'DIAGNOSE'})),)
         names = set()
+        phase = context.get('phase') or getattr(tool_pipeline, 'phase', 'DIAGNOSE')
         for spec in tools:
             if (not isinstance(spec, ToolSpec) or not spec.enabled
-                    or (spec.approval != 'never' and tool_pipeline is None)):
+                    or (spec.approval != 'never' and (tool_pipeline is None
+                        or not tool_pipeline.registry.contains(spec.name, phase)
+                        or tool_pipeline.registry.get(spec.name, phase) != spec))):
                 raise trace.failure('configuration', '适配器拒绝未授权或禁用工具')
             if spec.wire_name in names:
                 raise trace.failure('configuration', '工具模型名称重复：' + spec.wire_name)
             names.add(spec.wire_name)
         tool_registry = ToolRegistry(tools)
-        phase = context.get('phase') or getattr(tool_pipeline, 'phase', 'DIAGNOSE')
         concurrency = runtime_options.get('max_concurrency', 4)
         if type(concurrency) is not int or concurrency < 1:
             raise trace.failure('configuration', '工具并发上界必须为正整数')
@@ -449,6 +451,9 @@ class PydanticAIAdapter:
                 raise trace.failure('stream_interrupted', '模型流式响应中断', error) from error
 
         try:
+            if trace.messages and all(hasattr(message, 'parts') for message in trace.messages):
+                from tracefix.model.history import ModelProtocol
+                trace.messages = ModelProtocol.message_history(trace.messages)
             if trace.messages and isinstance(trace.messages[0], dict) and all(
                     isinstance(message, dict) and 'role' in message for message in trace.messages):
                 from tracefix.model.history import ModelProtocol

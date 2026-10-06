@@ -404,3 +404,46 @@ async def test_image_history_is_restored_and_uses_configured_vision_provider(mon
     from tracefix.model.history import ModelProtocol
     projected = ModelProtocol.message_history(completed['message_history'])
     assert projected[0]['content'][1]['image_url']['url'] == encoded
+
+
+async def test_unrelated_pipeline_cannot_authorize_an_approval_tool():
+    spec = tool_spec(approval='always')
+    pipeline = ToolPipeline(ToolRegistry([]), {}, 'DIAGNOSE')
+
+    def execute(messages, info):
+        pytest.fail('unbound approval tool cannot reach model execution')
+
+    with pytest.raises(PydanticAIAdapterError) as raised:
+        await PydanticAIAdapter(model(execute)).generate(Output, {}, tools=[spec],
+            tool_pipeline=pipeline, tool_executor=lambda *args: pytest.fail('cannot bypass approval'))
+    assert raised.value.category == 'configuration'
+
+
+async def test_framework_tool_history_reuses_completed_receipt_with_original_identity(monkeypatch):
+    from pydantic_ai.messages import ModelRequest, ToolReturnPart
+
+    history = [ModelResponse(parts=[ToolCallPart('RepoRead', {'index': 1},
+                                                tool_call_id='provider-call-9')]),
+        ModelRequest(parts=[ToolReturnPart('RepoRead', '{"evidence_ref":"saved"}',
+                                          tool_call_id='provider-call-9')])]
+    requests = transport(monkeypatch, [response(None, calls=[call()], finish='tool_calls'), response()])
+    result = await Gateway(key='fake', stream=False).generate(Output, {}, message_history=history,
+        tools=[tool_spec()], tool_executor=lambda *args: pytest.fail('completed call cannot execute'))
+    assert result.value.answer == 42
+    assert len(requests) == 2
+    assert requests[-1]['messages'][-1]['content'] == '{"evidence_ref":"saved"}'
+
+
+async def test_resumed_tool_rounds_count_toward_existing_limit(monkeypatch):
+    history = [{'role': 'assistant', 'content': None, 'tool_calls': [call()]},
+        {'role': 'tool', 'name': 'RepoRead', 'tool_call_id': 'provider-call-9',
+         'content': '{"evidence_ref":"saved"}'}]
+    requests = transport(monkeypatch, [response(None, calls=[
+        call(call_id='new-call')], finish='tool_calls')])
+    with pytest.raises(ModelOutputError) as raised:
+        await Gateway(key='fake', stream=False, max_tool_rounds=1).generate(Output, {},
+            messages=history, tools=[tool_spec()],
+            tool_executor=lambda *args: pytest.fail('tool round limit cannot reset on resume'))
+    assert len(requests) == 1
+    assert raised.value.details['tool_round'] == 1
+    assert raised.value.category == 'tool_protocol'

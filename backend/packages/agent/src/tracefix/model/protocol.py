@@ -49,7 +49,8 @@ class RequestBoundary:
         self.registry, self.phase, self.options = registry, phase, options
         self.logical_id = uuid4().hex
         self.request_count = 0
-        self.tool_round = 0
+        self.tool_round = sum(1 for message in options.get('initial_history', ())
+            if isinstance(message, dict) and message.get('role') == 'assistant' and message.get('tool_calls'))
         self.exchange = None
         self.requests, self.responses, self.tool_records = [], [], []
         self.completed = {}
