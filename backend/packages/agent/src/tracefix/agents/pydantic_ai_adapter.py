@@ -205,7 +205,7 @@ class PydanticAIAdapter:
                 boundary = RequestBoundary(self.model, schema, context, tool_registry,
                     phase, {
                         **runtime_options, 'agent_instructions': agent_instructions,
-                        'on_event': on_event,
+                        'on_event': on_event, 'initial_history': copy.deepcopy(trace.messages),
                         'framework_output_tool_names': framework_output_tool_names})
                 client = create_http_client(boundary)
                 provider = OpenAIProvider(openai_client=AsyncOpenAI(base_url=self.model.base_url,

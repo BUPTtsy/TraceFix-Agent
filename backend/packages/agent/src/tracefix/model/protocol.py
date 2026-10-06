@@ -90,21 +90,25 @@ class RequestBoundary:
                 and any(part.get('type') == 'image_url' for part in message['content'])
                 for message in payload['messages']):
             payload['model'] = self.gateway.vision_model
+        assistants = [message for message in self.options.get('initial_history', ())
+                      if isinstance(message, dict) and message.get('role') == 'assistant']
+        for raw in self.responses:
+            assistants.extend(choice.get('message', {}) for choice in raw.get('choices', ())
+                              if isinstance(choice, dict))
         for message in payload['messages']:
             if message.get('role') != 'assistant':
                 continue
             ids = {call['id'] for call in message.get('tool_calls', [])}
-            for raw in reversed(self.responses):
-                for choice in raw.get('choices', []):
-                    assistant = choice.get('message', {})
-                    raw_ids = {call['id'] for call in assistant.get('tool_calls', [])}
-                    if (ids and ids == raw_ids) or (not ids and message.get('content')
-                            and message.get('content') == assistant.get('content')):
-                        for field in ('reasoning', 'reasoning_content'):
-                            if field in assistant:
-                                message[field] = copy.deepcopy(assistant[field])
-                        break
-        self.last_history = copy.deepcopy(payload['messages'])
+            for assistant in reversed(assistants):
+                raw_ids = {call['id'] for call in assistant.get('tool_calls', [])}
+                if (ids and ids == raw_ids) or (not ids and message.get('content')
+                        and message.get('content') == assistant.get('content')):
+                    for field in ('reasoning', 'reasoning_content'):
+                        if field in assistant:
+                            message[field] = copy.deepcopy(assistant[field])
+                    if ids:
+                        message['content'] = copy.deepcopy(assistant.get('content'))
+                    break
         tool_names = {}
         for message in payload['messages']:
             for call in message.get('tool_calls', ()):
