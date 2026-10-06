@@ -72,6 +72,8 @@ class RequestBoundary:
             systems = [message for message in payload['messages'] if message['role'] == 'system']
             if systems:
                 systems[0]['content'] = system
+            else:
+                payload['messages'].insert(0, {'role': 'system', 'content': system})
             self.gateway._replace_context(payload['messages'], serialize_request(self.schema, self.context))
         if self.gateway.vision_model and any(isinstance(message.get('content'), list)
                 and any(part.get('type') == 'image_url' for part in message['content'])
@@ -129,6 +131,13 @@ class RequestBoundary:
             except ValueError:
                 body = {'raw_text': response.text}
             await self.finish_response(response, body, validate=response.is_success)
+            if not response.is_success:
+                category = ('authentication' if response.status_code in {401, 403}
+                            else 'rate_limit' if response.status_code == 429
+                            else 'service_unavailable' if response.status_code >= 500
+                            else 'http_error')
+                raise await self.fail(category, f'模型请求失败：HTTP {response.status_code}',
+                                     http_status=response.status_code)
 
     async def finish_response(self, response, body, *, complete=True, validate=True):
         self.last_body = body
@@ -168,6 +177,13 @@ class RequestBoundary:
                                 and isinstance(call.get('function'), dict)
                                 and call['function'].get('name') in output_names]
                 runtime_calls = [call for call in calls if call not in output_calls]
+                if not isinstance(calls, list) or any(
+                        not isinstance(call, dict) or call.get('type') != 'function'
+                        or not isinstance(call.get('id'), str) or not call['id'].strip()
+                        or not isinstance(call.get('function'), dict)
+                        or not isinstance(call['function'].get('arguments'), str)
+                        for call in calls) or len({call['id'] for call in calls}) != len(calls):
+                    raise await self.fail('tool_protocol', '工具调用 ID 或参数格式无效')
                 if output_calls and runtime_calls:
                     raise await self.fail('tool_protocol', '结构化输出不能与运行时工具混合')
                 if runtime_calls:
@@ -257,4 +273,25 @@ class AuditedStream(httpx.AsyncByteStream):
 
 def create_http_client(boundary):
     return httpx.AsyncClient(timeout=boundary.gateway.timeout, follow_redirects=False,
+        transport=BoundaryTransport(httpx.AsyncHTTPTransport(retries=0), boundary),
         event_hooks={'request': [boundary.before], 'response': [boundary.received]})
+
+
+class BoundaryTransport(httpx.AsyncBaseTransport):
+    def __init__(self, transport, boundary):
+        self.transport, self.boundary = transport, boundary
+
+    async def handle_async_request(self, request):
+        try:
+            return await self.transport.handle_async_request(request)
+        except asyncio.CancelledError:
+            raise
+        except httpx.HTTPError as error:
+            safe = isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
+            raise await self.boundary.fail('network' if safe else 'stream_interrupted',
+                '模型网络请求失败：' + type(error).__name__, error,
+                status='WAITING_NETWORK' if safe else 'UNKNOWN_OPERATION',
+                request_status='not_sent' if safe else 'unknown') from error
+
+    async def aclose(self):
+        await self.transport.aclose()

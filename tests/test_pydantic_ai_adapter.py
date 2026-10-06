@@ -387,7 +387,7 @@ async def test_usage_and_concurrency_options_are_preserved(fake_pydantic_ai):
     assert result.usage['output_tokens'] == 3
     assert result.usage['details'] == {'cached': 2}
     assert result.usage['total_tokens'] == 8
-    assert fake_pydantic_ai.instances[0].options['max_concurrency'] == 3
+    assert 'max_concurrency' not in fake_pydantic_ai.instances[0].options
 
 
 async def test_gateway_maps_legacy_history_and_constructor_port(monkeypatch):

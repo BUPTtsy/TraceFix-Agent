@@ -14,7 +14,7 @@ import httpx
 from pydantic import BaseModel, ValidationError
 from pydantic_core import to_json
 
-from tracefix.model.contracts import ModelResult
+from tracefix.model.contracts import ModelError, ModelResult
 from tracefix.runtime.contracts import digest
 
 if TYPE_CHECKING:
@@ -24,13 +24,11 @@ if TYPE_CHECKING:
 OutputT = TypeVar('OutputT', bound=BaseModel)
 
 
-class PydanticAIAdapterError(RuntimeError):
+class PydanticAIAdapterError(ModelError):
     """Classified failure with audit context, never an instruction to retry tools."""
 
     def __init__(self, message, *, category, status='FAILED', details=None):
-        super().__init__(message)
-        self.category = category
-        self.status = status
+        super().__init__(message, category=category, status=status, details=details)
         self.details = {**(details or {}), 'category': category, 'status': status,
                         'retryable': False, 'will_retry': False}
         if status == 'UNKNOWN_OPERATION':
@@ -116,14 +114,14 @@ class PydanticAIAdapter:
                        on_event: Callable | None = None, message_history: Sequence | None = None,
                        agent_instructions: str | None = None, image: bytes | None = None,
                        **runtime_options) -> Any:
-        from tracefix.runtime.tools import ToolSpec
+        from tracefix.runtime.tools import ToolProtocolError, ToolRegistry, ToolRejected, ToolSpec
 
         trace = _RunTrace(messages=copy.deepcopy(list(message_history or ())))
         if schema is not str and (not isinstance(schema, type) or not issubclass(schema, BaseModel)):
             raise trace.failure('configuration', '输出 schema 必须为现有 Pydantic 模型')
         tools = tuple(tools)
-        tool_registry = runtime_options.get('tool_registry')
         tool_pipeline = runtime_options.get('tool_pipeline')
+        tool_registry = runtime_options.get('tool_registry') or getattr(tool_pipeline, 'registry', None)
         context_provider = runtime_options.get('context_provider')
         validate_output = runtime_options.get('validate_output')
         if tool_registry is not None:
@@ -154,9 +152,16 @@ class PydanticAIAdapter:
             if spec.wire_name in names:
                 raise trace.failure('configuration', '工具模型名称重复：' + spec.wire_name)
             names.add(spec.wire_name)
+        tool_registry = ToolRegistry(tools)
+        phase = context.get('phase') or getattr(tool_pipeline, 'phase', 'DIAGNOSE')
+        concurrency = runtime_options.get('max_concurrency', 4)
+        if type(concurrency) is not int or concurrency < 1:
+            raise trace.failure('configuration', '工具并发上界必须为正整数')
+        read_slots = asyncio.Semaphore(concurrency)
         if on_event is not None and not callable(on_event):
             raise trace.failure('configuration', 'on_event 必须为 callable')
         client = None
+        boundary = None
         completed_results = {}
         try:
             library = importlib.import_module('pydantic_ai')
@@ -186,7 +191,7 @@ class PydanticAIAdapter:
             context = await _resolve(context_provider())
 
         def provider_model():
-            nonlocal client
+            nonlocal client, boundary
             if not all(hasattr(self.model, field) for field in ('base_url', 'text_model', 'key')):
                 return self.model
             if not getattr(self.model, 'key', ''):
@@ -195,16 +200,16 @@ class PydanticAIAdapter:
             try:
                 from pydantic_ai.models.openai import OpenAIChatModel
                 from pydantic_ai.providers.openai import OpenAIProvider
+                from openai import AsyncOpenAI
                 from tracefix.model.protocol import create_http_client, RequestBoundary
-                boundary = RequestBoundary(self.model, schema, context, tool_registry or
-                    type('Registry', (), {'specs': tools, 'contains': lambda *_: False})(),
-                    context.get('phase') or 'DIAGNOSE', {
+                boundary = RequestBoundary(self.model, schema, context, tool_registry,
+                    phase, {
                         **runtime_options, 'agent_instructions': agent_instructions,
                         'on_event': on_event,
                         'framework_output_tool_names': framework_output_tool_names})
                 client = create_http_client(boundary)
-                provider = OpenAIProvider(base_url=self.model.base_url,
-                    api_key=self.model.key, http_client=client)
+                provider = OpenAIProvider(openai_client=AsyncOpenAI(base_url=self.model.base_url,
+                    api_key=self.model.key, http_client=client, max_retries=0))
                 settings = {'max_tokens': self.model.max_output_tokens}
                 if self.model.thinking is not None:
                     settings['extra_body'] = {'thinking': {'type': self.model.thinking}}
@@ -290,21 +295,51 @@ class PydanticAIAdapter:
                     result = copy.deepcopy(cached['result'])
                 else:
                     try:
-                        if tool_pipeline is not None and tool_pipeline.registry.contains(spec.name, tool_pipeline.phase):
-                            result = await tool_pipeline.execute(spec.name, arguments, call_id)
-                        elif callable(tool_executor):
-                            result = await _resolve(tool_executor(spec.name, arguments, call_id))
-                        else:
+                        async def dispatch():
+                            if tool_pipeline is not None and tool_pipeline.registry.contains(spec.name, tool_pipeline.phase):
+                                return await tool_pipeline.execute(spec.name, arguments, call_id)
+                            if callable(tool_executor):
+                                return await _resolve(tool_executor(spec.name, arguments, call_id))
                             raise PydanticAIAdapterError('模型工具未绑定执行端口', category='tool_execution',
-                                                         details={'tool_call_id': call_id, 'tool_name': spec.name})
+                                details={'tool_call_id': call_id, 'tool_name': spec.name})
+                        if spec.parallel_safe and spec.side_effect in {'none', 'read'}:
+                            async with read_slots:
+                                result = await dispatch()
+                        else:
+                            result = await dispatch()
                     except Exception as error:
                         failure = trace.failure('tool_execution', '工具执行失败', error,
-                            tool_call_id=call_id, tool_name=spec.name, arguments=arguments)
+                            tool_call_id=call_id, tool_name=spec.name, arguments=arguments,
+                            status=('UNKNOWN_OPERATION' if spec.side_effect in {'write', 'external'}
+                                and not isinstance(error, (ToolRejected, ToolProtocolError, PermissionError))
+                                and not hasattr(error, 'status') else getattr(error, 'status', 'FAILED')))
                         await emit_failure(record, failure)
                         raise failure from error
                 record['result'] = result
                 receipt = result.model_dump(by_alias=True) if isinstance(result, BaseModel) else result
-                if isinstance(receipt, dict) and (receipt.get('isError') or receipt.get('is_error')):
+                failed = isinstance(receipt, dict) and (receipt.get('isError') or receipt.get('is_error'))
+                if not failed:
+                    completed_results[call_id] = {'identity': identity, 'result': copy.deepcopy(result)}
+                if boundary is not None:
+                    boundary.completed[call_id] = (identity, result)
+                    boundary.tool_records.append(copy.deepcopy(record))
+                callback = runtime_options.get('on_tool_result')
+                if callback is not None:
+                    try:
+                        metadata = await _resolve(callback(boundary.exchange if boundary else None, {
+                            'message': {'role': 'tool', 'tool_call_id': call_id,
+                                        'name': spec.wire_name,
+                                        'content': (result.to_content() if hasattr(result, 'to_content')
+                                                    else json.dumps(receipt, ensure_ascii=False, default=str))},
+                            'tool_call_id': call_id, 'receipt': receipt,
+                            'reused': record['reused']}))
+                        if boundary is not None and isinstance(metadata, dict):
+                            boundary.result_refs[call_id] = metadata
+                    except Exception as error:
+                        raise trace.failure('event_callback', '工具结果回调失败', error,
+                            event_kind='tool.completed', tool_call_id=call_id,
+                            tool_name=spec.name, result=copy.deepcopy(result)) from error
+                if failed:
                     error_details = receipt.get('error') or {}
                     failure = trace.failure('tool_execution', '工具返回失败回执',
                         tool_call_id=call_id, tool_name=spec.name, result=result, **{
@@ -313,22 +348,13 @@ class PydanticAIAdapter:
                                            'category', 'message', 'cause'}})
                     await emit_failure(record, failure)
                     raise failure
-                completed_results[call_id] = {'identity': identity, 'result': copy.deepcopy(result)}
-                callback = runtime_options.get('on_tool_result')
-                if callback is not None:
-                    try:
-                        await _resolve(callback(None, {
-                            'message': {'role': 'tool', 'tool_call_id': call_id,
-                                        'name': spec.wire_name,
-                                        'content': (result.to_content() if hasattr(result, 'to_content')
-                                                    else json.dumps(receipt, ensure_ascii=False, default=str))},
-                            'tool_call_id': call_id, 'receipt': receipt,
-                            'reused': record['reused']}))
-                    except Exception as error:
-                        raise trace.failure('event_callback', '工具结果回调失败', error,
-                            event_kind='tool.completed', tool_call_id=call_id,
-                            tool_name=spec.name, result=copy.deepcopy(result)) from error
                 await emit('tool.completed', record)
+                images = receipt.get('images') if isinstance(receipt, dict) else None
+                if images:
+                    messages = importlib.import_module('pydantic_ai.messages')
+                    return library.ToolReturn(return_value={key: value for key, value in receipt.items()
+                                              if key != 'images'}, content=[messages.ImageUrl(
+                        url=item['image_url']['url']) for item in images])
                 if isinstance(result, BaseModel):
                     return result.model_dump(mode='json', by_alias=True)
                 return result.to_content() if hasattr(result, 'to_content') else result
@@ -349,16 +375,16 @@ class PydanticAIAdapter:
         submission_spec = next((spec for spec in tools if spec.submission
                                 and spec.submission_schema is not None), None)
         output_type = schema
-        framework_output_tool_names = {'final_result'}
+        framework_output_tool_names = set()
         if submission_spec is not None:
-            try:
-                output_module = importlib.import_module('pydantic_ai')
-                output_type = [schema, output_module.ToolOutput(
-                    submission_spec.submission_schema, name=submission_spec.wire_name,
-                    max_retries=0)]
-                framework_output_tool_names.add(submission_spec.wire_name)
-            except AttributeError:
-                output_type = schema
+            output_type = [library.ToolOutput(schema, name='final_result'), library.ToolOutput(
+                submission_spec.submission_schema, name=submission_spec.wire_name,
+                max_retries=0)]
+            framework_output_tool_names.update({'final_result', submission_spec.wire_name})
+        elif schema is not str and hasattr(library, 'PromptedOutput'):
+            output_type = library.PromptedOutput(schema)
+        elif schema is not str:
+            framework_output_tool_names.add('final_result')
 
         async def stream_events(run_context, events):
             trace.observe(run_context)
@@ -385,7 +411,31 @@ class PydanticAIAdapter:
                 raise trace.failure('stream_interrupted', '模型流式响应中断', error) from error
 
         try:
+            if trace.messages and isinstance(trace.messages[0], dict) and all(
+                    isinstance(message, dict) and 'role' in message for message in trace.messages):
+                from tracefix.model.history import ModelProtocol
+                try:
+                    trace.messages = ModelProtocol._wire_history(trace.messages, tool_registry, phase)
+                    restored = ModelProtocol._completed_history(trace.messages,
+                        tool_registry.native_tools(phase))
+                    for call_id, (identity, content) in restored.items():
+                        spec = tool_registry.get_wire(identity[0], phase)
+                        try:
+                            receipt = json.loads(content)
+                        except ValueError:
+                            receipt = content
+                        completed_results[call_id] = {
+                            'identity': (spec.name, identity[1]), 'result': receipt}
+                    if tool_pipeline is not None:
+                        for call_id, entry in completed_results.items():
+                            receipt = entry['result']
+                            if isinstance(receipt, dict) and 'call_id' in receipt:
+                                tool_pipeline.completed_calls[call_id] = (entry['identity'], receipt)
+                except (ValueError, TypeError) as error:
+                    raise trace.failure('tool_protocol', '工具历史校验失败：' + str(error), error) from error
             prompt = to_json(copy.deepcopy(context)).decode('utf-8')
+            if runtime_options.get('preserve_resumed_request') or schema is str and trace.messages:
+                prompt = None
             if image:
                 try:
                     message_library = importlib.import_module('pydantic_ai.messages')
@@ -393,28 +443,34 @@ class PydanticAIAdapter:
                               prompt]
                 except (ImportError, TypeError, ValueError) as error:
                     raise trace.failure('configuration', '图片输入无法转换为 PydanticAI 内容', error) from error
-            agent_options = {}
-            if runtime_options.get('max_concurrency') is not None:
-                agent_options['max_concurrency'] = runtime_options['max_concurrency']
+            bound_tools = {spec.name: bind(spec) for spec in tools}
             agent = library.Agent(provider_model(), output_type=output_type,
-                instructions=agent_instructions, tools=[bind(spec) for spec in tools],
-                retries=self.output_retries, **agent_options)
-            if validate_output is not None:
+                instructions=agent_instructions, tools=[tool for name, tool in bound_tools.items()
+                    if submission_spec is None or name != submission_spec.name],
+                retries=self.output_retries)
+            if validate_output is not None or submission_spec is not None:
                 model_retry = getattr(exceptions, 'ModelRetry', RuntimeError)
                 @agent.output_validator
                 async def host_output_validator(run_context, output):
+                    if (submission_spec is not None
+                            and getattr(run_context, 'tool_name', None) == submission_spec.wire_name):
+                        await bound_tools[submission_spec.name].function(run_context,
+                            **output.model_dump(mode='json', by_alias=True))
+                        if tool_pipeline is not None and tool_pipeline.submission_value is not None:
+                            output = tool_pipeline.submission_value
                     try:
                         checked = output if isinstance(output, schema) else schema.model_validate(output)
-                        result = validate_output(checked)
-                        if inspect.isawaitable(result):
-                            await result
+                        if validate_output is not None:
+                            await _resolve(validate_output(checked))
                         return checked
                     except Exception as error:
+                        if isinstance(error, ModelError):
+                            raise
                         raise model_retry(str(error)) from error
             await emit('adapter.started', {'schema': getattr(schema, '__name__', str(schema)),
                        'message_history': trace.messages, 'output_retries': self.output_retries})
             result = await agent.run(prompt, message_history=history_messages(),
-                                     event_stream_handler=stream_events)
+                event_stream_handler=stream_events if getattr(self.model, 'stream', True) else None)
             trace.messages = copy.deepcopy(result.all_messages())
             trace.context = None
             output = result.output if schema is str else schema.model_validate(result.output)
@@ -432,6 +488,9 @@ class PydanticAIAdapter:
                 usage = usage()
             elif not isinstance(usage, dict):
                 usage = {'total_tokens': getattr(usage, 'total_tokens', 0)}
+            if boundary is not None:
+                usage = {**usage, **copy.deepcopy(boundary.usage),
+                         'raw_usage': copy.deepcopy(boundary.raw_usage)}
             model_revision = getattr(getattr(result, 'response', None), 'model_name',
                                      getattr(self.model, 'text_model', type(self.model).__name__))
             finish_reason = getattr(getattr(result, 'response', None), 'finish_reason', None) or 'stop'
@@ -443,10 +502,14 @@ class PydanticAIAdapter:
             adapted = next((cause for cause in causes
                             if isinstance(cause, PydanticAIAdapterError)), None)
             if adapted is not None:
+                if boundary is not None:
+                    adapted.details.update(usage=copy.deepcopy(boundary.usage),
+                        raw_usage=copy.deepcopy(boundary.raw_usage),
+                        logical_exchange_id=boundary.logical_id, attempt=boundary.request_count,
+                        tool_round=boundary.tool_round)
+                    await boundary.report(adapted)
                 raise adapted
-            host_error = next((cause for cause in causes
-                               if getattr(cause, 'category', None) in
-                               {'stream_interrupted', 'tool_execution', 'tool_protocol'}), None)
+            host_error = next((cause for cause in causes if isinstance(cause, ModelError)), None)
             if host_error is not None:
                 raise trace.failure(host_error.category, str(host_error), host_error) from error
             if trace.context is not None:
@@ -455,7 +518,7 @@ class PydanticAIAdapter:
                                if isinstance(cause, exceptions.UnexpectedModelBehavior)), None)
             if any(isinstance(cause, ValidationError) for cause in causes):
                 category, message = 'output_validation', '模型输出不符合现有 schema'
-            elif isinstance(error, (asyncio.CancelledError, httpx.ReadError,
+            elif isinstance(error, (httpx.ReadError,
                                     httpx.ReadTimeout, httpx.RemoteProtocolError)):
                 category, message = 'stream_interrupted', '模型调用被中断'
             elif unexpected is not None and (
@@ -465,6 +528,9 @@ class PydanticAIAdapter:
                 category, message = 'output_validation', '模型输出校验重试已耗尽'
             else:
                 category, message = 'model', 'PydanticAI 模型调用失败'
+            if boundary is not None:
+                audited = await boundary.fail(category, message, error)
+                raise trace.failure(category, message, audited) from error
             raise trace.failure(category, message, error) from error
         finally:
             if client is not None:
