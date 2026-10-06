@@ -10,6 +10,8 @@ import time
 from collections.abc import AsyncIterator
 from uuid import uuid4
 
+import httpx
+
 from tracefix.agents.pydantic_ai_adapter import PydanticAIAdapter, PydanticAIAdapterError
 from tracefix.model.gateway import Gateway
 from tracefix.model.streaming import CompletionStream, StreamProtocolError
