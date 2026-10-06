@@ -220,6 +220,7 @@ class _RequestAudit(BaseCallbackHandler):
     def __init__(self, sink: Callable | None, limit: int):
         self._sink, self._limit = sink, limit
         self._requests: dict[str, dict] = {}
+        self._pending: set[str] = set()
         self.cancelled: asyncio.CancelledError | None = None
         self.usage = {'model_calls': 0, 'tokens': 0, 'cost_usd': 0.0}
 
@@ -232,6 +233,7 @@ class _RequestAudit(BaseCallbackHandler):
             raise DeepAgentsError('DeepAgents 调查已达到真实请求上界', category='model_request_limit')
         identity = str(run_id)
         self._requests[identity] = {'tokens': 0, 'cost_usd': 0.0}
+        self._pending.add(identity)
         self.usage['model_calls'] += 1
         self._emit('request', {'request_id': identity, 'model': serialized,
             'messages': [[message.model_dump(mode='json') for message in batch] for batch in messages]})
@@ -268,6 +270,7 @@ class _RequestAudit(BaseCallbackHandler):
                     self._usage(identity, generation.message)
         self._emit('response', {'request_id': identity,
             'response': response.model_dump(mode='json')})
+        self._pending.discard(identity)
 
     def on_llm_error(self, error, *, run_id, **kwargs):
         if isinstance(error, asyncio.CancelledError):
@@ -285,6 +288,11 @@ class _RequestAudit(BaseCallbackHandler):
             'category': getattr(error, 'category', 'model_transport'),
             'status': getattr(error, 'status', 'UNKNOWN_OPERATION'),
             'details': getattr(error, 'details', {'billing_status': 'unknown', 'request_status': 'sent'})})
+        self._pending.discard(str(run_id))
+
+    def cancel_pending(self, error):
+        for identity in tuple(self._pending):
+            self.on_llm_error(error, run_id=identity)
 
 
 class _ProviderChatModel(ChatOpenAI):
@@ -376,7 +384,10 @@ class DeepAgentsReadonlyAdapter:
                 gaps=[category], worker_generation=request.worker_generation,
                 source_manifest=request.source_manifest, usage=dict(audit.usage),
                 error={'category': category, 'status': 'FAILED', 'details': getattr(error, 'details', {})})
-        except (asyncio.CancelledError, TimeoutError, ModelError):
+        except asyncio.CancelledError as error:
+            audit.cancel_pending(error)
+            raise
+        except (TimeoutError, ModelError):
             raise
         except Exception as error:
             if audit.cancelled is not None:
