@@ -519,6 +519,29 @@ async def test_event_callback_error_never_reexecutes_successful_tool(fake_pydant
     assert fake_pydantic_ai.instances[0].run_count == 1
 
 
+async def test_tool_result_callback_error_is_classified_without_reexecution(fake_pydantic_ai):
+    calls = []
+
+    def port(name, arguments, call_id):
+        calls.append(call_id)
+        return {'evidence_ref': 'callback-failed'}
+
+    def on_result(_, payload):
+        raise RuntimeError('audit sink unavailable')
+
+    async def model(agent, prompt, history, handler):
+        await execute_tool(agent)
+        pytest.fail('工具结果回调失败后不应继续执行模型')
+
+    with pytest.raises(PydanticAIAdapterError) as raised:
+        await PydanticAIAdapter(model).generate(BrowserAction, {}, tools=(readonly_tool(),),
+            tool_executor=port, on_tool_result=on_result)
+
+    assert raised.value.category == 'event_callback'
+    assert raised.value.details['tool_calls'][0]['result'] == {'evidence_ref': 'callback-failed'}
+    assert calls == ['read-1']
+
+
 @pytest.mark.parametrize('message,category', [
     ('Exceeded maximum retries (1) for output validation', 'output_validation'),
     ('Unknown content part', 'model'),
