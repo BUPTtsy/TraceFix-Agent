@@ -219,6 +219,32 @@ async def test_received_usage_survives_failure_after_tail_block(monkeypatch):
     assert errors[0]['billing_status'] == 'known'
 
 
+async def test_cancelled_stream_preserves_partial_audit_and_does_not_drain_tail(monkeypatch):
+    import asyncio
+
+    read_indices, errors, audits = [], [], []
+
+    def cancel_read(index):
+        read_indices.append(index)
+        if index == 1:
+            raise asyncio.CancelledError()
+
+    response = stream_response([event({'content': 'partial'}),
+        event(finish='stop'), b'data: [DONE]\n\n'], before_read=cancel_read)
+    requests = use_transport(monkeypatch, [response])
+    with pytest.raises(asyncio.CancelledError):
+        await Gateway(key='ci', stream=True).generate(str, {'message': 'hello'},
+            on_response=lambda exchange, value: audits.append(value),
+            on_error=lambda exchange, value: errors.append(value))
+    assert len(requests) == len(audits) == len(errors) == 1
+    assert read_indices == [0, 1]
+    assert audits[0]['stream_incomplete'] is True
+    assert audits[0]['body']['choices'][0]['message']['content'] == 'partial'
+    assert errors[0]['category'] == 'cancelled'
+    assert errors[0]['status'] == 'UNKNOWN_OPERATION'
+    assert response.stream.closed
+
+
 async def test_stream_http_error_and_connect_failure_keep_attempt_boundaries(monkeypatch):
     requests = use_transport(monkeypatch, [
         httpx.ConnectError('not connected'),

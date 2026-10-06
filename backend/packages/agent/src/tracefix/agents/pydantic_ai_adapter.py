@@ -367,6 +367,7 @@ class PydanticAIAdapter:
                             'message': {'role': 'tool', 'tool_call_id': call_id,
                                         'name': spec.wire_name,
                                         'content': (result.to_content() if hasattr(result, 'to_content')
+                                                    else result if isinstance(result, str)
                                                     else json.dumps(receipt, ensure_ascii=False, default=str))},
                             'tool_call_id': call_id, 'receipt': receipt,
                             'reused': record['reused'],
