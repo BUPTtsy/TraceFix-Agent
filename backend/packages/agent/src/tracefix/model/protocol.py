@@ -105,7 +105,7 @@ class RequestBoundary:
                 if (ids and ids == raw_ids) or (not ids and message.get('content')
                         and message.get('content') == assistant.get('content')):
                     for field in ('reasoning', 'reasoning_content'):
-                    if field in assistant:
+                        if field in assistant:
                             message[field] = copy.deepcopy(assistant[field])
                     if ids:
                         message['content'] = copy.deepcopy(assistant.get('content'))
