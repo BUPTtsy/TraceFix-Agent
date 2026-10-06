@@ -287,33 +287,37 @@ async def test_stream_interruption_keeps_tool_results_and_retry_context(fake_pyd
 
 @pytest.mark.parametrize('side_effect,submission', [('write', False), ('external', False),
                                                    ('write', True)])
-async def test_effectful_or_submission_tool_is_rejected_before_model_run(fake_pydantic_ai,
-                                                                        side_effect, submission):
+async def test_effectful_or_submission_tool_uses_injected_port_without_retry(
+        fake_pydantic_ai, side_effect, submission):
     calls = []
     spec = readonly_tool(side_effect=side_effect, submission=submission,
                          idempotency_key=lambda arguments: arguments.path)
 
     async def model(agent, prompt, history, handler):
-        pytest.fail('禁止的工具不得进入模型调用')
+        assert agent.tools[0].max_retries == 0
+        assert agent.tools[0].sequential is True
+        assert await execute_tool(agent) == {'accepted': True}
+        return completion()
 
-    with pytest.raises(PydanticAIAdapterError) as raised:
-        await PydanticAIAdapter(model).generate(BrowserAction, {}, tools=(spec,),
-            tool_executor=lambda *arguments: calls.append(arguments))
+    value = await PydanticAIAdapter(model).generate(BrowserAction, {}, tools=(spec,),
+        tool_executor=lambda name, arguments, call_id: calls.append(
+            (name, arguments, call_id)) or {'accepted': True})
 
-    assert raised.value.category == 'configuration'
-    assert calls == []
-    assert all(agent.run_count == 0 for agent in fake_pydantic_ai.instances)
+    assert value.value.kind == 'finish'
+    assert calls == [('repo.read', {'path': 'src/app.py'}, 'read-1')]
+    assert all(agent.run_count == 1 for agent in fake_pydantic_ai.instances)
 
 
 async def test_tools_require_an_injected_executor(fake_pydantic_ai):
     async def model(agent, prompt, history, handler):
-        pytest.fail('未注入 port 不得调用模型')
+        await execute_tool(agent)
+        pytest.fail('缺少 port 时工具调用应失败')
 
     with pytest.raises(PydanticAIAdapterError) as raised:
         await PydanticAIAdapter(model).generate(BrowserAction, {}, tools=(readonly_tool(),))
 
-    assert raised.value.category == 'configuration'
-    assert all(agent.run_count == 0 for agent in fake_pydantic_ai.instances)
+    assert raised.value.category == 'tool_execution'
+    assert all(agent.run_count == 1 for agent in fake_pydantic_ai.instances)
 
 
 async def test_retry_tool_context_and_message_history_are_preserved(fake_pydantic_ai):
