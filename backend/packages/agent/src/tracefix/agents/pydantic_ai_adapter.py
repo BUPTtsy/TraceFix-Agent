@@ -238,8 +238,20 @@ class PydanticAIAdapter:
                         converted.append(message_library.ModelRequest(parts=[
                             message_library.SystemPromptPart(content=item.get('content', ''))]))
                     elif role == 'user':
+                        content = item.get('content', '')
+                        if isinstance(content, list):
+                            converted_content = []
+                            for part in content:
+                                if part.get('type') == 'text' and isinstance(part.get('text'), str):
+                                    converted_content.append(part['text'])
+                                elif part.get('type') == 'image_url':
+                                    converted_content.append(message_library.ImageUrl(
+                                        url=part['image_url']['url']))
+                                else:
+                                    raise ValueError('历史用户消息包含不支持的内容')
+                            content = converted_content
                         converted.append(message_library.ModelRequest(parts=[
-                            message_library.UserPromptPart(content=item.get('content', ''))]))
+                            message_library.UserPromptPart(content=content)]))
                     elif role == 'assistant':
                         parts = []
                         if item.get('reasoning_content') or item.get('reasoning'):
@@ -318,7 +330,12 @@ class PydanticAIAdapter:
                         await emit_failure(record, failure)
                         raise failure from error
                 record['result'] = result
-                receipt = result.model_dump(by_alias=True) if isinstance(result, BaseModel) else result
+                receipt = result.model_dump(mode='json', by_alias=True) if isinstance(result, BaseModel) else result
+                if isinstance(receipt, str):
+                    try:
+                        receipt = json.loads(receipt)
+                    except ValueError:
+                        pass
                 failed = isinstance(receipt, dict) and (receipt.get('isError') or receipt.get('is_error'))
                 failure = None
                 if failed:
@@ -528,6 +545,9 @@ class PydanticAIAdapter:
             model_revision = getattr(getattr(result, 'response', None), 'model_name',
                                      getattr(self.model, 'text_model', type(self.model).__name__))
             finish_reason = getattr(getattr(result, 'response', None), 'finish_reason', None) or 'stop'
+            if boundary is not None:
+                model_revision = boundary.last_body.get('model') or model_revision
+                finish_reason = boundary.last_body['choices'][0].get('finish_reason') or finish_reason
             return ModelResult(output, usage, model_revision, finish_reason)
         except asyncio.CancelledError:
             if boundary is not None and boundary.request_count:

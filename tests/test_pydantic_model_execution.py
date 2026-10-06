@@ -372,3 +372,35 @@ async def test_sent_request_cancellation_propagates_and_is_audited(monkeypatch):
     assert len(requests) == len(errors) == 1
     assert errors[0]['category'] == 'cancelled'
     assert errors[0]['status'] == 'UNKNOWN_OPERATION'
+
+
+async def test_restored_unknown_receipt_is_not_reexecuted_or_treated_as_success(monkeypatch):
+    receipt = ToolResult(call_id='provider-call-9', name='repo.read', isError=True,
+        executed=True, error={'status': 'UNKNOWN_OPERATION', 'operation_id': 'restored-operation'})
+    history = [{'role': 'assistant', 'content': None, 'tool_calls': [call()]},
+               {'role': 'tool', 'name': 'RepoRead', 'tool_call_id': 'provider-call-9',
+                'content': receipt.to_content()}]
+    requests = transport(monkeypatch, [response(None, calls=[call()], finish='tool_calls')])
+    with pytest.raises(ModelError) as raised:
+        await Gateway(key='fake', stream=False).generate(Output, {}, messages=history,
+            tools=[tool_spec()], tool_executor=lambda *args: pytest.fail('unknown call must not execute'))
+    assert len(requests) == 1
+    assert raised.value.status == 'UNKNOWN_OPERATION'
+    assert raised.value.details['operation_id'] == 'restored-operation'
+
+
+async def test_image_history_is_restored_and_uses_configured_vision_provider(monkeypatch):
+    requests = transport(monkeypatch, [response()])
+    encoded = 'data:image/png;base64,iVBORw0KGgo='
+    events = []
+    history = [{'role': 'user', 'content': [
+        {'type': 'text', 'text': 'inspect evidence'},
+        {'type': 'image_url', 'image_url': {'url': encoded}}]}]
+    await Gateway(key='fake', stream=False, vision_model='vision-fixture').generate(Output, {},
+        messages=history, on_event=lambda kind, value: events.append((kind, value)))
+    assert requests[0]['model'] == 'vision-fixture'
+    assert requests[0]['messages'][1]['content'][1]['image_url']['url'] == encoded
+    completed = next(value for kind, value in events if kind == 'adapter.completed')
+    from tracefix.model.history import ModelProtocol
+    projected = ModelProtocol.message_history(completed['message_history'])
+    assert projected[0]['content'][1]['image_url']['url'] == encoded

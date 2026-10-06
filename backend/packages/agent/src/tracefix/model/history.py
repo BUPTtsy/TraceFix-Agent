@@ -39,7 +39,8 @@ class ModelProtocol:
                         if not isinstance(content, str):
                             import base64
                             content = [{'type': 'text', 'text': item} if isinstance(item, str)
-                                else {'type': 'image_url', 'image_url': {'url': 'data:' + item.media_type
+                                else {'type': 'image_url', 'image_url': {'url': item.url
+                                    if hasattr(item, 'url') else 'data:' + item.media_type
                                     + ';base64,' + base64.b64encode(item.data).decode()}}
                                 for item in content]
                         result.append({'role': 'system' if part.part_kind == 'system-prompt' else 'user',
