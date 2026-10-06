@@ -7,6 +7,7 @@ import pytest
 from tracefix.model.gateway import BrowserPolicyRouter, Gateway, ModelError, ModelResult
 from tracefix.runtime.contracts import BrowserAction, Decision
 from tracefix.model.chat import _chat_events
+from tracefix.model import protocol
 
 
 class EventBytes(httpx.AsyncByteStream):
@@ -59,10 +60,11 @@ def use_transport(monkeypatch, responses):
             raise response
         return response
 
-    def client(**kwargs):
-        return client_type(transport=httpx.MockTransport(handle), **kwargs)
+    def client(boundary):
+        return client_type(transport=protocol.BoundaryTransport(httpx.MockTransport(handle), boundary),
+            event_hooks={'request': [boundary.before], 'response': [boundary.received]})
 
-    monkeypatch.setattr('tracefix.model.gateway.httpx.AsyncClient', client)
+    monkeypatch.setattr(protocol, 'create_http_client', client)
     return requests
 
 

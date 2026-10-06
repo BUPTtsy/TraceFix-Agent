@@ -8,6 +8,7 @@ import pytest
 
 from tracefix.cli.main import chat_jsonl
 from tracefix.model.chat import stream_tool_chat
+from tracefix.model import protocol
 from tracefix.runtime.contracts import Phase
 from tracefix.runtime.tools import ToolPipeline, ToolRegistry, ToolSpec
 
@@ -47,8 +48,11 @@ def transport(monkeypatch, responses):
         requests.append(json.loads(request.content))
         return responses.pop(0)
 
-    monkeypatch.setattr('tracefix.model.chat.httpx.AsyncClient',
-        lambda **options: client_type(transport=httpx.MockTransport(handle), **options))
+    def client(boundary):
+        return client_type(transport=protocol.BoundaryTransport(httpx.MockTransport(handle), boundary),
+            event_hooks={'request': [boundary.before], 'response': [boundary.received]})
+
+    monkeypatch.setattr(protocol, 'create_http_client', client)
     monkeypatch.setenv('TRACEFIX_API_KEY', 'fixture-key')
     return requests
 

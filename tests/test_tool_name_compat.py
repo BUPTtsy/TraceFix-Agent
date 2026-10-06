@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from tracefix.model.gateway import Gateway, ModelOutputError
+from tracefix.model import protocol
 from tracefix.runtime.contracts import Contract, Phase, digest
 from tracefix.runtime.tool_handlers import EmptyInput, MemorySearch, RuleGet
 from tracefix.runtime.tools import model_tool_name, ToolPipeline, ToolProtocolError, ToolRegistry, ToolSpec
@@ -31,11 +32,15 @@ def completion(calls=None):
 def responses(monkeypatch, values):
     requests = []
 
-    async def post(client, url, **kwargs):
-        requests.append(copy.deepcopy(kwargs['json']))
+    async def handle(request):
+        requests.append(json.loads(request.content))
         return values.pop(0)
 
-    monkeypatch.setattr(httpx.AsyncClient, 'post', post)
+    def client(boundary):
+        return httpx.AsyncClient(transport=protocol.BoundaryTransport(httpx.MockTransport(handle), boundary),
+            event_hooks={'request': [boundary.before], 'response': [boundary.received]})
+
+    monkeypatch.setattr(protocol, 'create_http_client', client)
     return requests
 
 
