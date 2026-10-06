@@ -1,12 +1,18 @@
 """History validation, canonical tool names and evidence-aware request budgeting."""
 import copy
 import json
+from pydantic_core import to_json
 from tracefix.model.prompts import serialize_request
 from tracefix.runtime.contracts import digest
 from tracefix.runtime.tools import model_tool_name
 
 
 class ModelProtocol:
+    @staticmethod
+    def audit_value(value):
+        return json.loads(to_json(value, bytes_mode='base64', fallback=lambda item:
+            vars(item) if hasattr(item, '__dict__') else str(item)))
+
     @staticmethod
     def message_history(messages):
         result = []
@@ -343,7 +349,8 @@ class ModelProtocol:
     def _protocol_tokens(cls, payload, schema, counter):
         overhead = copy.deepcopy(payload)
         cls._replace_context(overhead['messages'], '')
-        overhead['response_json_schema'] = schema.model_json_schema()
+        if schema is not str:
+            overhead['response_json_schema'] = schema.model_json_schema()
         return cls._payload_tokens(counter, overhead)
 
     @classmethod
@@ -357,7 +364,7 @@ class ModelProtocol:
         projected = []
         assembly = None
         extra_tokens = cls._protocol_tokens(payload, schema, counter)
-        if not preserve:
+        if not preserve and schema is not str:
             while True:
                 try:
                     assembly = assembler.assemble(context, extra_tokens=extra_tokens)

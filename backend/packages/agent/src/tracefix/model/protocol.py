@@ -8,6 +8,7 @@ from uuid import uuid4
 import httpx
 
 from tracefix.model.contracts import ModelError, ModelOutputError
+from tracefix.model.history import ModelProtocol
 from tracefix.model.prompts import serialize_request, system_instructions
 from tracefix.model.streaming import CompletionStream, StreamProtocolError
 from tracefix.runtime.contracts import digest
@@ -104,7 +105,7 @@ class RequestBoundary:
                 if (ids and ids == raw_ids) or (not ids and message.get('content')
                         and message.get('content') == assistant.get('content')):
                     for field in ('reasoning', 'reasoning_content'):
-                        if field in assistant:
+                    if field in assistant:
                             message[field] = copy.deepcopy(assistant[field])
                     if ids:
                         message['content'] = copy.deepcopy(assistant.get('content'))
@@ -248,7 +249,9 @@ class RequestBoundary:
     async def report(self, error):
         if id(error) not in self.reported_errors:
             self.reported_errors.add(id(error))
-            await self.callback('on_error', self.exchange, error.details)
+            await self.callback('on_error', self.exchange, ModelProtocol.audit_value({
+                **error.details, 'message_history': self.last_history,
+                'tool_results': self.tool_records}))
 
 
 class AuditedStream(httpx.AsyncByteStream):

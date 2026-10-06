@@ -1,4 +1,4 @@
-"""Optional typed model calls; execution and persistence stay in injected ports."""
+"""PydanticAI model execution with persistence and tools governed by host ports."""
 from __future__ import annotations
 
 import asyncio
@@ -66,11 +66,10 @@ class _RunTrace:
         if category == 'stream_interrupted':
             status = 'UNKNOWN_OPERATION'
         return PydanticAIAdapterError(message, category=category, status=status,
-            details=json.loads(to_json({**inherited,
+            details=ModelProtocol.audit_value({**inherited,
                      'message_history': ModelProtocol.message_history(self.messages),
                      'tool_calls': self.tool_calls,
-                     'retry_context': self.retry_context, **details}, bytes_mode='base64',
-                     fallback=lambda value: vars(value) if hasattr(value, '__dict__') else str(value))))
+                     'retry_context': self.retry_context, **details}))
 
 
 async def _resolve(value):
@@ -92,9 +91,9 @@ def _causes(error):
 
 
 class PydanticAIAdapter:
-    """Opt-in adapter for existing schemas and an externally governed tool port.
+    """Model execution for existing schemas and an externally governed tool port.
 
-    ``generate`` returns the supplied schema type or raises
+    ``generate`` returns ``ModelResult`` containing the supplied schema or raises
     ``PydanticAIAdapterError``. Tools use existing ``ToolSpec`` definitions and
     ``tool_executor(name, arguments, tool_call_id)`` or ``ToolPipeline``. The
     port retains scope, evidence, approval and policy enforcement. Read-only
@@ -172,7 +171,7 @@ class PydanticAIAdapter:
             exceptions = importlib.import_module('pydantic_ai.exceptions')
         except ImportError as error:
             raise trace.failure('unavailable',
-                'PydanticAI 适配器不可用：请安装可选依赖 pydantic-ai 并确认其依赖完整',
+                'PydanticAI 执行不可用：请安装 pydantic-ai 并确认其依赖完整',
                 error, dependency='pydantic-ai') from error
 
         async def emit(kind, payload):
@@ -321,11 +320,29 @@ class PydanticAIAdapter:
                 record['result'] = result
                 receipt = result.model_dump(by_alias=True) if isinstance(result, BaseModel) else result
                 failed = isinstance(receipt, dict) and (receipt.get('isError') or receipt.get('is_error'))
+                failure = None
+                if failed:
+                    error_details = receipt.get('error') or {}
+                    rejected_submission = (spec.submission and receipt.get('executed') is False
+                                           and error_details.get('status', 'FAILED') == 'FAILED')
+                    failure = trace.failure('output_validation' if rejected_submission else 'tool_execution',
+                        '提交被拒绝，需要补充诊断上下文' if rejected_submission else '工具返回失败回执',
+                        tool_call_id=call_id, tool_name=spec.name, result=result, **{
+                            key: value for key, value in error_details.items()
+                            if key not in {'tool_call_id', 'tool_name', 'result',
+                                           'category', 'message', 'cause'}})
+                    if rejected_submission:
+                        failure.details.update(submission_rejected=True, requires_manual_review=False)
+                        failure.details.pop('message_history', None)
+                        failure.details.pop('tool_calls', None)
+                        failure.details['retry_context'] = [{key: value for key, value in item.items()
+                            if key != 'messages'} for item in trace.retry_context]
                 if not failed:
                     completed_results[call_id] = {'identity': identity, 'result': copy.deepcopy(result)}
                 if boundary is not None:
                     boundary.completed[call_id] = (identity, result)
-                    boundary.tool_records.append(copy.deepcopy(record))
+                    from tracefix.model.history import ModelProtocol
+                    boundary.tool_records.append(ModelProtocol.audit_value(record))
                 callback = runtime_options.get('on_tool_result')
                 if callback is not None:
                     try:
@@ -341,21 +358,14 @@ class PydanticAIAdapter:
                         if boundary is not None and isinstance(metadata, dict):
                             boundary.result_refs[call_id] = metadata
                     except Exception as error:
+                        if failure is not None:
+                            failure.details['callback_error'] = str(error)
+                            await emit_failure(record, failure)
+                            raise failure from error
                         raise trace.failure('event_callback', '工具结果回调失败', error,
                             event_kind='tool.completed', tool_call_id=call_id,
                             tool_name=spec.name, result=copy.deepcopy(result)) from error
                 if failed:
-                    error_details = receipt.get('error') or {}
-                    rejected_submission = (spec.submission and receipt.get('executed') is False
-                                           and error_details.get('status', 'FAILED') == 'FAILED')
-                    failure = trace.failure('output_validation' if rejected_submission else 'tool_execution',
-                        '提交被拒绝，需要补充诊断上下文' if rejected_submission else '工具返回失败回执',
-                        tool_call_id=call_id, tool_name=spec.name, result=result, **{
-                            key: value for key, value in error_details.items()
-                            if key not in {'tool_call_id', 'tool_name', 'result',
-                                           'category', 'message', 'cause'}})
-                    if rejected_submission:
-                        failure.details.update(submission_rejected=True, requires_manual_review=False)
                     await emit_failure(record, failure)
                     raise failure
                 await emit('tool.completed', record)
@@ -470,8 +480,9 @@ class PydanticAIAdapter:
                 model_retry = getattr(exceptions, 'ModelRetry', RuntimeError)
                 @agent.output_validator
                 async def host_output_validator(run_context, output):
-                    if (submission_spec is not None
-                            and getattr(run_context, 'tool_name', None) == submission_spec.wire_name):
+                    submitting = (submission_spec is not None
+                        and getattr(run_context, 'tool_name', None) == submission_spec.wire_name)
+                    if submitting:
                         await bound_tools[submission_spec.name].function(run_context,
                             **output.model_dump(mode='json', by_alias=True))
                         if tool_pipeline is not None and tool_pipeline.submission_value is not None:
@@ -484,6 +495,9 @@ class PydanticAIAdapter:
                     except Exception as error:
                         if isinstance(error, ModelError):
                             raise
+                        if submitting:
+                            raise trace.failure('output_validation', '提交完成后输出校验失败，需人工复核',
+                                error, status='UNKNOWN_OPERATION') from error
                         raise model_retry(str(error)) from error
             await emit('adapter.started', {'schema': getattr(schema, '__name__', str(schema)),
                        'message_history': trace.messages, 'output_retries': self.output_retries})
@@ -527,9 +541,13 @@ class PydanticAIAdapter:
                         tool_round=boundary.tool_round)
                     await boundary.report(adapted)
                 raise adapted
-            host_error = next((cause for cause in causes if isinstance(cause, ModelError)), None)
+            host_error = next((cause for cause in causes if isinstance(cause, ModelError)
+                or all(hasattr(cause, field) for field in ('category', 'status', 'details'))), None)
             if host_error is not None:
-                raise trace.failure(host_error.category, str(host_error), host_error) from error
+                failure = trace.failure(host_error.category, str(host_error), host_error)
+                if boundary is not None:
+                    await boundary.report(failure)
+                raise failure from error
             if trace.context is not None:
                 trace.observe(trace.context)
             unexpected = next((cause for cause in causes
