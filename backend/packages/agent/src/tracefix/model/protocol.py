@@ -132,9 +132,11 @@ class RequestBoundary:
             if message.get('role') == 'tool' and message.get('tool_call_id') in tool_names:
                 message.setdefault('name', tool_names[message['tool_call_id']])
         self.last_history = copy.deepcopy(payload['messages'])
+        preserve_context = preserve or (self.options.get('context_assembler') is None
+            and self.gateway._payload_tokens(self.assembler.counter, payload) <= self.assembler.available)
         manifest, compacted = self.gateway._budget_payload(payload, self.schema,
             self.context, self.assembler, self.result_refs,
-            self.registry.contains('context.expand', self.phase), preserve=preserve)
+            self.registry.contains('context.expand', self.phase), preserve=preserve_context)
         await self.callback('on_context', manifest, compacted)
         if manifest['request_tokens'] > self.assembler.available:
             from tracefix.knowledge.assembler import ContextWindowError
