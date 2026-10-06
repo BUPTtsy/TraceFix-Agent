@@ -351,7 +351,9 @@ class PydanticAIAdapter:
                     await emit('model.stream', payload)
             except (PydanticAIAdapterError, exceptions.UnexpectedModelBehavior, ValidationError):
                 raise
-            except (Exception, asyncio.CancelledError) as error:
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
                 if any(isinstance(cause, (PydanticAIAdapterError,
                                          exceptions.UnexpectedModelBehavior, ValidationError))
                        for cause in _causes(error)):
@@ -406,7 +408,9 @@ class PydanticAIAdapter:
                                      getattr(self.model, 'text_model', type(self.model).__name__))
             finish_reason = getattr(getattr(result, 'response', None), 'finish_reason', None) or 'stop'
             return ModelResult(output, usage, model_revision, finish_reason)
-        except (Exception, asyncio.CancelledError) as error:
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
             causes = list(_causes(error))
             adapted = next((cause for cause in causes
                             if isinstance(cause, PydanticAIAdapterError)), None)
