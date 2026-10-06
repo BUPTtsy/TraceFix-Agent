@@ -138,4 +138,3 @@ class CompletionStream:
                 if self.finish_reason is not None and finish_reason != self.finish_reason:
                     raise StreamProtocolError('流包含冲突的 finish_reason')
                 self.finish_reason = finish_reason
-
