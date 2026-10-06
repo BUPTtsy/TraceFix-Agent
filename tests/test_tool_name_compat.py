@@ -25,8 +25,9 @@ def completion(calls=None):
     message = {'role': 'assistant', 'content': None if calls else '{"summary":"done"}'}
     if calls:
         message['tool_calls'] = calls
-    return httpx.Response(200, json={'model': 'fixture', 'usage': {'total_tokens': 2},
-        'choices': [{'finish_reason': 'tool_calls' if calls else 'stop', 'message': message}]})
+    return httpx.Response(200, json={'id': 'fixture', 'created': 0, 'object': 'chat.completion',
+        'model': 'fixture', 'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2},
+        'choices': [{'index': 0, 'finish_reason': 'tool_calls' if calls else 'stop', 'message': message}]})
 
 
 def responses(monkeypatch, values):

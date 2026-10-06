@@ -64,12 +64,13 @@ def skill_context(name='inspect', observation='before'):
 
 
 def completion(*, calls=None, usage=None):
-    message = {'content': '{"kind":"finish"}'}
+    message = {'role': 'assistant', 'content': '{"kind":"finish"}'}
     if calls is not None:
-        message = {'content': None, 'tool_calls': calls, 'reasoning_content': 'keep reasoning'}
+        message = {'role': 'assistant', 'content': None, 'tool_calls': calls, 'reasoning_content': 'keep reasoning'}
     return httpx.Response(200, json={
-        'model': 'test-model', 'usage': usage or {'total_tokens': 3},
-        'choices': [{'finish_reason': 'tool_calls' if calls is not None else 'stop',
+        'id': 'fixture', 'object': 'chat.completion', 'created': 0,
+        'model': 'test-model', 'usage': usage or {'prompt_tokens': 2, 'completion_tokens': 1, 'total_tokens': 3},
+        'choices': [{'index': 0, 'finish_reason': 'tool_calls' if calls is not None else 'stop',
                      'message': message}],
     })
 

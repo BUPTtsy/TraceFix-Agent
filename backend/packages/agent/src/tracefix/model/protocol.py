@@ -65,6 +65,7 @@ class RequestBoundary:
 
     async def before(self, request):
         payload = json.loads(request.content)
+        payload['stream'] = self.gateway.stream
         preserve = self.options.get('preserve_resumed_request') and self.request_count == 0
         provider = self.options.get('context_provider')
         if provider and not preserve:

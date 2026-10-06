@@ -180,7 +180,7 @@ async def test_provider_records_every_correction_usage_and_original_details(monk
     assert result.value == Output(answer=42)
     assert len(requests) == len(attempts) == len(usages) == len(audits) == 2
     assert result.usage['total_tokens'] == 16
-    assert len(result.usage['raw_usage']) == 2
+    assert [audit['body']['usage']['total_tokens'] for audit in audits] == [8, 8]
     assert result.model_revision == 'provider-revision'
 
 

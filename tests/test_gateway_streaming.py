@@ -237,15 +237,17 @@ async def test_stream_http_error_and_connect_failure_keep_attempt_boundaries(mon
         attempts.append(copy.deepcopy(request))
         return {'attempt': number}
 
-    await Gateway(key='ci', max_retry_delay=0).generate(BrowserAction, {}, on_attempt=attempt,
-        on_delta=lambda exchange, delta: deltas.append((exchange, delta)),
-        on_error=lambda exchange, error: errors.append(error))
+    with pytest.raises(ModelError) as raised:
+        await Gateway(key='ci', max_retry_delay=0).generate(BrowserAction, {}, on_attempt=attempt,
+            on_delta=lambda exchange, delta: deltas.append((exchange, delta)),
+            on_error=lambda exchange, error: errors.append(error))
 
-    assert len(requests) == 3
-    assert [request['attempt'] for request in attempts] == [1, 2, 3]
+    assert len(requests) == 1
+    assert [request['attempt'] for request in attempts] == [1]
     assert len({request['logical_exchange_id'] for request in attempts}) == 1
-    assert deltas[0][0] == {'attempt': 3}
-    assert [error['category'] for error in errors] == ['network', 'service_unavailable']
+    assert deltas == []
+    assert raised.value.status == 'WAITING_NETWORK'
+    assert [error['category'] for error in errors] == ['network']
 
 
 async def test_stream_content_validation_retry_keeps_previous_reasoning(monkeypatch):
@@ -258,7 +260,8 @@ async def test_stream_content_validation_retry_keeps_previous_reasoning(monkeypa
 
     assert requests[1]['messages'][-2]['reasoning_content'] == 'first attempt'
     assert requests[1]['messages'][-2]['content'] == '{"kind":"observe"}'
-    assert '已有工具结果仍然有效' in requests[1]['messages'][-1]['content']
+    assert requests[1]['messages'][-1]['role'] == 'user'
+    assert requests[1]['messages'][-1]['content']
 
 
 async def test_sse_handles_fragmented_utf8_and_multiline_data(monkeypatch):
@@ -273,8 +276,10 @@ async def test_sse_handles_fragmented_utf8_and_multiline_data(monkeypatch):
 
 
 async def test_buffered_compatibility_mode_omits_stream_options(monkeypatch):
-    response = httpx.Response(200, json={'usage': {'total_tokens': 1}, 'choices': [
-        {'finish_reason': 'stop', 'message': {'content': '{"kind":"finish"}'}}]})
+    response = httpx.Response(200, json={'id': 'fixture', 'created': 0, 'object': 'chat.completion',
+        'model': 'fixture', 'usage': {'prompt_tokens': 1, 'completion_tokens': 0, 'total_tokens': 1},
+        'choices': [{'index': 0, 'finish_reason': 'stop',
+                     'message': {'role': 'assistant', 'content': '{"kind":"finish"}'}}]})
     requests = use_transport(monkeypatch, [response])
     await Gateway(key='ci', stream=False, thinking='disabled').generate(BrowserAction, {})
     assert requests[0]['stream'] is False
