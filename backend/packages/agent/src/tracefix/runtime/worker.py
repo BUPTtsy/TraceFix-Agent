@@ -1,10 +1,8 @@
-"""宿主调查子图与单写者生命周期；DeepAgents 仅执行只读调查叶节点。"""
+"""宿主只读调查生命周期；DeepAgents 仅执行调查叶节点。"""
 import asyncio
 import json
 import os
 from fnmatch import fnmatchcase
-
-from langgraph.graph import END, START, StateGraph
 
 from tracefix.runtime.contracts import Usage, digest, new_id
 from tracefix.runtime.effects import file_resource
@@ -155,20 +153,12 @@ class ReadOnlyWorker:
             'same_model_as_supervisor': True, 'framework': 'deepagents'})
         try:
             async with self.semaphore:
-                async def investigate(_data):
-                    adapter = DeepAgentsReadonlyAdapter(readonly_tools=self._tools(child, spec, check, versions),
+                with self.engine.store.writer(child.run_id):
+                    adapter = DeepAgentsReadonlyAdapter(
+                        readonly_tools=self._tools(child, spec, check, versions),
                         audit=self._audit(child, check),
                         max_model_calls=getattr(selected, 'max_tool_rounds', 40))
-                    result = await adapter.run(request)
-                    return {'result': result.model_dump(mode='json')}
-                graph = StateGraph(dict)
-                graph.add_node('investigate', investigate)
-                graph.add_edge(START, 'investigate')
-                graph.add_edge('investigate', END)
-                with self.engine.store.writer(child.run_id):
-                    answer = await graph.compile(checkpointer=self.engine.graph.checkpointer).ainvoke(
-                        {}, {'configurable': {'thread_id': child.run_id}})
-                result = SubtaskResult.model_validate(answer['result'])
+                    result = SubtaskResult.model_validate(await adapter.run(request))
                 if result.worker_generation != spec.generation or result.source_manifest != source_manifest:
                     raise ValueError('worker 返回的 generation/source 版本已过期')
                 result = result.model_copy(deep=True, update={'worker_id': child.run_id,
