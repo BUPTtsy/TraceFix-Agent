@@ -1,15 +1,9 @@
 """History validation, canonical tool names and evidence-aware request budgeting."""
 import copy
 import json
-import re
-
-from pydantic import BaseModel
-
-from tracefix.model.contracts import ModelOutputError
 from tracefix.model.prompts import serialize_request
 from tracefix.runtime.contracts import digest
 from tracefix.runtime.tools import model_tool_name
-from tracefix.storage.artifacts import sanitize
 
 
 class ModelProtocol:
@@ -20,7 +14,7 @@ class ModelProtocol:
             if isinstance(message, dict) or not hasattr(message, 'parts'):
                 result.append(copy.deepcopy(message))
                 continue
-            if message.kind == 'response':
+            if getattr(message, 'kind', 'request') == 'response':
                 item = {'role': 'assistant', 'content': None}
                 for part in message.parts:
                     if part.part_kind == 'text':
@@ -45,10 +39,11 @@ class ModelProtocol:
                         result.append({'role': 'system' if part.part_kind == 'system-prompt' else 'user',
                                        'content': content})
                     elif part.part_kind in {'tool-return', 'retry-prompt'}:
-                        content = part.content if isinstance(part.content, str) else json.dumps(
-                            part.content, ensure_ascii=False, default=str)
+                        raw_content = getattr(part, 'content', '')
+                        content = raw_content if isinstance(raw_content, str) else json.dumps(
+                            raw_content, ensure_ascii=False, default=str)
                         if getattr(part, 'tool_name', None):
-                            result.append({'role': 'tool', 'tool_call_id': part.tool_call_id,
+                            result.append({'role': 'tool', 'tool_call_id': getattr(part, 'tool_call_id', ''),
                                            'name': part.tool_name, 'content': content})
                         else:
                             result.append({'role': 'user', 'content': content})
@@ -195,25 +190,6 @@ class ModelProtocol:
                 if registry.contains(name, phase):
                     function['name'] = registry.get(name, phase).wire_name
         return history
-
-    @staticmethod
-    async def _call_tool_executor(executor, name, arguments, call_id):
-        if executor is None:
-            raise ModelOutputError('模型请求执行工具，但未配置 tool_executor', category='tool_execution')
-        return await executor(name, arguments, call_id)
-
-    @staticmethod
-    def _tool_content(value):
-        if hasattr(value, 'to_content'):
-            return value.to_content()
-        if isinstance(value, BaseModel):
-            value = value.model_dump(mode='json')
-        if isinstance(value, str):
-            return value
-        try:
-            return json.dumps(value, ensure_ascii=False, default=str)
-        except (TypeError, ValueError):
-            return json.dumps({'result': sanitize(str(value))}, ensure_ascii=False)
 
     @staticmethod
     def _payload_tokens(counter, payload):

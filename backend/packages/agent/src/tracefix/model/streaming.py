@@ -139,25 +139,3 @@ class CompletionStream:
                     raise StreamProtocolError('流包含冲突的 finish_reason')
                 self.finish_reason = finish_reason
 
-    async def read(self, response):
-        # 缺少 [DONE] 的流不能当作完整响应，由 Gateway 按结果未知处理。
-        if 'text/event-stream' not in response.headers.get('content-type', '').lower():
-            raise StreamProtocolError('流响应的 Content-Type 必须为 text/event-stream')
-        data_lines = []
-        async for line in response.aiter_lines():
-            if not line:
-                if data_lines:
-                    self.event('\n'.join(data_lines))
-                    data_lines = []
-                    if self.done:
-                        return self.result()
-                continue
-            if line.startswith('data:'):
-                data_lines.append(line[5:].removeprefix(' '))
-            elif not line.startswith((':', 'event:', 'id:', 'retry:')):
-                raise StreamProtocolError('流包含无效 SSE 字段')
-        if data_lines:
-            self.event('\n'.join(data_lines))
-        if not self.done:
-            raise StreamProtocolError('流提前结束，缺少 [DONE]')
-        return self.result()

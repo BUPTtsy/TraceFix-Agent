@@ -1,20 +1,10 @@
 """Host-compatible facade; PydanticAI is the sole model execution backend."""
-import asyncio
-import copy
-import json
 import math
 import os
-import re
 from urllib.parse import urlsplit
-
-import httpx
-from pydantic import BaseModel
 
 from tracefix.model.contracts import ModelError, ModelOutputError, ModelResult
 from tracefix.model.history import ModelProtocol
-from tracefix.runtime.contracts import Phase, digest
-from tracefix.runtime.tools import ToolRegistry, ToolSpec, model_tool_name
-from tracefix.storage.artifacts import sanitize
 
 
 class Gateway(ModelProtocol):

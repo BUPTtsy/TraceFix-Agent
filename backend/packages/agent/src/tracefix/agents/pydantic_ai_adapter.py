@@ -335,7 +335,9 @@ class PydanticAIAdapter:
                                         'content': (result.to_content() if hasattr(result, 'to_content')
                                                     else json.dumps(receipt, ensure_ascii=False, default=str))},
                             'tool_call_id': call_id, 'receipt': receipt,
-                            'reused': record['reused']}))
+                            'reused': record['reused'],
+                            'logical_exchange_id': boundary.logical_id if boundary else None,
+                            'tool_round': boundary.tool_round if boundary else 0}))
                         if boundary is not None and isinstance(metadata, dict):
                             boundary.result_refs[call_id] = metadata
                     except Exception as error:
