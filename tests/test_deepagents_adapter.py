@@ -1,5 +1,6 @@
 import asyncio
 import builtins
+import inspect
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -51,6 +52,8 @@ class ScriptedModel(BaseChatModel):
             step = self.steps.pop(0)
             if callable(step):
                 step = step(messages)
+            if inspect.isawaitable(step):
+                step = await step
             if isinstance(step, BaseException):
                 raise step
             message = step
@@ -329,16 +332,29 @@ def worker_payload(state, reference):
         source_manifest=state.source_manifest)
 
 
-async def test_worker_leaf_uses_deepagents_and_keeps_child_checkpoint_and_usage(tmp_path, monkeypatch):
+async def test_worker_direct_deepagents_keeps_child_identity_usage_and_trace(tmp_path, monkeypatch):
     model = ScriptedModel()
     engine, state, spec = worker_fixture(tmp_path, model)
-    model.steps = [calls(('Read', {'path': 'src/value.ts'}, 'read-1')),
+    def read_authorized(messages):
+        context = json.loads(messages[-1].content)
+        assert context['worker_generation'] == spec.generation
+        assert context['source_manifest'] == state.source_manifest
+        assert context['context']['evidence'] == [
+            {'ref': spec.allowed_artifacts[0], 'content': {'observation': 'frozen'}}]
+        assert len(engine.store.locked) == 1
+        child_id = next(iter(engine.store.locked))
+        assert engine.store.load(child_id, state.scope_id).parent_run_id == state.run_id
+        with pytest.raises(RuntimeError):
+            with engine.store.writer(child_id):
+                pytest.fail('同一 child Run 不能出现第二个 writer')
+        return calls(('Read', {'path': 'src/value.ts'}, 'read-1'))
+    model.steps = [read_authorized,
                    submit(worker_payload(state, spec.allowed_artifacts[0]))]
     async def old_executor(*args, **kwargs):
         raise AssertionError('旧调查 executor 不得调用')
     monkeypatch.setattr(engine, 'model_call', old_executor)
     engine.worker_model = SimpleNamespace(generate=old_executor)
-    monkeypatch.setenv('TRACEFIX_WORKER', '0')
+    monkeypatch.setattr(engine, 'graph', object())
     output = await ReadOnlyWorker(engine).run(state, spec)
     child = engine.store.load(output.worker_id, state.scope_id)
     assert child.parent_run_id == state.run_id and child.revision == 0
@@ -347,11 +363,25 @@ async def test_worker_leaf_uses_deepagents_and_keeps_child_checkpoint_and_usage(
     assert state.budget.cost_usd == 0.02
     assert state.phase == Phase.DIAGNOSE and state.patch_ref is None
     assert engine.workspace.read('src/value.ts') == 'export const persisted = false;\n'
-    assert engine.graph.checkpointer.get_tuple({'configurable': {'thread_id': output.worker_id}}) is not None
-    assert engine.graph.checkpointer.get_tuple({'configurable': {'thread_id': state.run_id}}) is None
+    assert output.worker_generation == spec.generation and output.source_manifest == child.source_manifest
+    assert engine.store.load(state.run_id, state.scope_id).budget == state.budget
+    assert engine.store.locked == set()
     assert child.model_exchange_refs
     assert all(record['status'] == 'DONE' for record in engine.store.operations.values())
     assert 'model_configuration' not in model.calls[0][0][-1].content
+    parent_events = engine.store.trace(state.run_id, state.scope_id)
+    started = next(event['payload'] for event in parent_events if event['type'] == 'subtask.started')
+    completed = next(event['payload'] for event in parent_events if event['type'] == 'subtask.completed')
+    assert started['child_run_id'] == completed['child_run_id'] == child.run_id
+    assert started['generation'] == spec.generation and started['source_manifest'] == state.source_manifest
+    assert started['parent_step_id'] == completed['parent_step_id'] == f'{state.run_id}:{state.revision}'
+    child_events = engine.store.trace(child.run_id, state.scope_id)
+    assert any(event['type'] == 'tool.result' for event in child_events)
+    finished = next(event['payload'] for event in child_events if event['type'] == 'subtask.finished')
+    assert finished['parent_run_id'] == state.run_id and finished['status'] == 'completed'
+    assert engine.get(child, completed['trace_ref']) == child_events
+    assert all(engine.get(child, reference)['framework'] == 'deepagents'
+               for reference in child.model_exchange_refs)
 
 
 @pytest.mark.parametrize('failure', [RuntimeError('disconnected'), asyncio.CancelledError(), TimeoutError('timeout')])
@@ -366,10 +396,18 @@ async def test_worker_failure_and_cancel_merge_all_observed_usage(tmp_path, fail
     assert state.budget.cost_usd == 0.01
     children = [run for run in engine.store.runs.values() if run.get('parent_run_id') == state.run_id]
     assert len(children) == 1
-    assert any(event['type'] == 'model.error.persisted' for event in engine.store.events[children[0]['run_id']])
+    child_id = children[0]['run_id']
+    events = engine.store.trace(child_id, state.scope_id)
+    assert any(event['type'] == 'model.error.persisted' for event in events)
+    assert not any(event['type'] == 'subtask.finished' for event in events)
+    assert not any(event['type'] == 'subtask.completed'
+                   for event in engine.store.trace(state.run_id, state.scope_id))
+    assert engine.store.load(child_id, state.scope_id).budget.model_calls == 2
+    assert engine.store.load(state.run_id, state.scope_id).budget == state.budget
+    assert engine.store.locked == set()
 
 
-@pytest.mark.parametrize('drift', ['source', 'generation', 'manifest'])
+@pytest.mark.parametrize('drift', ['source', 'generation', 'saved_generation', 'manifest', 'evidence'])
 async def test_worker_refuses_investigation_drift(tmp_path, drift):
     model = ScriptedModel()
     engine, state, spec = worker_fixture(tmp_path, model)
@@ -379,14 +417,25 @@ async def test_worker_refuses_investigation_drift(tmp_path, drift):
         elif drift == 'generation':
             state.revision += 1
             engine.store.save(state)
+        elif drift == 'saved_generation':
+            saved = engine.store.load(state.run_id, state.scope_id)
+            saved.revision += 1
+            engine.store.save(saved)
+        elif drift == 'evidence':
+            state.evidence_refs = []
+            engine.store.save(state)
         else:
             state.source_manifest = 'new-manifest'
             engine.store.save(state)
         return submit(worker_payload(state, spec.allowed_artifacts[0]))
     model.steps = [changed]
-    with pytest.raises(ValueError, match='版本'):
+    expected = PermissionError if drift == 'evidence' else ValueError
+    with pytest.raises(expected, match='授权' if drift == 'evidence' else '版本'):
         await ReadOnlyWorker(engine).run(state, spec)
     assert state.budget.model_calls == 1
+    assert not any(event['type'] == 'subtask.completed'
+                   for event in engine.store.trace(state.run_id, state.scope_id))
+    assert engine.store.locked == set()
 
 
 async def test_unknown_resource_fence_blocks_host_tools_and_propagates(tmp_path):
