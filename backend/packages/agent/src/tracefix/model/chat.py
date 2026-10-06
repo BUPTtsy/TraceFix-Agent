@@ -28,6 +28,10 @@ def _history_dict(messages):
     """Project framework messages to the chat turn contract without reimplementing its loop."""
     result = []
     for message in messages or ():
+        if isinstance(message, dict):
+            if message.get('role') in {'assistant', 'tool'}:
+                result.append(copy.deepcopy(message))
+            continue
         kind = getattr(message, 'kind', None)
         parts = getattr(message, 'parts', ())
         if kind == 'request':
@@ -38,6 +42,14 @@ def _history_dict(messages):
                     if isinstance(content, str):
                         result.append({'role': 'system' if part_kind == 'system-prompt' else 'user',
                                        'content': content})
+                elif part_kind == 'tool-return':
+                    content = getattr(part, 'content', '')
+                    if not isinstance(content, str):
+                        content = json.dumps(content, ensure_ascii=False, default=str)
+                    result.append({'role': 'tool',
+                                   'tool_call_id': getattr(part, 'tool_call_id', ''),
+                                   'name': getattr(part, 'tool_name', ''),
+                                   'content': content})
         elif kind == 'response':
             calls = []
             content = None
@@ -58,6 +70,33 @@ def _history_dict(messages):
             if calls:
                 item['tool_calls'] = calls
             result.append(item)
+    return result
+
+
+def _history_key(message):
+    role = message.get('role')
+    if role == 'tool':
+        return role, message.get('tool_call_id')
+    if role == 'assistant' and message.get('tool_calls'):
+        return role, tuple(call.get('id') for call in message['tool_calls'])
+    return role, json.dumps(message, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _new_framework_messages(projected, existing):
+    counts = {}
+    for message in existing:
+        if message.get('role') in {'assistant', 'tool'}:
+            key = _history_key(message)
+            counts[key] = counts.get(key, 0) + 1
+    result = []
+    for message in projected:
+        if message.get('role') not in {'assistant', 'tool'}:
+            continue
+        key = _history_key(message)
+        if counts.get(key, 0):
+            counts[key] -= 1
+            continue
+        result.append(message)
     return result
 
 
@@ -110,6 +149,10 @@ async def _stream_with_adapter(message, history, project_id, library, *, tools=(
             await queue.put({'tool_round': 0, 'tools': 1, 'succeeded': 1, 'failed': 0})
         elif kind == 'tool.error':
             await queue.put({'tool_round': 0, 'tools': 1, 'succeeded': 0, 'failed': 1})
+        elif kind == 'adapter.completed':
+            projected = _history_dict(payload.get('message_history'))
+            if projected:
+                audit['message_history'] = projected
 
     async def run():
         try:
@@ -120,8 +163,10 @@ async def _stream_with_adapter(message, history, project_id, library, *, tools=(
             audit['usage'] = copy.deepcopy(result.usage)
             audit['model_revision'] = result.model_revision
             audit['complete'] = True
-            yield_message = [*history[-20:], *turn,
-                             {'role': 'assistant', 'content': result.value}]
+            existing = [*history[-20:], *turn]
+            generated = _new_framework_messages(audit.get('message_history', ()), existing)
+            yield_message = [*existing, *(generated or [
+                {'role': 'assistant', 'content': result.value}])]
             await queue.put({'turn_messages': yield_message})
         except asyncio.CancelledError:
             audit['cancelled'] = True
