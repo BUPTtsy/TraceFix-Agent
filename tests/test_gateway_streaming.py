@@ -252,14 +252,14 @@ async def test_stream_http_error_and_connect_failure_keep_attempt_boundaries(mon
 
 async def test_stream_content_validation_retry_keeps_previous_reasoning(monkeypatch):
     first = stream_response([
-        event({'reasoning_content': 'first attempt'}), event({'content': '{"kind":"observe"}'}),
+        event({'reasoning_content': 'first attempt'}), event({'content': '{"kind":"invalid"}'}),
         event(finish='stop'), event(usage={'total_tokens': 4}), b'data: [DONE]\n\n',
     ])
     requests = use_transport(monkeypatch, [first, final_stream()])
     await Gateway(key='ci', max_retry_delay=0).generate(BrowserAction, {})
 
     assert requests[1]['messages'][-2]['reasoning_content'] == 'first attempt'
-    assert requests[1]['messages'][-2]['content'] == '{"kind":"observe"}'
+    assert requests[1]['messages'][-2]['content'] == '{"kind":"invalid"}'
     assert requests[1]['messages'][-1]['role'] == 'user'
     assert requests[1]['messages'][-1]['content']
 

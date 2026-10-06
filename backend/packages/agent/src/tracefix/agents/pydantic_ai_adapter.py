@@ -143,7 +143,7 @@ class PydanticAIAdapter:
                     'browser.' + function['name'][len('Browser'):].lower(),
                     function['description'], function['parameters'],
                     side_effect='external', idempotency_key=digest,
-                    phases=frozenset({context.get('phase', 'EXPLORE')})),)
+                    phases=frozenset({context.get('phase') or 'DIAGNOSE'})),)
         names = set()
         for spec in tools:
             if (not isinstance(spec, ToolSpec) or not spec.enabled
@@ -399,12 +399,12 @@ class PydanticAIAdapter:
                         trace.retry_context.append(payload)
                         await emit('adapter.retry', payload)
                     await emit('model.stream', payload)
-            except (PydanticAIAdapterError, exceptions.UnexpectedModelBehavior, ValidationError):
+            except (ModelError, exceptions.UnexpectedModelBehavior, ValidationError):
                 raise
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                if any(isinstance(cause, (PydanticAIAdapterError,
+                if any(isinstance(cause, (ModelError,
                                          exceptions.UnexpectedModelBehavior, ValidationError))
                        for cause in _causes(error)):
                     raise
@@ -425,10 +425,13 @@ class PydanticAIAdapter:
                         except ValueError:
                             receipt = content
                         completed_results[call_id] = {
-                            'identity': (spec.name, identity[1]), 'result': receipt}
+                            'identity': (spec.name, identity[1]), 'result': content}
                     if tool_pipeline is not None:
                         for call_id, entry in completed_results.items():
-                            receipt = entry['result']
+                            try:
+                                receipt = json.loads(entry['result'])
+                            except ValueError:
+                                continue
                             if isinstance(receipt, dict) and 'call_id' in receipt:
                                 tool_pipeline.completed_calls[call_id] = (entry['identity'], receipt)
                 except (ValueError, TypeError) as error:

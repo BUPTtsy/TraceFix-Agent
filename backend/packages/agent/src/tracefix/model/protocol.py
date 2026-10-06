@@ -98,7 +98,8 @@ class RequestBoundary:
                 for choice in raw.get('choices', []):
                     assistant = choice.get('message', {})
                     raw_ids = {call['id'] for call in assistant.get('tool_calls', [])}
-                    if ids and ids == raw_ids:
+                    if (ids and ids == raw_ids) or (not ids and message.get('content')
+                            and message.get('content') == assistant.get('content')):
                         for field in ('reasoning', 'reasoning_content'):
                             if field in assistant:
                                 message[field] = copy.deepcopy(assistant[field])
