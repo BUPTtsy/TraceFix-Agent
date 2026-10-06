@@ -436,8 +436,7 @@ class PydanticAIAdapter:
                 from tracefix.model.history import ModelProtocol
                 try:
                     trace.messages = ModelProtocol._wire_history(trace.messages, tool_registry, phase)
-                    restored = ModelProtocol._completed_history(trace.messages,
-                        tool_registry.native_tools(phase))
+                    restored = ModelProtocol._completed_history(trace.messages, tool_registry, phase)
                     for call_id, (identity, content) in restored.items():
                         spec = tool_registry.get_wire(identity[0], phase)
                         try:
@@ -501,8 +500,11 @@ class PydanticAIAdapter:
                         raise model_retry(str(error)) from error
             await emit('adapter.started', {'schema': getattr(schema, '__name__', str(schema)),
                        'message_history': trace.messages, 'output_retries': self.output_retries})
-            result = await agent.run(prompt, message_history=history_messages(),
-                event_stream_handler=stream_events if getattr(self.model, 'stream', True) else None)
+            run_options = {'message_history': history_messages(),
+                'event_stream_handler': stream_events if getattr(self.model, 'stream', True) else None}
+            if runtime_options.get('model_settings') is not None:
+                run_options['model_settings'] = runtime_options['model_settings']
+            result = await agent.run(prompt, **run_options)
             trace.messages = copy.deepcopy(result.all_messages())
             trace.context = None
             output = result.output if schema is str else schema.model_validate(result.output)
@@ -528,6 +530,9 @@ class PydanticAIAdapter:
             finish_reason = getattr(getattr(result, 'response', None), 'finish_reason', None) or 'stop'
             return ModelResult(output, usage, model_revision, finish_reason)
         except asyncio.CancelledError:
+            if boundary is not None and boundary.request_count:
+                await boundary.fail('cancelled', '模型调用已取消，已发送请求的结果未知',
+                                    status='UNKNOWN_OPERATION', request_status='unknown')
             raise
         except Exception as error:
             causes = list(_causes(error))

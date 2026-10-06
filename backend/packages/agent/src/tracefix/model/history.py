@@ -4,7 +4,7 @@ import json
 from pydantic_core import to_json
 from tracefix.model.prompts import serialize_request
 from tracefix.runtime.contracts import digest
-from tracefix.runtime.tools import model_tool_name
+from tracefix.runtime.tools import ToolRegistry, ToolSpec, model_tool_name
 
 
 class ModelProtocol:
@@ -106,48 +106,12 @@ class ModelProtocol:
         return BrowserAction(kind=kind, **arguments)
 
     @classmethod
-    def _validated_calls(cls, calls, native_tools, completed_calls):
-        # 整批校验通过后才允许执行，避免前半批已执行而后半批存在非法调用。
-        if not native_tools:
-            raise ValueError('当前模型输出类型或 tool_mode 不允许调用浏览器工具')
-        if not isinstance(calls, list) or not calls:
-            raise ValueError('tool_calls 必须为非空数组')
-        validated = []
-        seen = set()
-        for call in calls:
-            if not isinstance(call, dict) or call.get('type') != 'function':
-                raise ValueError('tool_call 必须为 function 类型')
-            call_id = call.get('id')
-            function = call.get('function')
-            if (not isinstance(call_id, str) or not call_id.strip()
-                    or call_id in seen or not isinstance(function, dict)):
-                raise ValueError('tool_call 的 id/function 无效或同批 id 重复')
-            seen.add(call_id)
-            name = function.get('name')
-            raw_arguments = function.get('arguments')
-            if not isinstance(raw_arguments, str):
-                raise ValueError('function.arguments 必须是 JSON 字符串')
-            arguments = json.loads(raw_arguments)
-            definitions = {tool['function']['name']: tool['function']['parameters'] for tool in native_tools}
-            if name not in definitions:
-                raise ValueError('未知或未授权的工具：' + str(name))
-            import jsonschema
-            try:
-                jsonschema.validate(arguments, definitions[name])
-            except jsonschema.ValidationError as error:
-                raise ValueError('工具参数校验失败：' + error.message) from error
-            if name.startswith('Browser'):
-                cls.browser_action(name, arguments)
-            identity = (name, json.dumps(arguments, sort_keys=True))
-            if call_id in completed_calls and completed_calls[call_id][0] != identity:
-                raise ValueError('tool_call_id 不可复用于不同参数')
-            validated.append((call_id, name, arguments, identity))
-        return validated
-
-    @classmethod
-    def _completed_history(cls, messages, native_tools):
+    def _completed_history(cls, messages, native_tools, phase='DIAGNOSE'):
         if not isinstance(messages, list) or not messages:
             raise ValueError('messages 必须为非空数组')
+        registry = native_tools if isinstance(native_tools, ToolRegistry) else ToolRegistry([
+            ToolSpec(tool['function']['name'], tool['function'].get('description') or '历史工具',
+                     tool['function']['parameters']) for tool in native_tools])
         completed = {}
         pending = {}
         for message in messages:
@@ -171,8 +135,10 @@ class ModelProtocol:
                 if message.get('tool_calls') is not None:
                     if role != 'assistant':
                         raise ValueError('只有 assistant 消息可以包含 tool_calls')
-                    pending = {call_id: identity for call_id, name, arguments, identity in
-                               cls._validated_calls(message['tool_calls'], native_tools, completed)}
+                    restored = {call_id: ((registry.get_wire(identity[0], phase).name, identity[1]), content)
+                                for call_id, (identity, content) in completed.items()}
+                    calls = registry.validate_batch(message['tool_calls'], phase, restored, wire_names=True)
+                    pending = {call.call_id: (call.spec.wire_name, call.identity[1]) for call in calls}
         if pending:
             raise ValueError('assistant tool_calls 缺少工具结果，不能自动重放')
         return completed

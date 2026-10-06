@@ -179,7 +179,7 @@ class RequestBoundary:
     async def finish_response(self, response, body, *, complete=True, validate=True):
         self.last_body = body
         self.responses.append(copy.deepcopy(body))
-        usage = body.get('usage')
+        usage = body.get('usage') if isinstance(body, dict) else None
         if isinstance(usage, dict):
             usage = copy.deepcopy(usage)
             if 'total_tokens' not in usage and all(type(usage.get(key)) is int
@@ -196,10 +196,14 @@ class RequestBoundary:
             'logical_exchange_id': self.logical_id, 'attempt': self.request_count,
             'tool_round': self.tool_round, 'messages': copy.deepcopy(self.last_history)})
         if complete and validate:
+            if not isinstance(body, dict):
+                raise await self.fail('malformed_response', '模型响应必须为对象')
             choices = body.get('choices')
             if not isinstance(choices, list) or len(choices) != 1:
                 raise await self.fail('malformed_response', '模型响应必须包含一个完整 choice')
             choice = choices[0]
+            if not isinstance(choice, dict):
+                raise await self.fail('malformed_response', '模型 choice 必须为对象')
             message = choice.get('message')
             if not isinstance(message, dict):
                 raise await self.fail('malformed_response', '模型响应缺少完整消息')
@@ -222,6 +226,8 @@ class RequestBoundary:
                     raise await self.fail('tool_protocol', '工具调用 ID 或参数格式无效')
                 if output_calls and runtime_calls:
                     raise await self.fail('tool_protocol', '结构化输出不能与运行时工具混合')
+                if len(output_calls) > 1:
+                    raise await self.fail('tool_protocol', '结构化提交必须独占一个批次')
                 if runtime_calls:
                     if self.tool_round >= self.gateway.max_tool_rounds:
                         raise await self.fail('tool_protocol', '模型工具轮次已达到上限')
@@ -263,9 +269,12 @@ class RequestBoundary:
     async def report(self, error):
         if id(error) not in self.reported_errors:
             self.reported_errors.add(id(error))
-            await self.callback('on_error', self.exchange, ModelProtocol.audit_value({
-                **error.details, 'message_history': self.last_history,
-                'tool_results': self.tool_records}))
+            try:
+                await self.callback('on_error', self.exchange, ModelProtocol.audit_value({
+                    **error.details, 'message_history': self.last_history,
+                    'tool_results': self.tool_records}))
+            except Exception as callback_error:
+                error.details['audit_callback_error'] = str(callback_error)
 
 
 class AuditedStream(httpx.AsyncByteStream):
@@ -287,7 +296,8 @@ class AuditedStream(httpx.AsyncByteStream):
                 self.deltas.clear()
                 yield chunk
             await self.finalize()
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            self.failure = error
             await self.boundary.finish_response(self.response, self.completion.result(),
                                                 complete=False, validate=False)
             raise
@@ -317,7 +327,8 @@ class AuditedStream(httpx.AsyncByteStream):
                             await self.boundary.callback('on_delta', self.boundary.exchange, delta)
                         self.deltas.clear()
                     await self.finalize()
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as error:
+                self.failure = error
                 await self.boundary.finish_response(self.response, self.completion.result(),
                                                     complete=False, validate=False)
                 raise

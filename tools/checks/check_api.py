@@ -1,4 +1,4 @@
-"""Check the configured DeepSeek Chat Completions connection and wire protocol."""
+"""Check PydanticAI typed output, configured provider and host tool protocol."""
 import asyncio
 import json
 import struct
@@ -35,6 +35,7 @@ class VisionResult(BaseModel):
 async def check_native_protocol(gateway):
     requests = []
     usage = []
+    manifests = []
     executed_calls = []
 
     async def diagnostic_snapshot(name, arguments, call_id):
@@ -51,6 +52,7 @@ async def check_native_protocol(gateway):
         tool_executor=diagnostic_snapshot,
         on_attempt=lambda model, request, attempt: requests.append(request),
         on_usage=usage.append,
+        on_context=lambda manifest, compacted: manifests.append(manifest),
     )
     if len(executed_calls) != 1 or response.value.kind != "finish":
         raise RuntimeError("未完成 native 工具协议诊断：需要一次工具调用及最终 finish")
@@ -67,8 +69,12 @@ async def check_native_protocol(gateway):
                 )
     if not paired:
         raise RuntimeError("native 工具结果未以原始 tool_call_id 回传 role=tool 消息")
+    if len(manifests) != len(requests) or any(
+            manifest['request_tokens'] > manifest['input_limit'] for manifest in manifests):
+        raise RuntimeError("PydanticAI 实际请求缺少有效的上下文预算清单")
     return {"kind": "native_protocol", "model": response.model_revision,
             "output": response.value.model_dump(), "usage": usage,
+            "backend": "pydantic_ai", "request_count": len(requests),
             "browser_executed": False,
             "message": "已验证 tools / tool_calls / role=tool；工具回执为本地合成数据，未验证 MCP 浏览器"}
 
