@@ -1,4 +1,5 @@
 import copy
+import asyncio
 import importlib
 import inspect
 from types import ModuleType, SimpleNamespace
@@ -9,6 +10,8 @@ from pydantic import BaseModel, ConfigDict
 
 from tracefix.agents import pydantic_ai_adapter as adapter_module
 from tracefix.agents.pydantic_ai_adapter import PydanticAIAdapter, PydanticAIAdapterError
+from tracefix.model.chat import _history_dict
+from tracefix.model.gateway import Gateway
 from tracefix.runtime.contracts import BrowserAction
 from tracefix.runtime.tools import ToolOperationUnknown, ToolResult, ToolSpec
 
@@ -318,6 +321,65 @@ async def test_tools_require_an_injected_executor(fake_pydantic_ai):
 
     assert raised.value.category == 'tool_execution'
     assert all(agent.run_count == 1 for agent in fake_pydantic_ai.instances)
+
+
+async def test_cancellation_is_propagated(fake_pydantic_ai):
+    async def model(agent, prompt, history, handler):
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await PydanticAIAdapter(model).generate(BrowserAction, {})
+
+
+async def test_usage_and_concurrency_options_are_preserved(fake_pydantic_ai):
+    usage = SimpleNamespace(input_tokens=5, output_tokens=3, details={'cached': 2},
+                            requests=1, total_tokens=8, request_tokens=5, response_tokens=3)
+
+    async def model(agent, prompt, history, handler):
+        result = completion()
+        result.usage = usage
+        return result
+
+    result = await PydanticAIAdapter(model).generate(BrowserAction, {}, max_concurrency=3)
+
+    assert result.usage['input_tokens'] == 5
+    assert result.usage['output_tokens'] == 3
+    assert result.usage['details'] == {'cached': 2}
+    assert result.usage['total_tokens'] == 8
+    assert fake_pydantic_ai.instances[0].options['max_concurrency'] == 3
+
+
+async def test_gateway_maps_legacy_history_and_constructor_port(monkeypatch):
+    captured = {}
+
+    async def generate(self, schema, context, **options):
+        captured.update(options)
+        return SimpleNamespace(value=BrowserAction(kind='finish'))
+
+    monkeypatch.setattr(PydanticAIAdapter, 'generate', generate)
+    port = object()
+    await Gateway(key='ci', tool_executor=port).generate(BrowserAction, {},
+        messages=[{'role': 'user', 'content': 'history'}])
+
+    assert captured['message_history'] == [{'role': 'user', 'content': 'history'}]
+    assert captured['tool_executor'] is port
+
+
+def test_chat_history_projection_preserves_framework_tool_identity():
+    messages = [
+        SimpleNamespace(kind='response', parts=[SimpleNamespace(
+            part_kind='tool-call', tool_name='RepoRead', args='{"path":"a"}',
+            tool_call_id='call-7')]),
+        SimpleNamespace(kind='request', parts=[SimpleNamespace(
+            part_kind='tool-return', tool_name='RepoRead', content={'ok': True},
+            tool_call_id='call-7')]),
+    ]
+
+    projected = _history_dict(messages)
+
+    assert projected[0]['tool_calls'][0]['id'] == 'call-7'
+    assert projected[1] == {'role': 'tool', 'tool_call_id': 'call-7',
+                            'name': 'RepoRead', 'content': '{"ok": true}'}
 
 
 async def test_retry_tool_context_and_message_history_are_preserved(fake_pydantic_ai):
