@@ -372,9 +372,12 @@ class PydanticAIAdapter:
                               prompt]
                 except (ImportError, TypeError, ValueError) as error:
                     raise trace.failure('configuration', '图片输入无法转换为 PydanticAI 内容', error) from error
+            agent_options = {}
+            if runtime_options.get('max_concurrency') is not None:
+                agent_options['max_concurrency'] = runtime_options['max_concurrency']
             agent = library.Agent(provider_model(), output_type=output_type,
                 instructions=agent_instructions, tools=[bind(spec) for spec in tools],
-                retries=self.output_retries)
+                retries=self.output_retries, **agent_options)
             if validate_output is not None:
                 model_retry = getattr(exceptions, 'ModelRetry', RuntimeError)
                 @agent.output_validator
@@ -400,9 +403,10 @@ class PydanticAIAdapter:
             if hasattr(usage, 'model_dump'):
                 usage = usage.model_dump(mode='json')
             elif hasattr(usage, 'total_tokens'):
-                usage = {'total_tokens': usage.total_tokens,
-                         'request_tokens': getattr(usage, 'request_tokens', 0),
-                         'response_tokens': getattr(usage, 'response_tokens', 0)}
+                usage = copy.deepcopy(vars(usage)) if hasattr(usage, '__dict__') else {}
+                usage.setdefault('total_tokens', getattr(result.usage, 'total_tokens', 0))
+                usage.setdefault('request_tokens', getattr(result.usage, 'request_tokens', 0))
+                usage.setdefault('response_tokens', getattr(result.usage, 'response_tokens', 0))
             elif callable(usage):
                 usage = usage()
             elif not isinstance(usage, dict):
