@@ -155,6 +155,7 @@ class PydanticAIAdapter:
         if on_event is not None and not callable(on_event):
             raise trace.failure('configuration', 'on_event 必须为 callable')
         client = None
+        completed_results = {}
         try:
             library = importlib.import_module('pydantic_ai')
             tool_library = importlib.import_module('pydantic_ai.tools')
@@ -272,22 +273,33 @@ class PydanticAIAdapter:
                     raise trace.failure('tool_protocol', '只读工具参数校验失败', error,
                         tool_call_id=call_id, tool_name=spec.name, arguments=arguments) from error
                 record = {'tool_call_id': call_id, 'tool_name': spec.name,
-                          'arguments': copy.deepcopy(arguments), **snapshot}
+                          'arguments': copy.deepcopy(arguments), 'reused': False, **snapshot}
                 trace.tool_calls.append(record)
                 await emit('tool.started', record)
-                try:
-                    if tool_pipeline is not None and tool_pipeline.registry.contains(spec.name, tool_pipeline.phase):
-                        result = await tool_pipeline.execute(spec.name, arguments, call_id)
-                    elif callable(tool_executor):
-                        result = await _resolve(tool_executor(spec.name, arguments, call_id))
-                    else:
-                        raise PydanticAIAdapterError('模型工具未绑定执行端口', category='tool_execution',
-                                                     details={'tool_call_id': call_id, 'tool_name': spec.name})
-                except Exception as error:
-                    failure = trace.failure('tool_execution', '只读工具执行失败', error,
-                        tool_call_id=call_id, tool_name=spec.name, arguments=arguments)
-                    await emit_failure(record, failure)
-                    raise failure from error
+                identity = (spec.name, json.dumps(arguments, sort_keys=True, default=str))
+                cached = completed_results.get(call_id)
+                if cached is not None:
+                    if cached['identity'] != identity:
+                        failure = trace.failure('tool_protocol', 'tool_call_id 不可复用于不同参数',
+                            tool_call_id=call_id, tool_name=spec.name, arguments=arguments)
+                        await emit_failure(record, failure)
+                        raise failure
+                    record['reused'] = True
+                    result = copy.deepcopy(cached['result'])
+                else:
+                    try:
+                        if tool_pipeline is not None and tool_pipeline.registry.contains(spec.name, tool_pipeline.phase):
+                            result = await tool_pipeline.execute(spec.name, arguments, call_id)
+                        elif callable(tool_executor):
+                            result = await _resolve(tool_executor(spec.name, arguments, call_id))
+                        else:
+                            raise PydanticAIAdapterError('模型工具未绑定执行端口', category='tool_execution',
+                                                         details={'tool_call_id': call_id, 'tool_name': spec.name})
+                    except Exception as error:
+                        failure = trace.failure('tool_execution', '只读工具执行失败', error,
+                            tool_call_id=call_id, tool_name=spec.name, arguments=arguments)
+                        await emit_failure(record, failure)
+                        raise failure from error
                 record['result'] = result
                 receipt = result.model_dump(by_alias=True) if isinstance(result, BaseModel) else result
                 if isinstance(receipt, dict) and (receipt.get('isError') or receipt.get('is_error')):
@@ -299,6 +311,7 @@ class PydanticAIAdapter:
                                            'category', 'message', 'cause'}})
                     await emit_failure(record, failure)
                     raise failure
+                completed_results[call_id] = {'identity': identity, 'result': copy.deepcopy(result)}
                 callback = runtime_options.get('on_tool_result')
                 if callback is not None:
                     await _resolve(callback(None, {
@@ -306,7 +319,7 @@ class PydanticAIAdapter:
                                     'name': spec.wire_name,
                                     'content': (result.to_content() if hasattr(result, 'to_content')
                                                 else json.dumps(receipt, ensure_ascii=False, default=str))},
-                        'tool_call_id': call_id, 'receipt': receipt, 'reused': False}))
+                        'tool_call_id': call_id, 'receipt': receipt, 'reused': record['reused']}))
                 await emit('tool.completed', record)
                 if isinstance(result, BaseModel):
                     return result.model_dump(mode='json', by_alias=True)
