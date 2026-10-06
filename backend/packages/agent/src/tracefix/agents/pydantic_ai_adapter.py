@@ -434,13 +434,18 @@ class PydanticAIAdapter:
                 except (ValueError, TypeError) as error:
                     raise trace.failure('tool_protocol', '工具历史校验失败：' + str(error), error) from error
             prompt = to_json(copy.deepcopy(context)).decode('utf-8')
+            if all(hasattr(self.model, name) for name in ('base_url', 'text_model', 'key')) and schema is not str:
+                from tracefix.model.prompts import serialize_request
+                prompt = serialize_request(schema, context)
+            if trace.messages:
+                prompt = None
             if runtime_options.get('preserve_resumed_request') or schema is str and trace.messages:
                 prompt = None
             if image:
                 try:
                     message_library = importlib.import_module('pydantic_ai.messages')
-                    prompt = [message_library.BinaryContent(data=image, media_type='image/png'),
-                              prompt]
+                    if prompt is not None:
+                        prompt = [prompt, message_library.BinaryContent(data=image, media_type='image/png')]
                 except (ImportError, TypeError, ValueError) as error:
                     raise trace.failure('configuration', '图片输入无法转换为 PydanticAI 内容', error) from error
             bound_tools = {spec.name: bind(spec) for spec in tools}
@@ -480,17 +485,17 @@ class PydanticAIAdapter:
             if hasattr(usage, 'model_dump'):
                 usage = usage.model_dump(mode='json')
             elif hasattr(usage, 'total_tokens'):
-                usage = copy.deepcopy(vars(usage)) if hasattr(usage, '__dict__') else {}
+                usage = {key: copy.deepcopy(value) for key, value in vars(usage).items()
+                         if not key.startswith('_')} if hasattr(usage, '__dict__') else {}
                 usage.setdefault('total_tokens', getattr(result.usage, 'total_tokens', 0))
-                usage.setdefault('request_tokens', getattr(result.usage, 'request_tokens', 0))
-                usage.setdefault('response_tokens', getattr(result.usage, 'response_tokens', 0))
+                usage.setdefault('request_tokens', usage.get('input_tokens', 0))
+                usage.setdefault('response_tokens', usage.get('output_tokens', 0))
             elif callable(usage):
                 usage = usage()
             elif not isinstance(usage, dict):
                 usage = {'total_tokens': getattr(usage, 'total_tokens', 0)}
             if boundary is not None:
-                usage = {**usage, **copy.deepcopy(boundary.usage),
-                         'raw_usage': copy.deepcopy(boundary.raw_usage)}
+                usage = copy.deepcopy(boundary.usage) or usage
             model_revision = getattr(getattr(result, 'response', None), 'model_name',
                                      getattr(self.model, 'text_model', type(self.model).__name__))
             finish_reason = getattr(getattr(result, 'response', None), 'finish_reason', None) or 'stop'

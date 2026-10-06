@@ -31,6 +31,16 @@ def causes(error):
             pending.append(linked)
 
 
+def merge_usage(target, source):
+    for key, value in source.items():
+        if type(value) is int:
+            target[key] = target.get(key, 0) + value
+        elif isinstance(value, dict):
+            merge_usage(target.setdefault(key, {}), value)
+        else:
+            target[key] = copy.deepcopy(value)
+
+
 class RequestBoundary:
     def __init__(self, gateway, schema, context, registry, phase, options):
         self.gateway, self.schema, self.context = gateway, schema, context
@@ -150,9 +160,7 @@ class RequestBoundary:
                 usage['total_tokens'] = usage['prompt_tokens'] + usage['completion_tokens']
             if type(usage.get('total_tokens')) is int and usage['total_tokens'] >= 0:
                 self.raw_usage.append(usage)
-                for key, value in usage.items():
-                    if type(value) is int:
-                        self.usage[key] = self.usage.get(key, 0) + value
+                merge_usage(self.usage, usage)
                 await self.callback('on_usage', usage)
         await self.callback('on_response', self.exchange, {
             'http_status': response.status_code, 'headers': dict(response.headers),
@@ -268,7 +276,28 @@ class AuditedStream(httpx.AsyncByteStream):
     async def aclose(self):
         if not self.closed:
             self.closed = True
-            await self.source.aclose()
+            try:
+                if not self.finished and self.failure is None:
+                    async for chunk in self.iterator:
+                        self.completion.feed(chunk)
+                        for delta in self.deltas:
+                            await self.boundary.callback('on_delta', self.boundary.exchange, delta)
+                        self.deltas.clear()
+                    await self.finalize()
+            except asyncio.CancelledError:
+                await self.boundary.finish_response(self.response, self.completion.result(),
+                                                    complete=False, validate=False)
+                raise
+            except ModelError:
+                raise
+            except Exception as error:
+                self.failure = error
+                await self.boundary.finish_response(self.response, self.completion.result(),
+                                                    complete=False, validate=False)
+                raise await self.boundary.fail('stream_incomplete', '模型流未完整结束，响应未完成',
+                    error, status='UNKNOWN_OPERATION') from error
+            finally:
+                await self.source.aclose()
 
 
 def create_http_client(boundary):

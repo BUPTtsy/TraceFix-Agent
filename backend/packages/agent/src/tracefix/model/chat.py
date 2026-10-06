@@ -163,7 +163,7 @@ async def _stream_with_adapter(message, history, project_id, library, *, tools=(
              'reasoning': {}, 'content': '', 'complete': False, 'usage': None}
 
     async def event(kind, payload):
-        if kind == 'model.stream':
+        if kind == 'model.stream' and not audit.get('wire_deltas'):
             event_value = payload.get('event')
             delta = getattr(event_value, 'delta', None)
             part = getattr(event_value, 'part', None)
@@ -188,18 +188,41 @@ async def _stream_with_adapter(message, history, project_id, library, *, tools=(
             if projected:
                 audit['message_history'] = projected
 
+    async def delta(exchange, value):
+        audit['wire_deltas'] = True
+        channel, content = value.get('channel'), value.get('delta', '')
+        if channel == 'content':
+            audit['content'] += content
+            await queue.put({'delta': content})
+        elif channel == 'reasoning':
+            audit['reasoning']['content'] = audit['reasoning'].get('content', '') + content
+            if not tools:
+                await queue.put({'reasoning': content})
+
+    def attempt(name, request, number):
+        exchange = {'request': copy.deepcopy(request), 'attempt': number, 'model': name}
+        audit.setdefault('exchanges', []).append(exchange)
+        return exchange
+
+    def response(exchange, value):
+        exchange['response'] = copy.deepcopy(value)
+
+    def usage(value):
+        audit.setdefault('raw_usage', []).append(copy.deepcopy(value))
+
     async def run():
         try:
             adapter = PydanticAIAdapter(gateway, output_retries=gateway.max_attempts - 1)
             result = await adapter.generate(str, context, tools=tools,
-                tool_pipeline=tool_pipeline, message_history=[*history[-20:], *turn],
-                agent_instructions=IDENTITY + f' 当前项目：{project_id}。', on_event=event)
+                tool_pipeline=tool_pipeline, message_history=[*history, *turn],
+                agent_instructions=IDENTITY + f' 当前项目：{project_id}。', on_event=event,
+                on_delta=delta, on_attempt=attempt, on_response=response, on_usage=usage)
             audit['usage'] = copy.deepcopy(result.usage)
             audit['model_revision'] = result.model_revision
             audit['complete'] = True
-            existing = [*history[-20:], *turn]
+            existing = [*history, *turn]
             generated = _new_framework_messages(audit.get('message_history', ()), existing)
-            yield_message = [*existing, *(generated or [
+            yield_message = [*turn, *(generated or [
                 {'role': 'assistant', 'content': result.value}])]
             await queue.put({'turn_messages': yield_message})
         except asyncio.CancelledError:
