@@ -341,11 +341,16 @@ class PydanticAIAdapter:
                             tool_name=spec.name, result=copy.deepcopy(result)) from error
                 if failed:
                     error_details = receipt.get('error') or {}
-                    failure = trace.failure('tool_execution', '工具返回失败回执',
+                    rejected_submission = (spec.submission and receipt.get('executed') is False
+                                           and error_details.get('status', 'FAILED') == 'FAILED')
+                    failure = trace.failure('output_validation' if rejected_submission else 'tool_execution',
+                        '提交被拒绝，需要补充诊断上下文' if rejected_submission else '工具返回失败回执',
                         tool_call_id=call_id, tool_name=spec.name, result=result, **{
                             key: value for key, value in error_details.items()
                             if key not in {'tool_call_id', 'tool_name', 'result',
                                            'category', 'message', 'cause'}})
+                    if rejected_submission:
+                        failure.details.update(submission_rejected=True, requires_manual_review=False)
                     await emit_failure(record, failure)
                     raise failure
                 await emit('tool.completed', record)

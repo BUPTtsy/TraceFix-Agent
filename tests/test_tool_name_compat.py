@@ -145,8 +145,10 @@ async def test_completed_tool_history_normalizes_alias_without_reexecuting(monke
         tool_registry=registry, tool_executor=handler)
     assert result.value.summary == 'done'
     assert history == original
-    assert requests[0]['messages'][0]['tool_calls'][0]['function']['name'] == 'RulesApplicable'
-    assert requests[0]['messages'][1]['name'] == 'RulesApplicable'
+    assistant = next(message for message in requests[0]['messages'] if message['role'] == 'assistant')
+    tool = next(message for message in requests[0]['messages'] if message['role'] == 'tool')
+    assert assistant['tool_calls'][0]['function']['name'] == 'RulesApplicable'
+    assert tool['name'] == 'RulesApplicable'
     assert requests[1]['messages'][-1]['content'] == '{"rules":[]}'
 
 
@@ -235,8 +237,8 @@ async def test_native_batch_noop_submissions_refresh_context_and_produce_valid_p
                 'image', 'agent_instructions', 'on_attempt', 'on_response', 'on_error', 'on_usage'}}
             return await inner.generate(schema, context, **callbacks)
 
-    async def post(client, url, **kwargs):
-        requests.append(copy.deepcopy(kwargs['json']))
+    async def handle(request):
+        requests.append(json.loads(request.content))
         context = contexts[-1]
         source = next(card for card in context['cards'] if card['path'] == 'src/value.ts')
         proposal = {'summary': '修复状态持久化', 'evidence_refs': context['available_evidence_refs'][-1:],
@@ -245,7 +247,11 @@ async def test_native_batch_noop_submissions_refresh_context_and_produce_valid_p
                               else 'export const persisted = true;\n'}]}
         return completion([call('propose_patch', 'patch-' + str(len(contexts)), proposal)])
 
-    monkeypatch.setattr(httpx.AsyncClient, 'post', post)
+    def client(boundary):
+        return httpx.AsyncClient(transport=protocol.BoundaryTransport(httpx.MockTransport(handle), boundary),
+            event_hooks={'request': [boundary.before], 'response': [boundary.received]})
+
+    monkeypatch.setattr(protocol, 'create_http_client', client)
     engine.model = NativePatches()
     await engine.run(state)
     finished = engine.store.load(state.run_id, state.scope_id)
