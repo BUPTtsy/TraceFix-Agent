@@ -546,7 +546,7 @@ class PydanticAIAdapter:
             if host_error is not None:
                 failure = trace.failure(host_error.category, str(host_error), host_error)
                 if boundary is not None:
-                    await boundary.report(failure)
+                    await boundary.report(host_error)
                 raise failure from error
             if trace.context is not None:
                 trace.observe(trace.context)

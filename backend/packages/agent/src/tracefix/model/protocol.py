@@ -3,6 +3,7 @@ import asyncio
 import copy
 import inspect
 import json
+import os
 from uuid import uuid4
 
 import httpx
@@ -59,6 +60,19 @@ class RequestBoundary:
         self.last_body = {}
         self.last_history = []
         self.reported_errors = set()
+        self.assembler = options.get('context_assembler')
+        if self.assembler is None:
+            from tracefix.knowledge.assembler import ContextAssembler, TokenCounter
+            counter = TokenCounter(encoder=lambda text: len(text.encode('utf-8')),
+                                   name='utf8_upper_bound')
+            counter.exact = False
+            try:
+                self.assembler = ContextAssembler(
+                    context_window=int(os.getenv('TRACEFIX_CONTEXT_WINDOW', '131072')),
+                    output_tokens=gateway.max_output_tokens, counter=counter)
+            except (TypeError, ValueError) as error:
+                raise ModelError('模型上下文预算配置无效', category='configuration',
+                                 details={'error': str(error)}) from error
 
     async def callback(self, name, *arguments):
         function = self.options.get(name)
@@ -117,20 +131,19 @@ class RequestBoundary:
             if message.get('role') == 'tool' and message.get('tool_call_id') in tool_names:
                 message.setdefault('name', tool_names[message['tool_call_id']])
         self.last_history = copy.deepcopy(payload['messages'])
-        assembler = self.options.get('context_assembler')
-        if assembler is not None:
-            manifest, compacted = self.gateway._budget_payload(payload, self.schema,
-                self.context, assembler, self.result_refs,
-                self.registry.contains('context.expand', self.phase), preserve=preserve)
-            await self.callback('on_context', manifest, compacted)
-            if manifest['request_tokens'] > assembler.available:
-                from tracefix.knowledge.assembler import ContextWindowError
-                raise ContextWindowError(manifest['request_tokens'], assembler.available,
-                                         ['system', 'schema', 'tools', 'tool_history'])
+        manifest, compacted = self.gateway._budget_payload(payload, self.schema,
+            self.context, self.assembler, self.result_refs,
+            self.registry.contains('context.expand', self.phase), preserve=preserve)
+        await self.callback('on_context', manifest, compacted)
+        if manifest['request_tokens'] > self.assembler.available:
+            from tracefix.knowledge.assembler import ContextWindowError
+            raise ContextWindowError(manifest['request_tokens'], self.assembler.available,
+                                     ['system', 'schema', 'tools', 'tool_history'])
         self.request_count += 1
         record = {'url': str(request.url), 'headers': {'Authorization': '[REDACTED]'},
                   'json': copy.deepcopy(payload), 'logical_exchange_id': self.logical_id,
                   'attempt': self.request_count, 'tool_round': self.tool_round,
+                  'context_manifest': copy.deepcopy(manifest),
                   'unprojected_messages': self.last_history,
                   'tool_result_refs': copy.deepcopy(self.result_refs)}
         self.requests.append(record)
@@ -179,6 +192,7 @@ class RequestBoundary:
         await self.callback('on_response', self.exchange, {
             'http_status': response.status_code, 'headers': dict(response.headers),
             'body': copy.deepcopy(body), 'stream_incomplete': not complete,
+            'billing_status': 'known' if isinstance(usage, dict) and usage in self.raw_usage else 'unknown',
             'logical_exchange_id': self.logical_id, 'attempt': self.request_count,
             'tool_round': self.tool_round, 'messages': copy.deepcopy(self.last_history)})
         if complete and validate:
