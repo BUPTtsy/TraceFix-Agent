@@ -8,7 +8,7 @@ status: in_progress
 
 ## 删除与保留
 
-删除 `runtime/worker.py` 中只为只读调查服务的 `StateGraph` 导入、单个 `investigate` 节点、START/END 连线、compile/ainvoke 外壳、child thread_id 配置及结果字典包装。Worker 直接调用现有 `DeepAgentsReadonlyAdapter.run(DeepAgentsInvestigation)`，随后校验 `SubtaskResult`。
+删除 `runtime/worker.py` 中只为只读调查服务的 `StateGraph` 导入、单个 `investigate` 节点、START/END 连线、compile/ainvoke 外壳及结果字典包装。Worker 直接调用现有 `DeepAgentsReadonlyAdapter.run(DeepAgentsInvestigation)`，随后校验 `SubtaskResult`。原有 child thread_id 交给 adapter 使用，作为 DeepAgents Agent loop 的宿主身份，不再用于创建外壳图。
 
 实际调用链：主流程 LangGraph → ReadOnlyWorker → DeepAgents Agent loop → 经 adapter 与宿主校验的 SubtaskResult。
 
@@ -18,9 +18,11 @@ status: in_progress
 
 在当前 worktree 中核查 `runtime/worker.py`、Engine 与 checkpoint 调用方：旧外壳在每次调用时创建新的 child run_id，以空输入执行图，没有按该 child thread_id 读取/恢复旧调查的业务消费者。Engine 的 resume 仍以主流程 run_id 执行主图。
 
-新路径不读取、不写入、不迁移、不删除旧调查外壳 checkpoint；已有记录留在共享 checkpoint 存储中，不参与新调查，也不作为回退。主流程 checkpoint 保持原样。
+新路径不读取、不写入、不迁移、不删除旧调查外壳 checkpoint；已有记录留在共享 checkpoint 存储中，不参与新调查，也不作为回退。主流程 checkpoint 保持原样。行为测试验证旧 child 记录不变，主图保存自身结果，DeepAgents 继承同一 saver 时仍使用新 child run_id。
 
-现有 DeepAgents 调查 Agent loop 使用 `checkpointer=None`、`store=None`，只保留单次调用内的规划/摘要状态。child Run、事件、artifact 与 usage 可用于宿主审计，不能据此声称工具级或跨进程调查断点恢复。宿主重新派发调查时仍须通过当前权限和来源版本检查。
+锁定版本中 `checkpointer=None` 允许继承父图提供的 saver；原外壳执行时 DeepAgents 已隐式继承宿主 saver 和 child thread_id。本轮保留这项继承，将 child thread_id 直接传入 adapter；不新建 saver、store 或恢复框架。脱离主图的直接调用没有 saver，因此没有持久化调查 checkpoint。
+
+现有业务没有按 child thread_id 重新进入调查 Agent loop 的恢复入口；即使宿主保存了内部 checkpoint，也不能声称提供工具级或跨进程调查断点恢复。child Run、事件、artifact 与 usage 仍可用于宿主审计。宿主重新派发调查时仍须通过当前权限和来源版本检查。
 
 ## 定向验证
 

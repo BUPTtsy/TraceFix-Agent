@@ -7,6 +7,8 @@ from typing import Any
 
 import httpx
 import pytest
+from langgraph.checkpoint.base import empty_checkpoint
+from langgraph.graph import END, START, StateGraph
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -429,8 +431,59 @@ async def test_worker_external_cancel_propagates_with_usage_and_queryable_trace(
     child = engine.store.load(child_id, state.scope_id)
     child_events = engine.store.trace(child_id, state.scope_id)
     assert child.parent_run_id == state.run_id and child.budget.model_calls == 2
-    assert any(event['type'] == 'model.error.persisted' for event in child_events)
+    assert len([event for event in child_events if event['type'] == 'model.error.persisted']) == 1
     assert not any(event['type'] == 'subtask.finished' for event in child_events)
+    assert engine.store.load(state.run_id, state.scope_id).budget == state.budget
+    assert engine.store.locked == set()
+
+
+async def test_worker_keeps_inherited_checkpoint_identity_without_loading_legacy_shell(tmp_path):
+    model = ScriptedModel()
+    engine, state, spec = worker_fixture(tmp_path, model)
+    saver = engine.graph.checkpointer
+    legacy = saver.put({'configurable': {'thread_id': 'legacy-child', 'checkpoint_ns': ''}},
+        empty_checkpoint(), {'source': 'input', 'step': -1, 'parents': {}}, {})
+    before = saver.get_tuple(legacy)
+    model.steps = [submit(worker_payload(state, spec.allowed_artifacts[0]))]
+    async def dispatch(data):
+        output = await ReadOnlyWorker(engine).run(state, spec)
+        return {'child_run_id': output.worker_id, 'status': output.status}
+    host = StateGraph(dict)
+    host.add_node('host_dispatch', dispatch)
+    host.add_edge(START, 'host_dispatch')
+    host.add_edge('host_dispatch', END)
+    output = await host.compile(checkpointer=saver).ainvoke({},
+        {'configurable': {'thread_id': state.run_id}})
+    assert output['status'] == 'completed'
+    child = engine.store.load(output['child_run_id'], state.scope_id)
+    assert child.parent_run_id == state.run_id
+    assert list(saver.list({'configurable': {'thread_id': child.run_id}}))
+    assert saver.get_tuple({'configurable': {'thread_id': state.run_id}}).checkpoint['channel_values'] == output
+    assert saver.get_tuple(legacy) == before
+    assert engine.store.load(state.run_id, state.scope_id).budget.model_calls == 1
+
+
+async def test_worker_group_child_cancel_cancels_sibling_and_propagates(tmp_path):
+    model = ScriptedModel()
+    engine, state, spec = worker_fixture(tmp_path, model)
+    entered = asyncio.Event()
+    async def cancelled(messages):
+        await asyncio.wait_for(entered.wait(), 5)
+        raise asyncio.CancelledError('child cancelled')
+    async def pending(messages):
+        entered.set()
+        await asyncio.Event().wait()
+    model.steps = [cancelled, pending]
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(ReadOnlyWorker(engine).group(state, [spec, spec]), 5)
+    assert state.budget.model_calls == 2 and state.budget.subtasks == 2
+    events = engine.store.trace(state.run_id, state.scope_id)
+    assert not any(event['type'] in {'subtask.completed', 'subtask.failed'} for event in events)
+    child_ids = [event['payload']['child_run_id'] for event in events if event['type'] == 'subtask.started']
+    assert len(child_ids) == 2
+    for child_id in child_ids:
+        assert any(event['type'] == 'model.error.persisted'
+                   for event in engine.store.trace(child_id, state.scope_id))
     assert engine.store.load(state.run_id, state.scope_id).budget == state.budget
     assert engine.store.locked == set()
 

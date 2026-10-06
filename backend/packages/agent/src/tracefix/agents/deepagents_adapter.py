@@ -2,7 +2,7 @@
 
 仅组合真实 TodoList、Summarization 和 PatchToolCalls middleware，不安装
 Filesystem、Shell、SubAgent 或 Memory middleware。框架的内部规划和压缩缓冲
-仅存活于单次调查，不创建独立 checkpoint、store 或持久化文件。
+不创建独立 checkpoint、store 或持久化文件；仅沿用宿主已有的图执行配置。
 """
 from __future__ import annotations
 
@@ -330,7 +330,7 @@ def investigation_model(configuration) -> BaseChatModel:
 class DeepAgentsReadonlyAdapter:
     def __init__(self, *, readonly_tools: Mapping[str, Callable], model: BaseChatModel | None = None,
                  audit: Callable | None = None, on_result: Callable | None = None,
-                 max_model_calls: int = 20, summarize_at: int = 24_000):
+                 max_model_calls: int = 20, summarize_at: int = 24_000, thread_id: str | None = None):
         if model is not None and not isinstance(model, BaseChatModel):
             raise DeepAgentsError('DeepAgents 必须接收 LangChain BaseChatModel', category='model_configuration')
         for name, tool in readonly_tools.items():
@@ -342,6 +342,7 @@ class DeepAgentsReadonlyAdapter:
         self._readonly_tools, self._model = dict(readonly_tools), model
         self._audit, self._on_result = audit, on_result
         self._max_model_calls, self._summarize_at = max_model_calls, summarize_at
+        self._thread_id = thread_id
 
     async def run(self, request: DeepAgentsInvestigation) -> SubtaskResult:
         if version('deepagents') != DEEPAGENTS_VERSION:
@@ -368,7 +369,8 @@ class DeepAgentsReadonlyAdapter:
         try:
             answer = await agent.ainvoke({'messages': [{'role': 'user', 'content':
                 json.dumps(request.model_dump(mode='json'), ensure_ascii=False)}]},
-                {'callbacks': [audit], 'recursion_limit': self._max_model_calls * 3 + 10})
+                {'callbacks': [audit], 'recursion_limit': self._max_model_calls * 3 + 10,
+                 'configurable': {'thread_id': self._thread_id} if self._thread_id is not None else {}})
             tools.check()
             raw = answer.get('structured_response')
             if isinstance(raw, SubtaskResult):

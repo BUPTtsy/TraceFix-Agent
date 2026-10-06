@@ -157,7 +157,7 @@ class ReadOnlyWorker:
                     adapter = DeepAgentsReadonlyAdapter(
                         readonly_tools=self._tools(child, spec, check, versions),
                         audit=self._audit(child, check),
-                        max_model_calls=getattr(selected, 'max_tool_rounds', 40))
+                        max_model_calls=getattr(selected, 'max_tool_rounds', 40), thread_id=child.run_id)
                     result = SubtaskResult.model_validate(await adapter.run(request))
                 if result.worker_generation != spec.generation or result.source_manifest != source_manifest:
                     raise ValueError('worker 返回的 generation/source 版本已过期')
@@ -200,6 +200,10 @@ class ReadOnlyWorker:
             try:
                 return await self.run(state, spec)
             except asyncio.CancelledError:
+                if not asyncio.current_task().cancelling():
+                    for task in tasks:
+                        if task is not asyncio.current_task():
+                            task.cancel()
                 raise
             except Exception as error:
                 self.engine.event(state, 'subtask.failed', {'role': spec.role,
