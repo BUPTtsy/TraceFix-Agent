@@ -80,7 +80,13 @@ class Gateway(ModelProtocol):
 
     async def generate(self, schema, context, **runtime_options):
         from tracefix.agents.pydantic_ai_adapter import PydanticAIAdapter
-        return await PydanticAIAdapter(self).generate(schema, context, **runtime_options)
+        options = dict(runtime_options)
+        if 'message_history' not in options and 'messages' in options:
+            options['message_history'] = options['messages']
+        options.pop('messages', None)
+        if 'tool_executor' not in options and self.tool_executor is not None:
+            options['tool_executor'] = self.tool_executor
+        return await PydanticAIAdapter(self).generate(schema, context, **options)
 
     @staticmethod
     def delegation_tools():

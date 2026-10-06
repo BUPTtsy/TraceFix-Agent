@@ -197,7 +197,8 @@ class PydanticAIAdapter:
                     type('Registry', (), {'specs': tools, 'contains': lambda *_: False})(),
                     context.get('phase') or 'DIAGNOSE', {
                         **runtime_options, 'agent_instructions': agent_instructions,
-                        'on_event': on_event})
+                        'on_event': on_event,
+                        'framework_output_tool_names': framework_output_tool_names})
                 client = create_http_client(boundary)
                 provider = OpenAIProvider(base_url=self.model.base_url,
                     api_key=self.model.key, http_client=client)
@@ -327,12 +328,14 @@ class PydanticAIAdapter:
         submission_spec = next((spec for spec in tools if spec.submission
                                 and spec.submission_schema is not None), None)
         output_type = schema
+        framework_output_tool_names = {'final_result'}
         if submission_spec is not None:
             try:
                 output_module = importlib.import_module('pydantic_ai')
                 output_type = [schema, output_module.ToolOutput(
                     submission_spec.submission_schema, name=submission_spec.wire_name,
                     max_retries=0)]
+                framework_output_tool_names.add(submission_spec.wire_name)
             except AttributeError:
                 output_type = schema
 

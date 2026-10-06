@@ -162,13 +162,23 @@ class RequestBoundary:
             if calls:
                 if choice.get('finish_reason') != 'tool_calls':
                     raise await self.fail('tool_protocol', '工具响应缺少成功终止原因')
-                if self.tool_round >= self.gateway.max_tool_rounds:
-                    raise await self.fail('tool_protocol', '模型工具轮次已达到上限')
-                try:
-                    self.registry.validate_batch(calls, self.phase, self.completed, wire_names=True)
-                except (ValueError, TypeError) as error:
-                    raise await self.fail('tool_protocol', str(error), error)
-                self.tool_round += 1
+                output_names = set(self.options.get('framework_output_tool_names') or ())
+                output_calls = [call for call in calls
+                                if isinstance(call, dict)
+                                and isinstance(call.get('function'), dict)
+                                and call['function'].get('name') in output_names]
+                runtime_calls = [call for call in calls if call not in output_calls]
+                if output_calls and runtime_calls:
+                    raise await self.fail('tool_protocol', '结构化输出不能与运行时工具混合')
+                if runtime_calls:
+                    if self.tool_round >= self.gateway.max_tool_rounds:
+                        raise await self.fail('tool_protocol', '模型工具轮次已达到上限')
+                    try:
+                        self.registry.validate_batch(runtime_calls, self.phase, self.completed,
+                                                     wire_names=True)
+                    except (ValueError, TypeError) as error:
+                        raise await self.fail('tool_protocol', str(error), error)
+                    self.tool_round += 1
             elif choice.get('finish_reason') != 'stop' or message.get('refusal'):
                 raise await self.fail('incomplete_output', '模型响应未正常结束',
                                      finish_reason=choice.get('finish_reason'))
