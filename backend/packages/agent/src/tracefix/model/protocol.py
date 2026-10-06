@@ -207,6 +207,8 @@ class RequestBoundary:
             message = choice.get('message')
             if not isinstance(message, dict):
                 raise await self.fail('malformed_response', '模型响应缺少完整消息')
+            if message.get('content') is not None and not isinstance(message['content'], str):
+                raise await self.fail('malformed_response', '模型消息正文必须为字符串')
             calls = message.get('tool_calls')
             if calls:
                 if choice.get('finish_reason') != 'tool_calls':

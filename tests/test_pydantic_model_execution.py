@@ -16,7 +16,7 @@ from tracefix.agents.pydantic_ai_adapter import PydanticAIAdapter, PydanticAIAda
 from tracefix.model import protocol
 from tracefix.model.chat import stream_tool_chat
 from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
-from tracefix.runtime.tools import ToolPipeline, ToolRegistry, ToolSpec
+from tracefix.runtime.tools import ToolPipeline, ToolRegistry, ToolResult, ToolSpec
 
 
 class Output(BaseModel):
@@ -224,3 +224,151 @@ async def test_provider_validates_whole_batch_before_any_write(monkeypatch):
         await Gateway(key='fake', stream=False).generate(Output, {}, tools=[spec],
             tool_executor=lambda *args: pytest.fail('invalid batch cannot execute'))
     assert raised.value.category == 'tool_protocol'
+
+
+async def test_every_request_has_budget_and_raw_usage_even_during_output_correction(monkeypatch):
+    vendor_usage = {'prompt_tokens': 5, 'completion_tokens': 3, 'total_tokens': 8,
+                    'prompt_tokens_details': {'cached_tokens': 4},
+                    'completion_tokens_details': {'reasoning_tokens': 2}}
+    requests = transport(monkeypatch, [response('{"answer":"invalid"}', usage=vendor_usage),
+                                       response(usage=vendor_usage)])
+    attempts, manifests, usages = [], [], []
+    result = await Gateway(key='fake', stream=False).generate(Output, {},
+        on_attempt=lambda name, record, number: attempts.append(record),
+        on_context=lambda manifest, compacted: manifests.append(manifest),
+        on_usage=usages.append)
+    assert len(requests) == len(attempts) == len(manifests) == len(usages) == 2
+    assert all(record['context_manifest'] == manifest for record, manifest in zip(attempts, manifests))
+    assert all(manifest['request_tokens'] <= manifest['input_limit'] for manifest in manifests)
+    assert all(manifest['exact_tokenizer'] is False for manifest in manifests)
+    assert result.usage['prompt_tokens_details']['cached_tokens'] == 8
+    assert result.usage['completion_tokens_details']['reasoning_tokens'] == 4
+    assert usages == [vendor_usage, vendor_usage]
+
+
+@pytest.mark.parametrize('schema', [Output, str])
+async def test_context_budget_exhaustion_preserves_pause_without_sending(monkeypatch, schema):
+    requests = transport(monkeypatch, [])
+    monkeypatch.setenv('TRACEFIX_CONTEXT_WINDOW', '4096')
+    errors = []
+    with pytest.raises(ModelError) as raised:
+        await Gateway(key='fake', stream=False, max_output_tokens=256).generate(schema,
+            {'instruction': 'protected' * 10000},
+            messages=[{'role': 'user', 'content': 'protected' * 10000}] if schema is str else None,
+            on_error=lambda exchange, error: errors.append(error))
+    assert requests == []
+    assert raised.value.category == 'context_window'
+    assert raised.value.status == 'PAUSED'
+    assert raised.value.details['requires_manual_review'] is False
+    assert len(errors) == 1
+
+
+async def test_completed_tool_before_disconnect_keeps_serializable_audit_and_receipt(monkeypatch):
+    requests = transport(monkeypatch, [response(None, calls=[call()], finish='tool_calls'),
+                                       httpx.ReadError('disconnected after tool')])
+    errors, executed = [], []
+
+    def port(name, arguments, call_id):
+        executed.append(call_id)
+        return {'evidence_ref': 'completed-evidence'}
+
+    with pytest.raises(ModelError) as raised:
+        await Gateway(key='fake', stream=False).generate(Output, {}, tools=[tool_spec()],
+            tool_executor=port, on_error=lambda exchange, error: errors.append(error))
+    assert raised.value.status == 'UNKNOWN_OPERATION'
+    assert len(requests) == 2
+    assert executed == ['provider-call-9']
+    assert len(errors) == 1
+    assert errors[0]['tool_results'][0]['tool_call_id'] == 'provider-call-9'
+    assert errors[0]['tool_results'][0]['result'] == {'evidence_ref': 'completed-evidence'}
+    assert errors[0]['message_history'][-1]['tool_call_id'] == 'provider-call-9'
+    assert errors[0]['usage']['total_tokens'] == 8
+    json.dumps(errors[0])
+
+
+async def test_unknown_receipt_is_preserved_when_result_and_error_callbacks_fail(monkeypatch):
+    requests = transport(monkeypatch, [response(None, calls=[call()], finish='tool_calls')])
+
+    def fail_callback(*arguments):
+        raise ValueError('audit callback unavailable')
+
+    def port(name, arguments, call_id):
+        return ToolResult(call_id=call_id, name=name, isError=True, executed=True,
+            error={'status': 'UNKNOWN_OPERATION', 'operation_id': 'operation-9'})
+
+    with pytest.raises(ModelError) as raised:
+        await Gateway(key='fake', stream=False).generate(Output, {}, tools=[tool_spec()],
+            tool_executor=port, on_tool_result=fail_callback, on_error=fail_callback)
+    assert len(requests) == 1
+    assert raised.value.category == 'tool_execution'
+    assert raised.value.status == 'UNKNOWN_OPERATION'
+    assert raised.value.details['operation_id'] == 'operation-9'
+    assert 'callback_error' in raised.value.details
+    assert 'audit_callback_error' in raised.value.details
+
+
+@pytest.mark.parametrize('body', [[], {'choices': [None]}, {'choices': []},
+    {'choices': [{'finish_reason': 'stop', 'message': None}]},
+    {'choices': [{'finish_reason': 'stop', 'message': {'content': {'answer': 42}}}]}])
+async def test_provider_envelope_failures_are_distinct_from_typed_output_validation(monkeypatch, body):
+    requests = transport(monkeypatch, [httpx.Response(200, json=body)])
+    with pytest.raises(ModelError) as raised:
+        await Gateway(key='fake', stream=False).generate(Output, {})
+    assert len(requests) == 1
+    assert raised.value.category == 'malformed_response'
+
+
+async def test_multiple_submission_output_calls_are_rejected_before_execution(monkeypatch):
+    requests = transport(monkeypatch, [response(None, finish='tool_calls', calls=[
+        call('SubmitAnswer', 'first', {'answer': 42}),
+        call('SubmitAnswer', 'second', {'answer': 43})])])
+    spec = ToolSpec('submit.answer', 'Submit answer', Output, side_effect='write',
+        idempotency_key=lambda value: str(value.answer), submission=True, submission_schema=Output)
+    with pytest.raises(ModelOutputError) as raised:
+        await Gateway(key='fake', stream=False).generate(Output, {}, tools=[spec],
+            tool_executor=lambda *arguments: pytest.fail('ambiguous submission cannot execute'))
+    assert raised.value.category == 'tool_protocol'
+    assert len(requests) == 1
+
+
+async def test_submission_validation_after_execution_never_retries_effect(monkeypatch):
+    requests = transport(monkeypatch, [response(None, finish='tool_calls', calls=[
+        call('SubmitAnswer', 'submitted', {'answer': 42})])])
+    spec = ToolSpec('submit.answer', 'Submit answer', Output, side_effect='write',
+        idempotency_key=lambda value: str(value.answer), submission=True, submission_schema=Output)
+    executed = []
+
+    def submit(name, arguments, call_id):
+        executed.append(call_id)
+        return {'saved': True}
+
+    def validate(output):
+        raise ValueError('host postcondition unavailable')
+
+    with pytest.raises(ModelOutputError) as raised:
+        await Gateway(key='fake', stream=False, max_attempts=3).generate(Output, {},
+            tools=[spec], tool_executor=submit, validate_output=validate)
+    assert raised.value.status == 'UNKNOWN_OPERATION'
+    assert len(requests) == 1
+    assert executed == ['submitted']
+
+
+async def test_runtime_model_settings_reach_framework_provider(monkeypatch):
+    requests = transport(monkeypatch, [response()])
+    await Gateway(key='fake', stream=False).generate(Output, {},
+        model_settings={'temperature': 0.2, 'top_p': 0.7,
+                        'extra_body': {'vendor_flag': 'keep'}})
+    assert requests[0]['temperature'] == 0.2
+    assert requests[0]['top_p'] == 0.7
+    assert requests[0]['vendor_flag'] == 'keep'
+
+
+async def test_sent_request_cancellation_propagates_and_is_audited(monkeypatch):
+    requests = transport(monkeypatch, [asyncio.CancelledError()])
+    errors = []
+    with pytest.raises(asyncio.CancelledError):
+        await Gateway(key='fake', stream=False).generate(Output, {},
+            on_error=lambda exchange, error: errors.append(error))
+    assert len(requests) == len(errors) == 1
+    assert errors[0]['category'] == 'cancelled'
+    assert errors[0]['status'] == 'UNKNOWN_OPERATION'
