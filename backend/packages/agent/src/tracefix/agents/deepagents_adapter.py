@@ -220,6 +220,7 @@ class _RequestAudit(BaseCallbackHandler):
     def __init__(self, sink: Callable | None, limit: int):
         self._sink, self._limit = sink, limit
         self._requests: dict[str, dict] = {}
+        self.cancelled: asyncio.CancelledError | None = None
         self.usage = {'model_calls': 0, 'tokens': 0, 'cost_usd': 0.0}
 
     def _emit(self, event, payload):
@@ -269,6 +270,8 @@ class _RequestAudit(BaseCallbackHandler):
             'response': response.model_dump(mode='json')})
 
     def on_llm_error(self, error, *, run_id, **kwargs):
+        if isinstance(error, asyncio.CancelledError):
+            self.cancelled = error
         body = getattr(error, 'body', None)
         if isinstance(body, dict) and isinstance(body.get('usage'), dict):
             self._record_usage(str(run_id), body['usage'])
@@ -376,6 +379,8 @@ class DeepAgentsReadonlyAdapter:
         except (asyncio.CancelledError, TimeoutError, ModelError):
             raise
         except Exception as error:
+            if audit.cancelled is not None:
+                raise audit.cancelled from error
             if getattr(error, 'status', None) == 'UNKNOWN_OPERATION':
                 raise
             known = getattr(error, 'status_code', None)

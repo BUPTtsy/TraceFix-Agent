@@ -136,7 +136,7 @@ async def test_real_framework_plans_investigates_and_returns_schema(phase):
     assert {args['call_id'] for name, args in injected} == {'read-1', 'grep-1', 'glob-1'}
     assert delivered == [output] and delivered[0] is not output
     assert len([item for item in audit if item[0] == 'request']) == 3
-    registered = {tool['function']['name'] for tool in model.calls[0][1]['tools']}
+    registered = {tool.name for tool in model.calls[0][1]['tools']}
     assert registered == {'Read', 'Grep', 'Glob', 'write_todos', 'SubtaskResult'}
 
 
