@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from tracefix.agents.pydantic_ai_adapter import PydanticAIAdapter, PydanticAIAdapterError
 from tracefix.model.gateway import Gateway
+from tracefix.model.streaming import CompletionStream, StreamProtocolError
 from tracefix.storage.artifacts import redact
 from tracefix.runtime.validation_feedback import _public
 
@@ -98,6 +99,37 @@ def _new_framework_messages(projected, existing):
             continue
         result.append(message)
     return result
+
+
+async def _chat_events(response, sources, audit):
+    if not response.is_success:
+        await response.aread()
+        raise ValueError(f'对话模型请求失败：HTTP {response.status_code}')
+    yield {'sources': [{field: record[field] for field in ('id', 'title', 'version')}
+                       for record in sources]}
+    deltas = []
+    stream = CompletionStream(on_delta=deltas.append)
+    try:
+        async for chunk in response.aiter_bytes():
+            stream.feed(chunk)
+            while deltas:
+                delta = deltas.pop(0)
+                channel = delta.get('channel')
+                if channel == 'reasoning':
+                    field = 'reasoning_content'
+                    audit['reasoning'][field] = audit['reasoning'].get(field, '') + delta['delta']
+                    yield {'reasoning': delta['delta']}
+                elif channel == 'content':
+                    audit['content'] += delta['delta']
+                    yield {'delta': delta['delta']}
+        body = stream.finish()
+    except (StreamProtocolError, httpx.HTTPError) as error:
+        raise ValueError('对话流未完整结束，响应未完成') from error
+    audit['usage'] = body.get('usage')
+    choice = body['choices'][0]
+    if choice.get('finish_reason') != 'stop' or not (body['choices'][0]['message'].get('content') or '').strip():
+        raise ValueError('对话流异常终止，响应未完成')
+    audit['complete'] = True
 
 
 async def _stream_with_adapter(message, history, project_id, library, *, tools=(),
