@@ -6,7 +6,7 @@ import pytest
 
 from tracefix.model.gateway import BrowserPolicyRouter, Gateway, ModelError, ModelResult
 from tracefix.runtime.contracts import BrowserAction, Decision
-from tracefix.model.chat import _chat_events
+from tracefix.model.chat import stream_chat
 from tracefix.model import protocol
 
 
@@ -82,24 +82,18 @@ def gateway_defaults(monkeypatch):
     [b'data: invalid\n\n', event(finish='stop'), b'data: [DONE]\n\n'],
     [b'data: {"error":{"message":"failed"}}\n\n'],
 ])
-async def test_chat_rejects_incomplete_or_invalid_response(fragments):
-    audit = {'reasoning': {}, 'content': '', 'complete': False}
-    response = stream_response(fragments)
-    with pytest.raises(ValueError, match='响应未完成'):
-        async for item in _chat_events(response, [], audit):
-            pass
-    assert audit['complete'] is False
-    await response.aclose()
+async def test_chat_rejects_incomplete_or_invalid_response(monkeypatch, fragments):
+    use_transport(monkeypatch, [stream_response(fragments)])
+    with pytest.raises(ModelError):
+        await Gateway(key='fake', stream=True).generate(str, {'message': 'hello'})
 
 
-async def test_chat_requires_successful_finish_and_done():
-    audit = {'reasoning': {}, 'content': '', 'complete': False}
-    response = final_stream(content='complete')
-    events = [item async for item in _chat_events(response, [], audit)]
+async def test_chat_requires_successful_finish_and_done(monkeypatch):
+    use_transport(monkeypatch, [final_stream(content='complete')])
+    monkeypatch.setenv('TRACEFIX_API_KEY', 'fake')
+    events = [item async for item in stream_chat('hello', [], 'scope', None, False)]
     assert {'delta': 'complete'} in events
-    assert audit['complete'] is True and audit['content'] == 'complete'
-    assert audit['usage'] == {'total_tokens': 3}
-    await response.aclose()
+    assert events[-1]['turn_messages'][-1]['content'] == 'complete'
 
 
 async def test_default_thinking_streams_before_completion_and_preserves_usage(monkeypatch):

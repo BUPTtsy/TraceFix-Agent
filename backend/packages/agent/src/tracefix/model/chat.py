@@ -10,11 +10,9 @@ import time
 from collections.abc import AsyncIterator
 from uuid import uuid4
 
-import httpx
-
 from tracefix.agents.pydantic_ai_adapter import PydanticAIAdapter, PydanticAIAdapterError
 from tracefix.model.gateway import Gateway
-from tracefix.model.streaming import CompletionStream, StreamProtocolError
+from tracefix.model.history import ModelProtocol
 from tracefix.storage.artifacts import redact
 from tracefix.runtime.validation_feedback import _public
 
@@ -29,51 +27,7 @@ IDENTITY = (
 
 def _history_dict(messages):
     """Project framework messages to the chat turn contract without reimplementing its loop."""
-    result = []
-    for message in messages or ():
-        if isinstance(message, dict):
-            if message.get('role') in {'assistant', 'tool'}:
-                result.append(copy.deepcopy(message))
-            continue
-        kind = getattr(message, 'kind', None)
-        parts = getattr(message, 'parts', ())
-        if kind == 'request':
-            for part in parts:
-                part_kind = getattr(part, 'part_kind', None)
-                if part_kind in {'system-prompt', 'user-prompt'}:
-                    content = getattr(part, 'content', '')
-                    if isinstance(content, str):
-                        result.append({'role': 'system' if part_kind == 'system-prompt' else 'user',
-                                       'content': content})
-                elif part_kind == 'tool-return':
-                    content = getattr(part, 'content', '')
-                    if not isinstance(content, str):
-                        content = json.dumps(content, ensure_ascii=False, default=str)
-                    result.append({'role': 'tool',
-                                   'tool_call_id': getattr(part, 'tool_call_id', ''),
-                                   'name': getattr(part, 'tool_name', ''),
-                                   'content': content})
-        elif kind == 'response':
-            calls = []
-            content = None
-            reasoning = None
-            for part in parts:
-                part_kind = getattr(part, 'part_kind', None)
-                if part_kind == 'text':
-                    content = getattr(part, 'content', '')
-                elif part_kind == 'thinking':
-                    reasoning = getattr(part, 'content', '')
-                elif part_kind == 'tool-call':
-                    calls.append({'id': getattr(part, 'tool_call_id', ''), 'type': 'function',
-                                  'function': {'name': getattr(part, 'tool_name', ''),
-                                               'arguments': getattr(part, 'args', '{}')}})
-            item = {'role': 'assistant', 'content': content}
-            if reasoning:
-                item['reasoning_content'] = reasoning
-            if calls:
-                item['tool_calls'] = calls
-            result.append(item)
-    return result
+    return ModelProtocol.message_history(messages or ())
 
 
 def _history_key(message):
@@ -101,37 +55,6 @@ def _new_framework_messages(projected, existing):
             continue
         result.append(message)
     return result
-
-
-async def _chat_events(response, sources, audit):
-    if not response.is_success:
-        await response.aread()
-        raise ValueError(f'对话模型请求失败：HTTP {response.status_code}')
-    yield {'sources': [{field: record[field] for field in ('id', 'title', 'version')}
-                       for record in sources]}
-    deltas = []
-    stream = CompletionStream(on_delta=deltas.append)
-    try:
-        async for chunk in response.aiter_bytes():
-            stream.feed(chunk)
-            while deltas:
-                delta = deltas.pop(0)
-                channel = delta.get('channel')
-                if channel == 'reasoning':
-                    field = 'reasoning_content'
-                    audit['reasoning'][field] = audit['reasoning'].get(field, '') + delta['delta']
-                    yield {'reasoning': delta['delta']}
-                elif channel == 'content':
-                    audit['content'] += delta['delta']
-                    yield {'delta': delta['delta']}
-        body = stream.finish()
-    except (StreamProtocolError, httpx.HTTPError) as error:
-        raise ValueError('对话流未完整结束，响应未完成') from error
-    audit['usage'] = body.get('usage')
-    choice = body['choices'][0]
-    if choice.get('finish_reason') != 'stop' or not (body['choices'][0]['message'].get('content') or '').strip():
-        raise ValueError('对话流异常终止，响应未完成')
-    audit['complete'] = True
 
 
 async def _stream_with_adapter(message, history, project_id, library, *, tools=(),
