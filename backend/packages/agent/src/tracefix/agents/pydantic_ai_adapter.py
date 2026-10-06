@@ -95,11 +95,13 @@ class PydanticAIAdapter:
 
     ``generate`` returns the supplied schema type or raises
     ``PydanticAIAdapterError``. Tools use existing ``ToolSpec`` definitions and
-    ``tool_executor(name, arguments, tool_call_id)``; only read/none tools with
-    approval='never' are accepted. The port retains scope, evidence and policy
-    enforcement. ``on_event(kind, payload)`` may be synchronous or asynchronous.
-    PydanticAI handles bounded output correction within one run; tool failures
-    and interrupted streams terminate the run. No adapter state is persisted.
+    ``tool_executor(name, arguments, tool_call_id)`` or ``ToolPipeline``. The
+    port retains scope, evidence, approval and policy enforcement. Read-only
+    tools may run in parallel; effectful tools are sequential and never retried
+    by the adapter. ``on_event(kind, payload)`` may be synchronous or
+    asynchronous. PydanticAI handles bounded output correction within one run;
+    tool failures and interrupted streams terminate the run. No adapter state
+    is persisted.
     """
 
     def __init__(self, model: Any, *, output_retries: int = 1):
@@ -270,7 +272,7 @@ class PydanticAIAdapter:
                         await _resolve(context_provider())
                     spec.validate(arguments)
                 except (ValueError, TypeError) as error:
-                    raise trace.failure('tool_protocol', '只读工具参数校验失败', error,
+                    raise trace.failure('tool_protocol', '工具参数校验失败', error,
                         tool_call_id=call_id, tool_name=spec.name, arguments=arguments) from error
                 record = {'tool_call_id': call_id, 'tool_name': spec.name,
                           'arguments': copy.deepcopy(arguments), 'reused': False, **snapshot}
@@ -296,7 +298,7 @@ class PydanticAIAdapter:
                             raise PydanticAIAdapterError('模型工具未绑定执行端口', category='tool_execution',
                                                          details={'tool_call_id': call_id, 'tool_name': spec.name})
                     except Exception as error:
-                        failure = trace.failure('tool_execution', '只读工具执行失败', error,
+                        failure = trace.failure('tool_execution', '工具执行失败', error,
                             tool_call_id=call_id, tool_name=spec.name, arguments=arguments)
                         await emit_failure(record, failure)
                         raise failure from error
@@ -304,7 +306,7 @@ class PydanticAIAdapter:
                 receipt = result.model_dump(by_alias=True) if isinstance(result, BaseModel) else result
                 if isinstance(receipt, dict) and (receipt.get('isError') or receipt.get('is_error')):
                     error_details = receipt.get('error') or {}
-                    failure = trace.failure('tool_execution', '只读工具返回失败回执',
+                    failure = trace.failure('tool_execution', '工具返回失败回执',
                         tool_call_id=call_id, tool_name=spec.name, result=result, **{
                             key: value for key, value in error_details.items()
                             if key not in {'tool_call_id', 'tool_name', 'result',
