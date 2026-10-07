@@ -140,9 +140,20 @@ def dispatch(operation, fields, *, library=None, projects_path=None, data_root=N
                 record['issueReport'] = artifacts.json(record['projectId'], record['agentRunId'], report_ref)
             issue_refs = {ref for issue in (record['issueReport'] or {}).get('issues', [])
                           for ref in issue.get('evidence_refs', [])}
+            report = record['issueReport'] or {}
+            check_refs = {ref for item in report.get('check_results', [])
+                          for ref in item.get('evidence_refs', [])}
+            check_refs.update(report.get('check_result_refs', []))
+            check_refs.update(report.get('initial_check_result_refs', []))
+            check_refs.update(image['ref'] for image in report.get('images', []) if image.get('ref'))
+            if report.get('check_plan_ref'):
+                check_refs.add(report['check_plan_ref'])
+            record.update({key: report[key] for key in
+                           ('check_plan', 'check_results', 'check_summary', 'overall_status', 'images')
+                           if key in report})
             knowledge_refs = {entry['artifact_ref'] for entry in record.get('knowledge', [])}
             record['artifacts'] = [{'ref': ref, 'label': entry['用途'], 'bytes': entry['字节数']} for ref, entry in index.items()
-                                   if ref.endswith(('.diff', '.html')) or ref == report_ref or ref in knowledge_refs or ref in issue_refs
+                                   if ref.endswith(('.diff', '.html')) or ref == report_ref or ref in knowledge_refs or ref in issue_refs or ref in check_refs
                                    or any(name in entry['用途'] for name in ('修复报告数据', '完整事件数据', '继续执行前状态', '_阶段轨迹'))]
         return record
     if operation == 'run.trace':

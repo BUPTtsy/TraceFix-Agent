@@ -188,7 +188,7 @@ const server = http.createServer(async (req,res) => {
       res.writeHead(200, {'Content-Type': mime[extension] || 'text/plain; charset=utf-8',
         'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(ref)}`,
         'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store',
-        ...(extension === '.html' ? {'Content-Security-Policy': "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; sandbox"} : {})});
+        ...(extension === '.html' ? {'Content-Security-Policy': "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; sandbox"} : {})});
       return res.end(Buffer.from(artifact.content, 'base64'));
     }
     if (url.pathname === '/api/knowledge' && req.method === 'GET') return send(res, 200, await bridge('documents', {projectId: url.searchParams.get('projectId') || undefined, query: url.searchParams.get('q') || ''}));

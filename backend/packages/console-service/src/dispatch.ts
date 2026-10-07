@@ -73,7 +73,12 @@ export function createConsoleService(options: ConsoleOptions = {}) {
       record.agentRunId, record.reportRef, index) : new Set<string>();
     const artifacts = Object.entries(index).filter(([ref]) => allowed.has(ref))
       .map(([ref, entry]) => ({ref, label: entry['用途'], bytes: entry['字节数']}));
+    const issueReport = record.reportRef && allowed.has(record.reportRef) ?
+      JSON.parse(readArtifact(artifactRoot(record), record.projectId, record.agentRunId, record.reportRef)) : null;
+    const checkReport = Object.fromEntries(['check_plan', 'check_results', 'check_summary', 'overall_status', 'images']
+      .filter(key => issueReport && key in issueReport).map(key => [key, issueReport[key]]));
     return {...record, canContinue: canContinue(record.status, record.outcome), artifacts,
+      issueReport, ...checkReport,
       ruleSnapshot: record.agentRunId ? rules.snapshot(record.agentRunId) : null};
   }
 

@@ -54,7 +54,9 @@ export function evidenceClosure(root: string, projectId: string, runId: string, 
     if (finished?.payload?.html_ref) pending.push(finished.payload.html_ref);
   }
   const edges = new Set(['evidence_refs', 'validation_refs', 'baseline_validation_refs', 'patch_diff_ref',
-    'artifact_ref', 'observation_ref', 'screenshot_ref', 'checkpoint_refs', 'issue_report_ref']);
+    'artifact_ref', 'observation_ref', 'screenshot_ref', 'checkpoint_refs', 'issue_report_ref',
+    'check_plan_ref', 'check_result_refs', 'initial_check_result_refs']);
+  const containers = new Set(['issues', 'issue_report', 'check_plan', 'check_results', 'items']);
   let bytes = 0;
   function collect(value: unknown, depth = 0): void {
     if (depth > 16) throw new DataError('证据嵌套超出边界');
@@ -67,7 +69,14 @@ export function evidenceClosure(root: string, projectId: string, runId: string, 
             pending.push(ref);
             if (pending.length > 512) throw new DataError('证据引用超出边界');
           }
-        } else if (key === 'issues' || key === 'issue_report') collect(item, depth + 1);
+        } else if (key === 'images') {
+          if (!Array.isArray(item)) throw new DataError('图片证据格式无效');
+          collect(item.map(image => {
+            if (!image || typeof image !== 'object' || typeof image.ref !== 'string' ||
+                !image.ref.endsWith('.png') || image.mime !== 'image/png') throw new DataError('图片证据引用无效');
+            return {screenshot_ref: image.ref};
+          }), depth + 1);
+        } else if (containers.has(key)) collect(item, depth + 1);
       }
     }
   }
