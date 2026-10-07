@@ -19,6 +19,7 @@
 - tools/checks/check_api.py：经真实框架验证 typed output、图片、合成工具端口及每次请求预算。
 - tests/test_pydantic_ai_adapter.py、tests/test_pydantic_model_execution.py、tests/test_pydantic_api_check.py：fake 适配器、真实 FunctionModel 和 MockTransport 离线协议验证。
 - tests/test_gateway_retries.py、tests/test_gateway_streaming.py、tests/test_chat_streaming.py、tests/test_skill_prompt_cache.py、tests/test_tool_name_compat.py：迁移模型及 Chat 协议测试。
+- 已删除旧的 tests/test_api_configuration.py、tests/test_native_tools.py、tests/test_retry_regressions.py；这些测试直接 monkeypatch 旧 HTTP `post`/网关 sleep，或断言已删除的自动重试和手写工具循环，分别由 PydanticAI 离线适配器、真实 FunctionModel/MockTransport 和新的 API 检查测试覆盖。
 
 ## 执行和治理契约
 
