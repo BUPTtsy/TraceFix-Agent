@@ -1,5 +1,5 @@
 ---
-status: in_progress
+status: completed
 ---
 
 # 只读调查调用链收敛记录
@@ -48,4 +48,6 @@ status: in_progress
 
 ## 遗留测试清理
 
-按后续要求删除阶段二的两项遗留测试：使用 TRACEFIX_WORKER 开关的 fake 诊断不可用测试，以及通过 engine.model_call/tool_pipeline 直接执行只读调查的旧测试；同时删除其无用导入。保留已改为真实 DeepAgents Agent loop 的 Worker 行为测试、单 Agent 宿主授权检查与主诊断校验。DeepAgents 测试中的旧入口禁止调用断言及旧 checkpoint 不被读取断言验证的是当前迁移边界，继续保留。生产代码没有新增改动，定向测试结果待补齐。
+按后续要求删除阶段二的两项遗留测试：使用 TRACEFIX_WORKER 开关的 fake 诊断不可用测试，以及通过 engine.model_call/tool_pipeline 直接执行只读调查的旧测试；同时删除其无用导入。保留已改为真实 DeepAgents Agent loop 的 Worker 行为测试、单 Agent 宿主授权检查与主诊断校验。DeepAgents 测试中的旧入口禁止调用断言及旧 checkpoint 不被读取断言验证的是当前迁移边界，继续保留。生产代码没有新增改动。
+
+清理后定向验证：`python -m pytest -q tests/test_phase2_diagnosis.py` 为 5 passed（15.50 秒）；`python -m pytest -q tests/test_deepagents_adapter.py -k 'direct_deepagents or scope_rejection'` 为 6 passed、70 deselected（14.20 秒）。旧开关和直接 executor 测试已无引用；`git diff 93149f2 --check` 通过。没有运行全项目基线，没有 push。
