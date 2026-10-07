@@ -2136,6 +2136,7 @@ class Engine:
                                                'observation': self.get(s, observation_ref)})
                 if observation_ref not in s.evidence_refs:
                     s.evidence_refs.append(observation_ref)
+        self.store.save(s)
         context['available_evidence_refs'] = list(dict.fromkeys(context['available_evidence_refs'] + s.evidence_refs))
         context.update(instruction='请诊断并提出最小局部补丁。优先 Read 取得当前 overlay_hash/revision，使用唯一 exact anchor 的 Edit(edits) 生成候选；检查真实 diff 后提交 staged_refs。运行时物化完整内容，模型无需重写未变全文。兼容旧 whole edits。只能编辑当前允许的文件并引用已有证据，失败按 error_code 重读/修正。',
                        allowed_files=self.workspace.allowed_files, repair_memory=recipes, retrieval_ids=[x['id'] for x in code],

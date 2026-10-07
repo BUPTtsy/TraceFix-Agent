@@ -116,6 +116,7 @@ def make_engine(root, bugfree=False, runner_fail=None, flaky=False):
     runner=FakeRunner(state.source_manifest,runner_fail);browser=FakeBrowser(workspace,bugfree,flaky)
     engine=Engine(store,artifacts,scopes,ctx,profile,workspace,runner,browser,FakeModel(workspace),
                   Retriever(store,scopes,ctx),source,InMemorySaver())
+    engine.subagent_enabled = False
     return engine,state
 
 
