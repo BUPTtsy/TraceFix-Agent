@@ -13,8 +13,8 @@ from tracefix.execution.repository import safe_index_files
 from tracefix.knowledge.retrieval import Retriever
 from tracefix.knowledge.scope import ScopeResolver
 from tracefix.model.gateway import ModelResult
-from tracefix.runtime.contracts import (Assertion, BrowserAction, Decision, FileEdit, Locator,
-    PatchProposal, ReproductionPlan, RunState, TestSpec, digest, new_id)
+from tracefix.runtime.contracts import (Assertion, BrowserAction, CheckJudgement, Decision, FileEdit,
+    GoalCheckDraft, Locator, PatchProposal, ReproductionPlan, RunState, TestSpec, digest, new_id)
 from tracefix.runtime.engine import Engine
 from tracefix.storage.artifacts import Artifacts
 from tracefix.storage.store import MemoryStore
@@ -84,6 +84,14 @@ class FakeModel:
             kind = 'observe' if self.decision_calls == 0 else 'finish'
             self.decision_calls += 1
             value=Decision(action=BrowserAction(kind=kind),summary='CI 模拟观察后停止')
+        elif schema is GoalCheckDraft:
+            value = GoalCheckDraft(name='任务完成状态检查', criteria='目标复选框在页面中处于 checked 状态')
+        elif schema is CheckJudgement:
+            observation = context.get('observation') or {}
+            passed = '[checked]' in str(observation.get('snapshot', ''))
+            value = CheckJudgement(status='pass' if passed else 'fail',
+                                   actual='CI 模拟页面检查：' + ('已选中' if passed else '未选中'),
+                                   evidence_refs=[context.get('observation', {}).get('id')] if context.get('observation', {}).get('id') else [])
         elif schema is PatchProposal:
             value=PatchProposal(summary='CI 模拟修复',evidence_refs=context['evidence_refs'][:1],edits=[FileEdit(path='src/value.ts',before_hash=digest(self.workspace.read('src/value.ts').encode()),content='export const persisted = true;\n')])
         elif schema is ReproductionPlan:
