@@ -1,14 +1,18 @@
 from copy import deepcopy
+import json
 from types import SimpleNamespace
+
+import pytest
 
 from tracefix.rules.models import Rule, RuleDetection
 from tracefix.runtime.checks import make_check_plan
 from tracefix.runtime.contracts import (
-    Assertion, BrowserAction, CheckJudgement, GoalCheckDraft, Locator, Phase,
+    Assertion, BehaviorScenario, BehaviorStep, BrowserAction, CheckJudgement, GoalCheckDraft, Locator, Phase,
     RunState, TestSpec, digest, reduce_state,
 )
 from tracefix.runtime.engine import Engine
-from tracefix.runtime.smoke import PNG
+from tracefix.runtime.smoke import PNG, make_engine
+from tracefix.runtime.tool_handlers import build_runtime_tools
 
 
 def suite_fixture(*, rules=(), mode='test', goal='页面应显示任务板且保存后出现反馈'):
@@ -40,7 +44,7 @@ def suite_fixture(*, rules=(), mode='test', goal='页面应显示任务板且保
                                       exists=lambda *arguments: True)
     engine.phase_observations = lambda current, phase: []
     engine.verification_context = lambda current: {'plan_hash': digest([])}
-    engine.store = SimpleNamespace(trace=lambda *arguments: [])
+    engine.store = SimpleNamespace(trace=lambda *arguments: [], save=lambda current: None)
     state.observation_ref = put(state, {
         'id': 'obs-current', 'type': 'gui_observation', 'url': state.url,
         'snapshot': '- heading "Task board" [ref=e1]\n- button "Save" [ref=e2]',
@@ -159,3 +163,69 @@ async def test_repair_rule_failure_enters_diagnosis_without_claiming_reproductio
     assert finished.reproduction_plan_frozen is True
     assert finished.trial == 0
     assert finished.initial_check_result_refs == finished.check_result_refs
+
+
+async def test_goal_runs_second_behavior_scenario_after_first_assertion_failure():
+    engine, state, records, events, model_calls = suite_fixture()
+    spec = engine.spec(state).model_copy(update={'behavior_scenarios': [
+        BehaviorScenario(id='first', steps=[BehaviorStep(action=BrowserAction(kind='observe'),
+            assertions=[Assertion(locator=Locator(role='heading', name='Missing heading'))])]),
+        BehaviorScenario(id='second', steps=[BehaviorStep(action=BrowserAction(kind='observe'),
+            assertions=[Assertion(locator=Locator(role='heading', name='Task board'))])]),
+    ]})
+    records[state.test_spec_ref] = spec.model_dump(mode='json')
+    state.test_spec_hash = digest(spec)
+    resets = []
+    actions = []
+
+    async def reset(current):
+        resets.append(current.observation_ref)
+        return {'observation_ref': current.observation_ref}
+
+    async def act(current, action, *, frozen=False):
+        actions.append((action.kind, frozen))
+        return current.observation_ref
+
+    engine.reset = reset
+    engine.act = act
+    result = await engine.evaluate_check_item(state, engine.check_plan(state).items[0])
+    details = json.loads(result.actual)
+    checkpoints = [item for item in details['deterministic_checks'] if item.get('scenario_id')]
+    assert [item['scenario_id'] for item in checkpoints] == ['first', 'second']
+    assert [item['passed'] for item in checkpoints] == [False, True]
+    assert len(resets) == 2 and actions == [('observe', True), ('observe', True)]
+    assert result.status == 'fail'
+    assert model_calls[-1]['context']['deterministic_checks'] == details['deterministic_checks']
+
+
+async def test_main_dom_failure_remains_failure_when_model_check_raises():
+    engine, state, records, events, model_calls = suite_fixture()
+    records[state.observation_ref]['snapshot'] = '- button "Save" [ref=e2]'
+
+    async def unavailable_model(current, schema, context, image=None, **options):
+        raise RuntimeError('model endpoint unavailable')
+
+    engine.model_call = unavailable_model
+    result = await engine.evaluate_check_item(state, engine.check_plan(state).items[0])
+    details = json.loads(result.actual)
+    assert details['deterministic_checks'][0]['passed'] is False
+    assert 'model endpoint unavailable' in details['criteria_judgement']
+    assert result.status == 'fail'
+    assert result.error is None
+    assert result.fallback is None
+
+
+@pytest.mark.parametrize('phase', [Phase.EXPLORE, Phase.DIAGNOSE, Phase.VERIFY])
+def test_check_judgement_registry_exposes_only_readonly_check_tools(tmp_path, phase):
+    engine, state = make_engine(tmp_path / str(phase))
+    state.phase = phase
+    engine.rule_resolver = object()
+    runtime = build_runtime_tools(engine, state, CheckJudgement)
+    expected = {'Read', 'Grep', 'Glob', 'code.analyze',
+                'rules.get', 'rules.applicable', 'context.expand'}
+    assert {tool.name for tool in runtime.registry.visible(phase)} == expected
+    assert set(runtime.handlers) == expected
+    assert all(tool.side_effect == 'read' for tool in runtime.registry.visible(phase))
+    assert not any(runtime.registry.contains(name) for name in (
+        'Bash', 'Write', 'Edit', 'NotebookEdit', 'agent.delegate',
+        'BrowserClick', 'BrowserNavigate', 'BrowserSnapshot', 'finish_exploration'))

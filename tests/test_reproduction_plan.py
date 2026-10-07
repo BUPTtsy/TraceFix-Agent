@@ -93,7 +93,12 @@ async def test_retries_are_excluded_before_patch_and_same_plan_verifies_persiste
     assert saved.run_status == RunStatus.WAITING_APPROVAL, saved.error
     assert saved.outcome == Outcome.FIX_VERIFIED
     assert saved.budget.patches == 1
-    assert saved.trial == 3 and len(saved.validation_refs) == 6
+    assert saved.trial == 0 and saved.reproduced is False and len(saved.validation_refs) == 6
+    assert saved.initial_check_result_refs
+    initial_results = [engine.get(saved, ref) for ref in saved.initial_check_result_refs]
+    assert len(initial_results) == len(engine.check_plan(saved).items)
+    assert all(result['stage'] == 'explore' for result in initial_results)
+    assert any(result['status'] == 'fail' for result in initial_results)
     assert saved.test_spec_hash == spec_hash
     assert len(plan_requests) == 1
     assert engine.get(saved, saved.exploration_plan_ref) == [action.model_dump() for action in actions]

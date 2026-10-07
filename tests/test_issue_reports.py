@@ -14,7 +14,7 @@ from tracefix.storage.presentation import report_page
 from tracefix.storage.reporting import collect_issues, report_text
 
 
-@pytest.mark.parametrize('mode,expected_status', [('test', 'confirmed'), ('repair', 'fixed')])
+@pytest.mark.parametrize('mode,expected_status', [('test', 'suspected'), ('repair', 'fixed')])
 async def test_run_explains_actual_bug_in_terminal_web_and_html(tmp_path, mode, expected_status):
     engine, state = make_engine(tmp_path)
     state.mode = mode
@@ -33,11 +33,15 @@ async def test_run_explains_actual_bug_in_terminal_web_and_html(tmp_path, mode, 
     assert len(report['issues']) == 1
     issue = report['issues'][0]
     assert issue['status'] == expected_status
+    if mode == 'test':
+        assert report['overall_status'] == 'FAILED'
+        assert any(result['status'] == 'fail' for result in report['check_results'])
+        assert current.reproduced is False and current.trial == 0
     assert issue['location'] == 'http://app:3000'
     assert 'Complete task' in issue['actual'] and '未选中' in issue['actual']
     assert '保持选中' in issue['expected']
     assert issue['steps'] == ['打开页面 http://app:3000']
-    assert len(issue['evidence_refs']) >= 2
+    assert len(issue['evidence_refs']) >= (1 if mode == 'test' else 2)
     output = capture.get()
     assert '问题报告' in output and '未选中' in output and '保持选中' in output
     assert '"action"' not in output
