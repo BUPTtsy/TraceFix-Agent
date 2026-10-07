@@ -1,5 +1,7 @@
 # 命令行 CLI
 
+> 定位更新：2026-10-07。CLI 为 Agent 组件的研发调试与兼容入口。本文命令设计不作为独立产品或接口型 Beta 的必交项；对外稳定任务契约以接口型 Beta 计划为准。
+
 ## 1. 现状
 
 CLI 有两种形态：交互式 REPL（`cli/main.py:566-596`，斜杠命令由 `Session.dispatch` 路由，见 `cli/main.py:416-564`）和一次性执行参数（`cli/main.py:599-673`）。命令注册表在 `cli/registry.py:11-28`。

@@ -86,7 +86,7 @@
 | 解析 | py-tree-sitter（已有 0.25.2）+ 各语言语法 | 官方语法（html、css、javascript、typescript、json）使用独立 wheel；社区语法（vue、svelte、astro、scss、angular 等）的候选来源是 tree-sitter-language-pack。它默认按需联网下载语法，内网部署时要在构建工具镜像时预下载，运行时不联网。M3 第 1 周逐个核对可用性、ABI 兼容性和许可证 |
 | 查询 | tree-sitter query（`.scm`） | 声明式、可审计；优先复用语法仓库自带的查询 |
 | 语义 | 通用 LSP 客户端，对接 typescript-language-server、@vue/language-server、svelte-language-server、@angular/language-server、@astrojs/language-server、vscode-langservers-extracted（HTML / CSS / SCSS / Less / JSON）、@tailwindcss/language-server | 运行在沙箱内 |
-| 静态规则 | Semgrep（覆盖它支持的语言）+ tree-sitter query（覆盖任意有语法的语言） | 嵌入语言先提取为虚拟文档再运行，结果映射回宿主坐标；与规则管理后台的 static 类规则对应 |
+| 静态规则 | Semgrep（覆盖它支持的语言）+ tree-sitter query（覆盖任意有语法的语言） | 嵌入语言先提取为虚拟文档再运行，结果映射回宿主坐标；与平台提供的 static 类规则对应 |
 | 类型检查与 lint | 优先项目自带脚本；否则用工具镜像中的 tsc、vue-tsc、svelte-check、ESLint、Stylelint、html-validate | 只比较补丁前后的增量 |
 | source map | `source-map` 库（在沙箱内执行） | JS 和 CSS 都适用 |
 | 编译期插桩 | TraceFix 自有插件（Vite / webpack / Babel / SWC / Vue 编译器 / Svelte 预处理） | 只用于定位回放，不进入补丁 |

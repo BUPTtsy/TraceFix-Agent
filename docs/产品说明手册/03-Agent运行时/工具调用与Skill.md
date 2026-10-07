@@ -170,7 +170,7 @@ owner: platform-team
 | 来源 | 位置 | 管理方式 |
 |---|---|---|
 | 内置 | 仓库 `backend/skills/` | 随版本发布 |
-| 组织 | 控制面数据库 | 规则管理后台中的 Skill 页，需审核后发布 |
+| 平台提供（可选） | 任务资源或配置引用 | 平台完成授权，Agent 校验版本和适用范围，不建设 Skill 管理后台 |
 | 项目 | 目标仓库 `.tracefix/backend/skills/` | 随代码评审；读取时校验路径与大小 |
 | 项目指令 | 目标仓库 `AGENTS.md` | 已实现（`gateway.py:91-94`、`cli/main.py:313-324`） |
 
