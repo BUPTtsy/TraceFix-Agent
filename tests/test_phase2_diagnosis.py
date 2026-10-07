@@ -1,6 +1,10 @@
 import pytest
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from pydantic import Field
 
-from tracefix.model.gateway import ModelOutputError, ModelResult
+from tracefix.model.gateway import ModelResult
 from tracefix.runtime.contracts import FileEdit, PatchProposal, Phase, digest
 from tracefix.runtime.diagnosis import (CandidatePath, DiagnosisDraft, DiagnosisReport, Hypothesis,
     binding_from_observation, symptom_query, validate_report)
@@ -63,17 +67,6 @@ async def test_structured_diagnosis_precedes_patch_and_keeps_versioned_fragments
     assert report['binding']['observation_ref'] == state.observation_ref
 
 
-async def test_fake_diagnosis_is_explicitly_unavailable(tmp_path, monkeypatch):
-    engine, state = await diagnosis_engine(tmp_path)
-    monkeypatch.setenv('TRACEFIX_WORKER', '0')
-    await engine.diagnose(state, None)
-    events = engine.store.trace(state.run_id, state.scope_id)
-    unavailable = next(event for event in events if event['type'] == 'diagnosis.unavailable')
-    report = engine.get(state, unavailable['payload']['report_ref'])
-    assert report['generated_by'] == 'deterministic_unavailable'
-    assert report['hypotheses'] == []
-
-
 async def test_diagnosis_rejects_unknown_refs_and_marks_stale_source(tmp_path):
     engine, state = await diagnosis_engine(tmp_path)
     binding = binding_from_observation(state, engine.get(state, state.observation_ref))
@@ -96,21 +89,36 @@ async def test_diagnosis_rejects_unknown_refs_and_marks_stale_source(tmp_path):
 async def test_worker_same_model_and_capabilities_are_enforced(tmp_path, monkeypatch):
     engine, state = await diagnosis_engine(tmp_path)
     monkeypatch.delenv('TRACEFIX_AGENT_MODE', raising=False)
-    monkeypatch.setenv('TRACEFIX_WORKER', '1')
     before_ref = state.observation_ref
 
-    class ReadModel:
-        supports_tool_executor = True
+    class ReadModel(BaseChatModel):
+        requests: int = 0
+        registered: set[str] = Field(default_factory=set)
 
-        async def generate(self, schema, context, **options):
-            assert schema is SubtaskResult
-            assert context['worker_same_model'] is True
-            assert {item.name for item in options['tool_registry'].specs} == {'Read', 'Grep', 'Glob'}
-            with pytest.raises(PermissionError, match='浏览器'):
-                await options['tool_executor']('BrowserNavigate', {'url': 'http://app:3000'}, 'forbidden')
-            value = SubtaskResult(summary='只读源码已核对', evidence_refs=[state.observation_ref],
-                files=['src/value.ts'], suggested_experiments=[], unresolved=[])
-            return ModelResult(value, {}, 'same-main-model', 'stop')
+        @property
+        def _llm_type(self):
+            return 'same-main-model'
+
+        def bind_tools(self, tools, **options):
+            self.registered = {tool.name for tool in tools}
+            return self.bind(tools=tools)
+
+        def _generate(self, messages, **options):
+            pytest.fail('调查必须异步执行')
+
+        async def _agenerate(self, messages, stop=None, run_manager=None, **options):
+            self.requests += 1
+            if self.requests == 1:
+                name, arguments = 'Read', {'path': 'src/value.ts'}
+            else:
+                assert messages[-1].name == 'Read' and messages[-1].tool_call_id == 'investigate-1'
+                name = 'SubtaskResult'
+                arguments = SubtaskResult(summary='只读源码已核对', evidence_refs=[state.observation_ref],
+                    files=['src/value.ts'], suggested_experiments=[], unresolved=[],
+                    worker_generation=state.revision, source_manifest=state.source_manifest).model_dump()
+            message = AIMessage(content='', tool_calls=[dict(name=name, args=arguments,
+                id=f'investigate-{self.requests}', type='tool_call')])
+            return ChatResult(generations=[ChatGeneration(message=message)])
 
     class WrongModel:
         async def generate(self, *arguments, **options):
@@ -118,11 +126,17 @@ async def test_worker_same_model_and_capabilities_are_enforced(tmp_path, monkeyp
 
     engine.model = ReadModel()
     engine.worker_model = WrongModel()
+    async def old_executor(*arguments, **options):
+        pytest.fail('调查不能调用旧 engine.model_call executor')
+    monkeypatch.setattr(engine, 'model_call', old_executor)
     spec = SubtaskSpec(state.goal, 'code-explorer', state.revision, ('src/value.ts',), (state.observation_ref,))
     result = await ReadOnlyWorker(engine).run(state, spec)
     assert result.worker_id
     assert result.worker_generation == spec.generation
     assert result.source_manifest == state.source_manifest
+    assert engine.model.requests == 2
+    assert engine.model.registered == {'Read', 'Grep', 'Glob', 'write_todos', 'SubtaskResult'}
+    assert result.usage['model_calls'] == state.budget.model_calls == 2
     assert state.observation_ref == before_ref
     assert state.patch_ref is None
 
@@ -141,39 +155,3 @@ def test_symptom_query_extracts_real_mcp_network_api_anchor():
         'network': '[POST] http://app:3000/api/tasks/1 => [404] Not Found'})
     assert '/api/tasks/1' in query
     assert '/api/tasks' in query.splitlines()
-
-
-async def test_on_demand_diagnosis_read_is_saved_and_can_be_cited(tmp_path, monkeypatch):
-    engine, state = await diagnosis_engine(tmp_path)
-    monkeypatch.setenv('TRACEFIX_AGENT_MODE', 'single')
-    binding = binding_from_observation(state, engine.get(state, state.observation_ref))
-
-    class ReadingModel:
-        supports_tool_executor = True
-
-        async def generate(self, schema, context, **options):
-            read = await options['tool_pipeline'].execute('Read', {
-                'file_path': str(engine.workspace.root / 'src/value.ts'), 'offset': 1, 'limit': 1}, 'read-current-source')
-            reference = read.result['artifact_ref']
-            assert reference in state.evidence_refs
-            stored = engine.get(state, reference)
-            assert stored['result']['content_version'] == digest(engine.workspace.read('src/value.ts').encode())
-            refreshed = options['context_provider']()
-            assert reference in refreshed['available_evidence_refs']
-            value = DiagnosisReport(binding=binding, source_version=state.source_manifest,
-                hypotheses=[Hypothesis(id='source-chain', summary='当前源码片段已取得',
-                    candidate_paths=[CandidatePath(path='src/value.ts',
-                        content_version=stored['result']['content_version'])],
-                    support_refs=[reference], prediction='读取同版源码应含 persisted=false',
-                    minimal_probe='Read 当前 value.ts', status='supported')])
-            return ModelResult(value, {}, 'fixture-read-model', 'stop')
-
-    engine.model = ReadingModel()
-    report = await engine.model_call(state, DiagnosisReport, {
-        'worker_depth': 1, 'worker_same_model': True, 'worker_readonly_investigation': True,
-        'worker_allowed_files': ['src/value.ts'], 'worker_allowed_tools': ['Read', 'Grep', 'Glob'],
-        'worker_write_enabled': False, 'worker_shell_mode': 'disabled'})
-    validate_report(report, evidence_refs=state.evidence_refs, allowed_files=['src/value.ts'],
-                    source_manifest=state.source_manifest, environment_digest=state.environment_digest,
-                    binding=binding,
-                    content_versions={'src/value.ts': digest(engine.workspace.source_bytes('src/value.ts')[1])})
