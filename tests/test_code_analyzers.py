@@ -85,6 +85,9 @@ def test_nested_react_label_names_input_and_missing_handler_requests_fallback():
     assert result["status"] == "pass"
     result = analyze_source({"index.html": '<button type="submit">保存</button>'}, {"check": "event_binding"})
     assert result["status"] == "error" and result["fallback_required"]
+    same_line = analyze_source({"src/App.jsx": '<div><label>邮箱<input /></label><input /></div>'}, {"check": "a11y_name"})
+    assert same_line["status"] == "fail"
+    assert len(same_line["findings"]) == 1 and same_line["findings"][0]["tag"] == "input"
 
 
 def test_malformed_html_syntax_is_failure():

@@ -30,6 +30,7 @@ class _Element:
     text: str = ""
     children: list[Any] = field(default_factory=list)
     dynamic: bool = False
+    source_start: int | None = None
 
 
 def _events(attributes):
@@ -132,14 +133,15 @@ def _script_analysis(content, *, jsx, line_offset=0):
         text_nodes = [child for child in _walk(node) if child.type == "jsx_text"]
         element = _Element(_text(raw, opening.child_by_field_name("name")), line,
                            attributes, " ".join(_text(raw, child).strip() for child in text_nodes),
-                           dynamic=any(child.type == "jsx_expression" for child in node.named_children))
+                           dynamic=any(child.type == "jsx_expression" for child in node.named_children),
+                           source_start=node.start_byte)
         elements.append(element)
         if element.tag == "label":
             for child in _walk(node):
                 if child.type in {"jsx_element", "jsx_self_closing_element"} and child != node:
                     child_opening = child.child_by_field_name("open_tag") if child.type == "jsx_element" else child
                     element.children.append((_text(raw, child_opening.child_by_field_name("name")),
-                                             child.start_point.row + 1 + line_offset))
+                                             child.start_byte))
     return elements, diagnostics, components, event_calls
 
 
@@ -184,7 +186,7 @@ def _name(element, elements):
     identity = attrs.get("id")
     for label in elements:
         if label.tag == "label" and ((identity and label.attributes.get("for", label.attributes.get("htmlFor")) == identity)
-                                     or element in label.children or (element.tag, element.line) in label.children):
+                                     or element in label.children or (element.tag, element.source_start) in label.children):
             return label.text.strip(), label.dynamic
     if element.tag == "input" and attrs.get("type") in {"submit", "reset", "button"}:
         return attrs.get("value") or {"submit": "Submit", "reset": "Reset"}.get(attrs["type"], ""), False
@@ -258,7 +260,7 @@ def analyze_source(files: Mapping[str, str] | Iterable[tuple[str, str]],
                 continue
             try:
                 elements, diagnostics, components, events = _source_analysis(path, content)
-            except (ImportError, AttributeError, TypeError, ValueError) as error:
+            except (ImportError, AttributeError, TypeError, ValueError, OSError, RuntimeError) as error:
                 result["errors"].append({"path": path, "detector": str(check), "language": language,
                                          "message": "源码分析器不可用：" + str(error)})
                 continue
