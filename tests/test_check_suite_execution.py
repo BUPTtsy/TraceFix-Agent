@@ -45,6 +45,7 @@ def suite_fixture(*, rules=(), mode='test', goal='页面应显示任务板且保
     engine.phase_observations = lambda current, phase: []
     engine.verification_context = lambda current: {'plan_hash': digest([])}
     engine.store = SimpleNamespace(trace=lambda *arguments: [], save=lambda current: None)
+    engine.spec = lambda current: TestSpec.model_validate(records[current.test_spec_ref])
     state.observation_ref = put(state, {
         'id': 'obs-current', 'type': 'gui_observation', 'url': state.url,
         'snapshot': '- heading "Task board" [ref=e1]\n- button "Save" [ref=e2]',
@@ -213,6 +214,53 @@ async def test_main_dom_failure_remains_failure_when_model_check_raises():
     assert result.status == 'fail'
     assert result.error is None
     assert result.fallback is None
+
+
+async def test_initial_dom_failure_and_reset_error_remain_failure_when_model_passes():
+    engine, state, records, events, model_calls = suite_fixture()
+    spec = engine.spec(state).model_copy(update={'behavior_scenarios': [
+        BehaviorScenario(id='reset-required', steps=[BehaviorStep(action=BrowserAction(kind='observe'),
+            assertions=[Assertion(locator=Locator(role='heading', name='Task board'))])]),
+    ]})
+    records[state.test_spec_ref] = spec.model_dump(mode='json')
+    state.test_spec_hash = digest(spec)
+    records[state.observation_ref]['snapshot'] = '- button "Save" [ref=e2]'
+
+    async def reset_error(current):
+        raise RuntimeError('reset unavailable')
+
+    engine.reset = reset_error
+    result = await engine.evaluate_check_item(state, engine.check_plan(state).items[0])
+    details = json.loads(result.actual)
+    assert result.status == 'fail'
+    assert result.error is None
+    assert details['deterministic_checks'][0]['passed'] is False
+    assert any('reset unavailable' in str(item.get('error')) for item in details['deterministic_checks'])
+    assert details['criteria_judgement'] == '页面与已有证据符合指标'
+
+
+async def test_verify_oracle_ignores_observations_from_previous_patch():
+    rule = console_rule()
+    engine, state, records, events, model_calls = suite_fixture(rules=[rule])
+    state.check_suite_stage = 'verify'
+    state.patch_hash = 'new-patch'
+    current = records[state.observation_ref]
+    current.update({'patch_hash': 'new-patch', 'scope_id': state.scope_id,
+                    'run_id': state.run_id, 'source_manifest': state.source_manifest,
+                    'test_spec_hash': state.test_spec_hash, 'console': '[]'})
+    records['stale-observation.json'] = {
+        **current, 'id': 'obs-stale', 'patch_hash': 'old-patch',
+        'console': '[{"level":"error","message":"stale failure"}]',
+    }
+    engine.phase_observations = lambda current_state, phase: [{
+        'observation_ref': 'stale-observation.json',
+        'observation': records['stale-observation.json'],
+        'action': None,
+    }]
+    result = await engine.evaluate_check_item(state, engine.check_plan(state).items[0])
+    assert result.status == 'pass'
+    assert 'stale-observation.json' not in result.evidence_refs
+    assert json.loads(result.actual) == []
 
 
 @pytest.mark.parametrize('phase', [Phase.EXPLORE, Phase.DIAGNOSE, Phase.VERIFY])
