@@ -16,7 +16,6 @@ jobs:
       TRACEFIX_API_KEY: ${{ secrets.TRACEFIX_API_KEY }}
       TRACEFIX_BASE_URL: ${{ vars.TRACEFIX_BASE_URL || 'https://api.deepseek.com' }}
       TRACEFIX_TEXT_MODEL: ${{ vars.TRACEFIX_TEXT_MODEL || 'deepseek-chat' }}
-      TRACEFIX_TOOL_MODE: native
       PYTHONUTF8: '1'
       PYTHONIOENCODING: utf-8
     steps:

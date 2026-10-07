@@ -44,7 +44,6 @@ class EvaluationConfig:
     effort: str = 'provider-default'
     vision_model: str = ''
     thinking: str = 'disabled'
-    tool_mode: str = 'native'
     held_out: bool = True
     mutation_file: str | None = None
     mutation_before: str | None = None
@@ -62,8 +61,8 @@ class EvaluationConfig:
             raise ValueError('固定输入字段不能为空')
         if type(self.seed) is not int or self.timeout_seconds <= 0:
             raise ValueError('seed 或 timeout 无效')
-        if self.tool_mode not in {'native', 'json'} or self.thinking not in {'enabled', 'disabled'}:
-            raise ValueError('工具模式或 thinking 无效')
+        if self.thinking not in {'enabled', 'disabled'}:
+            raise ValueError('thinking 无效')
         mutation = (self.mutation_file, self.mutation_before, self.mutation_after)
         if any(value is not None for value in mutation) and not all(value is not None for value in mutation):
             raise ValueError('缺陷注入必须提供 file/before/after')
@@ -104,14 +103,14 @@ class EvaluationConfig:
             'initial_experience_hash': digest(self.initial_experience.read_bytes()),
             'model': self.model, 'vision_model': self.vision_model,
             'effort': self.effort, 'thinking': self.thinking,
-            'tool_mode': self.tool_mode, 'tools_hash': self.tools_hash,
+            'tools_hash': self.tools_hash,
             'recovery_rules_hash': self.recovery_rules_hash,
             'environment_digest': digest({
                 'profile_hash': digest(self.profile.read_bytes()),
                 'spec_hash': digest(self.spec.read_bytes()),
                 'tools_hash': self.tools_hash, 'skills_hash': digest(skills),
                 'model': self.model, 'vision_model': self.vision_model, 'effort': self.effort,
-                'thinking': self.thinking, 'tool_mode': self.tool_mode,
+                'thinking': self.thinking,
             }),
             'mutation_hash': digest([self.mutation_file, self.mutation_before, self.mutation_after]),
             'allowed_files': list(self.allowed_files), 'held_out': self.held_out,

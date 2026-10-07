@@ -88,8 +88,7 @@ async def run_checks(gateway=None):
     results.append({"kind": "text", "model": text.model_revision,
                     "output": text.value.model_dump(), "usage": text.usage})
 
-    if gateway.tool_mode == "native":
-        results.append(await check_native_protocol(gateway))
+    results.append(await check_native_protocol(gateway))
 
     if gateway.vision_model:
         vision = await gateway.generate(

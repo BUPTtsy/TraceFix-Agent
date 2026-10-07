@@ -199,7 +199,6 @@ def run_flow(args, output_path: Path) -> int:
         "TRACEFIX_DATABASE_URL": dsn,
         "TRACEFIX_DATA": str(data_root),
         "TRACEFIX_PROJECTS": str(registry),
-        "TRACEFIX_TOOL_MODE": "native",
     })
     result = {"status": "failed", "started_at": stamp, "case": args.case,
               "run_root": str(run_root.relative_to(ROOT))}

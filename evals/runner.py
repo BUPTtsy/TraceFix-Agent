@@ -197,12 +197,12 @@ class SessionAdapter:
                     engines.append(engine)
                     from tracefix.model.gateway import BrowserPolicyRouter, Gateway
                     teacher = Gateway(text_model=config.model, vision_model=config.vision_model,
-                                      thinking=config.thinking, tool_mode=config.tool_mode)
+                                      thinking=config.thinking)
                     engine.model = BrowserPolicyRouter(teacher)
                     engine.worker_model = None
                     trace.append({'event': 'model.configuration', 'model_agent_id': state.run_id,
                                   'model': teacher.text_model, 'vision_model': teacher.vision_model,
-                                  'thinking': teacher.thinking, 'tool_mode': teacher.tool_mode,
+                                  'thinking': teacher.thinking,
                                   'effort': config.effort})
                     instrument_memory_calls(engine.memory, trace)
 
@@ -239,8 +239,7 @@ class SessionAdapter:
         configured_env = dict(env)
         configured_env.update({'TRACEFIX_TEXT_MODEL': config.model,
                                'TRACEFIX_VISION_MODEL': config.vision_model,
-                               'TRACEFIX_THINKING': config.thinking,
-                               'TRACEFIX_TOOL_MODE': config.tool_mode})
+                               'TRACEFIX_THINKING': config.thinking})
         for key in tuple(configured_env):
             if key.startswith(('TRACEFIX_WORKER_', 'TRACEFIX_STUDENT_')):
                 configured_env.pop(key)
@@ -500,7 +499,6 @@ class FourCellRunner:
             'TRACEFIX_TEXT_MODEL': self.config.model,
             'TRACEFIX_VISION_MODEL': self.config.vision_model,
             'TRACEFIX_THINKING': self.config.thinking,
-            'TRACEFIX_TOOL_MODE': self.config.tool_mode,
         })
         return env
 
