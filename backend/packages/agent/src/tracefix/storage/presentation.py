@@ -101,10 +101,12 @@ LABELS = {
     'verify.static': '静态检查', 'verify.unit': '单元测试', 'verify.build': '构建',
     'verify.health': '健康检查', 'verify.original': '原问题重测', 'verify.regression': '回归测试',
     'check_plan': '冻结检查计划', 'check_results': '逐项检查结果', 'check_summary': '检查汇总',
+    'initial_check_results': '初始检查结果', 'initial_check_summary': '初始检查汇总',
     'overall_status': '整体测试结果', 'images': '图片证据', 'image_errors': '图片证据错误',
     'PASSED': '测试通过', 'PASSED_WITH_FINDINGS': '通过但存在非阻断问题',
     'criteria': '检测内容与指标', 'severity': '严重级别', 'detector': '检测方式',
-    'blocker': '阻断', 'critical': '阻断', 'normal': '普通', 'warning': '告警',
+    'blocker': '阻断', 'critical': '严重', 'major': '主要', 'minor': '次要',
+    'normal': '普通', 'warning': '告警',
     'user_goal': '用户目标', 'rule': '检测规则', 'model': '模型', 'dom': 'DOM',
     'oracle': '页面规则', 'static': '源码静态检查', 'ast': 'AST', 'multimodal': '多模态',
     'actual': '实际检测结果', 'coverage_complete': '计划覆盖完整', 'blocker_failed': '阻断失败数',
@@ -182,10 +184,11 @@ def report_page(report, *, artifacts=None, scope_id=None, run_id=None):
                 + '</tbody></table>')
     checks = ''
     if 'check_plan' in report or 'check_results' in report or 'initial_check_results' in report:
-        initial = report.get('initial_check_results') or [] if report.get('mode') == 'repair' else []
-        final_heading = '修复后检查结果' if initial else '检查结果'
+        initial = (report.get('initial_check_results') or []) if report.get('mode') == 'repair' else []
+        verified = bool(initial) and any(item.get('stage') == 'verify' for item in report.get('check_results') or [])
+        final_heading = '修复后检查结果' if verified else '当前检查结果'
         checks = ('<section><h2>逐项检查</h2>'
-                  + (check_table(initial, '修复前检查结果') if initial else '')
+                  + (check_table(initial, '修复前检查结果' if verified else '初始检查结果') if initial else '')
                   + check_table(report.get('check_results') or [], final_heading)
                   + '<details><summary>完整检查计划</summary>'
                   + render(report.get('check_plan') or []) + '</details></section>')

@@ -100,7 +100,7 @@ def test_initial_check_results_contribute_images_and_render_before_after_tables(
               'check_plan': [item],
               'initial_check_results': [{**item, 'status': 'fail', 'actual': '修复前缺少反馈',
                                          'evidence_refs': [evidence]}],
-              'check_results': [{**item, 'status': 'pass', 'actual': '修复后已显示反馈',
+              'check_results': [{**item, 'status': 'pass', 'stage': 'verify', 'actual': '修复后已显示反馈',
                                  'evidence_refs': []}]}
     images, errors = collect_report_images(report, artifacts, 'demo', 'run_1')
     assert errors == []
@@ -110,6 +110,14 @@ def test_initial_check_results_contribute_images_and_render_before_after_tables(
     assert '修复前检查结果' in page and '修复后检查结果' in page
     assert '修复前缺少反馈' in page and '修复后已显示反馈' in page
     assert 'data:image/png;base64,' in page
+
+
+def test_repair_before_verification_does_not_label_initial_results_as_fixed():
+    result = {'id': 'rule', 'name': '检查', 'severity': 'critical', 'status': 'fail', 'actual': '发现问题'}
+    page = report_page({'mode': 'repair', 'check_results': [result], 'initial_check_results': [result]})
+    assert '初始检查结果' in page and '当前检查结果' in page
+    assert '修复后检查结果' not in page
+    assert '严重' in page
 
 
 @pytest.mark.parametrize('damage', ['missing', 'hash', 'not_png', 'foreign', 'unsafe'])
