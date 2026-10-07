@@ -127,7 +127,7 @@ def collect_report_images(report, artifacts, scope_id, run_id):
     references = []
     for key in ('evidence_refs', 'baseline_validation_refs', 'validation_refs'):
         references.extend(report.get(key) or [])
-    for key in ('check_results', 'issues'):
+    for key in ('check_results', 'initial_check_results', 'issues'):
         for item in report.get(key) or []:
             if isinstance(item, dict):
                 references.extend(item.get('evidence_refs') or [])

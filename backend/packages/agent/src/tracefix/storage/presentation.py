@@ -144,7 +144,8 @@ def report_page(report, *, artifacts=None, scope_id=None, run_id=None):
                       'environment_digest', 'agent_instructions_hash'}
     summary, technical = [], []
     for key, value in report.items():
-        if key in {'issues', 'check_plan', 'check_results', 'images', 'image_errors'}:
+        if key in {'issues', 'check_plan', 'check_results', 'initial_check_results', 'images', 'image_errors',
+                   'check_summary', 'initial_check_summary', 'overall_status'}:
             continue
         row = f'<tr><th>{html.escape(label(key))}</th><td>{render(value, key)}</td></tr>'
         (technical if key in technical_keys else summary).append(row)
@@ -159,28 +160,35 @@ def report_page(report, *, artifacts=None, scope_id=None, run_id=None):
             f'<dl>{details}</dl><h4>复现步骤</h4><ol>{steps}</ol><h4>证据</h4><ul>{evidence}</ul></article>')
     title = '测试报告' if report.get('mode') == 'test' else '修复报告'
     issues = '<section><h2>问题清单</h2>' + (''.join(issue_sections) or '<p>未形成有证据的问题记录。</p>') + '</section>'
-    check_rows = []
-    for item in report.get('check_results') or []:
-        status = str(item.get('status', 'inconclusive')).lower()
-        status = {'pass': 'passed', 'fail': 'failed'}.get(status, status)
-        cells = [html.escape(str(item.get('id') or item.get('check_id') or '')),
-                 html.escape(str(item.get('name') or item.get('title') or '未命名检查')),
-                 html.escape(_check_text(item.get('criteria', ''))),
-                 html.escape(label(item.get('severity', 'normal'))),
-                 html.escape(label(item.get('source', 'rule'))),
-                 html.escape(label(item.get('detector', item.get('detector_type', 'model')))),
-                 html.escape(CHECK_STATUSES.get(status, status)),
-                 html.escape(_check_text(item.get('actual', ''))),
-                 html.escape(_check_text(item.get('error', ''))),
-                 render(item.get('evidence_refs') or [], 'evidence_refs')]
-        check_rows.append('<tr>' + ''.join('<td>' + value + '</td>' for value in cells) + '</tr>')
-    checks = ''
-    if 'check_plan' in report or 'check_results' in report:
+    def check_table(results, heading):
+        rows = []
+        for item in results or []:
+            status = str(item.get('status', 'inconclusive')).lower()
+            status = {'pass': 'passed', 'fail': 'failed'}.get(status, status)
+            cells = [html.escape(str(item.get('id') or item.get('check_id') or '')),
+                     html.escape(str(item.get('name') or item.get('title') or '未命名检查')),
+                     html.escape(_check_text(item.get('criteria', ''))),
+                     html.escape(label(item.get('severity', 'normal'))),
+                     html.escape(label(item.get('source', 'rule'))),
+                     html.escape(label(item.get('detector', item.get('detector_type', 'model')))),
+                     html.escape(CHECK_STATUSES.get(status, status)),
+                     html.escape(_check_text(item.get('actual', ''))),
+                     html.escape(_check_text(item.get('error', ''))),
+                     render(item.get('evidence_refs') or [], 'evidence_refs')]
+            rows.append('<tr>' + ''.join('<td>' + value + '</td>' for value in cells) + '</tr>')
         headings = ['ID', '名称', '检测内容与指标', '严重级别', '来源', '检测方式', '状态', '实际结果', '错误', '证据']
-        checks = ('<section><h2>逐项检查</h2><table><thead><tr>'
-                  + ''.join('<th>' + heading + '</th>' for heading in headings)
-                  + '</tr></thead><tbody>' + ''.join(check_rows)
-                  + '</tbody></table><details><summary>完整检查计划</summary>'
+        return ('<h3>' + html.escape(heading) + '</h3><table><thead><tr>'
+                + ''.join('<th>' + heading + '</th>' for heading in headings)
+                + '</tr></thead><tbody>' + ''.join(rows)
+                + '</tbody></table>')
+    checks = ''
+    if 'check_plan' in report or 'check_results' in report or 'initial_check_results' in report:
+        initial = report.get('initial_check_results') or []
+        final_heading = '修复后检查结果' if initial else '检查结果'
+        checks = ('<section><h2>逐项检查</h2>'
+                  + (check_table(initial, '修复前检查结果') if initial else '')
+                  + check_table(report.get('check_results') or [], final_heading)
+                  + '<details><summary>完整检查计划</summary>'
                   + render(report.get('check_plan') or []) + '</details></section>')
     image_sections = []
     image_errors = list(report.get('image_errors') or [])

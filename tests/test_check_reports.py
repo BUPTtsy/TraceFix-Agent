@@ -89,6 +89,29 @@ def test_html_embeds_png_read_through_current_run_artifacts(tmp_path):
     assert '页面证据截图：http://app:3000' in page
 
 
+def test_initial_check_results_contribute_images_and_render_before_after_tables(tmp_path):
+    artifacts = Artifacts(tmp_path)
+    screenshot = artifacts.put('demo', 'run_1', PNG, 'png')
+    evidence = artifacts.put('demo', 'run_1', {'screenshot_ref': screenshot,
+        'url': 'http://app:3000/before', 'screenshot_hash': digest(PNG)})
+    item = {'id': 'goal', 'name': '保存反馈', 'criteria': '保存后显示反馈',
+            'source': 'user_goal', 'severity': 'blocker', 'detector': 'model'}
+    report = {'scope_id': 'demo', 'run_id': 'run_1', 'mode': 'repair',
+              'check_plan': [item],
+              'initial_check_results': [{**item, 'status': 'fail', 'actual': '修复前缺少反馈',
+                                         'evidence_refs': [evidence]}],
+              'check_results': [{**item, 'status': 'pass', 'actual': '修复后已显示反馈',
+                                 'evidence_refs': []}]}
+    images, errors = collect_report_images(report, artifacts, 'demo', 'run_1')
+    assert errors == []
+    assert images == [{'ref': screenshot, 'hash': digest(PNG), 'mime': 'image/png',
+                       'alt': '页面证据截图：http://app:3000/before'}]
+    page = report_page({**report, 'images': images}, artifacts=artifacts)
+    assert '修复前检查结果' in page and '修复后检查结果' in page
+    assert '修复前缺少反馈' in page and '修复后已显示反馈' in page
+    assert 'data:image/png;base64,' in page
+
+
 @pytest.mark.parametrize('damage', ['missing', 'hash', 'not_png', 'foreign', 'unsafe'])
 def test_invalid_image_evidence_is_reported_without_embedding(tmp_path, damage):
     artifacts = Artifacts(tmp_path)
