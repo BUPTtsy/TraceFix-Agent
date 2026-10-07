@@ -2135,6 +2135,8 @@ class Engine:
                                              'observation': observation, 'action': None})
                     applicable = [value for value in observations
                         if value['observation'].get('patch_hash', s.patch_hash) == s.patch_hash
+                        and all(value['observation'].get(field, getattr(s, field)) == getattr(s, field)
+                                for field in ('scope_id', 'run_id', 'source_manifest', 'test_spec_hash'))
                         and scope_matches(rule, value['observation'], paths)
                         and oracle_ready(rule, value['observation'], value.get('action'))]
                     if not applicable:
