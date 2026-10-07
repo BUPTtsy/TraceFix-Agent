@@ -1231,7 +1231,8 @@ class Engine:
                     s.evidence_refs.append(ref)
                     self.store.save(s)
                     ctx['available_evidence_refs'] = list(dict.fromkeys(
-                        ctx.get('available_evidence_refs', []) + s.evidence_refs))
+                        ctx.get('available_evidence_refs', []) +
+                        ([ref] if schema is CheckJudgement else s.evidence_refs)))
                     ctx['evidence_refs'] = ctx['available_evidence_refs']
                     self.event(s, 'check.source.read' if schema is CheckJudgement else 'diagnosis.source.read',
                                {'tool': name, 'artifact_ref': ref})
@@ -2001,6 +2002,7 @@ class Engine:
 
     async def model_check(self, s, item, observation, evidence_refs, *, reason=None, files=None,
                           deterministic_checks=None):
+        prior_refs = set(s.evidence_refs)
         image = None
         try:
             if observation.get('screenshot_ref'):
@@ -2019,7 +2021,8 @@ class Engine:
                 '检测出问题直接 fail，不要求复现，不修改代码；证据不足返回 inconclusive。'
                 '每项标准都必须有证据，禁止仅因工具失败断言业务失败或凭空通过。'
                 '引用 available_evidence_refs 中支持结论的真实证据。'}, image=image)
-        available = set(evidence_refs) | set(s.evidence_refs)
+        available = {reference for reference in set(evidence_refs) | (set(s.evidence_refs) - prior_refs)
+                     if not re.search(r'模型|推理|上下文|指令|记忆|源码|状态|事件', reference)}
         references = [ref for ref in judgment.evidence_refs if ref in available]
         if judgment.status != 'inconclusive' and not references:
             return 'inconclusive', '模型未提供可校验的当前检查证据：' + judgment.actual, []
@@ -2066,23 +2069,29 @@ class Engine:
             results.append(result)
             refs.append(ref)
             for scenario in spec.behavior_scenarios:
-                reset_result = await self.reset(s)
-                s.observation_ref = reset_result['observation_ref']
-                self.store.save(s)
-                for index, step in enumerate(scenario.steps, 1):
-                    business_failure = None
-                    try:
-                        s.observation_ref = await self.act(s, step.action, frozen=True)
-                    except ActionBusinessFailure as error:
-                        business_failure = error
-                        s.observation_ref = error.observation_ref
+                try:
+                    reset_result = await self.reset(s)
+                    s.observation_ref = reset_result['observation_ref']
                     self.store.save(s)
-                    refs.append(s.observation_ref)
-                    if step.assertions or business_failure:
-                        checkpoint, ref = self.check(s, step.assertions, scenario=scenario,
-                            scenario_step=index, business_failure=business_failure)
-                        results.append(checkpoint)
-                        refs.append(ref)
+                    for index, step in enumerate(scenario.steps, 1):
+                        business_failure = None
+                        try:
+                            s.observation_ref = await self.act(s, step.action, frozen=True)
+                        except ActionBusinessFailure as error:
+                            business_failure = error
+                            s.observation_ref = error.observation_ref
+                        self.store.save(s)
+                        refs.append(s.observation_ref)
+                        if step.assertions or business_failure:
+                            checkpoint, ref = self.check(s, step.assertions, scenario=scenario,
+                                scenario_step=index, business_failure=business_failure)
+                            results.append(checkpoint)
+                            refs.append(ref)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    results.append({'scenario_id': scenario.id, 'passed': None,
+                                    'error': sanitize(str(error))[:1500]})
         files, _ = self.check_source_files(s)
         failed = any(value.get('passed') is False for value in results)
         try:
@@ -2096,6 +2105,8 @@ class Engine:
             model_status, model_refs = 'inconclusive', []
             model_actual = '模型核查失败；已记录的确定性失败仍有效：' + sanitize(str(error))[:1500]
         status = 'fail' if failed else model_status
+        if status == 'pass' and any(value.get('error') for value in results):
+            status = 'inconclusive'
         actual = json.dumps({'deterministic_checks': results, 'criteria_judgement': model_actual}, ensure_ascii=False)
         return status, actual, list(dict.fromkeys(refs + model_refs))
 
@@ -2123,7 +2134,8 @@ class Engine:
                         observations.append({'observation_ref': s.observation_ref,
                                              'observation': observation, 'action': None})
                     applicable = [value for value in observations
-                        if scope_matches(rule, value['observation'], paths)
+                        if value['observation'].get('patch_hash', s.patch_hash) == s.patch_hash
+                        and scope_matches(rule, value['observation'], paths)
                         and oracle_ready(rule, value['observation'], value.get('action'))]
                     if not applicable:
                         raise RuntimeError('检测器缺少完整通道、触发动作或已实现能力')
