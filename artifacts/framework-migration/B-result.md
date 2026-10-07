@@ -1,5 +1,5 @@
 ---
-status: completed
+status: in_progress
 ---
 
 # 只读调查调用链收敛记录
@@ -45,3 +45,7 @@ status: completed
 测试虚拟环境使用 DeepAgents 0.4.12、langchain 1.4.3、langchain-core 1.6.6、langchain-openai 1.1.11、langgraph 1.2.14。项目原有依赖声明与锁仍待公共依赖集成；本轮不修改配置、依赖锁或 Engine。Engine 中既有 `TRACEFIX_WORKER`/`legacy_worker_switch` 策略也未在本轮改动，Worker 与 adapter 不存在旧 executor 或框架失败回退。
 
 测试读取 DeepAgents 内部 checkpoint 时，当前框架 serializer 对 SubtaskResult 的默认反序列化给出未来严格模式的类型注册提示；本轮未改变共享 serializer 配置，也未新增恢复承诺。
+
+## 遗留测试清理
+
+按后续要求删除阶段二的两项遗留测试：使用 TRACEFIX_WORKER 开关的 fake 诊断不可用测试，以及通过 engine.model_call/tool_pipeline 直接执行只读调查的旧测试；同时删除其无用导入。保留已改为真实 DeepAgents Agent loop 的 Worker 行为测试、单 Agent 宿主授权检查与主诊断校验。DeepAgents 测试中的旧入口禁止调用断言及旧 checkpoint 不被读取断言验证的是当前迁移边界，继续保留。生产代码没有新增改动，定向测试结果待补齐。
