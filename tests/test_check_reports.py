@@ -29,6 +29,7 @@ def test_check_report_preserves_legacy_issues_and_unifies_goal_with_rules():
     assert report['check_summary']['blocker_failed'] == 1
     assert report['check_summary']['coverage_complete'] is True
     assert report['check_results'][1]['source'] == 'user_goal'
+    assert report['check_results'][1]['status'] == 'pass'
     page = report_page(report)
     assert '逐项检查' in page and '刷新后完成状态保持' in page
     assert '用户目标' in page and '旧问题' in page
@@ -50,6 +51,16 @@ def test_missing_check_is_not_a_passing_suite():
     assert overall == 'INCONCLUSIVE'
     assert summary['coverage_complete'] is False
     assert summary['missing_ids'] == ['second']
+
+
+def test_missing_blocker_fails_but_critical_findings_do_not_block():
+    summary, overall = summarize_checks([{'id': 'first', 'severity': 'blocker'}], [])
+    assert overall == 'FAILED'
+    assert summary['blocker_failed'] == 1
+    summary, overall = summarize_checks([{'id': 'first', 'severity': 'critical'}],
+                                       [{'id': 'first', 'severity': 'critical', 'status': 'failed'}])
+    assert overall == 'PASSED_WITH_FINDINGS'
+    assert summary['failed'] == 1
 
 
 def test_json_images_keep_metadata_only():

@@ -14,11 +14,12 @@ ISSUE_STATUSES = {'suspected': '待确认', 'confirmed': '已确认', 'fixed': '
                   'wont_fix': '暂不修复', 'false_positive': '已判定误报'}
 
 CHECK_STATUSES = {
+    'pass': '通过', 'fail': '失败',
     'passed': '通过', 'failed': '失败', 'error': '执行错误',
     'inconclusive': '无法判断', 'skipped': '未执行', 'blocked': '被阻止',
 }
 CHECK_TERMINAL_STATUSES = frozenset(CHECK_STATUSES)
-BLOCKING_SEVERITIES = frozenset({'blocker', 'critical', 'blocking'})
+BLOCKING_SEVERITIES = frozenset({'blocker'})
 
 
 def _check_text(value, fallback=''):
@@ -45,7 +46,7 @@ def _normalize_check(item, *, result=False):
     normalized['detector'] = _check_text(item.get('detector', item.get('detector_type', 'model')), 'model')
     if result:
         normalized['status'] = _check_text(item.get('status', 'inconclusive'), 'inconclusive').lower()
-        normalized['status'] = {'pass': 'passed', 'fail': 'failed'}.get(normalized['status'], normalized['status'])
+        normalized['status'] = {'passed': 'pass', 'failed': 'fail'}.get(normalized['status'], normalized['status'])
         normalized['actual'] = item.get('actual', item.get('observed', ''))
         normalized['error'] = _check_text(item.get('error', ''))
         refs = item.get('evidence_refs', item.get('evidence', []))
@@ -62,12 +63,14 @@ def summarize_checks(check_plan=None, check_results=None):
     missing = [item['id'] for item in plan if item['id'] and item['id'] not in known_ids]
     blocking_failed = [item['id'] for item in results
                        if item['severity'] in BLOCKING_SEVERITIES
-                       and item['status'] != 'passed']
+                       and item['status'] != 'pass']
+    blocking_failed.extend(item['id'] for item in plan
+                           if item['severity'] in BLOCKING_SEVERITIES and item['id'] in missing)
     summary = {
         'total': len(plan) or len(results),
         'executed': len(results),
-        'passed': counts.get('passed', 0),
-        'failed': counts.get('failed', 0),
+        'passed': counts.get('pass', 0),
+        'failed': counts.get('fail', 0),
         'error': counts.get('error', 0),
         'inconclusive': counts.get('inconclusive', 0),
         'skipped': counts.get('skipped', 0),
