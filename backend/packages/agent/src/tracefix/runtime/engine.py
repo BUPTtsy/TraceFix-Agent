@@ -924,7 +924,8 @@ class Engine:
             raise
 
     async def model_call(self, s, schema, ctx, image=None, validate_output=None):
-        ctx = {**ctx, 'phase': str(s.phase), 'execution_mode': s.execution_mode}
+        ctx = {**ctx, 'phase': str(s.phase), 'execution_mode': s.execution_mode,
+               'workspace_root': str(self.workspace.root)}
         # Worker calls select locally; never replace the shared supervisor model.
         selected_model = (self.worker_model if ctx.get('worker_depth') == 1
                           and not ctx.get('worker_same_model')
@@ -1842,7 +1843,7 @@ class Engine:
                 'observation': observation,
                 'reference_documents': knowledge,
                 'detection_rules': [rule.summary() for rule in rules],
-                'instruction': '根据用户目标和首次只读观测编译 TestSpec。授权动作必须使用 schema 枚举；'
+                'instruction': '根据用户目标、首次只读观测及授权源码编译 TestSpec。用 Glob/Grep/Read 核对相关组件、可访问名称和事件绑定，不能仅凭截图判断可操作元素。授权动作必须使用 schema 枚举；'
                                '定位器使用页面中的完整可访问名称；保留用户要求的刷新后断言，并提供独立回归场景。'},
                 validate_output=lambda candidate: validate_spec_observation(candidate, observation))
             validate_spec_observation(spec, observation)
@@ -1881,7 +1882,7 @@ class Engine:
         context = build_context(s, spec.model_dump(), obs, pairs=[{'action': a, 'result': 'see current observation'} for a in plan[-4:]],
                                 rules=self.active_rules(s, str(Phase.EXPLORE)))
         context['reference_documents'] = await select_documents(self, s, obs)
-        context['instruction'] = '浏览器动作必须通过原生浏览器工具执行，每次只调用一个工具，并等待最新观测。必须匹配当前 observation_id 和 element_ref。完成请求的交互后返回 finish；它只是请求运行时执行确定性断言检查。'
+        context['instruction'] = '结合最新页面语义观测与授权源码识别可操作元素；用 Glob/Grep/Read 核对文案、组件、事件绑定和状态条件，不能仅凭截图或源码猜测页面目标。浏览器动作必须通过原生浏览器工具执行，每次只调用一个工具，并等待最新观测。必须匹配当前 observation_id 和 element_ref。完成请求的交互后返回 finish；它只是请求运行时执行确定性断言检查。'
         decision = await self.model_call(s, Decision, context, image=image)
         self.validate_rule_refs(s, decision.rule_refs)
         obs = self.get(s, s.observation_ref)

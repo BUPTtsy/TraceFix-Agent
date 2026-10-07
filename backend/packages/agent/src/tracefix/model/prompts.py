@@ -5,7 +5,7 @@ import json
 from tracefix.knowledge.context import POLICY
 
 
-PROMPT_VERSION = 'stage-prefix-v1'
+PROMPT_VERSION = 'stage-prefix-v2'
 
 STAGE_POLICIES = {
     'PREPARE': '当前阶段负责将用户目标编译为可执行、可核验的测试规范。先区分用户报告、首次页面观测与尚未证实的假设，不预设缺陷必然存在。根据真实页面元素和完整可访问名称定义操作、预期结果及刷新后的状态断言；动态元素必须有明确步骤支持。只申请完成目标所需的最小动作权限，并设计与原问题不同的独立回归场景。信息不足时明确说明限制，不编造页面、登录状态或成功条件。输出前检查断言是否真正衡量用户要求，以及授权动作是否覆盖必要流程；规范冻结后由运行时负责执行与判定。',
@@ -26,7 +26,7 @@ def serialize_request(schema, context):
     # 将目标、规则、引导与分层记忆固定在前部，保持请求顺序稳定便于复用前缀。
     canonical = json.loads(json.dumps(context, ensure_ascii=False, sort_keys=True))
     stable_fields = ('skills', 'policy', 'project_instructions', 'detection_rules', 'skill_index',
-                     'goal', 'url', 'test_spec', 'scope', 'phase', 'allowed_files',
+                     'goal', 'url', 'test_spec', 'scope', 'phase', 'workspace_root', 'allowed_files',
                      'rule_snapshot_hash', 'user_guidance', 'review_guidance', 'working_memory', 'job_memory')
     ordered = {field: canonical[field] for field in stable_fields if field in canonical}
     ordered.update({field: value for field, value in canonical.items() if field not in ordered})
@@ -78,6 +78,15 @@ observation_id 和 element_ref 必须来自本次观测，不得编造、截断�
 当目标要求“标记完成后刷新并验证”时，先操作，再 navigate 重新加载，观察加载后状态，最后 finish。
 """
 
+ELEMENT_DISCOVERY = """
+识别按钮、链接、表单及其他可操作元素时，结合最新页面语义观测与授权源码，不得仅凭截图外观判断可点击性。
+使用 Glob 定位相关组件，用 Grep 搜索页面文案、aria-label、role、事件绑定和动态渲染条件，再用 Read 核对相关代码及上下文。
+Glob/Grep 的 path 可省略以搜索当前工作区；Read.file_path 必须使用返回的绝对路径，或 workspace_root 下的绝对路径。
+源码用于解释操作意图、可访问名称、事件处理和状态条件，不能证明元素已在当前页面渲染或可操作；截图仅作辅助证据。
+最终 locator 的 role/name、observation_id、element_ref 必须来自最新页面观测，不得从源码标识符或截图猜测；
+找不到唯一匹配时先获取最新观测并核对源码，仍无法确认则说明限制，不编造目标或盲目点击。
+"""
+
 # 业务场景在修补前冻结，防止用禁用交互或破坏逆向操作来换取原问题断言通过。
 SPEC = """
 TestSpec 输出规范：你正在根据用户目标和首次只读页面观测编译测试规范，尚未冻结。
@@ -117,4 +126,5 @@ edits 的 path 必须是允许编辑的项目相对路径；before_hash 必须�
 def output_instructions(schema, *, include_common=True):
     specific = {'TestSpec': SPEC, 'Decision': ACTION, 'BrowserAction': ACTION,
                 'PatchProposal': PATCH}.get(schema.__name__, '')
-    return (COMMON if include_common else '') + NATIVE_OUTPUT + specific
+    discovery = ELEMENT_DISCOVERY if schema.__name__ in {'TestSpec', 'Decision', 'BrowserAction'} else ''
+    return (COMMON if include_common else '') + NATIVE_OUTPUT + discovery + specific

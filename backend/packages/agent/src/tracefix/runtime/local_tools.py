@@ -610,8 +610,8 @@ def register_local_tools(engine, state, context, bind):
     definitions = [
         ('Read', ReadInput, tools.read, False,
          '读取当前授权工作区内的绝对路径。文本默认最多 2000 行，可用 offset/limit 分页；支持图片、PDF 页文本、Jupyter cell。倾向并行读取多个文件。'),
-        ('Glob', GlobInput, tools.glob, False, '按文件名 glob（如 **/*.ts）列出授权文件，按修改时间降序排序；path 为绝对目录。'),
-        ('Grep', GrepInput, tools.grep, False, '正则内容搜索；支持 glob/type 过滤、multiline 和 content/files_with_matches/count 三种输出。'),
+        ('Glob', GlobInput, tools.glob, False, '按文件名 glob（如 **/*.ts）列出授权文件的绝对路径，按修改时间降序排序；path 为绝对目录，省略时从当前工作区根搜索。可定位页面组件供 Read 核对。'),
+        ('Grep', GrepInput, tools.grep, False, '正则内容搜索；支持 glob/type 过滤、multiline 和 content/files_with_matches/count 三种输出。path 为工作区内绝对路径，省略时搜索当前工作区；可搜索页面文案、可访问名称和事件绑定辅助识别可操作元素。'),
         ('Write', WriteInput, tools.write, True, '覆盖授权绝对路径的已有文件，仅暂存到 overlay；禁止新建文件，精确替换优先 Edit。'),
         ('Edit', EditInput, tools.edit, True, '旧模式支持单块精确替换；局部模式用 edits 在同一共同基线提交多个唯一、不重叠块，带 expected_overlay_revision/hash，失败返回可纠正错误，不自动模糊匹配或 replace_all。'),
         ('NotebookEdit', NotebookEditInput, tools.notebook_edit, True, '按零起始 cell_number 替换、插入或删除 Jupyter cell；保留 notebook 元数据，代码修改清空旧输出。'),
