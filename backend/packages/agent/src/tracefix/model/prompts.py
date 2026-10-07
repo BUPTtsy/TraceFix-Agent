@@ -5,7 +5,7 @@ import json
 from tracefix.knowledge.context import POLICY
 
 
-PROMPT_VERSION = 'stage-prefix-v2'
+PROMPT_VERSION = 'stage-prefix-v3'
 
 STAGE_POLICIES = {
     'PREPARE': '当前阶段负责将用户目标编译为可执行、可核验的测试规范。先区分用户报告、首次页面观测与尚未证实的假设，不预设缺陷必然存在。根据真实页面元素和完整可访问名称定义操作、预期结果及刷新后的状态断言；动态元素必须有明确步骤支持。只申请完成目标所需的最小动作权限，并设计与原问题不同的独立回归场景。信息不足时明确说明限制，不编造页面、登录状态或成功条件。输出前检查断言是否真正衡量用户要求，以及授权动作是否覆盖必要流程；规范冻结后由运行时负责执行与判定。',
@@ -81,6 +81,8 @@ observation_id 和 element_ref 必须来自本次观测，不得编造、截断�
 ELEMENT_DISCOVERY = """
 识别按钮、链接、表单及其他可操作元素时，结合最新页面语义观测与授权源码，不得仅凭截图外观判断可点击性。
 使用 Glob 定位相关组件，用 Grep 搜索页面文案、aria-label、role、事件绑定和动态渲染条件，再用 Read 核对相关代码及上下文。
+需要核对结构时调用 CodeAnalyze，支持 React JSX/TSX、Vue3 template/script、JavaScript、TypeScript 与 HTML 的语法、元素、可访问名称及事件绑定分析。
+辅助分析器报错时保留失败记录，回退到当前页面截图和语义观察，结合已读取源码继续判断；证据不足应明确无法判断，不能把工具失败当作检查通过。
 Glob/Grep 的 path 可省略以搜索当前工作区；Read.file_path 必须使用返回的绝对路径，或 workspace_root 下的绝对路径。
 源码用于解释操作意图、可访问名称、事件处理和状态条件，不能证明元素已在当前页面渲染或可操作；截图仅作辅助证据。
 实际执行元素操作时，locator 的 role/name、observation_id、element_ref 必须来自最新页面观测，不得从源码标识符或截图猜测；
