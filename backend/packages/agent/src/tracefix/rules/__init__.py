@@ -19,10 +19,12 @@ from .static import evaluate_static
 from .resolver import RuleResolver, derive_rule_snapshot, render_rule_context
 from .store import RuleLibrary
 from .builtins import builtin_rules
+from .analyzers import analyze_source, SUPPORTED_LANGUAGES, SUPPORTED_DETECTORS
 
 __all__ = [
     "DetectionType", "Finding", "FindingSource", "FindingStatus", "Rule",
     "RuleCategory", "RuleDetection", "RuleLibrary", "RuleRef", "RuleResolver",
     "RuleScope", "RuleSeverity", "RuleSnapshot", "RuleStatus", "derive_rule_snapshot",
     "builtin_rules", "evaluate_oracle", "evaluate_static", "render_rule_context",
+    "analyze_source", "SUPPORTED_LANGUAGES", "SUPPORTED_DETECTORS",
 ]
