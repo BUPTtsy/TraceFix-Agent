@@ -91,7 +91,7 @@ class FakeModel:
             passed = '[checked]' in str(observation.get('snapshot', ''))
             value = CheckJudgement(status='pass' if passed else 'fail',
                                    actual='CI 模拟页面检查：' + ('已选中' if passed else '未选中'),
-                                   evidence_refs=[context.get('observation', {}).get('id')] if context.get('observation', {}).get('id') else [])
+                                   evidence_refs=context.get('available_evidence_refs', [])[:1])
         elif schema is PatchProposal:
             value=PatchProposal(summary='CI 模拟修复',evidence_refs=context['evidence_refs'][:1],edits=[FileEdit(path='src/value.ts',before_hash=digest(self.workspace.read('src/value.ts').encode()),content='export const persisted = true;\n')])
         elif schema is ReproductionPlan:

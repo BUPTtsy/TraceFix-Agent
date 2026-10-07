@@ -10,7 +10,7 @@ from typing import Literal
 
 from pydantic import ConfigDict, Field
 
-from tracefix.runtime.contracts import (BrowserAction, Contract, Decision, PatchProposal,
+from tracefix.runtime.contracts import (BrowserAction, CheckJudgement, Contract, Decision, PatchProposal,
                                        Phase, TestSpec, digest)
 from tracefix.runtime.tools import ToolPipeline, ToolRegistry, ToolRejected, build_tool
 from tracefix.runtime.effects import file_resource, make_operation_executor, run_effect
@@ -120,6 +120,9 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
     def bind(name, description, input_model, handler, *, phases, side_effect='read',
              parallel_safe=True, submission=False, output_limit_tokens=4000, timeout_s=45,
              output_model=None, aliases=(), search_hint='', enabled=True, idempotency_key=None):
+        if schema is CheckJudgement and name not in {'Read', 'Grep', 'Glob', 'code.analyze',
+                                                      'rules.get', 'rules.applicable', 'context.expand'}:
+            return
         if not worker_tool_allowed(name, side_effect):
             return
         definition = build_tool(name, description, input_model, handler,
@@ -151,7 +154,7 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
                 if arguments.path_globs and not any(fnmatch.fnmatchcase(relative, pattern)
                                                     for pattern in arguments.path_globs):
                     continue
-                if path.suffix.lower() not in {'.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.vue', '.html', '.htm'}:
+                if path.suffix.lower() not in {'.js', '.mjs', '.cjs', '.jsx', '.ts', '.mts', '.cts', '.tsx', '.vue', '.html', '.htm'}:
                     continue
                 staged = local.staged_content(relative)
                 data = staged if staged is not None else path.read_bytes()
