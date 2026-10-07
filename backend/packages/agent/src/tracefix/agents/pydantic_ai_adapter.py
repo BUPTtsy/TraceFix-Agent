@@ -501,7 +501,6 @@ class PydanticAIAdapter:
             if (validate_output is not None or submission_spec is not None
                     or schema in {BrowserAction, Decision}):
                 model_retry = getattr(exceptions, 'ModelRetry', RuntimeError)
-                @agent.output_validator
                 async def host_output_validator(run_context, output):
                     submitting = (submission_spec is not None
                         and getattr(run_context, 'tool_name', None) == submission_spec.wire_name)
@@ -525,6 +524,8 @@ class PydanticAIAdapter:
                             raise trace.failure('output_validation', '提交完成后输出校验失败，需人工复核',
                                 error, status='UNKNOWN_OPERATION') from error
                         raise model_retry(str(error)) from error
+                if hasattr(agent, 'output_validator'):
+                    agent.output_validator(host_output_validator)
             await emit('adapter.started', {'schema': getattr(schema, '__name__', str(schema)),
                        'message_history': trace.messages, 'output_retries': self.output_retries})
             run_options = {'message_history': history_messages(),
@@ -535,6 +536,10 @@ class PydanticAIAdapter:
             trace.messages = copy.deepcopy(result.all_messages())
             trace.context = None
             output = result.output if schema is str else schema.model_validate(result.output)
+            if (schema in {BrowserAction, Decision}
+                    and getattr(output, 'action', output).kind != 'finish'):
+                raise trace.failure('output_validation',
+                    '最终浏览器输出只能是 finish，动作必须通过原生浏览器工具执行')
             await emit('adapter.completed', {'output': output, 'message_history': trace.messages,
                        'tool_calls': trace.tool_calls, 'retry_context': trace.retry_context})
             usage = getattr(result, 'usage', {})
