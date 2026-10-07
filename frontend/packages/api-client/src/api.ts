@@ -117,7 +117,7 @@ export interface Run {canContinue?: boolean}
 export interface ReportIssue {id: string; title: string; source: string; status: string; location: string; expected: string; actual: string; steps: string[]; verification: string; evidence_refs: string[]}
 export interface CheckItem {id: string; name: string; criteria: string; severity: 'blocker' | 'critical' | 'major' | 'minor'; source: 'rule' | 'user_goal'; detector: string; rule_version?: number | null}
 export interface CheckResult extends CheckItem {status: 'pass' | 'fail' | 'error' | 'inconclusive'; actual: string; evidence_refs: string[]; error?: string | null; fallback?: {source?: string; reason?: string; status?: string; error?: string} | null; stage?: 'explore' | 'verify'}
-export interface CheckSummary {total: number; executed: number; passed: number; failed: number; error: number; inconclusive: number; blocker_failed: number; missing: number; coverage_complete: boolean}
+export interface CheckSummary {total: number; executed?: number; passed: number; failed: number; error: number; inconclusive: number; blocker_failed: number; missing?: number; missing_ids?: string[]; coverage_complete: boolean}
 export interface ReportImage {ref: string; hash: string; mime: 'image/png'; alt: string}
 export interface CheckReport {check_plan?: CheckItem[]; check_results?: CheckResult[]; check_summary?: CheckSummary; overall_status?: 'PASSED' | 'PASSED_WITH_FINDINGS' | 'FAILED' | 'INCONCLUSIVE'; images?: ReportImage[]; initial_check_results?: CheckResult[]; initial_check_summary?: CheckSummary}
 export interface Run extends CheckReport {issueReport?: ({summary: string; issues: ReportIssue[]; coverage: string; limits: string} & CheckReport) | null; reportError?: string | null}

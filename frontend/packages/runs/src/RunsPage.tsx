@@ -10,18 +10,19 @@ export const timeLabel = (value?: string) => value ? new Date(value).toLocaleStr
 const checkStatuses: Record<string, string> = {pass: '通过', fail: '失败', error: '执行错误', inconclusive: '无法判断'};
 const overallStatuses: Record<string, string> = {PASSED: '全部通过', PASSED_WITH_FINDINGS: '通过但有非阻断问题', FAILED: '阻断检查失败', INCONCLUSIVE: '尚无法确定'};
 const checkSeverities: Record<string, string> = {blocker: '阻断', critical: '严重', major: '主要', minor: '次要'};
-function CheckResults({plan, results, summary}: {plan: CheckItem[]; results: CheckResult[]; summary?: CheckSummary}) {
+function CheckResults({plan, results, summary, runId, allowed}: {plan: CheckItem[]; results: CheckResult[]; summary?: CheckSummary; runId: string; allowed: Set<string>}) {
   const plannedIds = new Set(plan.map(item => item.id));
   const checks = [...plan.map(item => ({item, result: results.find(result => result.id === item.id)})),
     ...results.filter(result => !plannedIds.has(result.id)).map(result => ({item: result, result}))];
+  const missing = summary?.missing ?? summary?.missing_ids?.length ?? plan.filter(item => !results.some(result => result.id === item.id)).length;
   return <>
-    {summary && <p>已执行 {summary.executed} / {summary.total} 项 · 通过 {summary.passed} · 失败 {summary.failed} · 执行错误 {summary.error} · 无法判断 {summary.inconclusive} · 阻断未通过 {summary.blocker_failed}{summary.missing > 0 && ` · 未执行 ${summary.missing}`}</p>}
+    {summary && <p>已执行 {summary.executed ?? results.length} / {summary.total} 项 · 通过 {summary.passed} · 失败 {summary.failed} · 执行错误 {summary.error} · 无法判断 {summary.inconclusive} · 阻断未通过 {summary.blocker_failed}{missing > 0 && ` · 未执行 ${missing}`}</p>}
     {checks.map(({item, result}, index) => <article className="knowledge-use" key={item.id}>
       <h4>{index + 1}. {item.name} <span className={'badge ' + (result?.status === 'pass' ? 'success' : result?.status === 'fail' || result?.status === 'error' ? 'failure' : 'warning')}>{result ? checkStatuses[result.status] || result.status : '未执行'}</span></h4>
       <dl><dt>检查 ID</dt><dd>{item.id}</dd><dt>来源 / 级别</dt><dd>{item.source === 'user_goal' ? '用户目标' : '配置规则'} · {checkSeverities[item.severity] || item.severity}</dd><dt>检测方式</dt><dd>{item.detector}</dd><dt>检测内容 / 指标</dt><dd>{item.criteria}</dd><dt>实际检测结果</dt><dd>{result?.actual || '尚未记录执行结果'}</dd></dl>
       {result?.error && <p className="notice failure">{result.error}</p>}
       {result?.fallback && <p className="notice warning">已回退模型多模态判断：{result.fallback.reason || '辅助分析器不可用'}{result.fallback.status && ` · ${checkStatuses[result.fallback.status] || result.fallback.status}`}</p>}
-      <div className="source-links">{result?.evidence_refs.map(ref => <span key={ref}>{ref}</span>)}</div>
+      <div className="source-links">{result?.evidence_refs.map(ref => allowed.has(ref) ? <a href={artifactUrl(runId, ref)} key={ref} download={!ref.endsWith('.html')}>{ref}</a> : <span key={ref}>{ref}</span>)}</div>
     </article>)}
   </>;
 }
@@ -34,10 +35,9 @@ export function CheckReportPanel({run}: {run: Run}) {
   const allowed = new Set(run.artifacts?.map(artifact => artifact.ref) || []);
   return <section className="detail-block" aria-label="逐项检查报告">
     <h3>逐项检查 {report.overall_status && <span className="badge">{overallStatuses[report.overall_status] || report.overall_status}</span>}</h3>
-    {verified && <details><summary>修复前检查结果</summary><CheckResults plan={plan} results={initialResults} summary={report.initial_check_summary}/></details>}
+    {verified && <details><summary>修复前检查结果</summary><CheckResults plan={plan} results={initialResults} summary={report.initial_check_summary} runId={run.id} allowed={allowed}/></details>}
     {verified && <h4>修复后检查结果</h4>}
-    <CheckResults plan={plan} results={results} summary={report.check_summary}/>
-    <div className="source-links">{[...new Set([...initialResults, ...results].flatMap(result => result.evidence_refs))].filter(ref => allowed.has(ref)).map(ref => <a href={artifactUrl(run.id, ref)} key={ref} download={!ref.endsWith('.html')}>{ref}</a>)}</div>
+    <CheckResults plan={plan} results={results} summary={report.check_summary} runId={run.id} allowed={allowed}/>
     {!!report.images?.length && <div><h4>图片证据</h4>{report.images.filter(image => allowed.has(image.ref) && image.mime === 'image/png').map(image => <figure key={image.ref}><a href={artifactUrl(run.id, image.ref)}><img src={artifactUrl(run.id, image.ref)} alt={image.alt || '页面证据截图'} loading="lazy" style={{maxWidth: '100%', height: 'auto'}}/></a><figcaption>{image.alt || '页面证据截图'} · {image.ref}</figcaption></figure>)}</div>}
   </section>;
 }
