@@ -1,5 +1,6 @@
 """Human-readable findings derived from recorded checks and observations."""
 from collections import Counter
+from copy import deepcopy
 
 from tracefix.execution.browser import elements
 from tracefix.runtime.contracts import digest
@@ -11,6 +12,175 @@ CONDITIONS = {'visible': '可见且唯一', 'absent': '不存在', 'checked': '�
 ISSUE_STATUSES = {'suspected': '待确认', 'confirmed': '已确认', 'fixed': '已验证修复',
                   'reproduced': '已确认', 'not_reproducible': '未稳定复现',
                   'wont_fix': '暂不修复', 'false_positive': '已判定误报'}
+
+CHECK_STATUSES = {
+    'passed': '通过', 'failed': '失败', 'error': '执行错误',
+    'inconclusive': '无法判断', 'skipped': '未执行', 'blocked': '被阻止',
+}
+CHECK_TERMINAL_STATUSES = frozenset(CHECK_STATUSES)
+BLOCKING_SEVERITIES = frozenset({'blocker', 'critical', 'blocking'})
+
+
+def _check_text(value, fallback=''):
+    """Return a report-safe, human-readable representation of a check value."""
+    if value is None:
+        return fallback
+    if isinstance(value, (dict, list, tuple)):
+        import json
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
+
+def _normalize_check(item, *, result=False):
+    """Keep the common check contract stable while accepting legacy field names."""
+    if not isinstance(item, dict):
+        item = {'id': '', 'name': _check_text(item)}
+    normalized = deepcopy(item)
+    normalized['id'] = _check_text(item.get('id') or item.get('rule_id') or item.get('check_id'))
+    normalized['name'] = _check_text(item.get('name') or item.get('title') or normalized['id'], '未命名检查')
+    criteria = item.get('criteria', item.get('detection', item.get('content', item.get('description', ''))))
+    normalized['criteria'] = criteria
+    normalized['severity'] = _check_text(item.get('severity', 'normal'), 'normal').lower()
+    normalized['source'] = _check_text(item.get('source', 'rule'), 'rule')
+    normalized['detector'] = _check_text(item.get('detector', item.get('detector_type', 'model')), 'model')
+    if result:
+        normalized['status'] = _check_text(item.get('status', 'inconclusive'), 'inconclusive').lower()
+        normalized['status'] = {'pass': 'passed', 'fail': 'failed'}.get(normalized['status'], normalized['status'])
+        normalized['actual'] = item.get('actual', item.get('observed', ''))
+        normalized['error'] = _check_text(item.get('error', ''))
+        refs = item.get('evidence_refs', item.get('evidence', []))
+        normalized['evidence_refs'] = list(dict.fromkeys(refs if isinstance(refs, list) else ([refs] if refs else [])))
+    return normalized
+
+
+def summarize_checks(check_plan=None, check_results=None):
+    """Aggregate check execution without allowing one failed item to hide others."""
+    plan = [_normalize_check(item) for item in (check_plan or [])]
+    results = [_normalize_check(item, result=True) for item in (check_results or [])]
+    counts = Counter(item['status'] for item in results)
+    known_ids = {item['id'] for item in results if item['id']}
+    missing = [item['id'] for item in plan if item['id'] and item['id'] not in known_ids]
+    blocking_failed = [item['id'] for item in results
+                       if item['severity'] in BLOCKING_SEVERITIES
+                       and item['status'] != 'passed']
+    summary = {
+        'total': len(plan) or len(results),
+        'executed': len(results),
+        'passed': counts.get('passed', 0),
+        'failed': counts.get('failed', 0),
+        'error': counts.get('error', 0),
+        'inconclusive': counts.get('inconclusive', 0),
+        'skipped': counts.get('skipped', 0),
+        'blocked': counts.get('blocked', 0),
+        'blocker_failed': len(blocking_failed),
+        'missing': len(missing),
+        'missing_ids': missing,
+        'coverage_complete': not missing and len(results) >= len(plan),
+    }
+    if blocking_failed:
+        overall = 'FAILED'
+    elif missing or summary['error'] or summary['inconclusive'] or summary['skipped'] or summary['blocked']:
+        overall = 'INCONCLUSIVE'
+    elif summary['failed']:
+        overall = 'PASSED_WITH_FINDINGS'
+    else:
+        overall = 'PASSED'
+    return summary, overall
+
+
+def with_check_report(report, *, check_plan=None, check_results=None, images=None):
+    """Add the check-suite contract to an existing issue report.
+
+    Existing issue fields are deliberately preserved for old consumers.  The function
+    is pure and can be used by both test and repair finalization paths.
+    """
+    output = deepcopy(report or {})
+    if check_plan is not None:
+        output['check_plan'] = [_normalize_check(item) for item in check_plan]
+    elif 'check_plan' in output:
+        output['check_plan'] = [_normalize_check(item) for item in output['check_plan']]
+    if check_results is not None:
+        output['check_results'] = [_normalize_check(item, result=True) for item in check_results]
+    elif 'check_results' in output:
+        output['check_results'] = [_normalize_check(item, result=True) for item in output['check_results']]
+    if images is not None:
+        output['images'] = [
+            {key: item.get(key, '') for key in ('ref', 'hash', 'mime', 'alt')}
+            for item in images if isinstance(item, dict)
+        ]
+    elif 'images' in output:
+        output['images'] = [
+            {key: item.get(key, '') for key in ('ref', 'hash', 'mime', 'alt')}
+            for item in output['images'] if isinstance(item, dict)
+        ]
+    if 'check_plan' in output or 'check_results' in output:
+        summary, overall = summarize_checks(output.get('check_plan'), output.get('check_results'))
+        output['check_summary'] = summary
+        output['overall_status'] = overall
+    return output
+
+
+def collect_report_images(report, artifacts, scope_id, run_id):
+    references = []
+    for key in ('evidence_refs', 'baseline_validation_refs', 'validation_refs'):
+        references.extend(report.get(key) or [])
+    for key in ('check_results', 'issues'):
+        for item in report.get(key) or []:
+            if isinstance(item, dict):
+                references.extend(item.get('evidence_refs') or [])
+    images, errors, visited = {}, [], set()
+
+    def image(reference, expected_hash=None, alt='页面证据截图'):
+        raw = artifacts.read(scope_id, run_id, reference)
+        if not reference.endswith('.png') or not raw.startswith(b'\x89PNG\r\n\x1a\n') or len(raw) <= 8:
+            raise ValueError('图片证据不是 PNG')
+        checksum = digest(raw)
+        if expected_hash is not None and expected_hash != checksum:
+            raise ValueError('图片证据哈希不匹配')
+        images[reference] = {'ref': reference, 'hash': checksum, 'mime': 'image/png', 'alt': alt}
+
+    def visit(reference):
+        if not isinstance(reference, str) or not reference or reference in visited:
+            return
+        visited.add(reference)
+        try:
+            if reference.endswith('.png'):
+                image(reference)
+                return
+            if not reference.endswith('.json'):
+                return
+            item = artifacts.json(scope_id, run_id, reference)
+            if not isinstance(item, dict):
+                return
+            if ('scope_id' in item and item['scope_id'] != scope_id
+                    or 'run_id' in item and item['run_id'] != run_id):
+                raise ValueError('图片关联证据不属于当前 Run')
+            if item.get('screenshot_ref'):
+                image(item['screenshot_ref'], item.get('screenshot_hash'),
+                      '页面证据截图：' + str(item.get('url') or item.get('id') or reference))
+            for key in ('observation_ref', 'artifact_ref'):
+                if item.get(key):
+                    visit(item[key])
+            for key in ('checkpoint_refs', 'evidence_refs'):
+                for nested in item.get(key) or []:
+                    visit(nested)
+        except (OSError, ValueError, KeyError, TypeError, PermissionError) as error:
+            errors.append({'ref': reference, 'error': _check_text(error)})
+
+    for item in report.get('images') or []:
+        if not isinstance(item, dict):
+            errors.append({'ref': '', 'error': '图片记录格式无效'})
+            continue
+        reference = item.get('ref', '')
+        try:
+            if item.get('mime', 'image/png') != 'image/png':
+                raise ValueError('报告只支持 PNG 证据')
+            image(reference, item.get('hash') or None, item.get('alt') or '页面证据截图')
+        except (OSError, ValueError, KeyError, TypeError, PermissionError) as error:
+            errors.append({'ref': reference, 'error': _check_text(error)})
+    for reference in references:
+        visit(reference)
+    return list(images.values()), errors
 
 
 def assertion_description(check, snapshot=''):

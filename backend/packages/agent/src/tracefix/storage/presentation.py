@@ -1,6 +1,7 @@
 """Chinese labels for human-facing reports; machine contracts stay stable."""
 import html
 import json
+import base64
 from urllib.parse import quote
 
 
@@ -99,6 +100,15 @@ LABELS = {
     'workspace.patch': '应用工作区补丁', 'local.commit': '创建本地候选提交',
     'verify.static': '静态检查', 'verify.unit': '单元测试', 'verify.build': '构建',
     'verify.health': '健康检查', 'verify.original': '原问题重测', 'verify.regression': '回归测试',
+    'check_plan': '冻结检查计划', 'check_results': '逐项检查结果', 'check_summary': '检查汇总',
+    'overall_status': '整体测试结果', 'images': '图片证据', 'image_errors': '图片证据错误',
+    'PASSED': '测试通过', 'PASSED_WITH_FINDINGS': '通过但存在非阻断问题',
+    'criteria': '检测内容与指标', 'severity': '严重级别', 'detector': '检测方式',
+    'blocker': '阻断', 'critical': '阻断', 'normal': '普通', 'warning': '告警',
+    'user_goal': '用户目标', 'rule': '检测规则', 'model': '模型', 'dom': 'DOM',
+    'oracle': '页面规则', 'static': '源码静态检查', 'ast': 'AST', 'multimodal': '多模态',
+    'actual': '实际检测结果', 'coverage_complete': '计划覆盖完整', 'blocker_failed': '阻断失败数',
+    'executed': '已执行数', 'missing': '遗漏数', 'missing_ids': '遗漏检查编号',
 }
 
 
@@ -120,8 +130,8 @@ def readable(value):
     return value
 
 
-def report_page(report):
-    from tracefix.storage.reporting import ISSUE_STATUSES
+def report_page(report, *, artifacts=None, scope_id=None, run_id=None):
+    from tracefix.storage.reporting import CHECK_STATUSES, ISSUE_STATUSES, _check_text, collect_report_images
 
     def render(value, key=''):
         if isinstance(value, list) and key.endswith('_refs'):
@@ -134,7 +144,7 @@ def report_page(report):
                       'environment_digest', 'agent_instructions_hash'}
     summary, technical = [], []
     for key, value in report.items():
-        if key == 'issues':
+        if key in {'issues', 'check_plan', 'check_results', 'images', 'image_errors'}:
             continue
         row = f'<tr><th>{html.escape(label(key))}</th><td>{render(value, key)}</td></tr>'
         (technical if key in technical_keys else summary).append(row)
@@ -149,13 +159,65 @@ def report_page(report):
             f'<dl>{details}</dl><h4>复现步骤</h4><ol>{steps}</ol><h4>证据</h4><ul>{evidence}</ul></article>')
     title = '测试报告' if report.get('mode') == 'test' else '修复报告'
     issues = '<section><h2>问题清单</h2>' + (''.join(issue_sections) or '<p>未形成有证据的问题记录。</p>') + '</section>'
+    check_rows = []
+    for item in report.get('check_results') or []:
+        status = str(item.get('status', 'inconclusive')).lower()
+        status = {'pass': 'passed', 'fail': 'failed'}.get(status, status)
+        cells = [html.escape(str(item.get('id') or item.get('check_id') or '')),
+                 html.escape(str(item.get('name') or item.get('title') or '未命名检查')),
+                 html.escape(_check_text(item.get('criteria', ''))),
+                 html.escape(label(item.get('severity', 'normal'))),
+                 html.escape(label(item.get('source', 'rule'))),
+                 html.escape(label(item.get('detector', item.get('detector_type', 'model')))),
+                 html.escape(CHECK_STATUSES.get(status, status)),
+                 html.escape(_check_text(item.get('actual', ''))),
+                 html.escape(_check_text(item.get('error', ''))),
+                 render(item.get('evidence_refs') or [], 'evidence_refs')]
+        check_rows.append('<tr>' + ''.join('<td>' + value + '</td>' for value in cells) + '</tr>')
+    checks = ''
+    if 'check_plan' in report or 'check_results' in report:
+        headings = ['ID', '名称', '检测内容与指标', '严重级别', '来源', '检测方式', '状态', '实际结果', '错误', '证据']
+        checks = ('<section><h2>逐项检查</h2><table><thead><tr>'
+                  + ''.join('<th>' + heading + '</th>' for heading in headings)
+                  + '</tr></thead><tbody>' + ''.join(check_rows)
+                  + '</tbody></table><details><summary>完整检查计划</summary>'
+                  + render(report.get('check_plan') or []) + '</details></section>')
+    image_sections = []
+    image_errors = list(report.get('image_errors') or [])
+    if artifacts is not None:
+        scope_id, run_id = scope_id or report.get('scope_id'), run_id or report.get('run_id')
+        if not scope_id or not run_id:
+            image_errors.append({'ref': '', 'error': '缺少当前 Run 的 scope_id/run_id，无法读取图片证据'})
+        else:
+            images, errors = collect_report_images(report, artifacts, scope_id, run_id)
+            image_errors.extend(errors)
+            for item in images:
+                try:
+                    raw = artifacts.read(scope_id, run_id, item['ref'])
+                    source = 'data:image/png;base64,' + base64.b64encode(raw).decode('ascii')
+                    image_sections.append('<figure><img src="' + source + '" alt="'
+                        + html.escape(str(item['alt']), quote=True) + '"><figcaption>'
+                        + html.escape(str(item['alt'])) + ' — ' + render(item['ref'], 'artifact_ref')
+                        + '</figcaption></figure>')
+                except (OSError, ValueError, PermissionError) as error:
+                    image_errors.append({'ref': item['ref'], 'error': str(error)})
+    elif report.get('images'):
+        image_errors.append({'ref': '', 'error': '未提供当前 Run 的 Artifacts 读取器，无法校验并嵌入图片证据'})
+    for item in image_errors:
+        message = _check_text(item.get('error')) if isinstance(item, dict) else _check_text(item)
+        reference = item.get('ref', '') if isinstance(item, dict) else ''
+        image_sections.append('<p class="evidence-error">图片证据无法读取：'
+                              + html.escape(str(reference)) + '；' + html.escape(message) + '</p>')
+    image_section = '<section><h2>图片证据</h2>' + ''.join(image_sections) + '</section>' if image_sections else ''
     return ('<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
             '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
-            'style-src \'unsafe-inline\'; img-src \'self\'">'
+            'style-src \'unsafe-inline\'; img-src \'self\' data:">'
             f'<title>TraceFix {title}</title><style>body{{font:16px system-ui;max-width:1050px;'
             'margin:40px auto;padding:20px}table{border-collapse:collapse;width:100%}'
             'td,th{border:1px solid #ddd;padding:12px;text-align:left;vertical-align:top}'
             'pre{white-space:pre-wrap;overflow-wrap:anywhere}summary{cursor:pointer;margin:20px 0}'
-            'a{overflow-wrap:anywhere}</style>' + f'<h1>TraceFix {title}</h1>' + issues + '<table>'
+            'a{overflow-wrap:anywhere}img{max-width:100%;height:auto}figure{margin:24px 0}'
+            'figcaption{color:#555}.evidence-error{color:#9d2020}</style>'
+            + f'<h1>TraceFix {title}</h1>' + checks + issues + image_section + '<table>'
             +''.join(summary)+'</table><details><summary>技术详情与完整校验值</summary><table>'
             +''.join(technical)+'</table></details>')
