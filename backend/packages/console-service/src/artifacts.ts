@@ -56,7 +56,7 @@ export function evidenceClosure(root: string, projectId: string, runId: string, 
   const edges = new Set(['evidence_refs', 'validation_refs', 'baseline_validation_refs', 'patch_diff_ref',
     'artifact_ref', 'observation_ref', 'screenshot_ref', 'checkpoint_refs', 'issue_report_ref',
     'check_plan_ref', 'check_result_refs', 'initial_check_result_refs']);
-  const containers = new Set(['issues', 'issue_report', 'check_plan', 'check_results', 'items']);
+  const containers = new Set(['issues', 'issue_report', 'check_plan', 'check_results', 'initial_check_results', 'items']);
   let bytes = 0;
   function collect(value: unknown, depth = 0): void {
     if (depth > 16) throw new DataError('证据嵌套超出边界');

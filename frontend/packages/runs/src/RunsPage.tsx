@@ -1,5 +1,5 @@
 import {useEffect, useMemo, useState} from 'react';
-import {aggregateWorkers, artifactUrl, continueRun, deriveRun, DetectionRule, loadRun, loadRules, loadRunTrace, Run, TraceEvent, WorkerSnapshot, Guidance, loadGuidance, submitGuidance, confirmGuidance} from '@tracefix/api-client';
+import {aggregateWorkers, artifactUrl, CheckItem, CheckResult, CheckSummary, continueRun, deriveRun, DetectionRule, loadRun, loadRules, loadRunTrace, Run, TraceEvent, WorkerSnapshot, Guidance, loadGuidance, submitGuidance, confirmGuidance} from '@tracefix/api-client';
 import {eventLabel, outcomeLabel, phaseLabel, serviceLabel, workerRoleLabel, workerStatusLabel} from '@tracefix/presentation';
 
 const statuses: Record<string, string> = {idle: '空闲', running: '运行中', completed: '已结束', abnormal: '异常结束', failed: '失败', cancelled: '已停止', superseded: '目标已替换', paused: '已暂停', waiting_input: '等待输入', waiting_approval: '等待审批', stopping: '停止中'};
@@ -7,6 +7,40 @@ const issueStatuses: Record<string, string> = {suspected: '待确认', confirmed
 const guidanceStatus = (entry: Guidance) => entry.level === 'retarget' && entry.status === 'queued' && !entry.confirmed_at ? '等待确认' : {queued: '排队中', applied: '已注入', acknowledged: '已采纳', rejected: '被拒绝', superseded: '已改目标'}[entry.status];
 export const statusLabel = (status: string) => statuses[status.toLowerCase()] || status;
 export const timeLabel = (value?: string) => value ? new Date(value).toLocaleString('zh-CN', {hour12: false}) : '—';
+const checkStatuses: Record<string, string> = {pass: '通过', fail: '失败', error: '执行错误', inconclusive: '无法判断'};
+const overallStatuses: Record<string, string> = {PASSED: '全部通过', PASSED_WITH_FINDINGS: '通过但有非阻断问题', FAILED: '阻断检查失败', INCONCLUSIVE: '尚无法确定'};
+const checkSeverities: Record<string, string> = {blocker: '阻断', critical: '严重', major: '主要', minor: '次要'};
+function CheckResults({plan, results, summary}: {plan: CheckItem[]; results: CheckResult[]; summary?: CheckSummary}) {
+  const plannedIds = new Set(plan.map(item => item.id));
+  const checks = [...plan.map(item => ({item, result: results.find(result => result.id === item.id)})),
+    ...results.filter(result => !plannedIds.has(result.id)).map(result => ({item: result, result}))];
+  return <>
+    {summary && <p>已执行 {summary.executed} / {summary.total} 项 · 通过 {summary.passed} · 失败 {summary.failed} · 执行错误 {summary.error} · 无法判断 {summary.inconclusive} · 阻断未通过 {summary.blocker_failed}{summary.missing > 0 && ` · 未执行 ${summary.missing}`}</p>}
+    {checks.map(({item, result}, index) => <article className="knowledge-use" key={item.id}>
+      <h4>{index + 1}. {item.name} <span className={'badge ' + (result?.status === 'pass' ? 'success' : result?.status === 'fail' || result?.status === 'error' ? 'failure' : 'warning')}>{result ? checkStatuses[result.status] || result.status : '未执行'}</span></h4>
+      <dl><dt>检查 ID</dt><dd>{item.id}</dd><dt>来源 / 级别</dt><dd>{item.source === 'user_goal' ? '用户目标' : '配置规则'} · {checkSeverities[item.severity] || item.severity}</dd><dt>检测方式</dt><dd>{item.detector}</dd><dt>检测内容 / 指标</dt><dd>{item.criteria}</dd><dt>实际检测结果</dt><dd>{result?.actual || '尚未记录执行结果'}</dd></dl>
+      {result?.error && <p className="notice failure">{result.error}</p>}
+      {result?.fallback && <p className="notice warning">已回退模型多模态判断：{result.fallback.reason || '辅助分析器不可用'}{result.fallback.status && ` · ${checkStatuses[result.fallback.status] || result.fallback.status}`}</p>}
+      <div className="source-links">{result?.evidence_refs.map(ref => <span key={ref}>{ref}</span>)}</div>
+    </article>)}
+  </>;
+}
+export function CheckReportPanel({run}: {run: Run}) {
+  const report = run.check_plan || run.check_results ? run : run.issueReport;
+  if (!report || (!report.check_plan && !report.check_results)) return null;
+  const plan = report.check_plan || [], results = report.check_results || [];
+  const initialResults = report.initial_check_results || [];
+  const verified = initialResults.length > 0 && results.some(result => result.stage === 'verify');
+  const allowed = new Set(run.artifacts?.map(artifact => artifact.ref) || []);
+  return <section className="detail-block" aria-label="逐项检查报告">
+    <h3>逐项检查 {report.overall_status && <span className="badge">{overallStatuses[report.overall_status] || report.overall_status}</span>}</h3>
+    {verified && <details><summary>修复前检查结果</summary><CheckResults plan={plan} results={initialResults} summary={report.initial_check_summary}/></details>}
+    {verified && <h4>修复后检查结果</h4>}
+    <CheckResults plan={plan} results={results} summary={report.check_summary}/>
+    <div className="source-links">{[...new Set([...initialResults, ...results].flatMap(result => result.evidence_refs))].filter(ref => allowed.has(ref)).map(ref => <a href={artifactUrl(run.id, ref)} key={ref} download={!ref.endsWith('.html')}>{ref}</a>)}</div>
+    {!!report.images?.length && <div><h4>图片证据</h4>{report.images.filter(image => allowed.has(image.ref) && image.mime === 'image/png').map(image => <figure key={image.ref}><a href={artifactUrl(run.id, image.ref)}><img src={artifactUrl(run.id, image.ref)} alt={image.alt || '页面证据截图'} loading="lazy" style={{maxWidth: '100%', height: 'auto'}}/></a><figcaption>{image.alt || '页面证据截图'} · {image.ref}</figcaption></figure>)}</div>}
+  </section>;
+}
 export function RunList({runs, onSelect, selectedId}: {runs: Run[]; onSelect: (run: Run) => void; selectedId?: string}) {
   return runs.length ? <div className="run-list">{runs.map(run => <button className={'run-row ' + (selectedId === run.id ? 'selected' : '')} key={run.id} onClick={() => onSelect(run)} aria-current={selectedId === run.id ? 'true' : undefined}><span className={'run-symbol ' + run.mode} aria-hidden="true">{run.mode === 'repair' ? '↗' : '✓'}</span><div className="run-copy"><strong>{run.goal}</strong><small>{run.projectId} · {serviceLabel(run.mode)} · {run.timeSource ? '报告时间 ' : ''}{timeLabel(run.startedAt)}</small>{run.abnormalTermination && <small>曾非成功结束 · 已继续 {run.continuationCount || 0} 次</small>}</div><div className="run-state"><span className={'badge ' + (run.status === 'failed' ? 'failure' : run.status === 'running' ? 'success' : '')}>{statusLabel(run.status)}</span><small>{run.outcome ? outcomeLabel(run.outcome) : phaseLabel(run.phase)}</small></div></button>)}</div> : <div className="empty-state"><span aria-hidden="true">⌁</span><h3>还没有运行记录</h3><p>从右侧选择 Test 或 Repair 并启动，实际记录会出现在这里。</p></div>;
 }
@@ -97,6 +131,7 @@ export function RunsPage({runs, selectedId, onSelect, onDocument, onCapture, rep
       <h3>对话与干预</h3>
       {guidance.map(entry => <article className="knowledge-use" key={entry.id}><span className="badge">{guidanceStatus(entry)}</span><p>{entry.text}</p>{entry.how_applied && <p>{entry.how_applied}</p>}{entry.rejection_reason && <p className="notice failure">{entry.rejection_reason}</p>}{entry.level === 'retarget' && entry.status === 'queued' && !entry.confirmed_at && <button type="button" disabled={guidanceBusy} onClick={async () => {setGuidanceBusy(true); try {await confirmGuidance(detail.id, entry.id); setGuidance(await loadGuidance(detail.id));} catch (error) {report(error);} finally {setGuidanceBusy(false);}}}>确认结束当前目标并派生新任务</button>}{entry.child_run_id && <p>子 Run：{entry.child_run_id}</p>}</article>)}
       {detail.agentRunId && ['running', 'paused', 'waiting_input'].includes(detail.status) && <form onSubmit={async event => {event.preventDefault(); setGuidanceBusy(true); try {await submitGuidance(detail.id, guidanceText, guidanceLevel); setGuidance(await loadGuidance(detail.id)); setGuidanceText('');} catch (error) {report(error);} finally {setGuidanceBusy(false);}}}><label htmlFor="guidance-level">引导类型</label><select id="guidance-level" value={guidanceLevel} onChange={event => setGuidanceLevel(event.target.value as Guidance['level'])}><option value="hint">提示 L1</option><option value="constraint">约束 L2</option><option value="retarget">改目标 L3</option></select><label htmlFor="guidance-text">补充引导</label><textarea id="guidance-text" value={guidanceText} onChange={event => setGuidanceText(event.target.value)} maxLength={2000} required placeholder={guidanceLevel === 'constraint' ? '不要改 src/legacy；补丁不超过 50 行，或输入约束 JSON' : '描述需要调整的行为…'}/><button className="primary" disabled={guidanceBusy || !guidanceText.trim()}>{guidanceBusy ? '发送中…' : '发送引导'}</button></form>}
+      <CheckReportPanel run={detail}/>
       <h3>问题清单</h3>
       {detail.reportError && <div className="notice failure">{detail.reportError}</div>}
       {detail.issueReport ? <>

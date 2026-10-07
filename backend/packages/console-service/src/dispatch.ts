@@ -75,7 +75,8 @@ export function createConsoleService(options: ConsoleOptions = {}) {
       .map(([ref, entry]) => ({ref, label: entry['用途'], bytes: entry['字节数']}));
     const issueReport = record.reportRef && allowed.has(record.reportRef) ?
       JSON.parse(readArtifact(artifactRoot(record), record.projectId, record.agentRunId, record.reportRef)) : null;
-    const checkReport = Object.fromEntries(['check_plan', 'check_results', 'check_summary', 'overall_status', 'images']
+    const checkReport = Object.fromEntries(['check_plan', 'check_results', 'check_summary', 'overall_status', 'images',
+      'initial_check_results', 'initial_check_summary']
       .filter(key => issueReport && key in issueReport).map(key => [key, issueReport[key]]));
     return {...record, canContinue: canContinue(record.status, record.outcome), artifacts,
       issueReport, ...checkReport,

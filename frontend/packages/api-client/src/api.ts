@@ -115,7 +115,12 @@ export function aggregateWorkers(events: TraceEvent[]): WorkerAggregate {
 }
 export interface Run {canContinue?: boolean}
 export interface ReportIssue {id: string; title: string; source: string; status: string; location: string; expected: string; actual: string; steps: string[]; verification: string; evidence_refs: string[]}
-export interface Run {issueReport?: {summary: string; issues: ReportIssue[]; coverage: string; limits: string} | null; reportError?: string | null}
+export interface CheckItem {id: string; name: string; criteria: string; severity: 'blocker' | 'critical' | 'major' | 'minor'; source: 'rule' | 'user_goal'; detector: string; rule_version?: number | null}
+export interface CheckResult extends CheckItem {status: 'pass' | 'fail' | 'error' | 'inconclusive'; actual: string; evidence_refs: string[]; error?: string | null; fallback?: {source?: string; reason?: string; status?: string; error?: string} | null; stage?: 'explore' | 'verify'}
+export interface CheckSummary {total: number; executed: number; passed: number; failed: number; error: number; inconclusive: number; blocker_failed: number; missing: number; coverage_complete: boolean}
+export interface ReportImage {ref: string; hash: string; mime: 'image/png'; alt: string}
+export interface CheckReport {check_plan?: CheckItem[]; check_results?: CheckResult[]; check_summary?: CheckSummary; overall_status?: 'PASSED' | 'PASSED_WITH_FINDINGS' | 'FAILED' | 'INCONCLUSIVE'; images?: ReportImage[]; initial_check_results?: CheckResult[]; initial_check_summary?: CheckSummary}
+export interface Run extends CheckReport {issueReport?: ({summary: string; issues: ReportIssue[]; coverage: string; limits: string} & CheckReport) | null; reportError?: string | null}
 export interface Run {parentRunId?: string; additionalRuleIds?: string[]; ruleSnapshot?: {run_id: string; parent_run_id: string | null; snapshot_hash: string; refs: {id: string; version: number}[]} | null}
 export interface KnowledgeDocument {id: string; title: string; content: string; preview?: string; kind: 'repair' | 'testing' | 'experience'; projectId: string | null; tags: string[]; enabled: boolean; version: number; createdAt: string; updatedAt: string; sourceRunId: string | null}
 export type DocumentDraft = Omit<KnowledgeDocument, 'id' | 'createdAt' | 'updatedAt'> & {id?: string};

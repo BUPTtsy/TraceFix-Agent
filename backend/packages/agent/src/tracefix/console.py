@@ -141,7 +141,7 @@ def dispatch(operation, fields, *, library=None, projects_path=None, data_root=N
             issue_refs = {ref for issue in (record['issueReport'] or {}).get('issues', [])
                           for ref in issue.get('evidence_refs', [])}
             report = record['issueReport'] or {}
-            check_refs = {ref for item in report.get('check_results', [])
+            check_refs = {ref for item in report.get('check_results', []) + report.get('initial_check_results', [])
                           for ref in item.get('evidence_refs', [])}
             check_refs.update(report.get('check_result_refs', []))
             check_refs.update(report.get('initial_check_result_refs', []))
@@ -149,7 +149,8 @@ def dispatch(operation, fields, *, library=None, projects_path=None, data_root=N
             if report.get('check_plan_ref'):
                 check_refs.add(report['check_plan_ref'])
             record.update({key: report[key] for key in
-                           ('check_plan', 'check_results', 'check_summary', 'overall_status', 'images')
+                           ('check_plan', 'check_results', 'check_summary', 'overall_status', 'images',
+                            'initial_check_results', 'initial_check_summary')
                            if key in report})
             knowledge_refs = {entry['artifact_ref'] for entry in record.get('knowledge', [])}
             record['artifacts'] = [{'ref': ref, 'label': entry['用途'], 'bytes': entry['字节数']} for ref, entry in index.items()
