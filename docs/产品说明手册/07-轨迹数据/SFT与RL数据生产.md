@@ -17,7 +17,7 @@
 
 训练侧已有校验与训练入口，但仍缺轨迹导出器、数据生产流水线和已验证的训练环境。现有训练目标只覆盖「单步浏览器动作 JSON」，没有 native 工具训练产物，也没有覆盖诊断、补丁、规划的训练结果。运行时审计能力见 [轨迹采集规范](轨迹采集规范.md)。
 
-当前适配目标是 DeepSeek 类 Chat Completions：默认 `deepseek-chat`、`TRACEFIX_TOOL_MODE=native`、视觉关闭；上述 Qwen 脚本是保留的显式 JSON 兼容训练入口，不代表已接入 native 学生模型。`BrowserPolicyRouter` 仅在 `Decision` 且学生 `tool_mode` 明确为 `json` 时使用学生；native 学生不会经此路由执行。学生输出失败时可按现有路由回到教师，但 `UNKNOWN_OPERATION` / `WAITING_NETWORK` 会原样传播，不能借教师调用绕过暂停（`backend/packages/agent/src/tracefix/model/gateway.py:547`）。
+当前适配目标是 DeepSeek 类 Chat Completions：默认 `deepseek-chat`、原生工具调用、视觉关闭；上述 Qwen 脚本保留单步浏览器动作 JSON 训练入口，不代表已接入 native 学生模型。JSON 单动作运行路径及学生/教师浏览器策略路由已经移除；训练产物接入 Agent 需要后续实现原生工具协议，并保留 `UNKNOWN_OPERATION` / `WAITING_NETWORK` 等宿主核查语义。
 
 关闭视觉输入不影响运行时保存截图证据；当前训练脚本仍要求图片样本，这与默认 DeepSeek 文本推理是不同入口。是否训练图片或 reasoning、如何获得授权和脱敏数据，都不能由运行时已有 artifact 自动推定。
 
@@ -38,7 +38,7 @@ flowchart LR
   G --> H[打包+版本清单]
   H --> I[训练 SFT/DPO/RL]
   I --> J[评测 evals]
-  J -->|通过兼容性与评测后| K[学生/教师路由扩展<br/>当前仅显式JSON学生]
+  J -->|通过兼容性与评测后| K[学生模型原生工具接入<br/>待实现]
   K --> A
 ```
 
@@ -46,7 +46,7 @@ flowchart LR
 
 | 样本类型 | 来源 Step | 格式 | 用途 |
 |---|---|---|---|
-| `sft.action` | EXPLORE 的动作及执行前观测 | 沿用 `dataset.py` 的动作 JSON 格式；reasoning 扩展需另行实现 | 显式 JSON 兼容学生策略 |
+| `sft.action` | EXPLORE 的动作及执行前观测 | 沿用 `dataset.py` 的动作 JSON 格式；reasoning 扩展需另行实现 | 单步浏览器动作策略训练，运行时接入待实现 |
 | `sft.agentic` | 各阶段 ModelTurn，浏览器阶段包含 native 多轮消息 | DeepSeek 类 Chat Completions messages：`system` / `user` / `assistant` / `tool`；保留实际出现的 `tool_calls`、`tool_call_id` 和可选 `reasoning_content` | 后续 native 工具 Agent 训练 |
 | `sft.state` | 同上，但以「该步组装好的上下文 → 输出」为单位 | 单轮样本 | 适配「每步重建上下文」的架构（`knowledge/context.py:24`），样本之间相互独立，便于混合训练 |
 | `pref.dpo` | 同一状态下被接受 / 被拒绝的输出 | `{prompt, chosen, rejected}` | 补丁偏好、动作偏好 |
@@ -60,7 +60,7 @@ flowchart LR
 - 同一 DIAGNOSE 状态下：没通过 VERIFY 的补丁（rejected）与最终通过的补丁（chosen）。
 - 同一 EXPLORE 状态下：导致 `looping` 的动作与推动 `advanced` 的动作。
 - 人工审批：被驳回的补丁与修订后被批准的补丁。
-- 显式 JSON 学生的输出被拒绝、教师成功的路由样本（`backend/packages/agent/src/tracefix/model/gateway.py:547`）；结果未知或等待网络恢复不作为可自动回退的偏好对。
+- 后续可设计学生候选被拒绝、教师候选成功的对比样本，当前没有该路由采集入口；结果未知或等待网络恢复不作为可自动回退的偏好对。
 
 ### 2.3 奖励设计（Episode 级）
 

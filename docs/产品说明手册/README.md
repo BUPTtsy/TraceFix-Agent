@@ -6,7 +6,7 @@ TraceFix 面向 Web GUI，产品目标是「自动化测试 → 缺陷定位 →
 ## 当前交付边界
 
 - Python Test/Repair/Chat 的模型执行使用 PydanticAI，Gateway 保留宿主兼容接口；LangGraph 继续负责状态机、checkpoint 与 interrupt。没有 Legacy 模型执行或失败回退，框架缺失时返回明确 unavailable 错误。详细职责、依赖状态与验证入口见[框架接入说明](../agent-framework-migration.md)。
-- 浏览器默认 native function tools，显式 `TRACEFIX_TOOL_MODE=json` 是单动作协议配置，两者都使用 PydanticAI。ToolSpec/ToolRegistry/ToolPipeline 已实现，仍按阶段、权限、审批、operation receipt 和证据门执行；其他供应商协议与自动能力矩阵不构成已交付能力。
+- 浏览器统一使用 native function tools，由 PydanticAI 完成工具调用循环。ToolSpec/ToolRegistry/ToolPipeline 已实现，仍按阶段、权限、审批、operation receipt 和证据门执行；其他供应商协议与自动能力矩阵不构成已交付能力。
 - 默认文本模型为 `deepseek-chat`，`TRACEFIX_VISION_MODEL` 为空；只有显式配置视觉模型且携带图片才选择该模型。截图证据继续保存。DeepSeek 默认 `thinking=enabled`，原始 reasoning/usage 在供应商实际返回时保留，配置开启不证明一定取得 reasoning。
 - `max_attempts` 默认 3，映射为两次输出校正机会；provider/transport 不自动网络重试。`max_tool_rounds` 默认 40，恢复历史也计入。每次真实请求独立预算检查、审计与计量；已完成工具结果复用，未知副作用暂停核查，取消向外传播。
 - ReadOnlyWorker 调查使用 DeepAgents，宿主保留父子 Run、授权文件/证据、版本复核和用量归并；通用 Worker/GUI Scout 的 Gateway 模型调用仍使用 PydanticAI。框架执行不替代审批、UNKNOWN/resource fence、验证门或 Oracle。

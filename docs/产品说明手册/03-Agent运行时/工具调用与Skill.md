@@ -2,9 +2,9 @@
 
 ## 1. 现状
 
-### 1.1 调用协议：默认原生浏览器 function tools ✅
+### 1.1 调用协议：原生浏览器 function tools ✅
 
-当前 Gateway 保留 DeepSeek 类 Chat Completions 配置与宿主接口，模型执行已接入 PydanticAIAdapter。`TRACEFIX_TOOL_MODE` 默认 `native`，显式 `json` 是协议配置，不按接口错误自动切换。只读调查另外使用 DeepAgents 的 LangChain 模型与 Agent loop，详见 [框架接入说明](../../agent-framework-migration.md)。
+当前 Gateway 保留 DeepSeek 类 Chat Completions 配置与宿主接口，模型执行已接入 PydanticAIAdapter。浏览器统一使用原生 function tools，工具协议不再提供配置开关。只读调查另外使用 DeepAgents 的 LangChain 模型与 Agent loop，详见 [框架接入说明](../../agent-framework-migration.md)。
 
 | 环节 | 实现 | 证据 |
 |---|---|---|
@@ -40,7 +40,7 @@
 | 契约 | 使用阶段 | 定义 |
 |---|---|---|
 | `TestSpec` | PREPARE（编译并冻结测试规范） | `contracts.py:137-155` |
-| `Decision` / `BrowserAction` | EXPLORE（native 中可进行多轮工具交互，最终 JSON 只含 `finish`；显式 JSON 模式每次返回一个动作） | `runtime/contracts.py:Decision`、`BrowserAction` |
+| `Decision` / `BrowserAction` | EXPLORE（通过原生工具进行多轮交互，最终 JSON 只含 `finish`） | `runtime/contracts.py:Decision`、`BrowserAction` |
 | `KnowledgeQueries` / `KnowledgeSelection` | EXPLORE、DIAGNOSE（知识文档检索） | `knowledge/selection.py:8-13` |
 | `PatchProposal` | DIAGNOSE（完整文件替换，最多 8 个文件） | `contracts.py:165-174` |
 
@@ -118,8 +118,6 @@ PydanticAI Agent / OpenAI-compatible provider
   ──▶ ToolPipeline / 浏览器执行端口
   ──▶ 策略、审批、operation receipt、证据
   ──▶ 配对工具结果 ──▶ PydanticAI 下一次请求
-
-显式 TRACEFIX_TOOL_MODE=json：PydanticAI 输出 BrowserAction / Decision 单动作契约
 ```
 
 通用注册表与执行管线已经实现；以下保留后续扩展的检查顺序，具体已开放工具及字段以 runtime 工具文档为准：
@@ -137,7 +135,7 @@ PydanticAI Agent / OpenAI-compatible provider
 - 可恢复的错误（参数无效、元素未找到、文件不存在）作为 `ToolResult(is_error=true)` 返回给模型。
 - 策略违规：拒绝执行，把原因作为 `ToolResult(is_error=true)` 反馈给模型，并记录事件；不结束 Run。同一违规反复出现时，由死循环检测的「错误重复」信号判定为循环（见 `10-开发计划/开发计划与里程碑-内部模型版.md` 第 3 节）。
 
-当前 provider 范围为 DeepSeek 等 OpenAI-compatible Chat Completions，PydanticAI 框架支持的其他 provider 不等于 TraceFix 已接入这些供应商。JSON 单动作模式仍是显式协议配置；没有 Legacy 后端、依赖缺失回退、自动供应商切换或自定义 `{"tool_calls": [...]}` 执行循环。
+当前 provider 范围为 DeepSeek 等 OpenAI-compatible Chat Completions，PydanticAI 框架支持的其他 provider 不等于 TraceFix 已接入这些供应商。浏览器工具只使用原生调用协议；没有 Legacy 后端、依赖缺失回退、自动供应商切换或自定义 `{"tool_calls": [...]}` 执行循环。
 
 ### 2.4 Skill 机制重建
 

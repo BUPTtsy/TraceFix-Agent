@@ -84,7 +84,7 @@ class SubtaskResult(Contract):
 
 ### 2.5 模型路由
 
-- 子 Agent 默认走 `student`（成本更低的模型）。复用现有 `BrowserPolicyRouter` 的「学生失败则回退教师」逻辑（`model/gateway.py:261-290`），并推广到所有契约类型。
+- 子 Agent 规划默认走 `student`（成本更低的模型）。学生失败转教师的路由需另行实现，并推广到所有契约类型；原有浏览器学生路由已经移除。
 - planner 和 patch-reviewer 默认走 `teacher`（对质量敏感）。
 
 ### 2.6 轨迹中的层级关系

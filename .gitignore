@@ -12,6 +12,8 @@ dist/
 evals/generated/
 training/checkpoints/
 docs/*
+!docs/tracefix-globex-guidance/
+!docs/tracefix-globex-guidance/**
 !docs/产品说明手册/
 docs/产品说明手册/*
 !docs/产品说明手册/03-Agent运行时/

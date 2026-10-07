@@ -31,7 +31,7 @@
 
 #### 原生模型工具与 MCP 的边界 ✅
 
-默认 `TRACEFIX_TOOL_MODE=native` 由 PydanticAI Agent 通过 OpenAI-compatible provider 使用原生 function tools。模型只提出 TraceFix 受限调用，Adapter 只能使用宿主注入的执行端口，不能直连 MCP：
+浏览器交互统一由 PydanticAI Agent 通过 OpenAI-compatible provider 使用原生 function tools。模型只提出 TraceFix 受限调用，Adapter 只能使用宿主注入的执行端口，不能直连 MCP：
 
 ```text
 模型 tool_calls
@@ -52,7 +52,7 @@
 | `BrowserPress` | `press` | `browser_press_key` |
 | `BrowserSnapshot` | `observe` | 观察流程中的 `browser_snapshot` + `browser_take_screenshot` |
 
-本表对应 `model/history.py` 的六个默认浏览器函数；模型工具名由 ToolRegistry 规范化，不能与 MCP 侧名称混淆。console/network 诊断信息可由宿主观察流程收集，其他工具是否可见以阶段注册表为准。native 最终输出必须使用 `finish`，由运行时检查断言；显式 `TRACEFIX_TOOL_MODE=json` 返回单动作契约，两者都使用 PydanticAI，并共用上述策略和 receipt 边界。
+本表对应 `model/history.py` 的六个默认浏览器函数；模型工具名由 ToolRegistry 规范化，不能与 MCP 侧名称混淆。console/network 诊断信息可由宿主观察流程收集，其他工具是否可见以阶段注册表为准。原生工具交互的最终输出必须使用 `finish`，由运行时检查断言；上述策略和 receipt 边界继续由宿主负责。
 
 `click/type/select/press` 必须绑定最新 `observation_id`；前三者还需精确 role/name 和 `element_ref`。过期按键操作在策略阶段拒绝，不创建 operation；冻结重放会将 `press` 重新绑定到当前观测。没有有效观测时不能直接重放按键（`Engine.act`、`Policy.browser`）。
 
