@@ -5,6 +5,7 @@ import pytest
 from test_architecture_validation_repairs import bundle as validation_bundle, gate
 from tracefix.rules.models import RuleRef, RuleSnapshot
 from tracefix.runtime.contracts import CheckItem, CheckPlan, CheckResult, digest
+from tracefix.runtime.verification import initial_check_failure
 
 
 @pytest.fixture
@@ -211,3 +212,28 @@ def test_goal_only_plan_is_supported_without_a_rule_library(check_bundle):
     for ref in state.initial_check_result_refs + state.check_result_refs:
         artifacts[ref]['check_plan_hash'] = state.check_plan_hash
     assert gate(check_bundle)
+
+
+def test_initial_failure_helper_works_before_the_first_patch(check_bundle):
+    state, _, artifacts = check_bundle
+    state.patch_hash = None
+    state.check_suite_stage = 'explore'
+    state.check_suite_patch_hash = None
+    state.check_result_refs = list(state.initial_check_result_refs)
+    assert initial_check_failure(state, lambda ref: ref in artifacts,
+        lambda ref: copy.deepcopy(artifacts[ref]), lambda ref: artifacts[ref])
+
+
+@pytest.mark.parametrize('fault', ['spec-hash', 'spec-missing', 'missing-reader', 'initial-error'])
+def test_initial_failure_helper_rejects_corrupt_or_incomplete_evidence(check_bundle, fault):
+    state, _, artifacts = check_bundle
+    if fault == 'spec-hash':
+        artifacts['spec.json']['goal'] = 'unauthorized goal'
+    elif fault == 'spec-missing':
+        artifacts.pop('spec.json')
+    elif fault == 'initial-error':
+        for ref in state.initial_check_result_refs:
+            artifacts[ref]['status'] = 'error'
+    read_bytes = None if fault == 'missing-reader' else lambda ref: artifacts[ref]
+    assert not initial_check_failure(state, lambda ref: ref in artifacts,
+        lambda ref: copy.deepcopy(artifacts[ref]), read_bytes)

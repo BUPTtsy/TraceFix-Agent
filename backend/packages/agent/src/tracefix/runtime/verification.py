@@ -227,6 +227,10 @@ def initial_check_failure(state, exists, read, read_bytes):
         if (not state.check_plan_ref or not callable(exists) or not callable(read)
                 or not callable(read_bytes)):
             return False
+        raw_spec = _read(state.test_spec_ref, exists, read)
+        if type(raw_spec) is not dict or digest(raw_spec) != state.test_spec_hash:
+            return False
+        TestSpec.model_validate(raw_spec)
         plan = _frozen_check_plan(state, exists, read)
         if plan is None:
             return False
