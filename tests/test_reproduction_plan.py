@@ -207,8 +207,24 @@ async def test_verification_preserves_reload_and_checks_final_state(tmp_path, lo
 
 
 @pytest.mark.parametrize('invented_reference', [False, True])
-async def test_diagnose_reads_current_validation_and_checks_its_observation_refs(tmp_path, invented_reference):
+async def test_diagnose_reads_current_validation_and_checks_its_observation_refs(tmp_path, monkeypatch, invented_reference):
     engine, state = make_engine(tmp_path)
+    engine.subagent_enabled = True
+    monkeypatch.setenv('TRACEFIX_WORKER', '1')
+    monkeypatch.setenv('TRACEFIX_AGENT_MODE', 'multi')
+    investigated_roles = []
+
+    async def investigate(worker, parent, specs):
+        saved = engine.store.load(parent.run_id, parent.scope_id)
+        assert saved.evidence_refs == parent.evidence_refs
+        for spec in specs:
+            versions = {path: digest(engine.workspace.source_bytes(path)[1])
+                        for path in spec.allowed_files}
+            worker._current(parent, spec, parent.source_manifest, versions)
+            investigated_roles.append(spec.role)
+        return []
+
+    monkeypatch.setattr('tracefix.runtime.worker.ReadOnlyWorker.group', investigate)
     engine.store.save(state)
     output = await engine.prepare(state, None)
     state = RunState(**output['data'])
@@ -262,3 +278,4 @@ async def test_diagnose_reads_current_validation_and_checks_its_observation_refs
     else:
         output = await engine.diagnose(state, None)
         assert output['data']['phase'] == Phase.PATCH
+    assert investigated_roles == ['code-explorer', 'evidence-reviewer']
