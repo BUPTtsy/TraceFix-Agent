@@ -25,7 +25,8 @@ from tracefix.knowledge.context import SkillCatalog, build_context
 from tracefix.knowledge.selection import select_documents
 from tracefix.rules import Finding, RuleResolver, RuleSnapshot, evaluate_oracle, evaluate_static
 from tracefix.rules.resolver import render_rule_context, rule_applies
-from tracefix.runtime.contracts import (BudgetExceeded, BrowserAction, Decision, Outcome,
+from tracefix.runtime.contracts import (BudgetExceeded, BrowserAction, CheckJudgement, CheckPlan,
+    CheckResult, Decision, GoalCheckDraft, Outcome,
     PatchProposal, Phase, ReplayUnbound, ReproductionPlan, RunState, RunStatus, TestSpec, Validation, digest, new_id,
     reduce_state, verification_gate)
 from tracefix.runtime.guidance import (GuidanceLedger, GuidanceRejected, active_guidance,
@@ -40,10 +41,11 @@ from tracefix.runtime.event_adapter import EventAdapter, EventCursor
 from tracefix.runtime.recovery import RecoveryAction, RecoveryController, classify_cause, has_real_progress
 from tracefix.runtime.diagnosis import (DiagnosisDraft, DiagnosisReport, binding_from_observation,
     symptom_query, validate_report)
+from tracefix.runtime.checks import make_check_plan, oracle_ready, scope_matches, summarize_checks
 from tracefix.knowledge.assembler import ContextAssembler, ContextWindowError
 from tracefix.storage.artifacts import redact, sanitize
 from tracefix.storage.presentation import label, readable, report_page
-from tracefix.storage.reporting import collect_issues
+from tracefix.storage.reporting import collect_issues, collect_report_images, with_check_report
 from tracefix.storage.store import UnknownOperation
 from tracefix.messages import error_message
 
@@ -675,6 +677,7 @@ class Engine:
             progressed = explicit
             meaningful_fields = {
                 'validation_refs', 'behavior_check_refs', 'reproduced', 'source_aligned',
+                'check_plan_ref', 'check_result_refs', 'check_suite_completed',
             }
             progressed = progressed or any(
                 field in delta and delta[field] != getattr(s, field)
@@ -715,6 +718,7 @@ class Engine:
                        if key not in {'observation_id', 'element_ref', 'page_generation',
                                       'generation', 'call_id', 'tool_call_id', 'attempt_id'}}
         return digest([str(s.phase), s.trial, s.validation_index, s.replay_index,
+                       s.check_suite_stage, len(s.check_result_refs),
                        snapshot, pending,
                        s.last_error_signature or (s.failure_signatures[-1]
                                                   if s.failure_signatures else None)])
@@ -1426,7 +1430,7 @@ class Engine:
     def _graph(self, saver):
         graph = StateGraph(GraphState)
         names = ['prelude', 'prepare', 'decide', 'execute', 'explore_gate', 'reproduce',
-                 'diagnose', 'patch', 'verify', 'review', 'paused', 'finalize']
+                 'check_suite', 'diagnose', 'patch', 'verify', 'review', 'paused', 'finalize']
         for name in names:
             async def wrapped(data, node=name):
                 s = RunState(**data['data'])
@@ -1639,6 +1643,8 @@ class Engine:
         return ref, detail
 
     def route(self, s):
+        if s.check_suite_stage and not s.check_suite_completed:
+            return 'check_suite'
         return {Phase.PREPARE: 'prepare', Phase.EXPLORE: 'decide', Phase.REPRODUCE: 'reproduce',
                 Phase.DIAGNOSE: 'diagnose', Phase.PATCH: 'patch', Phase.VERIFY: 'verify',
                 Phase.REVIEW: 'review', Phase.FINALIZE: 'finalize'}[s.phase]
@@ -1850,6 +1856,9 @@ class Engine:
             ref = self.put(s, spec.model_dump(), name='测试规范')
             s = self.changed(s, test_spec_ref=ref, test_spec_hash=digest(spec))
             return self.output(s, 'prelude')
+        if not s.check_plan_ref:
+            s = await self.ensure_check_plan(s)
+            return self.output(s, 'prelude')
         phase = Phase.VERIFY if s.continuation_count and s.patch_hash and s.reproduced and s.replay_plan_ref else Phase.EXPLORE
         if phase == Phase.EXPLORE:
             await self.discover(s)
@@ -1933,14 +1942,210 @@ class Engine:
         done = s.pending_action['kind'] == 'finish'
         if not done:
             return self.output(self.changed(s, pending_action=None), 'prelude')
-        result, ref = self.check(s, self.spec(s).assertions)
-        if result['passed']:
-            s = self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.NO_BUG_FOUND,
-                evidence_refs=s.evidence_refs+[ref], pending_action=None)
-        else:
-            s = self.changed(s, phase=Phase.REPRODUCE, replay_index=0, trial=0,
-                evidence_refs=s.evidence_refs+[ref], failure_signatures=[digest(result['assertions'])], pending_action=None)
-        return self.output(s, 'prelude')
+        s = await self.ensure_check_plan(s)
+        s = self.changed(s, check_suite_stage='explore', check_suite_completed=False,
+                         check_suite_patch_hash=s.patch_hash, pending_action=None)
+        return self.output(s, 'check_suite')
+
+    def frozen_check_rules(self, s):
+        snapshot = self._rule_snapshot(s)
+        if not snapshot:
+            return []
+        rules = []
+        for reference in snapshot.refs:
+            rule = self.rule_resolver.by_id(reference.id)
+            if rule.version != reference.version:
+                if not self.rule_library:
+                    raise ValueError(f'冻结规则版本不可用：{reference.id}@{reference.version}')
+                rule = self.rule_library.version(reference.id, reference.version)
+            rules.append(rule)
+        return rules
+
+    async def ensure_check_plan(self, s):
+        if s.check_plan_ref:
+            self.check_plan(s)
+            return s
+        rules = self.frozen_check_rules(s)
+        error = None
+        draft = None
+        try:
+            draft = await self.model_call(s, GoalCheckDraft, {
+                'goal': s.goal, 'test_spec': self.spec(s).model_dump(mode='json'),
+                'observation': self.get(s, s.observation_ref) if s.observation_ref else None,
+                'instruction': '把用户原始自然语言测试目标提炼为一个准确的检测问题名称和完整检测指标。'
+                    '保留原目标中的所有要求，不得降低标准、遗漏子要求或把用户规则混入目标。'
+                    '只返回 name 和 criteria；不执行页面动作。'})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = sanitize(f'{type(exc).__name__}: {error_message(exc)}')[:1500]
+            self.event(s, 'check.goal.extraction_failed', {'error': error})
+        plan = make_check_plan(s, rules, draft, extraction_error=error)
+        ref = self.put(s, plan.model_dump(mode='json'), name='冻结检查计划')
+        s = self.changed(s, check_plan_ref=ref, check_plan_hash=digest(plan))
+        self.event(s, 'check.plan.frozen', {'artifact_ref': ref, 'hash': s.check_plan_hash,
+            'items': [item.model_dump(mode='json') for item in plan.items]})
+        return s
+
+    def check_plan(self, s):
+        plan = CheckPlan.model_validate(self.get(s, s.check_plan_ref))
+        if digest(plan) != s.check_plan_hash or plan.run_id != s.run_id:
+            raise ValueError('冻结检查计划内容、哈希或 Run 绑定不匹配')
+        return plan
+
+    async def model_check(self, s, item, observation, evidence_refs, *, reason=None, files=None):
+        image = None
+        try:
+            if observation.get('screenshot_ref'):
+                image = self.artifacts.read(s.scope_id, s.run_id, observation['screenshot_ref'])
+        except (OSError, ValueError, KeyError):
+            pass
+        cards = [{'path': path, 'content': content[:12000]} for path, content in (files or [])[:20]]
+        judgment = await self.model_call(s, CheckJudgement, {
+            'goal': s.goal, 'check_item': item.model_dump(mode='json'),
+            'test_spec': self.spec(s).model_dump(mode='json'), 'observation': observation,
+            'cards': cards, 'available_evidence_refs': evidence_refs, 'evidence_refs': evidence_refs,
+            'fallback_reason': reason, 'allowed_tools': ['Read', 'Grep', 'Glob', 'AnalyzeCode'],
+            'instruction': '检测当前检查项的全部具体指标。优先读取真实DOM和授权源码，可调用只读分析工具；'
+                '辅助分析器不可用时根据实际截图、已有观察和源码进行多模态判断。'
+                '检测出问题直接 fail，不要求复现，不修改代码；证据不足返回 inconclusive。'
+                '每项标准都必须有证据，禁止仅因工具失败断言业务失败或凭空通过。'
+                '引用 available_evidence_refs 中支持结论的真实证据。'}, image=image)
+        references = [ref for ref in judgment.evidence_refs if ref in evidence_refs]
+        if judgment.status != 'inconclusive' and not references:
+            return 'inconclusive', '模型未提供可校验的当前检查证据：' + judgment.actual, []
+        return judgment.status, judgment.actual, references
+
+    async def evaluate_check_item(self, s, item):
+        started = time.time()
+        observation = self.get(s, s.observation_ref) if s.observation_ref else {}
+        refs = [s.observation_ref] if s.observation_ref else []
+        status, actual, error, fallback = 'error', '', None, None
+        files = []
+        try:
+            if item.extraction_error:
+                raise ValueError('用户目标提炼失败：' + item.extraction_error)
+            if item.source == 'user_goal':
+                result, ref = self.check(s, self.spec(s).assertions)
+                refs.append(ref)
+                status = 'pass' if result['passed'] else 'fail'
+                actual = json.dumps(result['assertions'], ensure_ascii=False)
+            else:
+                from tracefix.rules.models import Rule
+                rule = Rule.model_validate(item.detection)
+                paths = list(self.workspace.files())
+                if not scope_matches(rule, observation, paths):
+                    raise ValueError('当前页面或授权源码不符合检查项作用域，需模型核查覆盖')
+                if item.detector == 'oracle':
+                    observations = self.phase_observations(s,
+                        Phase.VERIFY if s.check_suite_stage == 'verify' else Phase.EXPLORE)
+                    if not any(value['observation_ref'] == s.observation_ref for value in observations):
+                        observations.append({'observation_ref': s.observation_ref,
+                                             'observation': observation, 'action': None})
+                    applicable = [value for value in observations
+                        if scope_matches(rule, value['observation'], paths)
+                        and oracle_ready(rule, value['observation'], value.get('action'))]
+                    if not applicable:
+                        raise RuntimeError('检测器缺少完整通道、触发动作或已实现能力')
+                    findings = []
+                    for value in applicable:
+                        refs.append(value['observation_ref'])
+                        findings.extend(evaluate_oracle(rule, value['observation'],
+                            job_id=s.job_id or s.run_id, run_id=s.run_id,
+                            evidence_ref=value['observation_ref'], action=value.get('action')))
+                    status = 'fail' if findings else 'pass'
+                    actual = json.dumps([value.model_dump(mode='json') for value in findings], ensure_ascii=False)
+                    for finding in findings:
+                        if self.rule_library:
+                            finding = self.rule_library.save_finding(finding)
+                        self.event(s, 'finding.created', {'finding_id': finding.id,
+                            'finding': finding.model_dump(mode='json'), 'rule_id': rule.id})
+                elif item.detector == 'static':
+                    files = [(path, self.workspace.read(path)) for path in paths]
+                    config = rule.detection.static or {}
+                    if config.get('engine') in {'ast', 'semgrep'} or config.get('detector') in {'ast', 'semgrep'}:
+                        from tracefix.rules.analyzers import analyze_source
+                        result = await asyncio.to_thread(analyze_source, files, config,
+                            detector=config.get('engine') or config.get('detector'))
+                        if result['status'] == 'error':
+                            raise RuntimeError(json.dumps(result.get('errors', result), ensure_ascii=False))
+                        status, actual = result['status'], json.dumps(result, ensure_ascii=False)
+                    else:
+                        if not (config.get('regex') or config.get('pattern')):
+                            raise ValueError('静态规则缺少 regex/pattern 或代码分析 detector')
+                        findings = evaluate_static(rule, files, job_id=s.job_id or s.run_id, run_id=s.run_id)
+                        status = 'fail' if findings else 'pass'
+                        actual = json.dumps([value.model_dump(mode='json') for value in findings], ensure_ascii=False)
+                    refs.append(self.put(s, {'files': [{'path': path, 'content_hash': digest(content)}
+                        for path, content in files], 'result': actual}, name='源码检查证据'))
+                else:
+                    status, actual, refs = await self.model_check(s, item, observation, refs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = sanitize(f'{type(exc).__name__}: {error_message(exc)}')[:1500]
+            if not item.extraction_error:
+                fallback = {'source': 'multimodal', 'reason': error, 'attempted': True}
+                try:
+                    if not files:
+                        files = [(path, self.workspace.read(path)) for path in list(self.workspace.files())[:20]]
+                    source_ref = self.put(s, {'files': [{'path': path, 'content': content[:12000]}
+                        for path, content in files]}, name='回退源码证据')
+                    refs.append(source_ref)
+                    status, actual, refs = await self.model_check(s, item, observation, refs,
+                        reason=error, files=files)
+                    fallback['status'] = status
+                    error = None
+                except asyncio.CancelledError:
+                    raise
+                except Exception as fallback_error:
+                    fallback['status'] = 'error'
+                    fallback['error'] = sanitize(str(fallback_error))[:1500]
+                    error += '; 模型回退失败：' + fallback['error']
+                    status, actual = 'error', error
+            else:
+                status, actual = 'error', error
+        return CheckResult(**item.model_dump(include={'id', 'name', 'criteria', 'severity', 'source', 'detector'}),
+            status=status, actual=actual, evidence_refs=list(dict.fromkeys(ref for ref in refs if ref)),
+            error=error, fallback=fallback, started_at=started, finished_at=time.time(),
+            check_plan_hash=s.check_plan_hash, source_manifest=s.source_manifest,
+            patch_hash=s.patch_hash, stage=s.check_suite_stage or 'explore')
+
+    async def check_suite(self, s, _):
+        plan = self.check_plan(s)
+        results = [CheckResult.model_validate(self.get(s, ref)) for ref in s.check_result_refs]
+        if any(result.check_plan_hash != s.check_plan_hash or result.patch_hash != s.patch_hash
+               or result.stage != s.check_suite_stage for result in results):
+            raise ValueError('检查结果不属于当前检查计划、源码补丁或执行阶段')
+        done = {result.id for result in results}
+        item = next((item for item in plan.items if item.id not in done), None)
+        if item is not None:
+            result = await self.evaluate_check_item(s, item)
+            ref = self.put(s, result.model_dump(mode='json'), name='逐项检查结果')
+            s = self.changed(s, check_result_refs=s.check_result_refs + [ref],
+                evidence_refs=list(dict.fromkeys(s.evidence_refs + result.evidence_refs + [ref])))
+            self.event(s, 'check.completed', {'artifact_ref': ref, **result.model_dump(mode='json')})
+            return self.output(s, 'prelude')
+        overall, summary = summarize_checks(plan, results)
+        delta = {'overall_status': overall, 'check_summary': summary, 'check_suite_completed': True}
+        if s.check_suite_stage == 'explore':
+            delta['initial_check_result_refs'] = list(s.check_result_refs)
+        s = self.changed(s, **delta)
+        self.event(s, 'check.suite.completed', {'overall_status': overall, 'summary': summary})
+        if s.check_suite_stage == 'verify':
+            if overall in {'FAILED', 'INCONCLUSIVE'}:
+                return self.output(self.changed(s, phase=Phase.DIAGNOSE,
+                    error='修复后的检查套件未通过，参见逐项检查证据'), 'prelude')
+            return await self.complete_verification(s)
+        if s.mode == 'test':
+            outcome = (Outcome.BUG_CONFIRMED if any(result.status == 'fail' for result in results)
+                else Outcome.INCONCLUSIVE if overall in {'FAILED', 'INCONCLUSIVE'} else Outcome.NO_BUG_FOUND)
+            return self.output(self.changed(s, phase=Phase.FINALIZE, outcome=outcome), 'prelude')
+        if any(result.status == 'fail' for result in results):
+            return self.output(self.changed(s, phase=Phase.REPRODUCE, replay_index=0, trial=0,
+                failure_signatures=[], pending_action=None), 'prelude')
+        outcome = Outcome.INCONCLUSIVE if overall in {'FAILED', 'INCONCLUSIVE'} else Outcome.NO_BUG_FOUND
+        return self.output(self.changed(s, phase=Phase.FINALIZE, outcome=outcome), 'prelude')
 
     async def reset(self, s):
         async def reset_env():
@@ -2503,6 +2708,12 @@ class Engine:
             return self.output(self.changed(s, phase=Phase.DIAGNOSE), 'prelude')
         if s.validation_index < len(kinds)-1:
             return self.output(self.changed(s, validation_index=s.validation_index+1), 'prelude')
+        s = await self.ensure_check_plan(s)
+        s = self.changed(s, check_suite_stage='verify', check_suite_completed=False,
+            check_suite_patch_hash=s.patch_hash, check_result_refs=[])
+        return self.output(s, 'check_suite')
+
+    async def complete_verification(self, s):
         if not await self.runtime_verification_passed(s):
             s = self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.INFRA_FAILURE,
                              run_status=RunStatus.RUNNING,
@@ -2616,6 +2827,8 @@ class Engine:
             Outcome.INCONCLUSIVE: '现有证据不足以得出确定性验收结论，已输出最终结果。',
         }
         result_summary = summaries.get(s.outcome, str(s.outcome))
+        if s.mode == 'test' and s.check_plan_ref:
+            result_summary = '检查套件已完成，逐项检测结果为 ' + str(s.overall_status or 'INCONCLUSIVE') + '；检测问题直接报告。'
         if patch_available and patch_verification != 'verified':
             result_summary += ' 已导出候选补丁，但该补丁尚未通过全部验证。'
         if s.error:
@@ -2629,6 +2842,7 @@ class Engine:
         status = (RunStatus.SUPERSEDED if s.superseded_by_run_id else
                   RunStatus.CANCELLED if s.error == '用户已取消' else
                   RunStatus.ABNORMAL if s.outcome == Outcome.LOOP_DETECTED else
+                  RunStatus.FAILED if s.mode == 'test' and s.overall_status == 'FAILED' else
                   RunStatus.FAILED if s.outcome in {Outcome.INFRA_FAILURE, Outcome.POLICY_BLOCKED, Outcome.REPAIR_EXHAUSTED}
                   or isinstance(s.error, str) and s.error.startswith('ModelOutputError:') else RunStatus.COMPLETED)
         report = {'schema_version': s.schema_version, 'run_id': s.run_id, 'scope_id': s.scope_id,
@@ -2664,6 +2878,16 @@ class Engine:
                   'agent_instructions_hash': s.agent_instructions_hash,
                   'agent_instructions_path': s.agent_instructions_path,
                   'limits': '未发现问题仅适用于本次测试规范覆盖的范围。修复通过仅代表本地验证通过，不代表已合并或发布。'}
+        if s.check_plan_ref:
+            try:
+                report = with_check_report(report,
+                    check_plan=[item.model_dump(mode='json') for item in self.check_plan(s).items],
+                    check_results=[self.get(s, reference) for reference in s.check_result_refs])
+                report.update(check_plan_ref=s.check_plan_ref, check_plan_hash=s.check_plan_hash,
+                    check_result_refs=s.check_result_refs, initial_check_result_refs=s.initial_check_result_refs,
+                    check_suite_stage=s.check_suite_stage)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                report.update(overall_status='FAILED', check_results_error=sanitize(str(error))[:1500])
         report['behavior_scenarios_error'] = None
         if s.test_spec_ref:
             try:
@@ -2683,24 +2907,15 @@ class Engine:
             report['tested_urls'] = []
             self.event(s, 'run.warning', {'source': 'report_issues',
                 'error': report['issues_error']})
+        images, image_errors = collect_report_images(report, self.artifacts, s.scope_id, s.run_id)
+        report.update(images=images, image_errors=image_errors)
         ref = self.put(s, report, name='修复报告数据')
-        page = report_page(report)
+        page = report_page(report, artifacts=self.artifacts, scope_id=s.scope_id, run_id=s.run_id)
         if report.get('issues_error'):
             page = page.replace('<p>未形成有证据的问题记录。</p>',
                 '<p>问题明细不可用：' + html.escape(report['issues_error']) + '</p>')
         if report['behavior_scenarios_error']:
             page += '<h2>业务场景覆盖不可用</h2><p>' + html.escape(report['behavior_scenarios_error']) + '</p>'
-        for evidence in s.evidence_refs:
-            try:
-                item = self.get(s, evidence)
-                obs_ref = item.get('observation_ref')
-                if obs_ref:
-                    obs = self.get(s, obs_ref)
-                    page += f'<h2>证据：{html.escape(evidence)}</h2><img alt="页面证据截图" style="max-width:100%" src="{html.escape(obs["screenshot_ref"], quote=True)}">'
-            except (OSError, ValueError, KeyError) as error:
-                page += '<p>证据附件无法读取：' + html.escape(evidence) + '</p>'
-                self.event(s, 'run.warning', {'source': 'report_evidence', 'evidence_ref': evidence,
-                                            'error': sanitize(error_message(error))[:300]})
         if patch_available:
             page += '<h2>候选补丁差异</h2><pre>'+html.escape(diff_text)+'</pre>'
         html_ref = self.put(s, page+'</html>', 'html', name='修复报告')

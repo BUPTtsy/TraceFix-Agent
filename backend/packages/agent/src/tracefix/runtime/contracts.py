@@ -215,6 +215,66 @@ class TestSpec(Contract):
         return self
 
 
+class GoalCheckDraft(Contract):
+    name: str = Field(min_length=1, max_length=160)
+    criteria: str = Field(min_length=1, max_length=4096)
+    guidance_ack: list[GuidanceAck] = Field(default_factory=list)
+
+
+class CheckItem(Contract):
+    id: str = Field(min_length=1, max_length=160)
+    name: str = Field(min_length=1, max_length=160)
+    criteria: str = Field(min_length=1, max_length=8192)
+    severity: Literal['blocker', 'critical', 'major', 'minor'] = 'blocker'
+    source: Literal['rule', 'user_goal']
+    detector: str = Field(min_length=1)
+    detection: dict = Field(default_factory=dict)
+    rule_version: int | None = Field(default=None, ge=1)
+    extraction_error: str | None = None
+
+
+class CheckPlan(Contract):
+    run_id: str
+    source_manifest: str
+    test_spec_hash: str
+    rule_snapshot_hash: str
+    items: list[CheckItem] = Field(min_length=1)
+
+    @model_validator(mode='after')
+    def unique_items(self):
+        ids = [item.id for item in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError('检查计划的 id 不可重复')
+        return self
+
+
+class CheckJudgement(Contract):
+    status: Literal['pass', 'fail', 'inconclusive']
+    actual: str = Field(min_length=1, max_length=8192)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=100)
+    guidance_ack: list[GuidanceAck] = Field(default_factory=list)
+
+
+class CheckResult(Contract):
+    id: str
+    name: str
+    criteria: str
+    severity: Literal['blocker', 'critical', 'major', 'minor']
+    source: Literal['rule', 'user_goal']
+    detector: str
+    status: Literal['pass', 'fail', 'error', 'inconclusive']
+    actual: str
+    evidence_refs: list[str] = Field(default_factory=list)
+    error: str | None = None
+    fallback: dict | None = None
+    started_at: float
+    finished_at: float
+    check_plan_hash: str
+    source_manifest: str
+    patch_hash: str | None = None
+    stage: Literal['explore', 'verify'] = 'explore'
+
+
 class GuidanceConstraints(Contract):
     # 只描述可执行的收窄条件；最终允许范围是项目授权与所有约束的交集。
     include_paths: list[str] = Field(default_factory=list)
@@ -354,6 +414,15 @@ class RunState(Contract):
     agent_instructions_hash: str | None = None
     agent_instructions_path: str | None = None
     test_spec_ref: str | None = None
+    check_plan_ref: str | None = None
+    check_plan_hash: str = ''
+    check_result_refs: list[str] = Field(default_factory=list)
+    initial_check_result_refs: list[str] = Field(default_factory=list)
+    check_suite_stage: Literal['explore', 'verify'] | None = None
+    check_suite_completed: bool = False
+    check_suite_patch_hash: str | None = None
+    overall_status: Literal['PASSED', 'PASSED_WITH_FINDINGS', 'FAILED', 'INCONCLUSIVE'] | None = None
+    check_summary: dict = Field(default_factory=dict)
     replay_plan_ref: str | None = None
     exploration_plan_ref: str | None = None
     reproduction_plan_frozen: bool = False
@@ -446,6 +515,9 @@ def reduce_state(state: RunState, expected_revision: int, **delta) -> RunState:
     if state.test_spec_ref and any(delta.get(field, getattr(state, field)) != getattr(state, field)
                                    for field in ('test_spec_ref', 'test_spec_hash')):
         raise ValueError('已冻结的 TestSpec 不可变更')
+    if state.check_plan_ref and any(delta.get(field, getattr(state, field)) != getattr(state, field)
+                                  for field in ('check_plan_ref', 'check_plan_hash')):
+        raise ValueError('已冻结的 CheckPlan 不可变更')
     if state.patch_base_commit and delta.get('patch_base_commit', state.patch_base_commit) != state.patch_base_commit:
         raise ValueError('已固定的补丁基线不可变更')
     if state.patch_hash and not state.test_spec_ref and delta.get('test_spec_ref'):
@@ -464,6 +536,11 @@ def reduce_state(state: RunState, expected_revision: int, **delta) -> RunState:
         delta["validation_refs"] = []
         delta["approval_ref"] = None
         delta["behavior_check_refs"] = []
+        delta['check_result_refs'] = []
+        delta['check_suite_completed'] = False
+        delta['check_suite_stage'] = None
+        delta['overall_status'] = None
+        delta['check_summary'] = {}
     return RunState.model_validate({**state.model_dump(), **delta, "revision": state.revision + 1})
 
 
