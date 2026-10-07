@@ -174,7 +174,7 @@ async def test_real_submission_is_an_output_tool_executed_by_host_pipeline():
 async def test_provider_records_every_correction_usage_and_original_details(monkeypatch):
     requests = transport(monkeypatch, [response('{"answer":"invalid"}'), response()])
     attempts, usages, audits = [], [], []
-    result = await Gateway(key='fake', stream=False, tool_mode='json').generate(Output, {},
+    result = await Gateway(key='fake', stream=False).generate(Output, {},
         on_attempt=lambda name, request, attempt: attempts.append(request) or {'attempt': attempt},
         on_usage=usages.append, on_response=lambda exchange, raw: audits.append(raw))
     assert result.value == Output(answer=42)

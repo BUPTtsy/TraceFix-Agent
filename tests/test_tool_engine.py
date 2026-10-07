@@ -57,7 +57,7 @@ async def test_gateway_executes_registered_code_tool_and_returns_typed_submissio
         return responses.pop(0)
 
     monkeypatch.setattr(httpx.AsyncClient, 'post', post)
-    result = await Gateway(key='ci', tool_mode='native', stream=False,
+    result = await Gateway(key='ci', stream=False,
                            max_attempts=1).generate(PatchProposal,
         {'phase': 'DIAGNOSE', 'available_evidence_refs': ['evidence']},
         tool_registry=runtime.registry, tool_pipeline=pipeline)

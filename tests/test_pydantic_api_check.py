@@ -65,10 +65,13 @@ async def test_diagnostic_uses_real_agent_typed_output_and_synthetic_host_port(m
 
 
 async def test_diagnostic_sends_image_to_configured_vision_model(monkeypatch):
-    requests = transport(monkeypatch, [completion('{"ok":true,"sum":4}'), completion('{"color":"red"}')])
-    results = await api_check().run_checks(Gateway(key='fixture', stream=False, tool_mode='json',
+    requests = transport(monkeypatch, [completion('{"ok":true,"sum":4}'),
+        completion(calls=[call()]), completion('{"kind":"finish"}'),
+        completion('{"color":"red"}')])
+    results = await api_check().run_checks(Gateway(key='fixture', stream=False,
         text_model='text-fixture', vision_model='vision-fixture'))
-    assert [request['json']['model'] for request in requests] == ['text-fixture', 'vision-fixture']
+    assert [request['json']['model'] for request in requests] == [
+        'text-fixture', 'text-fixture', 'text-fixture', 'vision-fixture']
     image = requests[-1]['json']['messages'][1]['content'][1]
     assert image['image_url']['url'].startswith('data:image/png;base64,')
     assert results[-1]['output'] == {'color': 'red'}

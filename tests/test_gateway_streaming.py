@@ -4,8 +4,8 @@ import json
 import httpx
 import pytest
 
-from tracefix.model.gateway import BrowserPolicyRouter, Gateway, ModelError, ModelResult
-from tracefix.runtime.contracts import BrowserAction, Decision
+from tracefix.model.gateway import Gateway, ModelError
+from tracefix.runtime.contracts import BrowserAction
 from tracefix.model.chat import stream_chat
 from tracefix.model import protocol
 
@@ -331,25 +331,3 @@ def test_gateway_settings_support_environment_and_explicit_compatible_thinking(m
 def test_invalid_gateway_stream_settings_fail_early(settings):
     with pytest.raises(ValueError):
         Gateway(key='ci', **settings)
-
-
-async def test_router_streaming_capability_keeps_nonstreaming_models_compatible():
-    received = []
-
-    class Teacher:
-        async def generate(self, schema, context):
-            return ModelResult(BrowserAction(kind='finish'), {'total_tokens': 1}, 'teacher', 'stop')
-
-    class Student:
-        supports_streaming = True
-        tool_mode = 'json'
-
-        async def generate(self, schema, context, on_delta=None):
-            on_delta({'attempt': 1}, {'channel': 'reasoning', 'delta': 'inspect'})
-            return ModelResult(BrowserAction(kind='finish'), {'total_tokens': 1}, 'student', 'stop')
-
-    router = BrowserPolicyRouter(Teacher(), Student())
-    assert router.supports_streaming is True
-    await router.generate(Decision, {}, on_delta=lambda exchange, delta: received.append(delta))
-    await router.generate(BrowserAction, {}, on_delta=lambda exchange, delta: received.append(delta))
-    assert received == [{'channel': 'reasoning', 'delta': 'inspect'}]

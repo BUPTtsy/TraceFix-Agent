@@ -22,11 +22,10 @@ def test_stage_policy_length_and_selection(phase):
     assert all(other not in system for name, other in STAGE_POLICIES.items() if name != phase)
 
 
-def test_cross_stage_and_tool_mode_share_global_and_project_prefix():
+def test_cross_stage_share_global_and_project_prefix():
     prefix = POLICY + COMMON
     systems = [system_instructions(BrowserAction, {'phase': phase},
-               agent_instructions='project policy', native_tools=native)
-               for phase in STAGE_POLICIES for native in (False, True)]
+               agent_instructions='project policy') for phase in STAGE_POLICIES]
     shared = commonprefix(systems)
     assert shared.startswith(prefix)
     assert '</project_instructions>' in shared
@@ -45,7 +44,7 @@ def test_stable_task_fields_precede_dynamic_observation_without_mutating_context
 async def test_provider_refresh_uses_current_phase_and_identical_serialization(monkeypatch):
     requests = capture_requests(monkeypatch)
     current = {'phase': 'DIAGNOSE', 'goal': 'inspect', 'observation': {'id': 'fresh'}}
-    await Gateway(key='ci', tool_mode='json').generate(BrowserAction,
+    await Gateway(key='ci').generate(BrowserAction,
         {'phase': 'EXPLORE'}, context_provider=lambda: current)
     assert requests[0]['messages'][1]['content'] == serialize_request(BrowserAction, current)
     assert STAGE_POLICIES['DIAGNOSE'] in requests[0]['messages'][0]['content']
@@ -100,7 +99,7 @@ async def test_observation_changes_keep_schema_and_skill_body_in_shared_prefix(m
     requests = capture_requests(monkeypatch)
     before = skill_context()
     after = skill_context(observation='after')
-    gateway = Gateway(key='ci', tool_mode='json')
+    gateway = Gateway(key='ci')
 
     await gateway.generate(BrowserAction, before)
     await gateway.generate(BrowserAction, after)
@@ -130,7 +129,7 @@ async def test_prompt_serialization_is_stable_across_dictionary_insertion_order(
     reordered['observation'] = dict(reversed(list(original['observation'].items())))
     reordered['skills'] = [dict(reversed(list(original['skills'][0].items())))]
     reordered['skill_index'] = [dict(reversed(list(original['skill_index'][0].items())))]
-    gateway = Gateway(key='ci', tool_mode='json')
+    gateway = Gateway(key='ci')
 
     await gateway.generate(BrowserAction, original)
     await gateway.generate(BrowserAction, reordered)
@@ -141,7 +140,7 @@ async def test_prompt_serialization_is_stable_across_dictionary_insertion_order(
 
 async def test_stage_changes_preserve_fixed_system_prefix_and_limit_index_to_summaries(monkeypatch):
     requests = capture_requests(monkeypatch)
-    gateway = Gateway(key='ci', tool_mode='json')
+    gateway = Gateway(key='ci')
     before = skill_context('inspect')
     after = skill_context('repair')
     instructions = 'Keep changes within the approved project scope.'
@@ -171,7 +170,7 @@ async def test_selected_skill_changes_retain_schema_prefix_when_index_is_unchang
     after = skill_context('repair')
     index = before['skill_index'] + after['skill_index']
     before['skill_index'] = after['skill_index'] = index
-    gateway = Gateway(key='ci', tool_mode='json')
+    gateway = Gateway(key='ci')
 
     await gateway.generate(BrowserAction, before)
     await gateway.generate(BrowserAction, after)
