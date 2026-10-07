@@ -195,10 +195,10 @@ class SessionAdapter:
                     original_bind(state, profile, workspace, source)
                     engine = session.engine
                     engines.append(engine)
-                    from tracefix.model.gateway import BrowserPolicyRouter, Gateway
+                    from tracefix.model.gateway import Gateway
                     teacher = Gateway(text_model=config.model, vision_model=config.vision_model,
                                       thinking=config.thinking)
-                    engine.model = BrowserPolicyRouter(teacher)
+                    engine.model = teacher
                     engine.worker_model = None
                     trace.append({'event': 'model.configuration', 'model_agent_id': state.run_id,
                                   'model': teacher.text_model, 'vision_model': teacher.vision_model,
@@ -241,7 +241,7 @@ class SessionAdapter:
                                'TRACEFIX_VISION_MODEL': config.vision_model,
                                'TRACEFIX_THINKING': config.thinking})
         for key in tuple(configured_env):
-            if key.startswith(('TRACEFIX_WORKER_', 'TRACEFIX_STUDENT_')):
+            if key.startswith('TRACEFIX_WORKER_'):
                 configured_env.pop(key)
         with FourCellRunner._environment_context(configured_env):
             return asyncio.run(execute())

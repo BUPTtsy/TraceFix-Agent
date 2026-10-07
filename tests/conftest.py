@@ -69,5 +69,4 @@ def engine_session(cli_session, tmp_path, monkeypatch):
     monkeypatch.setattr(FakeRunner, 'browser_command', lambda self: [], raising=False)
     monkeypatch.setattr('tracefix.cli.main.MCPBrowser', lambda *args: FakeBrowser(engine.workspace, bugfree=True))
     monkeypatch.setattr('tracefix.cli.main.Gateway', lambda *args, **kwargs: engine.model)
-    monkeypatch.setattr('tracefix.cli.main.BrowserPolicyRouter', lambda model, student: model)
     return session, engine, state
