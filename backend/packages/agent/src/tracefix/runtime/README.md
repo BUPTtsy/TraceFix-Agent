@@ -55,6 +55,18 @@ handlers[definition.spec.name] = definition.handler
 
 ## 当前边界
 
+### DeepAgents 只读调查
+
+`ReadOnlyWorker.run(state, spec)` 在 child Run 的 writer 锁内直接调用 `DeepAgentsReadonlyAdapter.run(DeepAgentsInvestigation) → SubtaskResult`，不再创建只包含 investigate 的 StateGraph。DeepAgents 内部 Agent loop 保留，调查 DTO 位于 `runtime/subtask_contracts.py`，从 `runtime.worker` 导入的名称仍兼容。
+
+调查在 DIAGNOSE 或授权的 REVIEW 中执行，REVIEW 只接受 patch-reviewer；深度固定为 1。Worker 注入 Read/Grep/Glob 受控入口和冻结证据，复核 source manifest、generation、源码内容版本、文件及所有嵌套证据/artifact 引用；工具操作仍受宿主 operation ledger 和 UNKNOWN/resource fence 约束。框架不具备 Write/Edit/Bash/Git、浏览器、数据库、MCP 动态工具或递归委派权限。
+
+每次模型请求、响应、错误及已观察 usage 回调宿主并记录 child 事件/模型 artifact；失败和取消仍归并消耗，取消向外传播。合法的 rejected/failed 结果记录失败事件，框架异常不会伪装为成功或调用旧 executor。`group()` 继续使用 TaskGroup，并发最多 2 个调查。
+
+主图提供 saver 时，DeepAgents 沿用宿主执行配置和 child thread_id；单独调用 Worker 时不新建 saver。旧外壳 checkpoint 不再读取，当前没有按 child thread_id 恢复调查的业务入口。此行为不构成工具级或跨进程恢复承诺。
+
+### 通用工具
+
 `ToolSearch` 是可调用目录查询，尚未实现 Gateway 的 deferred loading。`Task*` 表示规划任务，现有委派仍同步等待；没有注册需要后台生命周期的 `TaskOutput` / `TaskStop`。LSP、MCP 动态工具、交互提问、计划权限模式、团队 mailbox 和 Cron 需对应服务和生命周期支持后再接入；不会仅注册 schema 后宣称能力已可执行。
 
 成功输出在截断前校验；错误工具回执保留原错误载荷。写操作已经发生后的输出契约错误仍进入 `UNKNOWN_OPERATION`，不会伪装为未执行或自动重试。

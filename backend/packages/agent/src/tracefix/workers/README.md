@@ -63,6 +63,10 @@ Supervisor 与 Worker 默认复用同一个 `Gateway`。CLI 的 `configured_work
 
 `Engine.model_call()` 在 Worker 调用中局部选择 `selected_model`，不替换共享的 `engine.model`；GUI scout 子 Engine 同样优先使用 Worker Gateway，未配置时使用父 Gateway。该记录支持配置继承、覆盖与实际路由行为，不代表所有模型、推理配置及运行时实际使用值已经有完整审计，也不等于阶段三验收。
 
+上述模型覆盖与线程 scheduler 用于通用 Worker/GUI Scout。`runtime.worker.ReadOnlyWorker` 的只读调查已改为直接调用 DeepAgents adapter，继续使用主 `engine.model`（有 teacher 时取 teacher）的配置属性构造 LangChain ChatOpenAI 模型，不调用 `Engine.model_call()` 或 `engine.worker_model`。调查仅限 DIAGNOSE 和授权的 REVIEW，工作区工具限于 Read/Grep/Glob，使用 child Run writer 锁与 TaskGroup 管理宿主生命周期。此次替换没有修改本包 scheduler、GUI Scout 或其授权上界。
+
+DeepAgents 沿用宿主已有的 checkpoint 配置与 child thread_id；旧单节点调查外壳已删除，没有框架失败/缺失时的旧执行器回退，也没有 child 调查恢复业务入口。权限、事件和证据检查见 [运行时调查边界](../runtime/README.md#deepagents-只读调查)。
+
 本轮开发编排中的子 Agent 在 spawn 时省略 `model` / `reasoning`，继承主 Agent 配置，不自动升级或指定其他模型；这是开发编排记录，不能与 TraceFix 产品的 `TRACEFIX_WORKER_*` 配置机制混为一谈。产品中的 Gateway 覆盖须由父级明确记录并授权，仍不能扩大工具、文件、网络、Skill 或验证权限；实际使用值及推理配置仍需补足审计证据。
 
 ```text

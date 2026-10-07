@@ -4,17 +4,17 @@
 
 ### 1.1 调用协议：默认原生浏览器 function tools ✅
 
-当前只适配 DeepSeek 类 OpenAI Chat Completions API（`/chat/completions`）。`TRACEFIX_TOOL_MODE` 默认 `native`；只有显式设为 `json` 才使用旧的 JSON 动作协议，不根据接口错误自动切换模式。
+当前 Gateway 保留 DeepSeek 类 Chat Completions 配置与宿主接口，模型执行已接入 PydanticAIAdapter。`TRACEFIX_TOOL_MODE` 默认 `native`，显式 `json` 是协议配置，不按接口错误自动切换。只读调查另外使用 DeepAgents 的 LangChain 模型与 Agent loop，详见 [框架接入说明](../../agent-framework-migration.md)。
 
 | 环节 | 实现 | 证据 |
 |---|---|---|
-| 请求构造 | `context` 与最终 `response_json_schema` 仍在 user 消息中；native 浏览器请求另带 `tools`、`tool_choice=auto`、`parallel_tool_calls=false`，`stream=false` | `model/gateway.py:Gateway.generate` |
+| 请求构造 | Gateway 将 schema/context 和宿主工具传给 PydanticAIAdapter；供应商请求、流式完整性与回调由 protocol 桥接 | `agents/pydantic_ai_adapter.py`、`model/protocol.py` |
 | system 提示 | 安全策略 `POLICY` + 项目 `AGENTS.md` + 本阶段输出规范；区分原生工具交互与最终 JSON | `model/prompts.py:output_instructions` |
-| 浏览器交互 | 校验整个 batch 的函数类型、名称、调用 id、JSON 字符串参数和 schema 后串行执行；下一轮携带配对的 assistant/tool 消息 | `model/gateway.py:Gateway._validated_calls`、`Gateway._completed_history` |
-| 最终输出 | native 下 `Decision.action.kind` / `BrowserAction.kind` 只能为 `finish`；显式 JSON 模式仍返回单个动作。非浏览器契约继续使用 `response_format=json_object` | `model/gateway.py:Gateway.generate` |
-| 重试与防护 | 每个请求最多 `max_attempts` 次（默认 3）；每次逻辑交互最多 `max_tool_rounds` 个工具轮次（默认 40），恢复历史也计入轮次；与 Run 累计用量分开 | `model/gateway.py:Gateway.__init__`、`Gateway.generate` |
+| 浏览器交互 | 框架调用宿主绑定的工具；阶段、参数、历史、权限和回执仍由宿主检查，浏览器副作用串行执行 | `agents/pydantic_ai_adapter.py`、`model/history.py`、`runtime/tools.py` |
+| 最终输出 | PydanticAI 结构化输出再次通过宿主 schema 与输出校验，阶段与成功结论由 Engine 的门禁决定 | `agents/pydantic_ai_adapter.py`、`runtime/engine.py` |
+| 重试与防护 | Gateway 的 max_attempts/max_tool_rounds 继续作为宿主配置；DeepAgents 调查另有真实请求上界，错误不回退旧执行器 | `model/gateway.py`、`agents/pydantic_ai_adapter.py`、`agents/deepagents_adapter.py` |
 
-当前暴露的工具只有以下 7 个；这些是 TraceFix 的受限函数名，MCP 端可能使用不同名称：
+以下保留浏览器动作分类和参数说明；当前模型侧工具名/schema 以宿主注册表及 `model/history.py` 为准。运行时还提供 Read/Grep/Glob 等通用工具，见 [工具定义与注册](../../../backend/packages/agent/src/tracefix/runtime/README.md)，这些能力按阶段和授权选择，不全量开放给每个 Agent：
 
 | 原生函数 | TraceFix 动作 | 必填参数 |
 |---|---|---|
@@ -59,15 +59,15 @@
 
 ### 1.3 局限
 
-1. 尚无独立的读文件、搜代码或 console 查询工具；模型可请求浏览器观察，并从返回的快照及可用诊断信息继续决策，其他上下文仍由运行时提供。
-2. 浏览器工具串行执行；一次逻辑交互可包含多轮模型请求，但尚无通用并行工具调度。`ReadOnlyWorker.group()` 已实现并发，但未接入主循环（`runtime/worker.py`）。
-3. 原生工具调用与结果已经审计；通用 ToolSpec、代码检索工具及统一训练轨迹导出仍未实现，Skill 自动注入已接入运行时。
+1. 运行时已提供 ToolSpec/ToolRegistry/ToolPipeline 及 Read/Grep/Glob；DeepAgents 调查只使用宿主注入的三个只读入口与冻结证据，不获得其他通用工具。
+2. Engine 的 DIAGNOSE 已按宿主策略调用 ReadOnlyWorker.group，使用 TaskGroup 并发最多 2 个调查。Worker 直接调用 DeepAgents adapter，没有额外单节点调查子图；阶段限制为 DIAGNOSE/授权的 REVIEW，不开放 EXPLORE。
+3. 浏览器副作用保持宿主串行控制；调查保留 child Run、writer 锁、版本和嵌套引用校验、事件与用量。DeepAgents 可继承主图 saver 与 child thread_id，但没有 child 调查恢复入口，也没有完整训练轨迹导出的验收结论。
 
 ## 2. 目标设计 📐
 
 ### 2.1 工具注册表
 
-本节及后续工具目录是 📐 扩展设计；当前仅有 1.1 节所列的 7 个浏览器函数，尚无通用注册表。
+本节及后续工具目录保留早期 📐 扩展设计示意，实际通用注册表已经实现；当前字段、工具集合和授权以 [runtime 工具文档](../../../backend/packages/agent/src/tracefix/runtime/README.md) 和源码为准。目录中的计划能力不能推断为已开放给 DeepAgents。
 
 ```python
 @dataclass(frozen=True)
