@@ -2799,9 +2799,12 @@ class Engine:
             s = self.changed(s, diagnosis_feedback_refs=s.diagnosis_feedback_refs + [feedback_ref],
                              failed_candidate_signatures=failed[-50:])
             self.event(s, 'gate.decided', {'validation': kind, 'passed': False})
+            if not s.check_plan_ref:
+                return self.output(self.changed(s, phase=Phase.DIAGNOSE), 'prelude')
         if s.validation_index < len(kinds)-1:
             return self.output(self.changed(s, validation_index=s.validation_index+1), 'prelude')
-        s = await self.ensure_check_plan(s)
+        if not s.check_plan_ref:
+            return await self.complete_verification(s)
         s = self.changed(s, check_suite_stage='verify', check_suite_completed=False,
             check_suite_patch_hash=s.patch_hash, check_result_refs=[])
         return self.output(s, 'check_suite')
