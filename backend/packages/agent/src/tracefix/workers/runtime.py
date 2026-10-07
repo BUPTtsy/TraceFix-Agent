@@ -169,8 +169,6 @@ class IsolatedGuiScout:
             child.agent_instructions_path = parent.agent_instructions_path
         # GUI workers use the isolated Gateway when configured; otherwise retain supervisor behavior.
         model = getattr(self.engine, 'worker_model', None) or self.engine.model
-        if hasattr(model, 'student') and model.student:
-            model = type(model)(model.teacher, model.student)
         worker = Engine(self.engine.store, self.engine.artifacts, self.engine.scopes,
                         self.engine.context, self.engine.profile, self.engine.workspace,
                         sandbox.runner, sandbox.browser, model, self.engine.retriever,

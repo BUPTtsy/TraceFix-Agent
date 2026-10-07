@@ -24,7 +24,7 @@ from tracefix.knowledge.documents import DocumentLibrary, timestamp
 from tracefix.knowledge.retrieval import EmbeddingAdapter, Retriever
 from tracefix.knowledge.memory import MemoryLibrary
 from tracefix.knowledge.scope import ScopeResolver
-from tracefix.model.gateway import BrowserPolicyRouter, Gateway
+from tracefix.model.gateway import Gateway
 from tracefix.model.chat import stream_chat, stream_tool_chat
 from tracefix.messages import ChineseArgumentParser, error_message
 from tracefix.runtime.contracts import Outcome, Phase, RunState, RunStatus, TestSpec, digest, new_id
@@ -432,12 +432,8 @@ class Session:
         retriever = Retriever(self.store, self.scopes, self.ctx, embedding, fallback=memory)
         rule_library = RuleLibrary(self.documents.path)
         rule_resolver = RuleResolver(rule_library)
-        student = None
-        if os.getenv('TRACEFIX_STUDENT_URL'):
-            student = Gateway(base_url=os.environ['TRACEFIX_STUDENT_URL'], key=os.getenv('TRACEFIX_STUDENT_KEY','local'),
-                              text_model=os.environ['TRACEFIX_STUDENT_MODEL'], vision_model=os.environ['TRACEFIX_STUDENT_MODEL'])
         self.engine = Engine(self.store, self.artifacts, self.scopes, self.ctx, profile, workspace,
-            runner, browser, BrowserPolicyRouter(Gateway(), student), retriever, source, self.saver, self.notify,
+            runner, browser, Gateway(), retriever, source, self.saver, self.notify,
             rule_resolver=rule_resolver, rule_library=rule_library)
         self.engine.worker_model = configured_worker_model()
         self.engine.memory = memory

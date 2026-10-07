@@ -5,7 +5,6 @@ from urllib.parse import urlsplit
 
 from tracefix.model.contracts import ModelError, ModelOutputError, ModelResult
 from tracefix.model.history import ModelProtocol
-from tracefix.runtime.tools import ToolSpec
 
 
 class Gateway(ModelProtocol):
@@ -16,7 +15,7 @@ class Gateway(ModelProtocol):
 
     def __init__(self, base_url=None, key=None, text_model=None, vision_model=None,
                  max_output_tokens=20480, timeout=None, max_attempts=None,
-                 max_retry_delay=60, tool_mode=None, tool_executor=None,
+                 max_retry_delay=60, tool_executor=None,
                  max_tool_rounds=40, thinking=None, stream=None, additional_tools=None):
         self.base_url = (base_url or os.getenv('TRACEFIX_BASE_URL', 'https://api.deepseek.com')).rstrip('/')
         self.key = key or os.getenv('TRACEFIX_API_KEY', '')
@@ -41,9 +40,6 @@ class Gateway(ModelProtocol):
         if self.thinking is not None and self.thinking not in {'enabled', 'disabled'}:
             raise ValueError('thinking must be enabled or disabled')
         self.additional_tools = list(additional_tools or [])
-        self.tool_mode = (tool_mode or os.getenv('TRACEFIX_TOOL_MODE', 'native')).strip().lower()
-        if self.tool_mode not in {'native', 'json'}:
-            raise ValueError("tool_mode must be 'native' or 'json'")
         self.tool_executor = tool_executor
         try:
             parsed_rounds = int(max_tool_rounds)
@@ -89,66 +85,3 @@ class Gateway(ModelProtocol):
     def delegation_tools():
         from tracefix.workers.tools import supervisor_tools
         return supervisor_tools()
-
-class BrowserPolicyRouter:
-    """Only the browser node may use a student; fallback is explicit and counted."""
-    def __init__(self, teacher, student=None):
-        self.teacher, self.student = teacher, student
-
-    @property
-    def supports_tool_executor(self):
-        return getattr(self.teacher, 'supports_tool_executor', False)
-
-    @property
-    def supports_context_assembler(self):
-        return getattr(self.teacher, 'supports_context_assembler', False)
-
-    @property
-    def supports_tool_history_projection(self):
-        return any(getattr(model, 'supports_tool_history_projection', False)
-                   for model in (self.teacher, self.student))
-
-    @property
-    def vision_model(self):
-        return getattr(self.teacher, 'vision_model', None)
-
-    @property
-    def supports_streaming(self):
-        return any(getattr(model, 'supports_streaming', False) for model in (self.teacher, self.student))
-
-    @staticmethod
-    def _generation_kwargs(model, kwargs):
-        adapted = dict(kwargs)
-        if not getattr(model, 'supports_tool_history_projection', False):
-            adapted.pop('tool_result_refs', None)
-        if not getattr(model, 'supports_streaming', False):
-            adapted.pop('on_delta', None)
-        return adapted
-
-    async def generate(self, schema, context, **kwargs):
-        from tracefix.runtime.contracts import Decision, BrowserAction
-        if schema is Decision and self.student and getattr(self.student, 'tool_mode', None) == 'json':
-            try:
-                result = await self.student.generate(BrowserAction, context,
-                    **self._generation_kwargs(self.student, kwargs))
-                action = result.value
-                if action.locator:
-                    from tracefix.execution.browser import resolve_locator
-                    obs = context['observation']
-                    try:
-                        stale = (action.observation_id != obs['id']
-                                 or action.element_ref != resolve_locator(obs['snapshot'], action.locator))
-                    except ValueError as e:
-                        # 定位器零匹配或多匹配同样是 student 输出不可用，与 schema 校验失败一样回退教师模型。
-                        raise ModelOutputError('学生模型定位器无法唯一匹配元素：'+str(e)) from e
-                    if stale:
-                        raise ModelError('学生模型引用的元素已过期或无法解析')
-                result.value = Decision(action=action, summary='学生模型浏览器动作策略')
-                return result
-            except ModelError as error:
-                if error.status in {'UNKNOWN_OPERATION', 'WAITING_NETWORK'}:
-                    raise
-                # Let the host log the externally checkable reason, never confidence.
-                context = {**context, 'student_fallback_reason': str(error)}
-        return await self.teacher.generate(schema, context,
-            **self._generation_kwargs(self.teacher, kwargs))

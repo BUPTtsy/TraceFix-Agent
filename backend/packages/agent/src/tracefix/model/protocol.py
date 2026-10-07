@@ -88,8 +88,7 @@ class RequestBoundary:
             self.context = await resolve(provider())
         if self.schema is not str and not preserve:
             system = system_instructions(self.schema, self.context,
-                agent_instructions=self.options.get('agent_instructions'),
-                native_tools=bool(self.registry.specs))
+                agent_instructions=self.options.get('agent_instructions'))
             if any(spec.name.startswith('agent.') for spec in self.registry.specs):
                 from tracefix.workers.prompt_policy import SUPERVISOR_DELEGATION_POLICY
                 policy = SUPERVISOR_DELEGATION_POLICY

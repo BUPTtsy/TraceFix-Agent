@@ -135,8 +135,7 @@ class PydanticAIAdapter:
             for spec in self.model.additional_tools:
                 if spec not in tools:
                     tools += (spec,)
-        if (getattr(self.model, 'tool_mode', None) == 'native'
-                and getattr(schema, '__name__', None) in {'BrowserAction', 'Decision'}):
+        if getattr(schema, '__name__', None) in {'BrowserAction', 'Decision'}:
             for definition in getattr(self.model, '_native_tools', lambda _schema: [])(schema):
                 function = definition['function']
                 if any(spec.wire_name == function['name'] for spec in tools):
