@@ -181,7 +181,7 @@ try {
   assert.equal(failed.stdout, '');
   evidence.push('nonTTY model error: deterministic HTTP 503, no false final answer');
 
-  const jsonl = spawn(python, ['tools/bootstrap/launch.py', '--plain', ...argumentsValue,
+  const jsonl = spawn(python, ['scripts/bootstrap/launch.py', '--plain', ...argumentsValue,
     '--mode', 'chat', '--chat-jsonl', '--chat-session', 'chat-smoke-jsonl'],
   {cwd: root, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe']});
   children.add(jsonl);

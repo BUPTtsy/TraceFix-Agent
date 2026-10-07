@@ -66,7 +66,7 @@ function pythonCommand(): [string, string[]] {
 
 async function agent(args: string[], environment: Record<string, string> = {}): Promise<number> {
   const [python, prefix] = pythonCommand();
-  const child = spawn(python, [...prefix, 'tools/bootstrap/launch.py', '--plain', '--console-db', databasePath, ...args], {
+  const child = spawn(python, [...prefix, 'scripts/bootstrap/launch.py', '--plain', '--console-db', databasePath, ...args], {
     cwd: root, stdio: 'inherit', windowsHide: true, env: {...process.env, ...environment},
   });
   return new Promise((resolve, reject) => { child.once('error', reject); child.once('close', code => resolve(code || 0)); });
@@ -147,7 +147,7 @@ function ensureChatAgent(): ReturnType<typeof spawn> {
   stopChat();
   const [python, prefix] = pythonCommand();
   const scope = projectId;
-  const child = spawn(python, [...prefix, 'tools/bootstrap/launch.py', '--plain', '--console-db', databasePath,
+  const child = spawn(python, [...prefix, 'scripts/bootstrap/launch.py', '--plain', '--console-db', databasePath,
     '--project', scope, '--projects', projectsPath, '--data', dataRoot, '--mode', 'chat',
     '--chat-jsonl', '--chat-session', session.id], {
     cwd: root, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env: {...process.env, ...agentEnvironment()},
@@ -234,7 +234,7 @@ function currentRun(): any {
 function interactiveAgent(args: string[], environment: Record<string, string>, recordId: string, commands: string[]): void {
   if (activeAgent) throw new DataError('已有 Agent Run 正在执行');
   const [python, prefix] = pythonCommand();
-  const child = spawn(python, [...prefix, 'tools/bootstrap/launch.py', '--plain', '--console-db', databasePath, ...args], {
+  const child = spawn(python, [...prefix, 'scripts/bootstrap/launch.py', '--plain', '--console-db', databasePath, ...args], {
     cwd: root, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env: {...process.env, ...environment},
   });
   activeAgent = child;

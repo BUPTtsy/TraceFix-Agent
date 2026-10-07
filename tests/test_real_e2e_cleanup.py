@@ -9,7 +9,7 @@ import pytest
 
 @pytest.mark.parametrize('api_key', ['', '   '])
 def test_real_e2e_required_preflight_reports_missing_secret(tmp_path, monkeypatch, capsys, api_key):
-    module = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'tools/checks/verify_real_e2e.py'))
+    module = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'scripts/checks/verify_real_e2e.py'))
     main = module['main']
     monkeypatch.setenv('TRACEFIX_API_KEY', api_key)
     monkeypatch.setenv('TRACEFIX_BASE_URL', 'https://api.deepseek.com')
@@ -29,7 +29,7 @@ def test_real_e2e_required_preflight_reports_missing_secret(tmp_path, monkeypatc
 
 
 def test_real_e2e_preflight_does_not_run_flow(tmp_path, monkeypatch, capsys):
-    module = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'tools/checks/verify_real_e2e.py'))
+    module = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'scripts/checks/verify_real_e2e.py'))
     main = module['main']
     monkeypatch.setitem(main.__globals__, 'load_local_env', lambda: None)
     monkeypatch.setitem(main.__globals__, 'prerequisites', lambda: [])
@@ -43,7 +43,7 @@ def test_real_e2e_preflight_does_not_run_flow(tmp_path, monkeypatch, capsys):
 
 
 def test_real_e2e_uses_postgres_password_for_compose_and_dsn(monkeypatch):
-    module = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'tools/checks/verify_real_e2e.py'))
+    module = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'scripts/checks/verify_real_e2e.py'))
     monkeypatch.setenv('POSTGRES_PASSWORD', 'pa:ss@word#1')
 
     dsn, compose_env = module['postgres_connection_config']()
@@ -55,7 +55,7 @@ def test_real_e2e_uses_postgres_password_for_compose_and_dsn(monkeypatch):
 @pytest.mark.parametrize('already_running', [False, True])
 def test_real_e2e_preserves_preexisting_postgres_on_failure(tmp_path, monkeypatch, already_running):
     root = Path(__file__).resolve().parents[1]
-    module = runpy.run_path(str(root / 'tools/checks/verify_real_e2e.py'))
+    module = runpy.run_path(str(root / 'scripts/checks/verify_real_e2e.py'))
     spec = tmp_path / 'persistence.spec.json'
     spec.write_bytes((root / 'profiles/persistence.spec.json').read_bytes())
     run_flow = module['run_flow']

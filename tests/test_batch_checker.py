@@ -10,7 +10,7 @@ from tracefix.storage.artifacts import Artifacts
 
 def test_real_e2e_failure_preserves_batch_report_and_patch_refs(tmp_path, monkeypatch):
     root = Path(__file__).resolve().parents[1]
-    module = runpy.run_path(str(root / 'tools/checks/verify_real_e2e.py'))
+    module = runpy.run_path(str(root / 'scripts/checks/verify_real_e2e.py'))
     spec = tmp_path / 'persistence.spec.json'
     spec.write_bytes((root / 'profiles/persistence.spec.json').read_bytes())
     run_flow = module['run_flow']

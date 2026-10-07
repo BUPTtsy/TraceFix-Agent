@@ -174,7 +174,7 @@ class FixtureChild extends EventEmitter {
 
 const originalSpawn = childProcess.spawn;
 childProcess.spawn = (command, args = [], options) => {
-  if (process.env.TRACEFIX_CLI_FIXTURE === '1' && args.includes('tools/bootstrap/launch.py')) {
+  if (process.env.TRACEFIX_CLI_FIXTURE === '1' && args.includes('scripts/bootstrap/launch.py')) {
     return new FixtureChild(args);
   }
   return originalSpawn(command, args, options);

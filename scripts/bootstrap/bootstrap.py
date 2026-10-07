@@ -271,14 +271,14 @@ def main(argv=None):
     progress.run('检查 Python 环境', [python, '-c', "import sys; assert sys.version_info[:2] == (3, 12), '现有虚拟环境必须使用 Python 3.12'"])
     if offline:
         progress.finish('正在进入界面预览。' if options.preview else '正在运行离线 Smoke。')
-        run([python, 'tools/bootstrap/launch.py', '--preview' if options.preview else '--smoke', *agent_args])
+        run([python, 'scripts/bootstrap/launch.py', '--preview' if options.preview else '--smoke', *agent_args])
         return 0
     if options.console_only:
         if not options.skip_install:
             progress.run('安装控制台 workspace 依赖', [npm, 'ci'])
         progress.run('构建控制台软件包', [npm, 'run', 'build'])
         progress.finish('正在启动 Web 控制台；Test / Repair 需要完整 Agent 环境。')
-        run([python, 'tools/bootstrap/services.py', *(['--dev'] if options.dev else [])])
+        run([python, 'scripts/bootstrap/services.py', *(['--dev'] if options.dev else [])])
         return 0
     progress.run('检查模型配置', [python, '-c', "from dotenv import load_dotenv; import os; load_dotenv('.env', encoding='utf-8-sig'); assert os.getenv('TRACEFIX_API_KEY'), '请先在 .env 中填写 TRACEFIX_API_KEY'"])
     progress.run('启动 PostgreSQL', ['docker', 'compose', '--env-file', '.env', 'up', '-d', '--wait', 'postgres'])
@@ -293,7 +293,7 @@ def main(argv=None):
     progress.run('构建控制台软件包', [npm, 'run', 'build', *([] if web else ['--workspace', '@tracefix/cli'])])
     if web:
         progress.finish('正在启动 Web 控制台；请在页面选择项目并启动 Agent Run。')
-        run([python, 'tools/bootstrap/services.py', *(['--dev'] if options.dev else [])])
+        run([python, 'scripts/bootstrap/services.py', *(['--dev'] if options.dev else [])])
         return 0
     if not [argument for argument in agent_args if argument != '--plain'] and options.default_mode == 'repair':
         agent_args = ['--mode', 'repair', '--spec', 'profiles/persistence.spec.json', *agent_args]

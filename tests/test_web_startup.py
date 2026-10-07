@@ -12,7 +12,7 @@ from packaging.utils import canonicalize_name, parse_wheel_filename
 
 
 def load_tool(name):
-    filename = Path(__file__).resolve().parents[1] / 'tools/bootstrap' / f'{name}.py'
+    filename = Path(__file__).resolve().parents[1] / 'scripts/bootstrap' / f'{name}.py'
     spec = importlib.util.spec_from_file_location(f'tracefix_web_{name}_test', filename)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -47,7 +47,7 @@ def test_full_web_prepares_agent_and_starts_services(tmp_path, monkeypatch):
     assert ['docker', 'compose', '--env-file', '.env', 'up', '-d', '--wait', 'postgres'] in calls
     assert any(command[1:3] == ['image', 'inspect'] for command in calls)
     assert ['npm', 'run', 'build'] in calls
-    assert calls[-1] == [str(module.venv_python(tmp_path)), 'tools/bootstrap/services.py']
+    assert calls[-1] == [str(module.venv_python(tmp_path)), 'scripts/bootstrap/services.py']
     assert not any('frontend/apps/cli/dist/cli.mjs' in command for command in calls)
 
 
@@ -70,7 +70,7 @@ def test_console_only_does_not_require_docker_or_key(tmp_path, monkeypatch):
     assert prerequisites == [{'require_docker': False}]
     assert all(command[0] != 'docker' for command in calls)
     assert not any('bugboard/scripts/init_demo.py' in command for command in calls)
-    assert calls[-1][-2:] == ['tools/bootstrap/services.py', '--dev']
+    assert calls[-1][-2:] == ['scripts/bootstrap/services.py', '--dev']
     assert (tmp_path / '.env').read_text(encoding='utf-8') == 'TRACEFIX_API_KEY=\n'
 
 

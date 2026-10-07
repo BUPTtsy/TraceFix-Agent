@@ -10,7 +10,7 @@ from tracefix.model.gateway import Gateway, ModelError
 
 
 def api_check():
-    path = Path(__file__).resolve().parents[1] / 'tools/checks/check_api.py'
+    path = Path(__file__).resolve().parents[1] / 'scripts/checks/check_api.py'
     spec = importlib.util.spec_from_file_location('pydantic_api_check', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

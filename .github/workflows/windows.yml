@@ -22,7 +22,7 @@ jobs:
         with:
           node-version: '22'
       - name: Bootstrap with native PowerShell (explicit fake model)
-        run: ./tools/bootstrap/start.ps1 --smoke --plain
+        run: ./scripts/bootstrap/start.ps1 --smoke --plain
       - name: Check Python runtime dependencies
         run: |
           ./.venv/Scripts/python.exe -m pip check
@@ -42,7 +42,7 @@ jobs:
           path: artifacts/pytest-results.xml
           if-no-files-found: error
       - name: Native backend HTTP
-        run: ./.venv/Scripts/python.exe tools/checks/check_backend.py
+        run: ./.venv/Scripts/python.exe scripts/checks/check_backend.py
       - name: TypeScript and build
         run: |
           npm run typecheck

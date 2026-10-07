@@ -7,7 +7,7 @@ rem Stage files changed for dynamic rule injection and the TypeScript console.
 git add -- backend/packages/console-service/README.md frontend/apps/cli/src/cli.ts backend/packages/console-service/src/config.ts backend/packages/console-service/src/database.ts backend/packages/console-service/src/dispatch.ts backend/packages/console-service/src/rules.ts backend/packages/console-service/src/builtins.ts backend/packages/console-service/test.mjs
 git add -- backend/apps/console-api/server/index.mjs frontend/apps/web/src/App.tsx frontend/packages/api-client/src/api.ts frontend/packages/rules/src/RulesPage.tsx frontend/packages/runs/src/RunsPage.tsx frontend/apps/web/src/style.css
 git add -- backend/packages/agent/src/tracefix/cli/main.py backend/packages/agent/src/tracefix/console.py backend/packages/agent/src/tracefix/model/gateway.py backend/packages/agent/src/tracefix/model/prompts.py backend/packages/agent/src/tracefix/runtime/continuation.py backend/packages/agent/src/tracefix/runtime/contracts.py backend/packages/agent/src/tracefix/rules
-git add -- tools/checks/verify_rules_ui.mjs tools/checks/verify_rules_changes.bat tools/maintenance/stage_rules_changes.bat
+git add -- scripts/checks/verify_rules_ui.mjs scripts/checks/verify_rules_changes.bat scripts/maintenance/stage_rules_changes.bat
 git add -f -- "docs/产品说明手册/04-检测规则/规则模型与注入.md" "docs/产品说明手册/04-检测规则/规则管理后台.md" "docs/产品说明手册/04-检测规则/规则中心前台需求.md" tests/test_rule_injection.py
 if errorlevel 1 exit /b 1
 

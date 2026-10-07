@@ -129,7 +129,7 @@ async function verifyVariant(source,runRoot,variant){
 
 async function main(){
  if(process.argv.includes('--help')){
-  console.log('node tools/checks/verify_b01_behavior_ui.mjs\nBuilds isolated clean and completion-only BugBoard copies under .tracefix, runs the real Playwright B01 Oracle, and writes report.json. Uses existing dependencies only.');
+  console.log('node scripts/checks/verify_b01_behavior_ui.mjs\nBuilds isolated clean and completion-only BugBoard copies under .tracefix, runs the real Playwright B01 Oracle, and writes report.json. Uses existing dependencies only.');
   return;
  }
  assert.equal(process.argv.length,2,'unexpected arguments');

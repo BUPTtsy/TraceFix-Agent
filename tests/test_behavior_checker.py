@@ -16,7 +16,7 @@ from tracefix.storage.artifacts import Artifacts
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_SPEC = importlib.util.spec_from_file_location(
-    "behavior_checker", ROOT / "tools/checks/verify_real_e2e.py"
+    "behavior_checker", ROOT / "scripts/checks/verify_real_e2e.py"
 )
 checker = importlib.util.module_from_spec(MODULE_SPEC)
 MODULE_SPEC.loader.exec_module(checker)

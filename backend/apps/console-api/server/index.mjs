@@ -106,7 +106,7 @@ async function startAgent(goal, mode, projectId, continuation = null, derived = 
   try {
   agent = continuation ? await bridge('run.continue', {id: continuation.runId, instruction: continuation.instruction}) : await bridge('run.create', {goal, mode, projectId, ...(derived || {})});
   const python = pythonCommand();
-  const args = [...(python === 'py' ? ['-3.12'] : []), 'tools/bootstrap/launch.py', '--plain',
+  const args = [...(python === 'py' ? ['-3.12'] : []), 'scripts/bootstrap/launch.py', '--plain',
     ...(continuation ? ['--continue-run', agent.id, '--instruction', continuation.instruction] : ['--run', '--goal', goal, '--mode', mode]),
     ...(derived?.parentRunId ? ['--parent-run', derived.parentRunId] : []),
     ...((derived?.additionalRuleIds || []).flatMap(ruleId => ['--rule', ruleId])),

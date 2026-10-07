@@ -18,7 +18,7 @@ python -m pytest tests/test_rule_injection.py tests/test_rules.py -q
 if errorlevel 1 exit /b 1
 
 echo [4/4] Rules UI acceptance
-node tools/checks/verify_rules_ui.mjs
+node scripts/checks/verify_rules_ui.mjs
 if errorlevel 1 exit /b 1
 
 echo All rule and console checks passed.

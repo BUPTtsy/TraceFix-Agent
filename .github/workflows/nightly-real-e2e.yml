@@ -24,7 +24,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Check real E2E prerequisites
-        run: python tools/checks/verify_real_e2e.py --required --preflight-only --case B01 --output artifacts/real-e2e/report.json
+        run: python scripts/checks/verify_real_e2e.py --required --preflight-only --case B01 --output artifacts/real-e2e/report.json
       - uses: actions/setup-node@v5
         with:
           node-version: '22'
@@ -37,7 +37,7 @@ jobs:
           python -m pip check
           python -c "import tracefix.agents.deepagents_adapter; from pydantic_ai.models.openai import OpenAIChatModel"
       - name: Run real BugBoard B01 E2E
-        run: python tools/checks/verify_real_e2e.py --required --case B01 --output artifacts/real-e2e/report.json
+        run: python scripts/checks/verify_real_e2e.py --required --case B01 --output artifacts/real-e2e/report.json
       - name: Upload E2E report
         if: always()
         uses: actions/upload-artifact@v6

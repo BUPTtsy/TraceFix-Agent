@@ -6,4 +6,4 @@ smoke:
 doctor:
 	.venv/bin/tracefix --doctor
 demo:
-	./scripts/start.sh --mode repair --spec profiles/persistence.spec.json
+	./scripts/bootstrap/start.sh --mode repair --spec profiles/persistence.spec.json

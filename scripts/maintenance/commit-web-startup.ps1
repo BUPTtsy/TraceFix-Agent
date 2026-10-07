@@ -9,8 +9,8 @@ $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $CommitFiles = @(
     'start-web.cmd'
     'start-windows.cmd'
-    'tools/bootstrap/bootstrap.py'
-    'tools/bootstrap/services.py'
+    'scripts/bootstrap/bootstrap.py'
+    'scripts/bootstrap/services.py'
     'package.json'
     'package-lock.json'
     'pyproject.toml'
