@@ -492,7 +492,7 @@ class RunState(Contract):
 
 TRANSITIONS = {
     Phase.PREPARE: {Phase.EXPLORE, Phase.FINALIZE},
-    Phase.EXPLORE: {Phase.REPRODUCE, Phase.FINALIZE},
+    Phase.EXPLORE: {Phase.REPRODUCE, Phase.DIAGNOSE, Phase.FINALIZE},
     Phase.REPRODUCE: {Phase.EXPLORE, Phase.DIAGNOSE, Phase.FINALIZE},
     Phase.DIAGNOSE: {Phase.PATCH, Phase.FINALIZE},
     Phase.PATCH: {Phase.DIAGNOSE, Phase.VERIFY, Phase.FINALIZE},
@@ -526,12 +526,17 @@ def reduce_state(state: RunState, expected_revision: int, **delta) -> RunState:
                                for field in ('replay_plan_ref', 'exploration_plan_ref', 'reproduction_plan_frozen')):
         raise ValueError('修补后不能更改冻结复现计划')
     phase = Phase(delta.get("phase", state.phase))
+    detected_failure = bool(state.check_plan_ref and state.check_suite_completed
+                            and state.initial_check_result_refs and state.check_summary.get('failed', 0) > 0)
+    if phase == Phase.DIAGNOSE and state.phase == Phase.EXPLORE and not detected_failure:
+        raise ValueError('诊断门禁：需要完整检查套件的失败证据')
     if phase != state.phase and phase not in TRANSITIONS[state.phase]:
         if not (state.continuation_count and state.phase == Phase.PREPARE and phase == Phase.VERIFY
-                and state.patch_hash and state.reproduced and state.source_aligned and state.replay_plan_ref):
+                and state.patch_hash and (state.reproduced or state.initial_check_result_refs)
+                and state.source_aligned and state.replay_plan_ref):
             raise ValueError(f"非法的阶段转换：{state.phase} -> {phase}")
-    if phase == Phase.PATCH and not (state.reproduced and state.source_aligned):
-        raise ValueError("补丁门禁：需要先完成复现并与源码对齐")
+    if phase == Phase.PATCH and not ((state.reproduced or detected_failure) and state.source_aligned):
+        raise ValueError("补丁门禁：需要检测或复现失败证据并与源码对齐")
     if delta.get("patch_hash", state.patch_hash) != state.patch_hash:
         delta["validation_refs"] = []
         delta["approval_ref"] = None

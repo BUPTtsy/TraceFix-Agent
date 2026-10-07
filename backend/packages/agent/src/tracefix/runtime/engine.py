@@ -1863,7 +1863,7 @@ class Engine:
         if not s.check_plan_ref:
             s = await self.ensure_check_plan(s)
             return self.output(s, 'prelude')
-        phase = Phase.VERIFY if s.continuation_count and s.patch_hash and s.reproduced and s.replay_plan_ref else Phase.EXPLORE
+        phase = Phase.VERIFY if s.continuation_count and s.patch_hash and (s.reproduced or s.initial_check_result_refs) and s.replay_plan_ref else Phase.EXPLORE
         if phase == Phase.EXPLORE:
             await self.discover(s)
         s = self.changed(s, phase=phase, step=0)
@@ -2661,6 +2661,12 @@ class Engine:
     async def patch(self, s, _):
         self.scopes.assert_current(self.context)
         self.sync_guidance(s)
+        if s.check_plan_ref:
+            from tracefix.runtime.verification import initial_check_failure
+            if not initial_check_failure(s, lambda ref: self.bundle_exists(s, ref),
+                    lambda ref: self.get(s, ref),
+                    lambda ref: self.artifacts.read(s.scope_id, s.run_id, ref)):
+                raise ValueError('补丁门禁：初始检查失败证据不存在、损坏或绑定不匹配')
         spec = self.spec(s)
         if spec.behavior_scenarios and not (s.reproduction_plan_frozen and s.replay_plan_ref):
             raise ValueError('业务验证要求在补丁前冻结复现计划')
