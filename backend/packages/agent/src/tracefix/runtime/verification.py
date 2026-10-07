@@ -195,20 +195,20 @@ def _check_results(state, plan, refs, stage, patch_hash, exists, read, read_byte
     return results
 
 
-def _check_suite_verified(state, exists, read, read_bytes):
+def _frozen_check_plan(state, exists, read):
     from tracefix.rules.models import RuleSnapshot
 
     raw = _read(state.check_plan_ref, exists, read)
     if type(raw) is not dict or digest(raw) != state.check_plan_hash:
-        return False
+        return None
     plan = CheckPlan.model_validate(raw)
     if (plan.run_id != state.run_id or plan.source_manifest != state.source_manifest
             or plan.test_spec_hash != state.test_spec_hash
             or plan.rule_snapshot_hash != state.rule_snapshot_hash):
-        return False
+        return None
     rule_items = {item.id: item.rule_version for item in plan.items if item.source == 'rule'}
     if not any(item.source == 'user_goal' for item in plan.items):
-        return False
+        return None
     if state.rule_snapshot_ref:
         snapshot = RuleSnapshot.model_validate(_read(state.rule_snapshot_ref, exists, read))
         refs = [ref.model_dump(mode='json') for ref in snapshot.refs]
@@ -216,17 +216,37 @@ def _check_suite_verified(state, exists, read, read_bytes):
                 or len({ref.id for ref in snapshot.refs}) != len(snapshot.refs)
                 or rule_items != {ref.id: ref.version for ref in snapshot.refs}
                 or refs != state.rule_refs):
-            return False
+            return None
     elif rule_items or state.rule_snapshot_hash or state.rule_refs:
+        return None
+    return plan
+
+
+def initial_check_failure(state, exists, read, read_bytes):
+    try:
+        if (not state.check_plan_ref or not callable(exists) or not callable(read)
+                or not callable(read_bytes)):
+            return False
+        plan = _frozen_check_plan(state, exists, read)
+        if plan is None:
+            return False
+        results = _check_results(state, plan, state.initial_check_result_refs, 'explore', None,
+                                 exists, read, read_bytes)
+        return results is not None and any(result.status == 'fail' for result in results.values())
+    except Exception:
+        return False
+
+
+def _check_suite_verified(state, exists, read, read_bytes):
+    plan = _frozen_check_plan(state, exists, read)
+    if plan is None:
         return False
     if (state.check_suite_completed is not True or state.check_suite_stage != 'verify'
             or state.check_suite_patch_hash != state.patch_hash):
         return False
-    initial = _check_results(state, plan, state.initial_check_result_refs, 'explore', None,
-                             exists, read, read_bytes)
     final = _check_results(state, plan, state.check_result_refs, 'verify', state.patch_hash,
                            exists, read, read_bytes)
-    return (initial is not None and any(result.status == 'fail' for result in initial.values())
+    return (initial_check_failure(state, exists, read, read_bytes)
             and final is not None and all(result.status in {'pass', 'fail'}
                 and (result.severity != 'blocker' or result.status == 'pass') for result in final.values()))
 
