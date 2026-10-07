@@ -128,5 +128,5 @@ edits 的 path 必须是允许编辑的项目相对路径；before_hash 必须�
 def output_instructions(schema, *, include_common=True):
     specific = {'TestSpec': SPEC, 'Decision': ACTION, 'BrowserAction': ACTION,
                 'PatchProposal': PATCH}.get(schema.__name__, '')
-    discovery = ELEMENT_DISCOVERY if schema.__name__ in {'TestSpec', 'Decision', 'BrowserAction'} else ''
+    discovery = ELEMENT_DISCOVERY if schema.__name__ in {'TestSpec', 'Decision', 'BrowserAction', 'CheckJudgement'} else ''
     return (COMMON if include_common else '') + NATIVE_OUTPUT + discovery + specific

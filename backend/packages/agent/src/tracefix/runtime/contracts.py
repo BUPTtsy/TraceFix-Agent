@@ -535,7 +535,8 @@ def reduce_state(state: RunState, expected_revision: int, **delta) -> RunState:
                 and state.patch_hash and (state.reproduced or state.initial_check_result_refs)
                 and state.source_aligned and state.replay_plan_ref):
             raise ValueError(f"非法的阶段转换：{state.phase} -> {phase}")
-    if phase == Phase.PATCH and not ((state.reproduced or detected_failure) and state.source_aligned):
+    if phase == Phase.PATCH and not ((state.reproduced or state.check_plan_ref
+                                     and state.initial_check_result_refs) and state.source_aligned):
         raise ValueError("补丁门禁：需要检测或复现失败证据并与源码对齐")
     if delta.get("patch_hash", state.patch_hash) != state.patch_hash:
         delta["validation_refs"] = []

@@ -1647,7 +1647,7 @@ class Engine:
         return ref, detail
 
     def route(self, s):
-        if s.check_suite_stage and not s.check_suite_completed:
+        if s.phase != Phase.FINALIZE and s.check_suite_stage and not s.check_suite_completed:
             return 'check_suite'
         return {Phase.PREPARE: 'prepare', Phase.EXPLORE: 'decide', Phase.REPRODUCE: 'reproduce',
                 Phase.DIAGNOSE: 'diagnose', Phase.PATCH: 'patch', Phase.VERIFY: 'verify',
@@ -1981,6 +1981,8 @@ class Engine:
                     '只返回 name 和 criteria；不执行页面动作。'})
         except asyncio.CancelledError:
             raise
+        except (ModelError, ContextWindowError):
+            raise
         except Exception as exc:
             error = sanitize(f'{type(exc).__name__}: {error_message(exc)}')[:1500]
             self.event(s, 'check.goal.extraction_failed', {'error': error})
@@ -1997,7 +1999,8 @@ class Engine:
             raise ValueError('冻结检查计划内容、哈希或 Run 绑定不匹配')
         return plan
 
-    async def model_check(self, s, item, observation, evidence_refs, *, reason=None, files=None):
+    async def model_check(self, s, item, observation, evidence_refs, *, reason=None, files=None,
+                          deterministic_checks=None):
         image = None
         try:
             if observation.get('screenshot_ref'):
@@ -2009,6 +2012,7 @@ class Engine:
             'goal': s.goal, 'check_item': item.model_dump(mode='json'),
             'test_spec': self.spec(s).model_dump(mode='json'), 'observation': observation,
             'cards': cards, 'available_evidence_refs': evidence_refs, 'evidence_refs': evidence_refs,
+            'deterministic_checks': deterministic_checks or [],
             'fallback_reason': reason, 'allowed_tools': ['Read', 'Grep', 'Glob', 'code.analyze'],
             'instruction': '检测当前检查项的全部具体指标。优先读取真实DOM和授权源码，可调用只读分析工具；'
                 '辅助分析器不可用时根据实际截图、已有观察和源码进行多模态判断。'
@@ -2080,8 +2084,18 @@ class Engine:
                         results.append(checkpoint)
                         refs.append(ref)
         files, _ = self.check_source_files(s)
-        model_status, model_actual, model_refs = await self.model_check(s, item, observation, refs, files=files)
-        status = 'fail' if any(value.get('passed') is False for value in results) else model_status
+        failed = any(value.get('passed') is False for value in results)
+        try:
+            model_status, model_actual, model_refs = await self.model_check(s, item, observation, refs,
+                files=files, deterministic_checks=results)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if not failed:
+                raise
+            model_status, model_refs = 'inconclusive', []
+            model_actual = '模型核查失败；已记录的确定性失败仍有效：' + sanitize(str(error))[:1500]
+        status = 'fail' if failed else model_status
         actual = json.dumps({'deterministic_checks': results, 'criteria_judgement': model_actual}, ensure_ascii=False)
         return status, actual, list(dict.fromkeys(refs + model_refs))
 
@@ -2921,7 +2935,7 @@ class Engine:
         status = (RunStatus.SUPERSEDED if s.superseded_by_run_id else
                   RunStatus.CANCELLED if s.error == '用户已取消' else
                   RunStatus.ABNORMAL if s.outcome == Outcome.LOOP_DETECTED else
-                  RunStatus.FAILED if s.mode == 'test' and s.overall_status == 'FAILED' else
+                  RunStatus.FAILED if s.overall_status == 'FAILED' else
                   RunStatus.FAILED if s.outcome in {Outcome.INFRA_FAILURE, Outcome.POLICY_BLOCKED, Outcome.REPAIR_EXHAUSTED}
                   or isinstance(s.error, str) and s.error.startswith('ModelOutputError:') else RunStatus.COMPLETED)
         report = {'schema_version': s.schema_version, 'run_id': s.run_id, 'scope_id': s.scope_id,
