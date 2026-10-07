@@ -31,11 +31,12 @@
 
 #### 原生模型工具与 MCP 的边界 ✅
 
-默认 `TRACEFIX_TOOL_MODE=native` 使用 DeepSeek 类 Chat Completions 原生 function tools。模型只提出 TraceFix 受限调用，不能绕过运行时直连 MCP：
+默认 `TRACEFIX_TOOL_MODE=native` 由 PydanticAI Agent 通过 OpenAI-compatible provider 使用原生 function tools。模型只提出 TraceFix 受限调用，Adapter 只能使用宿主注入的执行端口，不能直连 MCP：
 
 ```text
 模型 tool_calls
-  → Gateway 校验整批函数名、id、JSON 参数和 schema
+  → model/protocol + ToolRegistry 校验整批函数名、真实 id、JSON 参数和 schema
+  → PydanticAI 工具 wrapper 调用宿主端口
   → Engine 校验当前 scope、TestSpec 授权和最新 observation
   → operation intent + receipt
   → MCPBrowser 动作映射 + 已发现的 MCP inputSchema 校验
@@ -44,15 +45,14 @@
 
 | 模型可见函数 | TraceFix 动作 | MCP 工具 |
 |---|---|---|
-| `browser_navigate` | `navigate` | `browser_navigate` |
-| `browser_click` | `click` | `browser_click` |
-| `browser_type` | `type` | `browser_type` |
-| `browser_select` | `select` | `browser_select_option` |
-| `browser_press` | `press` | `browser_press_key` |
-| `browser_snapshot` | `observe` | 观察流程中的 `browser_snapshot` + `browser_take_screenshot` |
-| `browser_take_screenshot` | `observe` | 同一观察流程，返回快照和截图证据引用 |
+| `BrowserNavigate` | `navigate` | `browser_navigate` |
+| `BrowserClick` | `click` | `browser_click` |
+| `BrowserType` | `type` | `browser_type` |
+| `BrowserSelect` | `select` | `browser_select_option` |
+| `BrowserPress` | `press` | `browser_press_key` |
+| `BrowserSnapshot` | `observe` | 观察流程中的 `browser_snapshot` + `browser_take_screenshot` |
 
-console / network 是运行时观察流程可收集的诊断信息，不是本次开放给模型的独立函数。native 的最终 JSON 必须使用 `finish`，由运行时检查断言；显式 `TRACEFIX_TOOL_MODE=json` 才使用旧 JSON 动作路径，两者共用上述策略和 receipt 边界，不自动 fallback。
+本表对应 `model/history.py` 的六个默认浏览器函数；模型工具名由 ToolRegistry 规范化，不能与 MCP 侧名称混淆。console/network 诊断信息可由宿主观察流程收集，其他工具是否可见以阶段注册表为准。native 最终输出必须使用 `finish`，由运行时检查断言；显式 `TRACEFIX_TOOL_MODE=json` 返回单动作契约，两者都使用 PydanticAI，并共用上述策略和 receipt 边界。
 
 `click/type/select/press` 必须绑定最新 `observation_id`；前三者还需精确 role/name 和 `element_ref`。过期按键操作在策略阶段拒绝，不创建 operation；冻结重放会将 `press` 重新绑定到当前观测。没有有效观测时不能直接重放按键（`Engine.act`、`Policy.browser`）。
 
@@ -60,7 +60,7 @@ console / network 是运行时观察流程可收集的诊断信息，不是本�
 
 #### 模型重试与浏览器重连的区别 ✅
 
-- 模型连接失败且请求确定 `not_sent` 时可按退避重试，默认 `max_attempts=3`；耗尽后暂停。安全恢复按 schema 和 `logical_exchange_id` 取回原有 assistant/tool 历史，已完成调用不再执行，历史轮次计入默认 `max_tool_rounds=8`。
+- `max_attempts=3` 转换为 PydanticAI 首次输出后的两次校正机会；模型连接、HTTP 和 transport 不自动退避重试。确定 `not_sent` 的错误交给宿主暂停/安全恢复，按 schema 和原 `logical_exchange_id` 核对历史；已完成工具结果按 ID/参数复用，历史轮次计入默认 `max_tool_rounds=40`。
 - 模型读取超时、浏览器动作结果未知或缺少 receipt 时，不能根据模型重试策略重新执行浏览器动作。`UNKNOWN_OPERATION` / `WAITING_NETWORK` 优先进入相应暂停处理，不被循环检测覆盖。
 - MCP 连接在调用确定未派发时可自动 reconnect 一次，结果写入异常详情的 `reconnect_attempted`、`reconnected` 和 `requires_new_observation`。重连不重试原动作，后续交互必须取得新 observation；已派发或派发状态不明的动作继续暂停核查，需要人工核查的状态会阻止普通 resume。
 

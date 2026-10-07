@@ -77,7 +77,7 @@ user：输出 JSON schema → context.skills 全文 → 其余动态 context
 ) + 工具与运行环境成本
 ```
 
-推理 token 是否包含于输出 token、是否单独报告或计费，取决于模型和服务，不能重复计算。前缀缓存主要影响重复输入的处理，不会自动减少模型生成的推理或输出 token。当前默认 DeepSeek 请求显式关闭 thinking；Skill 依然可能通过改变决策和调用次数影响整个任务成本。
+推理 token 是否包含于输出 token、是否单独报告或计费，取决于模型和服务，不能重复计算。前缀缓存主要影响重复输入的处理，不会自动减少模型生成的推理或输出 token。当前 Gateway 对 DeepSeek 默认设置 `thinking=enabled`，其他兼容端点仅在显式配置时发送；PydanticAI provider 保留该参数。是否取得 reasoning 仍以供应商实际响应为准，Skill 可能通过改变决策和调用次数影响整个任务成本。
 
 阶段选择与全量常驻没有固定的费用优劣。例如只考虑 Skill 部分，若选中 2,000 token 全部未命中，全量 8,000 token 已经全部命中，且命中单价恰为普通单价的 10%，后者本次输入费相当于 800 个普通输入 token，反而更低。这只是算例：它忽略冷启动、其它上下文、缓存期限以及额外正文对任务质量的影响，不能当作当前供应商报价或本项目实测。
 
@@ -88,7 +88,7 @@ user：输出 JSON schema → context.skills 全文 → 其余动态 context
 - 首 token 延迟、完整任务延迟和每个成功任务的费用。
 - Skill 清单、版本哈希、阶段、输出契约与对应请求，解释缓存变化来源。
 
-网关原样保存供应商 usage；DeepSeek 的 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`、OpenAI 兼容服务的 `prompt_tokens_details.cached_tokens` 可在服务实际返回时用于分析。没有这些字段时应标记为未知，不能把未报告视为命中数为零。离线公共前缀测试验证布局，不测量真实供应商命中率、费用或修复成功率。
+PydanticAI provider 的 `RequestBoundary` 对每次实际请求保存供应商原始 usage，包括工具后续请求和输出校正，而非只计最终结果。DeepSeek 的 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`、OpenAI 兼容服务的 `prompt_tokens_details.cached_tokens` 可在服务实际返回时用于分析。没有这些字段时应标记为未知，不能把未报告视为命中数为零。离线公共前缀测试验证布局，不测量真实供应商命中率、费用或修复成功率。
 
 ## 审计口径与边界
 

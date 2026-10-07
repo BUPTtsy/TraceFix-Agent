@@ -3,14 +3,17 @@
 TraceFix 面向 Web GUI，产品目标是「自动化测试 → 缺陷定位 → 修复 → 验证 → 提交合并请求」。
 隔离工作区、浏览器操作、确定性验证和本地候选提交已有实现；远程 push / Pull Request、完整规则平台等仍属规划，不能把目标流程当成已完成的端到端能力。
 
-## 当前交付边界（2026-09-25）
+## 当前交付边界
 
-- 本次交付对应 `82d74ca`、`f5cc31b`：面向 DeepSeek 类 Chat Completions 服务，浏览器默认使用原生 function tools，经参数校验、运行时 policy 和 MCP 执行；`TRACEFIX_TOOL_MODE=json` 是显式 legacy 配置，没有自动协议回退。Skill 已支持按阶段和触发器渐进式注入；通用 ToolSpec 注册表、Anthropic 原生协议和自动能力矩阵仍未实现。
-- 默认文本模型为 `deepseek-chat`，`TRACEFIX_VISION_MODEL` 为空；只有显式配置视觉模型才向模型发送截图。页面截图仍作为运行证据保存。服务返回的模型响应、工具结果和 usage 会留存；DeepSeek 默认关闭 thinking，不能保证取得 reasoning。
-- Run 累计 `Usage` 只计量；单次请求仍默认最多尝试 3 次，一次工具交互默认最多 8 轮，恢复时已完成轮次继续计数。请求或 MCP 副作用结果不明时暂停核对，不被循环检测覆盖；确定 `not_sent` 的模型请求才可安全恢复对应历史。
-- 本次工作区离线重点测试 **85 项通过**，未完成真实 API + MCP + Docker 端到端验证，也不等同于干净 HEAD checkout 已通过。历史完成度与本次增量见[完成度评估](00-项目进度/完成度评估.md)；内部双模型等长期方案见[内部模型版开发计划](10-开发计划/开发计划与里程碑-内部模型版.md)，仍是规划。
+- Python Test/Repair/Chat 的模型执行使用 PydanticAI，Gateway 保留宿主兼容接口；LangGraph 继续负责状态机、checkpoint 与 interrupt。没有 Legacy 模型执行或失败回退，框架缺失时返回明确 unavailable 错误。详细职责、依赖状态与验证入口见[框架接入说明](../agent-framework-migration.md)。
+- 浏览器默认 native function tools，显式 `TRACEFIX_TOOL_MODE=json` 是单动作协议配置，两者都使用 PydanticAI。ToolSpec/ToolRegistry/ToolPipeline 已实现，仍按阶段、权限、审批、operation receipt 和证据门执行；其他供应商协议与自动能力矩阵不构成已交付能力。
+- 默认文本模型为 `deepseek-chat`，`TRACEFIX_VISION_MODEL` 为空；只有显式配置视觉模型且携带图片才选择该模型。截图证据继续保存。DeepSeek 默认 `thinking=enabled`，原始 reasoning/usage 在供应商实际返回时保留，配置开启不证明一定取得 reasoning。
+- `max_attempts` 默认 3，映射为两次输出校正机会；provider/transport 不自动网络重试。`max_tool_rounds` 默认 40，恢复历史也计入。每次真实请求独立预算检查、审计与计量；已完成工具结果复用，未知副作用暂停核查，取消向外传播。
+- ReadOnlyWorker 调查使用 DeepAgents，宿主保留父子 Run、授权文件/证据、版本复核和用量归并；通用 Worker/GUI Scout 的 Gateway 模型调用仍使用 PydanticAI。框架执行不替代审批、UNKNOWN/resource fence、验证门或 Oracle。
 
-代码依据：`backend/packages/agent/src/tracefix/model/gateway.py:70`、`backend/packages/agent/src/tracefix/model/gateway.py:248`、`backend/packages/agent/src/tracefix/runtime/engine.py:350`、`backend/packages/agent/src/tracefix/runtime/contracts.py:68`。
+2026-09-25 的 `82d74ca`、`f5cc31b` 与 **85 项离线重点测试通过**是历史记录，不能作为当前框架迁移的全量或真实 API + MCP + Docker 验收结论。历史完成度见[完成度评估](00-项目进度/完成度评估.md)；长期方案见[内部模型版开发计划](10-开发计划/开发计划与里程碑-内部模型版.md)，仍需按章节状态标记区分实现与规划。
+
+代码依据：`backend/packages/agent/src/tracefix/model/gateway.py:72`、`backend/packages/agent/src/tracefix/agents/pydantic_ai_adapter.py:114`、`backend/packages/agent/src/tracefix/model/protocol.py:46`、`backend/packages/agent/src/tracefix/runtime/tools.py:65`。
 
 ## 目录结构
 

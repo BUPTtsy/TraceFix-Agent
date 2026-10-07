@@ -12,23 +12,28 @@
 | system 提示 | 安全策略 `POLICY` + 项目 `AGENTS.md` + 本阶段输出规范；区分原生工具交互与最终 JSON | `model/prompts.py:output_instructions` |
 | 浏览器交互 | 框架调用宿主绑定的工具；阶段、参数、历史、权限和回执仍由宿主检查，浏览器副作用串行执行 | `agents/pydantic_ai_adapter.py`、`model/history.py`、`runtime/tools.py` |
 | 最终输出 | PydanticAI 结构化输出再次通过宿主 schema 与输出校验，阶段与成功结论由 Engine 的门禁决定 | `agents/pydantic_ai_adapter.py`、`runtime/engine.py` |
-| 重试与防护 | Gateway 的 max_attempts/max_tool_rounds 继续作为宿主配置；DeepAgents 调查另有真实请求上界，错误不回退旧执行器 | `model/gateway.py`、`agents/pydantic_ai_adapter.py`、`agents/deepagents_adapter.py` |
+| 输出校正与防护 | `max_attempts` 默认 3，映射为 PydanticAI 两次输出校正机会；网络/transport 自动重试为 0。`max_tool_rounds` 默认 40，恢复历史也计入；每次实际请求检查上下文预算并计量 usage | `model/gateway.py:Gateway.generate`、`agents/pydantic_ai_adapter.py`、`model/protocol.py:RequestBoundary` |
 
 以下保留浏览器动作分类和参数说明；当前模型侧工具名/schema 以宿主注册表及 `model/history.py` 为准。运行时还提供 Read/Grep/Glob 等通用工具，见 [工具定义与注册](../../../backend/packages/agent/src/tracefix/runtime/README.md)，这些能力按阶段和授权选择，不全量开放给每个 Agent：
 
-| 原生函数 | TraceFix 动作 | 必填参数 |
+| 模型侧函数 | TraceFix 动作 | 必填参数 |
 |---|---|---|
-| `browser_navigate` | `navigate` | `value`（授权范围内的 URL） |
-| `browser_click` | `click` | `observation_id`、`element_ref`、`locator`（精确 role/name） |
-| `browser_type` | `type` | 同 click，加 `value` |
-| `browser_select` | `select` | 同 click，加 `value` |
-| `browser_press` | `press` | `observation_id`、`value`（允许的按键） |
-| `browser_snapshot` | `observe` | 无 |
-| `browser_take_screenshot` | `observe` | 无 |
+| `BrowserNavigate` | `navigate` | `value`（授权范围内的 URL） |
+| `BrowserClick` | `click` | `observation_id`、`element_ref`、`locator`（精确 role/name） |
+| `BrowserType` | `type` | 同 click，加 `value` |
+| `BrowserSelect` | `select` | 同 click，加 `value` |
+| `BrowserPress` | `press` | `observation_id`、`value`（允许的按键） |
+| `BrowserSnapshot` | `observe` | 无 |
 
-每次成功调用都返回最新 observation 和截图证据引用。两种观察工具均复用现有观察流程。所有动作仍经过 `Engine.act → Policy.browser → Engine.operation → MCPBrowser`；scope 撤销和未知执行结果不作为普通工具错误继续。明确未执行的策略或定位器拒绝可返回 `isError=true`、`executed=false`，由模型修正。
+每次成功调用都返回最新 observation 和截图证据引用，`BrowserSnapshot` 复用现有快照与截图观察流程。模型侧名称由 `ToolSpec.wire_name` / `model_tool_name` 规范化，MCP 侧名称仍是 `browser_*`；本表列出 `model/history.py` 的六个默认浏览器函数。所有动作仍经过 `Engine.act → Policy.browser → Engine.operation → MCPBrowser`。
+
+明确未执行的策略或定位器拒绝保留 `isError=true`、`executed=false`，供宿主反馈和重新决策。Adapter 将一般工具异常/失败回执分类为 `tool_execution`，不启动工具自动重试；仅提交工具明确未执行的输出拒绝可进入有界输出校正。scope 撤销、结果未知和缺少 receipt 继续受宿主 UNKNOWN/核查语义约束。
 
 同一 `tool_call_id` 与相同参数再次出现时复用已记录结果，不再执行动作；同 id 改参数、同批重复 id、缺失消息配对会被拒绝。供应商返回的 `reasoning_content` 在工具往返中保留，并记录到审计，不作为最终任务结论。最终 JSON 校验失败时保留已有工具结果，不能重复执行已完成的动作。
+
+工具只通过注入的 callable 或 ToolPipeline 执行。`parallel_safe` 且副作用为 `none/read` 的工具受 semaphore 限流，Adapter 默认 `max_concurrency=4`；写/外部操作由框架串行调度。调用 ID、receipt、工具结果和 retry context 随事件与错误保留；`output_validation`、`tool_execution`、`tool_protocol`、`stream_interrupted/stream_incomplete` 分别可判定，取消向外传播。
+
+`model/history.py` 统一恢复消息、参数/结果配对和证据投影；`model/protocol.py` 在每次实际 provider 请求前刷新宿主上下文、guidance、规则/Skill 并检查 `context_manifest`。安全恢复保留已持久化输入和结果，受保护内容超窗时暂停；usage/reasoning 逐请求审计，不只统计最终 `ModelResult`。
 
 工具交互之外，以下**类型化契约**继续由运行时校验和消费：
 
@@ -108,13 +113,16 @@ class ToolSpec:
 ### 2.3 统一执行管线扩展 📐
 
 ```text
-DeepSeek 类 Chat Completions tools / tool_calls
-  ──▶ 📐 通用 ToolSpec 注册表 ──▶ 执行管线 ──▶ tool 消息 ──▶ 下一轮上下文
+PydanticAI Agent / OpenAI-compatible provider
+  ──▶ 宿主 ToolSpec / ToolRegistry 校验
+  ──▶ ToolPipeline / 浏览器执行端口
+  ──▶ 策略、审批、operation receipt、证据
+  ──▶ 配对工具结果 ──▶ PydanticAI 下一次请求
 
-显式 TRACEFIX_TOOL_MODE=json：保留 BrowserAction / Decision JSON 兼容路径
+显式 TRACEFIX_TOOL_MODE=json：PydanticAI 输出 BrowserAction / Decision 单动作契约
 ```
 
-未来通用执行管线（每个 ToolCall 依次经过，不能据此推断当前已开放这些能力）：
+通用注册表与执行管线已经实现；以下保留后续扩展的检查顺序，具体已开放工具及字段以 runtime 工具文档为准：
 
 1. **解析**：工具名必须在本阶段可见集合内。
 2. **校验**：用 `input_model.model_validate`；失败时返回结构化错误，让模型自行修正。
@@ -129,7 +137,7 @@ DeepSeek 类 Chat Completions tools / tool_calls
 - 可恢复的错误（参数无效、元素未找到、文件不存在）作为 `ToolResult(is_error=true)` 返回给模型。
 - 策略违规：拒绝执行，把原因作为 `ToolResult(is_error=true)` 反馈给模型，并记录事件；不结束 Run。同一违规反复出现时，由死循环检测的「错误重复」信号判定为循环（见 `10-开发计划/开发计划与里程碑-内部模型版.md` 第 3 节）。
 
-协议范围保持为 DeepSeek 类 Chat Completions；本次不新增 Anthropic 等其他协议、供应商能力矩阵或自动 fallback。JSON 兼容模式仍是显式配置，也不是 `{"tool_calls": [...]}` 形式的另一个自定义协议。
+当前 provider 范围为 DeepSeek 等 OpenAI-compatible Chat Completions，PydanticAI 框架支持的其他 provider 不等于 TraceFix 已接入这些供应商。JSON 单动作模式仍是显式协议配置；没有 Legacy 后端、依赖缺失回退、自动供应商切换或自定义 `{"tool_calls": [...]}` 执行循环。
 
 ### 2.4 Skill 机制重建
 
