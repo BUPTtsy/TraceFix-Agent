@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import httpx
 
 from tracefix.execution.workspace import Workspace
+from tracefix.model import protocol
 from tracefix.model.gateway import Gateway
 from tracefix.runtime.contracts import FileEdit, PatchProposal, Phase, RunState, digest
 from tracefix.runtime.tool_handlers import build_runtime_tools
@@ -39,12 +40,16 @@ async def test_gateway_executes_registered_code_tool_and_returns_typed_submissio
     edit = FileEdit(path='src/value.ts', before_hash=digest(original.encode()),
                     content='export const persisted = true;\n')
     responses = [
-        httpx.Response(200, json={'model': 'tool-test', 'usage': {'total_tokens': 2},
-            'choices': [{'finish_reason': 'tool_calls', 'message': {
+        httpx.Response(200, json={'id': 'read-response', 'object': 'chat.completion',
+            'created': 0, 'model': 'tool-test', 'usage': {
+                'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2},
+            'choices': [{'index': 0, 'finish_reason': 'tool_calls', 'message': {
                 'role': 'assistant', 'content': None,
                 'tool_calls': [call('read-1', 'Read', {'file_path': str(source / 'value.ts')})]}}]}),
-        httpx.Response(200, json={'model': 'tool-test', 'usage': {'total_tokens': 2},
-            'choices': [{'finish_reason': 'tool_calls', 'message': {
+        httpx.Response(200, json={'id': 'patch-response', 'object': 'chat.completion',
+            'created': 0, 'model': 'tool-test', 'usage': {
+                'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2},
+            'choices': [{'index': 0, 'finish_reason': 'tool_calls', 'message': {
                 'role': 'assistant', 'content': None,
                 'tool_calls': [call('patch-1', 'ProposePatch', {
                     'summary': '修复状态持久化', 'evidence_refs': ['evidence'],
@@ -52,11 +57,16 @@ async def test_gateway_executes_registered_code_tool_and_returns_typed_submissio
     ]
     requests = []
 
-    async def post(client, url, **kwargs):
-        requests.append(copy.deepcopy(kwargs['json']))
+    async def handle(request):
+        requests.append(copy.deepcopy(json.loads(request.content)))
         return responses.pop(0)
 
-    monkeypatch.setattr(httpx.AsyncClient, 'post', post)
+    def client(boundary):
+        return httpx.AsyncClient(transport=protocol.BoundaryTransport(
+            httpx.MockTransport(handle), boundary), event_hooks={
+                'request': [boundary.before], 'response': [boundary.received]})
+
+    monkeypatch.setattr(protocol, 'create_http_client', client)
     result = await Gateway(key='ci', stream=False,
                            max_attempts=1).generate(PatchProposal,
         {'phase': 'DIAGNOSE', 'available_evidence_refs': ['evidence']},
@@ -66,7 +76,8 @@ async def test_gateway_executes_registered_code_tool_and_returns_typed_submissio
     assert pipeline.submission_value == result.value
     assert len(validated) == 1
     assert validated[0][0] == result.value and validated[0][1] is state
-    assert requests[0]['parallel_tool_calls'] is True
     assert requests[0]['tools'][0]['function']['name'] == 'Read'
+    assert requests[1]['messages'][-1]['tool_call_id'] == 'read-1'
+    assert requests[1]['messages'][-1]['role'] == 'tool'
     assert any(':patch-1:' in key for key in store.operations)
     assert all(record['status'] == 'DONE' for record in store.operations.values())

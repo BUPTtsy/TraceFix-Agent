@@ -38,8 +38,7 @@ class ToggleBrowser(FakeBrowser):
         return raw
 
 
-@pytest.mark.parametrize('native', [False, True])
-async def test_retries_are_excluded_before_patch_and_same_plan_verifies_persistence(tmp_path, native):
+async def test_retries_are_excluded_before_patch_and_same_plan_verifies_persistence(tmp_path):
     engine, state = make_engine(tmp_path)
     engine.browser = ToggleBrowser(engine.workspace)
     engine.LOOP_STATE_LIMIT = 100
@@ -56,7 +55,7 @@ async def test_retries_are_excluded_before_patch_and_same_plan_verifies_persiste
     plan_requests = []
 
     class ExploringModel:
-        supports_tool_executor = native
+        supports_tool_executor = True
         index = 0
 
         async def generate(self, schema, context, **options):
@@ -76,8 +75,6 @@ async def test_retries_are_excluded_before_patch_and_same_plan_verifies_persiste
                         action.observation_id = observation['id']
                     if action.locator:
                         action.element_ref = resolve_locator(observation['snapshot'], action.locator)
-                    if not native:
-                        return ModelResult(Decision(action=action), {}, 'fake', 'stop')
                     names = {'click': 'BrowserClick', 'observe': 'BrowserSnapshot',
                              'navigate': 'BrowserNavigate', 'press': 'BrowserPress'}
                     arguments = action.model_dump(exclude_none=True)

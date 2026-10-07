@@ -16,6 +16,7 @@ from tracefix.agents.pydantic_ai_adapter import PydanticAIAdapter, PydanticAIAda
 from tracefix.model import protocol
 from tracefix.model.chat import stream_tool_chat
 from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
+from tracefix.runtime.contracts import BrowserAction, Decision
 from tracefix.runtime.tools import ToolPipeline, ToolRegistry, ToolResult, ToolSpec
 
 
@@ -74,7 +75,61 @@ def response(content='{"answer":42}', *, calls=None, usage=None, finish='stop', 
 
 def call(name='RepoRead', call_id='provider-call-9', arguments=None):
     return {'id': call_id, 'type': 'function', 'function': {
-        'name': name, 'arguments': json.dumps(arguments or {'index': 1})}}
+        'name': name, 'arguments': json.dumps({'index': 1} if arguments is None else arguments)}}
+
+
+@pytest.mark.parametrize('schema', [BrowserAction, Decision])
+async def test_gateway_always_exposes_native_browser_tools(monkeypatch, schema):
+    monkeypatch.setenv('TRACEFIX_TOOL_MODE', 'json')
+    finished = {'kind': 'finish'} if schema is BrowserAction else {'action': {'kind': 'finish'}}
+    requests = transport(monkeypatch, [response(None, calls=[
+        call('BrowserSnapshot', 'snapshot-1', {})], finish='tool_calls'),
+        response(json.dumps(finished))])
+    executed = []
+
+    def execute(name, arguments, call_id):
+        executed.append((name, arguments, call_id))
+        return {'observation': {'id': 'observed', 'snapshot': '- heading "Ready"'}}
+
+    result = await Gateway(key='fake', stream=False).generate(schema, {'phase': 'EXPLORE'},
+        tool_executor=execute)
+    assert executed == [('browser.snapshot', {}, 'snapshot-1')]
+    assert {tool['function']['name'] for tool in requests[0]['tools']} == {
+        'BrowserNavigate', 'BrowserClick', 'BrowserType', 'BrowserSelect',
+        'BrowserPress', 'BrowserSnapshot'}
+    assert requests[1]['messages'][-1]['tool_call_id'] == 'snapshot-1'
+    action = result.value if schema is BrowserAction else result.value.action
+    assert action.kind == 'finish'
+
+
+@pytest.mark.parametrize('schema', [BrowserAction, Decision])
+@pytest.mark.parametrize('output_tool', [False, True])
+@pytest.mark.parametrize('kind', ['observe', 'click'])
+async def test_gateway_rejects_browser_actions_in_final_output(monkeypatch, schema, output_tool, kind):
+    action = {'kind': kind, 'observation_id': 'current', 'element_ref': 'e1',
+              'locator': {'role': 'button', 'name': 'Save'}}
+    output = action if schema is BrowserAction else {'action': action}
+    reply = response(None, calls=[call('final_result', 'returned-action', output)],
+        finish='tool_calls') if output_tool else response(json.dumps(output))
+    requests = transport(monkeypatch, [reply])
+    tools = [ToolSpec('finish_exploration', 'Finish exploration', schema, side_effect='write',
+        idempotency_key=lambda value: value.model_dump_json(), submission=True,
+        submission_schema=schema)] if output_tool else []
+    with pytest.raises(ModelOutputError) as raised:
+        await Gateway(key='fake', stream=False, max_attempts=1).generate(schema, {}, tools=tools,
+            tool_executor=lambda *args: pytest.fail('returned browser action must not execute'))
+    assert raised.value.category == 'output_validation'
+    assert len(requests) == 1
+
+
+async def test_gateway_corrects_non_finish_browser_output_without_executing_it(monkeypatch):
+    requests = transport(monkeypatch, [response('{"kind":"observe"}'),
+                                       response('{"kind":"finish"}')])
+    result = await Gateway(key='fake', stream=False, max_attempts=2).generate(BrowserAction, {},
+        tool_executor=lambda *args: pytest.fail('returned browser action must not execute'))
+    assert result.value.kind == 'finish'
+    assert len(requests) == 2
+    assert 'finish' in requests[1]['messages'][-1]['content']
 
 
 async def test_real_agent_typed_output_and_bounded_correction():

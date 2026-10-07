@@ -117,6 +117,7 @@ class PydanticAIAdapter:
                        agent_instructions: str | None = None, image: bytes | None = None,
                        **runtime_options) -> Any:
         from tracefix.runtime.tools import ToolProtocolError, ToolRegistry, ToolRejected, ToolSpec
+        from tracefix.runtime.contracts import BrowserAction, Decision
 
         trace = _RunTrace(messages=copy.deepcopy(list(message_history or ())))
         if schema is not str and (not isinstance(schema, type) or not issubclass(schema, BaseModel)):
@@ -135,7 +136,7 @@ class PydanticAIAdapter:
             for spec in self.model.additional_tools:
                 if spec not in tools:
                     tools += (spec,)
-        if getattr(schema, '__name__', None) in {'BrowserAction', 'Decision'}:
+        if schema in {BrowserAction, Decision}:
             for definition in getattr(self.model, '_native_tools', lambda _schema: [])(schema):
                 function = definition['function']
                 if any(spec.wire_name == function['name'] for spec in tools):
@@ -497,7 +498,8 @@ class PydanticAIAdapter:
                 instructions=agent_instructions, tools=[tool for name, tool in bound_tools.items()
                     if submission_spec is None or name != submission_spec.name],
                 retries=self.output_retries)
-            if validate_output is not None or submission_spec is not None:
+            if (validate_output is not None or submission_spec is not None
+                    or schema in {BrowserAction, Decision}):
                 model_retry = getattr(exceptions, 'ModelRetry', RuntimeError)
                 @agent.output_validator
                 async def host_output_validator(run_context, output):
@@ -510,6 +512,9 @@ class PydanticAIAdapter:
                             output = tool_pipeline.submission_value
                     try:
                         checked = output if isinstance(output, schema) else schema.model_validate(output)
+                        if (schema in {BrowserAction, Decision}
+                                and getattr(checked, 'action', checked).kind != 'finish'):
+                            raise ValueError('最终浏览器输出只能是 finish，动作必须通过原生浏览器工具执行')
                         if validate_output is not None:
                             await _resolve(validate_output(checked))
                         return checked

@@ -1881,7 +1881,7 @@ class Engine:
         context = build_context(s, spec.model_dump(), obs, pairs=[{'action': a, 'result': 'see current observation'} for a in plan[-4:]],
                                 rules=self.active_rules(s, str(Phase.EXPLORE)))
         context['reference_documents'] = await select_documents(self, s, obs)
-        context['instruction'] = '每次只请求一个浏览器动作，并等待最新观测。必须匹配当前 observation_id 和 element_ref。完成请求的交互后使用 finish；它只是请求运行时执行确定性断言检查。'
+        context['instruction'] = '浏览器动作必须通过原生浏览器工具执行，每次只调用一个工具，并等待最新观测。必须匹配当前 observation_id 和 element_ref。完成请求的交互后返回 finish；它只是请求运行时执行确定性断言检查。'
         decision = await self.model_call(s, Decision, context, image=image)
         self.validate_rule_refs(s, decision.rule_refs)
         obs = self.get(s, s.observation_ref)
