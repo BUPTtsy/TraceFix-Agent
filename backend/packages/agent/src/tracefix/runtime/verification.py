@@ -15,9 +15,11 @@ action_hash and the same GUI fields/execution_plan_hash. The result references
 the last checkpoint's observation. Readers must enforce scope/run and storage
 integrity; JSON and screenshot-byte readers are separate and both mandatory.
 """
+from math import isfinite
 from urllib.parse import urlsplit
 
-from tracefix.runtime.contracts import BrowserAction, SCHEMA_VERSION, TestSpec, Validation, digest
+from tracefix.runtime.contracts import (BrowserAction, CheckPlan, CheckResult, SCHEMA_VERSION,
+                                       TestSpec, Validation, digest)
 
 REQUIRED = {'static', 'unit', 'build', 'health', 'original', 'regression'}
 
@@ -134,11 +136,111 @@ def _behavior(result, scenario, binding, exists, read, read_bytes):
             and result.get('observation_hash') == last_checkpoint['observation_hash'])
 
 
+def _check_evidence(ref, state, patch_hash, exists, read, read_bytes, seen, depth=0):
+    if depth > 8:
+        return False
+    if ref in seen:
+        return True
+    value = _read(ref, exists, read if ref.endswith('.json') else read_bytes)
+    seen.add(ref)
+    if not ref.endswith('.json'):
+        return type(value) is bytes and bool(value)
+    if type(value) is not dict:
+        return False
+    binding = {'scope_id': state.scope_id, 'run_id': state.run_id,
+               'source_manifest': state.source_manifest, 'test_spec_hash': state.test_spec_hash,
+               'patch_hash': patch_hash}
+    if any(key in value and value[key] != expected for key, expected in binding.items()):
+        return False
+    for key in ('artifact_ref', 'observation_ref', 'screenshot_ref'):
+        if value.get(key) and not _check_evidence(
+                value[key], state, patch_hash, exists, read, read_bytes, seen, depth + 1):
+            return False
+    for key in ('evidence_refs', 'checkpoint_refs'):
+        refs = value.get(key, [])
+        if type(refs) is not list or any(not _check_evidence(
+                nested, state, patch_hash, exists, read, read_bytes, seen, depth + 1) for nested in refs):
+            return False
+    if value.get('screenshot_ref'):
+        png = _read(value['screenshot_ref'], exists, read_bytes)
+        if (type(png) is not bytes or not png.startswith(b'\x89PNG\r\n\x1a\n') or len(png) <= 8
+                or value.get('screenshot_hash') != digest(png)):
+            return False
+    return True
+
+
+def _check_results(state, plan, refs, stage, patch_hash, exists, read, read_bytes):
+    if (type(refs) is not list or len(refs) != len(plan.items)
+            or any(type(ref) is not str for ref in refs) or len(set(refs)) != len(refs)):
+        return None
+    items = {item.id: item for item in plan.items}
+    results = {}
+    seen = set()
+    for ref in refs:
+        result = CheckResult.model_validate(_read(ref, exists, read))
+        item = items.get(result.id)
+        if (item is None or result.id in results or result.stage != stage
+                or result.patch_hash != patch_hash or result.source_manifest != state.source_manifest
+                or result.check_plan_hash != state.check_plan_hash
+                or any(getattr(result, field) != getattr(item, field)
+                       for field in ('name', 'criteria', 'severity', 'source', 'detector'))
+                or not result.actual.strip() or not isfinite(result.started_at)
+                or not isfinite(result.finished_at) or result.finished_at < result.started_at
+                or result.status in {'pass', 'fail'} and (result.error or not result.evidence_refs)):
+            return None
+        if any(not _check_evidence(evidence, state, patch_hash, exists, read, read_bytes, seen)
+               for evidence in result.evidence_refs):
+            return None
+        results[result.id] = result
+    return results
+
+
+def _check_suite_verified(state, exists, read, read_bytes):
+    from tracefix.rules.models import RuleSnapshot
+
+    raw = _read(state.check_plan_ref, exists, read)
+    if type(raw) is not dict or digest(raw) != state.check_plan_hash:
+        return False
+    plan = CheckPlan.model_validate(raw)
+    if (plan.run_id != state.run_id or plan.source_manifest != state.source_manifest
+            or plan.test_spec_hash != state.test_spec_hash
+            or plan.rule_snapshot_hash != state.rule_snapshot_hash):
+        return False
+    rule_items = {item.id: item.rule_version for item in plan.items if item.source == 'rule'}
+    if not any(item.source == 'user_goal' for item in plan.items):
+        return False
+    if state.rule_snapshot_ref:
+        snapshot = RuleSnapshot.model_validate(_read(state.rule_snapshot_ref, exists, read))
+        refs = [ref.model_dump(mode='json') for ref in snapshot.refs]
+        if (snapshot.run_id != state.run_id or snapshot.hash != state.rule_snapshot_hash
+                or len({ref.id for ref in snapshot.refs}) != len(snapshot.refs)
+                or rule_items != {ref.id: ref.version for ref in snapshot.refs}
+                or refs != state.rule_refs):
+            return False
+    elif rule_items or state.rule_snapshot_hash or state.rule_refs:
+        return False
+    if (state.check_suite_completed is not True or state.check_suite_stage != 'verify'
+            or state.check_suite_patch_hash != state.patch_hash):
+        return False
+    initial = _check_results(state, plan, state.initial_check_result_refs, 'explore', None,
+                             exists, read, read_bytes)
+    final = _check_results(state, plan, state.check_result_refs, 'verify', state.patch_hash,
+                           exists, read, read_bytes)
+    return (initial is not None and any(result.status == 'fail' for result in initial.values())
+            and final is not None and all(result.status in {'pass', 'fail'}
+                and (result.severity != 'blocker' or result.status == 'pass') for result in final.values()))
+
+
 def verify_artifacts(state, validations, exists, read, read_bytes):
     try:
         if (not callable(exists) or not callable(read) or not callable(read_bytes)
-                or not state.reproduced or not state.source_aligned or not state.patch_hash
+                or not state.source_aligned or not state.patch_hash
                 or not state.reproduction_plan_frozen or not state.test_spec_ref or not state.replay_plan_ref):
+            return False
+        if state.check_plan_ref:
+            if not _check_suite_verified(state, exists, read, read_bytes):
+                return False
+        elif not state.reproduced:
             return False
         raw_spec = _read(state.test_spec_ref, exists, read)
         if type(raw_spec) is not dict or digest(raw_spec) != state.test_spec_hash:
