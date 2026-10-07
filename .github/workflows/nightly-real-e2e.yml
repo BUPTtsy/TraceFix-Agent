@@ -33,6 +33,10 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check -r requirements.lock
           python -m pip install --disable-pip-version-check --no-deps --no-build-isolation -e .
+      - name: Check Python runtime dependencies
+        run: |
+          python -m pip check
+          python -c "import tracefix.agents.deepagents_adapter; from pydantic_ai.models.openai import OpenAIChatModel"
       - name: Run real BugBoard B01 E2E
         run: python tools/checks/verify_real_e2e.py --required --case B01 --output artifacts/real-e2e/report.json
       - name: Upload E2E report

@@ -23,6 +23,12 @@ jobs:
           node-version: '22'
       - name: Bootstrap with native PowerShell (explicit fake model)
         run: ./tools/bootstrap/start.ps1 --smoke --plain
+      - name: Check Python runtime dependencies
+        run: |
+          ./.venv/Scripts/python.exe -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./.venv/Scripts/python.exe -c "import tracefix.agents.deepagents_adapter; from pydantic_ai.models.openai import OpenAIChatModel"
+          exit $LASTEXITCODE
       - name: Unit and platform tests
         run: |
           npm ci --ignore-scripts
