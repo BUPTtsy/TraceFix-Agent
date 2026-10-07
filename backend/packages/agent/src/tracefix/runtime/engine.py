@@ -2961,7 +2961,8 @@ class Engine:
                   'result_summary': result_summary,
                   'diagnosis_retry_count': s.diagnosis_retry_count,
                   'diagnosis_feedback_refs': s.diagnosis_feedback_refs,
-                  'budget': s.budget.model_dump(), 'evidence_refs': s.evidence_refs,
+                  'budget': s.budget.model_dump(), 'evidence_refs': [reference for reference in s.evidence_refs
+                      if not re.search(r'模型|推理|上下文|指令|记忆|源码|状态|事件', reference)],
                   'execution_backend': type(self.runner).__name__, 'source_manifest': s.source_manifest,
                   'environment_digest': s.environment_digest, 'baseline_validation_refs': s.baseline_validation_refs,
                    'validation_refs': s.validation_refs, 'error': s.error,
@@ -3019,7 +3020,7 @@ class Engine:
         if patch_available:
             page += '<h2>候选补丁差异</h2><pre>'+html.escape(diff_text)+'</pre>'
         html_ref = self.put(s, page+'</html>', 'html', name='修复报告')
-        if s.reproduced:
+        if s.reproduced or s.initial_check_result_refs:
             try:
                 self.warn_retrieval_degraded(s)
                 self.retriever.candidate(s, json.dumps(report, ensure_ascii=False), 'success_recipe' if s.outcome == Outcome.FIX_VERIFIED else 'failure_recipe')
