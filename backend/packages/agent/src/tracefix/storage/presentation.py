@@ -144,8 +144,7 @@ def report_page(report, *, artifacts=None, scope_id=None, run_id=None):
                       'environment_digest', 'agent_instructions_hash'}
     summary, technical = [], []
     for key, value in report.items():
-        if key in {'issues', 'check_plan', 'check_results', 'initial_check_results', 'images', 'image_errors',
-                   'check_summary', 'initial_check_summary', 'overall_status'}:
+        if key in {'issues', 'check_plan', 'check_results', 'initial_check_results', 'images', 'image_errors'}:
             continue
         row = f'<tr><th>{html.escape(label(key))}</th><td>{render(value, key)}</td></tr>'
         (technical if key in technical_keys else summary).append(row)
@@ -183,7 +182,7 @@ def report_page(report, *, artifacts=None, scope_id=None, run_id=None):
                 + '</tbody></table>')
     checks = ''
     if 'check_plan' in report or 'check_results' in report or 'initial_check_results' in report:
-        initial = report.get('initial_check_results') or []
+        initial = report.get('initial_check_results') or [] if report.get('mode') == 'repair' else []
         final_heading = '修复后检查结果' if initial else '检查结果'
         checks = ('<section><h2>逐项检查</h2>'
                   + (check_table(initial, '修复前检查结果') if initial else '')
