@@ -7,6 +7,7 @@ import pytest
 
 from tracefix.knowledge.context import POLICY
 from tracefix.model.gateway import Gateway
+from tracefix.model import protocol
 from tracefix.model.prompts import COMMON, STAGE_POLICIES, serialize_request, system_instructions
 from tracefix.runtime.contracts import BrowserAction
 
@@ -63,12 +64,13 @@ def skill_context(name='inspect', observation='before'):
 
 
 def completion(*, calls=None, usage=None):
-    message = {'content': '{"kind":"finish"}'}
+    message = {'role': 'assistant', 'content': '{"kind":"finish"}'}
     if calls is not None:
-        message = {'content': None, 'tool_calls': calls, 'reasoning_content': 'keep reasoning'}
+        message = {'role': 'assistant', 'content': None, 'tool_calls': calls, 'reasoning_content': 'keep reasoning'}
     return httpx.Response(200, json={
-        'model': 'test-model', 'usage': usage or {'total_tokens': 3},
-        'choices': [{'finish_reason': 'tool_calls' if calls is not None else 'stop',
+        'id': 'fixture', 'object': 'chat.completion', 'created': 0,
+        'model': 'test-model', 'usage': usage or {'prompt_tokens': 2, 'completion_tokens': 1, 'total_tokens': 3},
+        'choices': [{'index': 0, 'finish_reason': 'tool_calls' if calls is not None else 'stop',
                      'message': message}],
     })
 
@@ -82,11 +84,15 @@ def capture_requests(monkeypatch, responses=None):
     monkeypatch.setenv('TRACEFIX_STREAM', 'false')
     requests = []
 
-    async def post(client, url, **kwargs):
-        requests.append(copy.deepcopy(kwargs['json']))
+    async def handle(request):
+        requests.append(json.loads(request.content))
         return responses.pop(0) if responses is not None else completion()
 
-    monkeypatch.setattr(httpx.AsyncClient, 'post', post)
+    def client(boundary):
+        return httpx.AsyncClient(transport=protocol.BoundaryTransport(httpx.MockTransport(handle), boundary),
+            event_hooks={'request': [boundary.before], 'response': [boundary.received]})
+
+    monkeypatch.setattr(protocol, 'create_http_client', client)
     return requests
 
 

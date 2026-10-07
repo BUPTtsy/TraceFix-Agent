@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from tracefix.model.gateway import Gateway, ModelOutputError
+from tracefix.model import protocol
 from tracefix.runtime.contracts import Contract, Phase, digest
 from tracefix.runtime.tool_handlers import EmptyInput, MemorySearch, RuleGet
 from tracefix.runtime.tools import model_tool_name, ToolPipeline, ToolProtocolError, ToolRegistry, ToolSpec
@@ -24,18 +25,23 @@ def completion(calls=None):
     message = {'role': 'assistant', 'content': None if calls else '{"summary":"done"}'}
     if calls:
         message['tool_calls'] = calls
-    return httpx.Response(200, json={'model': 'fixture', 'usage': {'total_tokens': 2},
-        'choices': [{'finish_reason': 'tool_calls' if calls else 'stop', 'message': message}]})
+    return httpx.Response(200, json={'id': 'fixture', 'created': 0, 'object': 'chat.completion',
+        'model': 'fixture', 'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2},
+        'choices': [{'index': 0, 'finish_reason': 'tool_calls' if calls else 'stop', 'message': message}]})
 
 
 def responses(monkeypatch, values):
     requests = []
 
-    async def post(client, url, **kwargs):
-        requests.append(copy.deepcopy(kwargs['json']))
+    async def handle(request):
+        requests.append(json.loads(request.content))
         return values.pop(0)
 
-    monkeypatch.setattr(httpx.AsyncClient, 'post', post)
+    def client(boundary):
+        return httpx.AsyncClient(transport=protocol.BoundaryTransport(httpx.MockTransport(handle), boundary),
+            event_hooks={'request': [boundary.before], 'response': [boundary.received]})
+
+    monkeypatch.setattr(protocol, 'create_http_client', client)
     return requests
 
 
@@ -139,8 +145,10 @@ async def test_completed_tool_history_normalizes_alias_without_reexecuting(monke
         tool_registry=registry, tool_executor=handler)
     assert result.value.summary == 'done'
     assert history == original
-    assert requests[0]['messages'][0]['tool_calls'][0]['function']['name'] == 'RulesApplicable'
-    assert requests[0]['messages'][1]['name'] == 'RulesApplicable'
+    assistant = next(message for message in requests[0]['messages'] if message['role'] == 'assistant')
+    tool = next(message for message in requests[0]['messages'] if message['role'] == 'tool')
+    assert assistant['tool_calls'][0]['function']['name'] == 'RulesApplicable'
+    assert tool['name'] == 'RulesApplicable'
     assert requests[1]['messages'][-1]['content'] == '{"rules":[]}'
 
 
@@ -229,8 +237,8 @@ async def test_native_batch_noop_submissions_refresh_context_and_produce_valid_p
                 'image', 'agent_instructions', 'on_attempt', 'on_response', 'on_error', 'on_usage'}}
             return await inner.generate(schema, context, **callbacks)
 
-    async def post(client, url, **kwargs):
-        requests.append(copy.deepcopy(kwargs['json']))
+    async def handle(request):
+        requests.append(json.loads(request.content))
         context = contexts[-1]
         source = next(card for card in context['cards'] if card['path'] == 'src/value.ts')
         proposal = {'summary': '修复状态持久化', 'evidence_refs': context['available_evidence_refs'][-1:],
@@ -239,11 +247,15 @@ async def test_native_batch_noop_submissions_refresh_context_and_produce_valid_p
                               else 'export const persisted = true;\n'}]}
         return completion([call('propose_patch', 'patch-' + str(len(contexts)), proposal)])
 
-    monkeypatch.setattr(httpx.AsyncClient, 'post', post)
+    def client(boundary):
+        return httpx.AsyncClient(transport=protocol.BoundaryTransport(httpx.MockTransport(handle), boundary),
+            event_hooks={'request': [boundary.before], 'response': [boundary.received]})
+
+    monkeypatch.setattr(protocol, 'create_http_client', client)
     engine.model = NativePatches()
     await engine.run(state)
     finished = engine.store.load(state.run_id, state.scope_id)
-    assert finished.run_status == RunStatus.COMPLETED, finished.error
+    assert finished.run_status == RunStatus.COMPLETED, (finished.error, finished.error_details)
     assert finished.outcome == Outcome.FIX_VERIFIED
     assert len(requests) == len(contexts) == 3
     assert [context['diagnosis_retry_count'] for context in contexts] == [0, 1, 2]

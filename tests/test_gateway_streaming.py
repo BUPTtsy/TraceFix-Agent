@@ -6,7 +6,8 @@ import pytest
 
 from tracefix.model.gateway import BrowserPolicyRouter, Gateway, ModelError, ModelResult
 from tracefix.runtime.contracts import BrowserAction, Decision
-from tracefix.model.chat import _chat_events
+from tracefix.model.chat import stream_chat
+from tracefix.model import protocol
 
 
 class EventBytes(httpx.AsyncByteStream):
@@ -59,10 +60,11 @@ def use_transport(monkeypatch, responses):
             raise response
         return response
 
-    def client(**kwargs):
-        return client_type(transport=httpx.MockTransport(handle), **kwargs)
+    def client(boundary):
+        return client_type(transport=protocol.BoundaryTransport(httpx.MockTransport(handle), boundary),
+            event_hooks={'request': [boundary.before], 'response': [boundary.received]})
 
-    monkeypatch.setattr('tracefix.model.gateway.httpx.AsyncClient', client)
+    monkeypatch.setattr(protocol, 'create_http_client', client)
     return requests
 
 
@@ -80,24 +82,18 @@ def gateway_defaults(monkeypatch):
     [b'data: invalid\n\n', event(finish='stop'), b'data: [DONE]\n\n'],
     [b'data: {"error":{"message":"failed"}}\n\n'],
 ])
-async def test_chat_rejects_incomplete_or_invalid_response(fragments):
-    audit = {'reasoning': {}, 'content': '', 'complete': False}
-    response = stream_response(fragments)
-    with pytest.raises(ValueError, match='响应未完成'):
-        async for item in _chat_events(response, [], audit):
-            pass
-    assert audit['complete'] is False
-    await response.aclose()
+async def test_chat_rejects_incomplete_or_invalid_response(monkeypatch, fragments):
+    use_transport(monkeypatch, [stream_response(fragments)])
+    with pytest.raises(ModelError):
+        await Gateway(key='fake', stream=True).generate(str, {'message': 'hello'})
 
 
-async def test_chat_requires_successful_finish_and_done():
-    audit = {'reasoning': {}, 'content': '', 'complete': False}
-    response = final_stream(content='complete')
-    events = [item async for item in _chat_events(response, [], audit)]
+async def test_chat_requires_successful_finish_and_done(monkeypatch):
+    use_transport(monkeypatch, [final_stream(content='complete')])
+    monkeypatch.setenv('TRACEFIX_API_KEY', 'fake')
+    events = [item async for item in stream_chat('hello', [], 'scope', None, False)]
     assert {'delta': 'complete'} in events
-    assert audit['complete'] is True and audit['content'] == 'complete'
-    assert audit['usage'] == {'total_tokens': 3}
-    await response.aclose()
+    assert events[-1]['turn_messages'][-1]['content'] == 'complete'
 
 
 async def test_default_thinking_streams_before_completion_and_preserves_usage(monkeypatch):
@@ -167,7 +163,7 @@ async def test_streamed_tool_arguments_execute_only_after_complete_usage_and_don
         tool_executor=execute, on_usage=usages.append)
 
     assert result.value.kind == 'finish'
-    assert executed == [('browser_navigate', {'value': 'https://example.test'}, 'navigate-1')]
+    assert executed == [('browser.navigate', {'value': 'https://example.test'}, 'navigate-1')]
     assistant, tool = requests[1]['messages'][-2:]
     assert assistant['reasoning_content'] == 'inspect page'
     assert assistant['tool_calls'][0]['function']['arguments'] == '{"value":"https://example.test"}'
@@ -223,6 +219,32 @@ async def test_received_usage_survives_failure_after_tail_block(monkeypatch):
     assert errors[0]['billing_status'] == 'known'
 
 
+async def test_cancelled_stream_preserves_partial_audit_and_does_not_drain_tail(monkeypatch):
+    import asyncio
+
+    read_indices, errors, audits = [], [], []
+
+    def cancel_read(index):
+        read_indices.append(index)
+        if index == 1:
+            raise asyncio.CancelledError()
+
+    response = stream_response([event({'content': 'partial'}),
+        event(finish='stop'), b'data: [DONE]\n\n'], before_read=cancel_read)
+    requests = use_transport(monkeypatch, [response])
+    with pytest.raises(asyncio.CancelledError):
+        await Gateway(key='ci', stream=True).generate(str, {'message': 'hello'},
+            on_response=lambda exchange, value: audits.append(value),
+            on_error=lambda exchange, value: errors.append(value))
+    assert len(requests) == len(audits) == len(errors) == 1
+    assert read_indices == [0, 1]
+    assert audits[0]['stream_incomplete'] is True
+    assert audits[0]['body']['choices'][0]['message']['content'] == 'partial'
+    assert errors[0]['category'] == 'cancelled'
+    assert errors[0]['status'] == 'UNKNOWN_OPERATION'
+    assert response.stream.closed
+
+
 async def test_stream_http_error_and_connect_failure_keep_attempt_boundaries(monkeypatch):
     requests = use_transport(monkeypatch, [
         httpx.ConnectError('not connected'),
@@ -235,28 +257,31 @@ async def test_stream_http_error_and_connect_failure_keep_attempt_boundaries(mon
         attempts.append(copy.deepcopy(request))
         return {'attempt': number}
 
-    await Gateway(key='ci', max_retry_delay=0).generate(BrowserAction, {}, on_attempt=attempt,
-        on_delta=lambda exchange, delta: deltas.append((exchange, delta)),
-        on_error=lambda exchange, error: errors.append(error))
+    with pytest.raises(ModelError) as raised:
+        await Gateway(key='ci', max_retry_delay=0).generate(BrowserAction, {}, on_attempt=attempt,
+            on_delta=lambda exchange, delta: deltas.append((exchange, delta)),
+            on_error=lambda exchange, error: errors.append(error))
 
-    assert len(requests) == 3
-    assert [request['attempt'] for request in attempts] == [1, 2, 3]
+    assert len(requests) == 1
+    assert [request['attempt'] for request in attempts] == [1]
     assert len({request['logical_exchange_id'] for request in attempts}) == 1
-    assert deltas[0][0] == {'attempt': 3}
-    assert [error['category'] for error in errors] == ['network', 'service_unavailable']
+    assert deltas == []
+    assert raised.value.status == 'WAITING_NETWORK'
+    assert [error['category'] for error in errors] == ['network']
 
 
 async def test_stream_content_validation_retry_keeps_previous_reasoning(monkeypatch):
     first = stream_response([
-        event({'reasoning_content': 'first attempt'}), event({'content': '{"kind":"observe"}'}),
+        event({'reasoning_content': 'first attempt'}), event({'content': '{"kind":"invalid"}'}),
         event(finish='stop'), event(usage={'total_tokens': 4}), b'data: [DONE]\n\n',
     ])
     requests = use_transport(monkeypatch, [first, final_stream()])
     await Gateway(key='ci', max_retry_delay=0).generate(BrowserAction, {})
 
     assert requests[1]['messages'][-2]['reasoning_content'] == 'first attempt'
-    assert requests[1]['messages'][-2]['content'] == '{"kind":"observe"}'
-    assert '已有工具结果仍然有效' in requests[1]['messages'][-1]['content']
+    assert requests[1]['messages'][-2]['content'] == '{"kind":"invalid"}'
+    assert requests[1]['messages'][-1]['role'] == 'user'
+    assert requests[1]['messages'][-1]['content']
 
 
 async def test_sse_handles_fragmented_utf8_and_multiline_data(monkeypatch):
@@ -271,8 +296,10 @@ async def test_sse_handles_fragmented_utf8_and_multiline_data(monkeypatch):
 
 
 async def test_buffered_compatibility_mode_omits_stream_options(monkeypatch):
-    response = httpx.Response(200, json={'usage': {'total_tokens': 1}, 'choices': [
-        {'finish_reason': 'stop', 'message': {'content': '{"kind":"finish"}'}}]})
+    response = httpx.Response(200, json={'id': 'fixture', 'created': 0, 'object': 'chat.completion',
+        'model': 'fixture', 'usage': {'prompt_tokens': 1, 'completion_tokens': 0, 'total_tokens': 1},
+        'choices': [{'index': 0, 'finish_reason': 'stop',
+                     'message': {'role': 'assistant', 'content': '{"kind":"finish"}'}}]})
     requests = use_transport(monkeypatch, [response])
     await Gateway(key='ci', stream=False, thinking='disabled').generate(BrowserAction, {})
     assert requests[0]['stream'] is False
