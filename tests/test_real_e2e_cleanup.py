@@ -1,10 +1,68 @@
 import json
 from pathlib import Path
 import runpy
+import shutil
+import subprocess
+import sys
 from types import SimpleNamespace
 from urllib.parse import unquote, urlsplit
 
 import pytest
+
+
+def demo_initializer(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    script = tmp_path / 'bugboard/scripts/init_demo.py'
+    script.parent.mkdir(parents=True)
+    shutil.copyfile(root / 'bugboard/scripts/init_demo.py', script)
+    cases = tmp_path / 'evals/cases.py'
+    cases.parent.mkdir()
+    shutil.copyfile(root / 'evals/cases.py', cases)
+    return script
+
+
+@pytest.mark.parametrize('empty_directory', [False, True])
+def test_demo_initialization_rejects_uninitialized_submodule_before_copy(tmp_path, empty_directory):
+    script = demo_initializer(tmp_path)
+    if empty_directory:
+        (tmp_path / 'bugboard/target').mkdir()
+    destination = tmp_path / 'demo'
+
+    result = subprocess.run([sys.executable, str(script), '--case', 'B01',
+        '--destination', str(destination)], capture_output=True, text=True,
+        encoding='utf-8', errors='replace', timeout=30)
+
+    assert result.returncode != 0
+    assert 'git submodule update --init --recursive' in result.stderr
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize('case', ['clean', 'B01'])
+def test_demo_initialization_copies_template_and_freezes_case_in_baseline(tmp_path, case):
+    script = demo_initializer(tmp_path)
+    source = tmp_path / 'bugboard/target'
+    (source / 'src').mkdir(parents=True)
+    (source / 'package.json').write_text('{"name":"bugboard"}\n', encoding='utf-8')
+    original = "{method: 'PATCH', body: JSON.stringify(fields)}"
+    (source / 'src/api.ts').write_text(original, encoding='utf-8')
+    (source / 'node_modules').mkdir()
+    (source / 'node_modules/excluded.txt').write_text('dependency', encoding='utf-8')
+    (source / 'Dockerfile').write_text('FROM node', encoding='utf-8')
+    destination = tmp_path / 'demo'
+
+    result = subprocess.run([sys.executable, str(script), '--case', case,
+        '--destination', str(destination)], capture_output=True, text=True,
+        encoding='utf-8', errors='replace', timeout=30)
+
+    assert result.returncode == 0, result.stderr
+    expected = original if case == 'clean' else original.replace("'PATCH'", "'POST'")
+    assert (destination / 'src/api.ts').read_text(encoding='utf-8') == expected
+    assert (source / 'src/api.ts').read_text(encoding='utf-8') == original
+    assert not (destination / 'node_modules').exists()
+    assert not (destination / 'Dockerfile').exists()
+    baseline = subprocess.run(['git', '-C', str(destination), 'show', 'HEAD:src/api.ts'],
+        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30)
+    assert baseline.returncode == 0 and baseline.stdout == expected
 
 
 @pytest.mark.parametrize('api_key', ['', '   '])

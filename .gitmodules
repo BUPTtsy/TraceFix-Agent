@@ -1,0 +1,3 @@
+[submodule "bugboard/target"]
+	path = bugboard/target
+	url = https://github.com/BUPTtsy/Test-Bug-repo.git

@@ -15,10 +15,10 @@ if args.destination.exists():
     print('演示仓库已存在，已保留。请为其他用例选择新的 --destination。')
     raise SystemExit(0)
 source=ROOT/'bugboard/target'
-if not source.is_dir():
+if not source.is_dir() or not (source/'package.json').is_file():
     raise FileNotFoundError(
-        f'找不到独立目标模板：{source}。'
-        '请创建 bugboard/target，或先配置远程项目再初始化演示。'
+        f'找不到完整的独立目标模板：{source}。'
+        '请先运行 git submodule update --init --recursive 初始化 bugboard/target 后重试。'
     )
 shutil.copytree(source,args.destination,ignore=shutil.ignore_patterns('node_modules','dist','.git','Dockerfile'))
 spec=importlib.util.spec_from_file_location('cases',ROOT/'evals/cases.py')
