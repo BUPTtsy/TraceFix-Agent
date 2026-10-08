@@ -61,5 +61,5 @@ library.save_document(fields, document_id=None)
 
 - 从 `tests/test_architecture_engine_repairs.py`、`tests/test_architecture_repairs.py`、`tests/test_workers.py` 和相关 CLI/execution 测试中选最小用例。知识层测试归 Goal 2。
 - 覆盖成功终态、非法跳转、过期 revision、取消/恢复、重试耗尽、UNKNOWN 不重放、显式 smoke；用知识契约 double 覆盖带来源回答、空结果拒答、降级标签、失效引用和知识不充当验证证据。
-- 在现有环境运行 `python -m pytest <相关文件> -q`；启动命令按当前 CLI 参数核验。不跑完整基线；两个 Goal 合并后由集成负责人一次运行，真实 E2E 入口 `tools/checks/verify_real_e2e.py` 独立记录。
+- 在现有环境运行 `python -m pytest <相关文件> -q`；启动命令按当前 CLI 参数核验。不跑完整基线；两个 Goal 合并后由集成负责人一次运行，真实 E2E 入口 `scripts/checks/verify_real_e2e.py` 独立记录。
 - 交付 worktree/base HEAD、AgentTeam 分工、文件清单、主链命令、知识回答接入说明、定向测试和未验证项。附仅含本会话文件的中文 `git commit` 命令；没有明确授权就仅展示，不执行。

@@ -66,7 +66,7 @@
 
 ### 1.3 本地准备工作
 
-`tools/bootstrap/bootstrap.py:179-192` 检查以下前置条件：Python 3.12 x64、git、docker、`docker info`（Linux 引擎）、docker compose v2；随后预构建应用镜像和浏览器镜像（`bootstrap.py:257-258`）。
+`scripts/bootstrap/bootstrap.py:179-192` 检查以下前置条件：Python 3.12 x64、git、docker、`docker info`（Linux 引擎）、docker compose v2；随后预构建应用镜像和浏览器镜像（`bootstrap.py:257-258`）。
 
 ### 1.4 局限
 
