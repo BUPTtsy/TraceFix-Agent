@@ -65,6 +65,17 @@ async def finish_without_commit(engine, state):
     assert engine.get(finished, finished.report_ref)['patch_verification'] != 'verified'
 
 
+async def finish_verification_suite(engine, state):
+    assert state.phase == Phase.VERIFY and state.check_suite_stage == 'verify'
+    assert not state.check_suite_completed and state.check_result_refs == []
+    for attempt in range(len(engine.check_plan(state).items) + 1):
+        output = await engine.check_suite(state, None)
+        state = RunState(**output['data'])
+        if state.check_suite_completed:
+            return state
+    pytest.fail('修复验证检查套件未在预期步数内完成')
+
+
 async def test_producers_bind_actual_evidence_and_distinct_execution_plans(verified_engine):
     engine, state = verified_engine
     spec = engine.spec(state)
@@ -308,7 +319,8 @@ async def test_latest_failure_blocks_production_verify_instead_of_old_success(ve
     latest = copy.deepcopy(wrapper)
     result['passed'] = False
     latest.update(passed=False, artifact_ref=engine.put(state, result))
-    state.validation_refs.append(engine.put(state, latest))
+    latest_ref = engine.put(state, latest)
+    state.validation_refs.append(latest_ref)
     assert not engine.verification_passed(state)
     if kind == 'behavior':
         await finish_without_commit(engine, state)
@@ -316,14 +328,18 @@ async def test_latest_failure_blocks_production_verify_instead_of_old_success(ve
     scenario = engine.spec(state).behavior_scenarios[0]
     _, _, behavior = result_for(engine, state, 'behavior')
     state.phase, state.run_status = Phase.VERIFY, RunStatus.RUNNING
+    state.outcome, state.approval_ref = None, None
     state.validation_index, state.replay_index = 6, len(scenario.steps) + 1
     state.behavior_check_refs = behavior['checkpoint_refs']
     engine.store.save(state)
     output = await engine.verify(state, None)
-    rejected = RunState(**output['data'])
-    assert output['next_node'] == 'finalize' and rejected.phase == Phase.FINALIZE
-    assert rejected.outcome == Outcome.INFRA_FAILURE and rejected.validation_refs
-    assert rejected.error_details['terminal_reason'] == 'runtime_environment_gate_failed'
+    assert output['next_node'] == 'check_suite'
+    rejected = await finish_verification_suite(engine, RunState(**output['data']))
+    assert rejected.phase == Phase.DIAGNOSE and latest_ref in rejected.validation_refs
+    assert rejected.outcome != Outcome.FIX_VERIFIED and rejected.approval_ref is None
+    assert not engine.verification_passed(rejected)
+    _, wrapper, result = result_for(engine, rejected, kind)
+    assert wrapper['passed'] is False and result['passed'] is False
 
 
 @pytest.mark.parametrize('kind', ['static', 'unit', 'build', 'health'])
@@ -351,12 +367,16 @@ async def test_missing_behavior_checkpoints_rejects_without_indexing_empty_list(
     engine, state = verified_engine
     scenario = engine.spec(state).behavior_scenarios[0]
     state.phase, state.run_status = Phase.VERIFY, RunStatus.RUNNING
+    state.outcome, state.approval_ref = None, None
     state.validation_index, state.replay_index = 6, len(scenario.steps) + 1
     state.behavior_check_refs = []
     engine.store.save(state)
     output = await engine.verify(state, None)
-    rejected = RunState(**output['data'])
+    assert output['next_node'] == 'check_suite'
+    rejected = await finish_verification_suite(engine, RunState(**output['data']))
     assert rejected.phase == Phase.DIAGNOSE
+    assert rejected.outcome != Outcome.FIX_VERIFIED and rejected.approval_ref is None
+    assert not engine.verification_passed(rejected)
     _, wrapper, result = result_for(engine, rejected, 'behavior')
     assert wrapper['passed'] is False and result['checkpoint_refs'] == []
     assert result['observation_ref'] is None and result['observation_hash'] is None
@@ -524,6 +544,7 @@ async def test_prepare_rejects_snapshot_mismatch_before_runner(tmp_path, fault):
 async def test_behavior_intermediate_failure_stops_before_next_action(verified_engine):
     engine, state = verified_engine
     state.phase, state.run_status = Phase.VERIFY, RunStatus.RUNNING
+    state.outcome, state.approval_ref = None, None
     state.validation_index, state.replay_index = 6, 1
     state.behavior_check_refs = []
     engine.store.save(state)
@@ -538,8 +559,11 @@ async def test_behavior_intermediate_failure_stops_before_next_action(verified_e
 
     engine.browser.action = fail_first_checkpoint
     output = await engine.verify(state, None)
-    failed = RunState(**output['data'])
+    assert output['next_node'] == 'check_suite' and attempted == ['observe']
+    failed = await finish_verification_suite(engine, RunState(**output['data']))
     assert failed.phase == Phase.DIAGNOSE and attempted == ['observe']
+    assert failed.outcome != Outcome.FIX_VERIFIED and failed.approval_ref is None
+    assert not engine.verification_passed(failed)
     _, wrapper, result = result_for(engine, failed, 'behavior')
     assert wrapper['passed'] is False and result['passed'] is False
     assert len(result['checkpoint_refs']) == 1
