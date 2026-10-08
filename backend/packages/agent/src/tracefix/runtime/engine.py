@@ -31,12 +31,14 @@ from tracefix.runtime.contracts import (BudgetExceeded, BrowserAction, CheckJudg
     reduce_state, verification_gate)
 from tracefix.runtime.guidance import (GuidanceLedger, GuidanceRejected, active_guidance,
                                       retarget_state)
-from tracefix.runtime.tool_handlers import build_runtime_tools, materialize_patch_proposal
+from tracefix.tools.handlers import build_runtime_tools, materialize_patch_proposal
+from tracefix.tools.browser import execute_browser_tool
+from tracefix.tools.evidence import attach_source_evidence_tools
 from tracefix.runtime.skills import SkillStore
 from tracefix.runtime.validation_feedback import (ValidationFeedback, build_validation_feedback,
     feedback_is_current)
 from tracefix.runtime.verification import verification_binding
-from tracefix.runtime.effects import file_resource, make_operation_executor
+from tracefix.tools.effects import file_resource, make_operation_executor
 from tracefix.runtime.event_adapter import EventAdapter, EventCursor
 from tracefix.runtime.recovery import RecoveryAction, RecoveryController, classify_cause, has_real_progress
 from tracefix.runtime.diagnosis import (DiagnosisDraft, DiagnosisReport, binding_from_observation,
@@ -1167,77 +1169,12 @@ class Engine:
                         break
             async def execute_tool(name, arguments, call_id):
                 nonlocal ctx
-                if ctx.get('worker_readonly_investigation'):
-                    raise PermissionError('只读调查 Worker 未获浏览器动作权限')
-                self.sync_guidance(s)
-                self.scopes.assert_current(self.context)
-                action = Gateway.browser_action(name, arguments)
-                observation = self.get(s, s.observation_ref) if s.observation_ref else None
-                try:
-                    self.browser.policy.browser(s, action, self.spec(s), observation)
-                except (ValueError, PermissionError, ModelOutputError) as exc:
-                    if isinstance(exc, ModelOutputError) and (exc.status != 'FAILED'
-                            or exc.details.get('requires_manual_review')):
-                        raise
-                    self.event(s, 'tool.rejected', {'tool_call_id': call_id,
-                        'action': action.model_dump(), 'error': sanitize(str(exc))})
-                    return {'isError': True, 'error': {'type': type(exc).__name__,
-                        'message': sanitize(str(exc)), 'executed': False},
-                        'observation_ref': s.observation_ref, 'observation': observation}
-                business_failure = None
-                try:
-                    ref = await self.act(s, action, tool_call_id=call_id)
-                except ActionBusinessFailure as exc:
-                    business_failure = exc
-                    ref = exc.observation_ref
-                canonical = action.model_copy(update={'observation_id': None, 'element_ref': None,
-                                                      'page_generation': None})
-                plan = self.get(s, s.replay_plan_ref) if s.replay_plan_ref else []
-                plan.append(canonical.model_dump())
-                plan_ref = self.put(s, plan, name='操作重放计划')
-                fingerprint = digest([canonical.model_dump(), stable_snapshot(observation['snapshot']) if observation else ''])
-                updated = self.changed(s, observation_ref=ref, replay_plan_ref=plan_ref,
-                    step=s.step+1, action_fingerprints=(s.action_fingerprints+[fingerprint])[-12:])
-                for field in type(s).model_fields:
-                    setattr(s, field, getattr(updated, field))
-                observation = self.get(s, ref)
-                if self.rule_resolver:
-                    ctx = self.inject_rules(s, {**ctx, 'observation': observation})
-                ctx = self.guidance_context(s, {**ctx, 'observation': observation}, logical_call)
-                if business_failure is not None:
-                    return {'isError': True, 'executed': True,
-                        'error': {'type': type(business_failure).__name__,
-                            'message': sanitize(str(business_failure)), 'executed': True,
-                            'category': 'business_assertion', 'check': business_failure.check},
-                        'business_outcome': {'status': 'failed', 'passed': False,
-                            'check': business_failure.check, 'assertions': business_failure.assertions},
-                        'observation_ref': ref, 'observation': observation}
-                return {'executed': True, 'observation_ref': ref, 'observation': observation}
+                result, ctx = await execute_browser_tool(self, s, ctx, name, arguments, call_id, logical_call)
+                return result
             validation['tool_executor'] = execute_tool
             validation['on_tool_result'] = tool_result
         runtime_tools = build_runtime_tools(self, s, schema, ctx, validate_output=validate_output)
-        if schema in {DiagnosisDraft, DiagnosisReport, CheckJudgement}:
-            for name in ('Read', 'Grep', 'Glob', 'code.analyze'):
-                handler = runtime_tools.handlers.get(name)
-                if handler is None:
-                    continue
-                async def read_evidence(arguments, call_id, handler=handler, name=name):
-                    result = await handler(arguments, call_id)
-                    record = {'tool': name, 'arguments': arguments.model_dump(mode='json'),
-                        'source_manifest': s.source_manifest, 'patch_hash': s.patch_hash}
-                    record.update({'result_hash': digest(result)} if schema is CheckJudgement
-                                  else {'result': result})
-                    ref = self.put(s, record, name='代码工具检查证据' if schema is CheckJudgement else '诊断工具证据')
-                    s.evidence_refs.append(ref)
-                    self.store.save(s)
-                    ctx['available_evidence_refs'] = list(dict.fromkeys(
-                        ctx.get('available_evidence_refs', []) +
-                        ([ref] if schema is CheckJudgement else s.evidence_refs)))
-                    ctx['evidence_refs'] = ctx['available_evidence_refs']
-                    self.event(s, 'check.source.read' if schema is CheckJudgement else 'diagnosis.source.read',
-                               {'tool': name, 'artifact_ref': ref})
-                    return {**result, 'artifact_ref': ref}
-                runtime_tools.handlers[name] = read_evidence
+        attach_source_evidence_tools(self, s, schema, lambda: ctx, runtime_tools)
         # 工具写入共享运行时 operation 回执，完整结果交由 artifact 保存。
         async def tool_operation(name, intent, fn, *, idempotency_key=None):
             return await self.operation(s, name, intent, fn, idempotency_key=idempotency_key)

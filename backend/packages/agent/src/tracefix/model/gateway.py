@@ -83,5 +83,5 @@ class Gateway(ModelProtocol):
 
     @staticmethod
     def delegation_tools():
-        from tracefix.workers.tools import supervisor_tools
+        from tracefix.tools.supervisor import supervisor_tools
         return supervisor_tools()

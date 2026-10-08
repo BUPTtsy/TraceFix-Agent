@@ -2,18 +2,16 @@
 from __future__ import annotations
 
 import asyncio
-import fnmatch
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Literal
 
 from pydantic import ConfigDict, Field
 
 from tracefix.runtime.contracts import (BrowserAction, CheckJudgement, Contract, Decision, PatchProposal,
                                        Phase, TestSpec, digest)
-from tracefix.runtime.tools import ToolPipeline, ToolRegistry, ToolRejected, build_tool
-from tracefix.runtime.effects import file_resource, make_operation_executor, run_effect
+from tracefix.tools.core import ToolPipeline, ToolRegistry, ToolRejected, build_tool
+from tracefix.tools.effects import file_resource, make_operation_executor, run_effect
 
 
 class EmptyInput(Contract):
@@ -22,13 +20,6 @@ class EmptyInput(Contract):
 
 class RuleGet(Contract):
     rule_id: str = Field(min_length=1, max_length=200)
-
-
-class CodeAnalyze(Contract):
-    paths: list[str] = Field(default_factory=list, max_length=100)
-    path_globs: list[str] = Field(default_factory=lambda: ['**'], max_length=30)
-    check: Literal['syntax', 'elements', 'a11y_name', 'event_binding', 'regex'] = 'elements'
-    config: dict = Field(default_factory=dict)
 
 
 class MemorySearch(Contract):
@@ -94,7 +85,7 @@ def materialize_patch_proposal(engine, state, proposal):
 
 
 def build_runtime_tools(engine, state, schema, context=None, validate_output=None):
-    from tracefix.runtime.local_tools import local_tool_context, register_local_tools
+    from tracefix.tools.local import local_tool_context, register_local_tools
     context = local_tool_context(engine, context)
     # 子 Agent 默认只读，写权限及路径由 Supervisor 契约显式声明。
     worker_mode = context.get('worker_depth') == 1
@@ -138,49 +129,17 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
 
     register_local_tools(engine, state, context, bind)
 
-    async def code_analyze(arguments, call_id):
-        from tracefix.rules.analyzers import analyze_source
-        from tracefix.runtime.local_tools import LocalTools
+    from tracefix.tools.code_analysis import register_code_analysis_tool
+    from tracefix.tools.task import register_task_tools
+    from tracefix.tools.web import register_web_tools
 
-        local = LocalTools(engine, context, state)
-        requested = {local.path(value).relative_to(local.root).as_posix() for value in arguments.paths}
-        files = []
-        versions = {}
-        with local.mutex.workspace_read():
-            for path in local.files():
-                relative = path.relative_to(local.root).as_posix()
-                if requested and relative not in requested:
-                    continue
-                if arguments.path_globs and not any(fnmatch.fnmatchcase(relative, pattern)
-                                                    for pattern in arguments.path_globs):
-                    continue
-                if path.suffix.lower() not in {'.js', '.mjs', '.cjs', '.jsx', '.ts', '.mts', '.cts', '.tsx', '.vue', '.html', '.htm'}:
-                    continue
-                staged = local.staged_content(relative)
-                data = staged if staged is not None else path.read_bytes()
-                files.append((relative, data.decode('utf-8')))
-                versions[relative] = digest(data)
-        result = await asyncio.to_thread(analyze_source, files,
-                                        {**arguments.config, 'check': arguments.check})
-        result.update(source_manifest=state.source_manifest, content_versions=versions)
-        if callable(getattr(engine, 'put', None)):
-            result['artifact_ref'] = engine.put(state, result, name='代码分析证据')
-        return result
-
-    bind('code.analyze', '分析授权源码的 AST 和模板结构，支持 JavaScript/TypeScript、React JSX/TSX、Vue3 SFC 和 HTML。'
-         '按需检查 syntax、elements、a11y_name、event_binding 或 regex；paths 使用工作区绝对路径，省略时按 path_globs 选择。'
-         '结果含实际位置、源码哈希和证据引用；status=error 时应结合页面截图、语义观察和 Read/Grep 回退检测，不能视为通过。',
-         CodeAnalyze, code_analyze, phases=set(Phase), output_limit_tokens=6000,
-         search_hint='AST DOM frontend React Vue JavaScript TypeScript HTML accessibility event handler')
-    from tracefix.runtime.task_tools import register_task_tools
-    from tracefix.runtime.web_tools import register_web_tools
-
+    register_code_analysis_tool(engine, state, context, bind)
     register_task_tools(engine, state, context, bind)
     register_web_tools(engine, state, context, bind)
 
     if not worker_mode and os.getenv('TRACEFIX_AGENT_MODE', '').lower() != 'single':
         from tracefix.workers.contracts import WorkerResult, WorkerTask
-        from tracefix.workers.tools import supervisor_tools
+        from tracefix.tools.supervisor import supervisor_tools
         from tracefix.runtime.contracts import Usage, new_id
 
         async def delegate(arguments, call_id):
@@ -356,7 +315,7 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
     bind('context.expand', '在当前 Run 作用域内按 artifact 引用展开被省略的证据通道或行范围。',
          ReferenceExpand, expand_reference, phases=set(Phase), output_limit_tokens=5000)
 
-    from tracefix.runtime.discovery_tools import register_discovery_tools
+    from tracefix.tools.discovery import register_discovery_tools
 
     register_discovery_tools(engine, state, context, registry, bind)
 
@@ -400,7 +359,7 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
                         or getattr(error, 'details', {}).get('requires_manual_review')):
                     raise
                 if schema is PatchProposal and getattr(error, 'details', {}).get('error_code'):
-                    from tracefix.runtime.tools import ToolResult
+                    from tracefix.tools.core import ToolResult
                     return ToolResult(call_id=call_id, name=name, isError=True,
                         result=error.details, error={**error.details, 'message': str(error), 'executed': False})
                 raise ToolRejected(str(error)) from error

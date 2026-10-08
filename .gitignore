@@ -44,6 +44,7 @@ tests/*
 !tests/test_tool_name_compat.py
 !tests/test_worker_configuration.py
 !tests/test_worker_model_binding.py
+!tests/test_code_analysis_tool.py
 !backend/apps/console-api/tests/
 !backend/apps/console-api/tests/**
 .gitignore/

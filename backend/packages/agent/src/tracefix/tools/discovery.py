@@ -6,7 +6,7 @@ import re
 from pydantic import Field
 
 from tracefix.runtime.contracts import Contract, Phase, digest
-from tracefix.runtime.tools import ToolRejected
+from tracefix.tools.core import ToolRejected
 
 
 class ToolSearchInput(Contract):

@@ -11,8 +11,8 @@ from pydantic import Field
 
 from tracefix.execution.workspace import Workspace
 from tracefix.runtime.contracts import Contract, Phase
-from tracefix.runtime.local_tools import GlobInput, GrepInput, LocalTools, ReadInput
-from tracefix.runtime.tools import ToolPipeline, ToolRegistry, ToolRejected, build_tool
+from tracefix.tools.local import GlobInput, GrepInput, LocalTools, ReadInput
+from tracefix.tools.core import ToolPipeline, ToolRegistry, ToolRejected, build_tool
 from tracefix.runtime.validation_feedback import _public
 from tracefix.storage.artifacts import redact
 

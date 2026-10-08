@@ -10,13 +10,13 @@ import pytest
 from tracefix.execution.repository import safe_index_files
 from tracefix.execution.workspace import Workspace, commit_workspace
 from tracefix.runtime.contracts import PatchProposal, Phase, digest
-from tracefix.runtime.effects import (EffectBoundaryError, file_resource,
+from tracefix.tools.effects import (EffectBoundaryError, file_resource,
                                      make_operation_executor)
-from tracefix.runtime.local_tools import (BashInput, EditInput, GlobInput, GrepInput,
+from tracefix.tools.local import (BashInput, EditInput, GlobInput, GrepInput,
     LocalTools, NotebookEditInput, ReadInput, WriteInput, local_tool_context)
 from tracefix.runtime.smoke import make_engine
-from tracefix.runtime.tool_handlers import build_runtime_tools
-from tracefix.runtime.tools import ToolRejected
+from tracefix.tools.handlers import build_runtime_tools
+from tracefix.tools.core import ToolRejected
 from tracefix.storage.store import MemoryStore, UnknownOperation
 
 
@@ -203,7 +203,7 @@ async def test_read_image_pipeline_keeps_visual_payload_out_of_text(engine):
 @pytest.mark.asyncio
 async def test_seven_tools_execute_through_registered_pipeline(engine, monkeypatch):
     engine, state = engine
-    from tracefix.runtime import local_tools
+    from tracefix.tools import local as local_tools
     import csv
     from pathlib import Path
 
@@ -276,7 +276,7 @@ async def test_bash_docker_readonly_and_scoped_writeback(engine, monkeypatch):
     engine, state = engine
     import csv
     from pathlib import Path
-    from tracefix.runtime import local_tools
+    from tracefix.tools import local as local_tools
     commands = []
 
     async def fake_process(command, timeout):
@@ -308,7 +308,7 @@ async def test_bash_rejects_unsafe_writeback(engine, monkeypatch, mode):
     engine, state = engine
     import csv
     from pathlib import Path
-    from tracefix.runtime import local_tools
+    from tracefix.tools import local as local_tools
 
     async def fake_process(command, timeout):
         if 'run' in command:
@@ -460,7 +460,7 @@ def test_mode_phase_and_worker_path_permissions_remain_restrictive(engine):
 
 @pytest.mark.asyncio
 async def test_local_side_effects_without_operation_guard_fail_before_execution(engine, monkeypatch):
-    from tracefix.runtime import local_tools
+    from tracefix.tools import local as local_tools
 
     engine, state = engine
     tools = LocalTools(engine, {}, state)
@@ -491,7 +491,7 @@ async def test_local_side_effects_without_operation_guard_fail_before_execution(
 
 @pytest.mark.asyncio
 async def test_shell_readonly_authorization_cannot_be_upgraded_to_patch(engine, monkeypatch):
-    from tracefix.runtime import local_tools
+    from tracefix.tools import local as local_tools
 
     engine, state = engine
     commands = []
@@ -529,7 +529,7 @@ async def test_shell_readonly_authorization_cannot_be_upgraded_to_patch(engine, 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('change', ['hash', 'overlay', 'disk_with_overlay'])
 async def test_async_prepare_preserves_hash_and_concurrent_baselines(engine, monkeypatch, change):
-    from tracefix.runtime import local_tools
+    from tracefix.tools import local as local_tools
 
     engine, state = engine
     path = engine.workspace.root / 'app.py'
@@ -566,7 +566,7 @@ async def test_async_prepare_preserves_hash_and_concurrent_baselines(engine, mon
 
 @pytest.mark.asyncio
 async def test_unknown_operation_fences_writes_without_blocking_read(engine, monkeypatch):
-    from tracefix.runtime import local_tools
+    from tracefix.tools import local as local_tools
 
     engine, state = engine
     path = engine.workspace.root / 'app.py'
@@ -590,7 +590,7 @@ async def test_unknown_operation_fences_writes_without_blocking_read(engine, mon
 
 @pytest.mark.asyncio
 async def test_prepare_cannot_apply_after_owned_fence_becomes_unknown(engine, monkeypatch):
-    from tracefix.runtime import local_tools
+    from tracefix.tools import local as local_tools
 
     engine, state = engine
     path = engine.workspace.root / 'app.py'

@@ -13,7 +13,7 @@ from tracefix.agents.pydantic_ai_adapter import PydanticAIAdapter, PydanticAIAda
 from tracefix.model.chat import _history_dict
 from tracefix.model.gateway import Gateway
 from tracefix.runtime.contracts import BrowserAction
-from tracefix.runtime.tools import ToolOperationUnknown, ToolResult, ToolSpec
+from tracefix.tools.core import ToolOperationUnknown, ToolResult, ToolSpec
 
 
 class ReadArguments(BaseModel):

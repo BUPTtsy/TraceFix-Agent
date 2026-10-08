@@ -7,8 +7,8 @@ import httpx
 import pytest
 
 from tracefix.runtime.contracts import Phase
-from tracefix.runtime.tools import ToolPipeline, ToolRegistry, ToolRejected, ToolSpec
-from tracefix.runtime.web_tools import (
+from tracefix.tools.core import ToolPipeline, ToolRegistry, ToolRejected, ToolSpec
+from tracefix.tools.web import (
     WebFetchInput,
     WebFetchOutput,
     WebSearchInput,
@@ -92,8 +92,8 @@ async def test_fetch_html_strips_scripts_and_reports_untrusted(monkeypatch):
         return _response(request, headers={"content-type": "text/html; charset=utf-8"},
                          body=b"<h1>Hello</h1><script>ignore()</script><p>world</p>")
 
-    monkeypatch.setattr("tracefix.runtime.web_tools._resolve_public", resolve)
-    monkeypatch.setattr("tracefix.runtime.web_tools._pinned_transport", lambda host, addresses: httpx.MockTransport(handler))
+    monkeypatch.setattr("tracefix.tools.web._resolve_public", resolve)
+    monkeypatch.setattr("tracefix.tools.web._pinned_transport", lambda host, addresses: httpx.MockTransport(handler))
     output = await _fetch_url("https://example.com/page#fragment")
     assert output.final_url == "https://example.com/page"
     assert output.body == "Hello world"
@@ -106,7 +106,7 @@ async def test_fetch_rejects_private_dns_and_redirect_target(monkeypatch):
     async def private_dns(host, port):
         raise ToolRejected("WebFetch 拒绝解析到非公有 IP")
 
-    monkeypatch.setattr("tracefix.runtime.web_tools._resolve_public", private_dns)
+    monkeypatch.setattr("tracefix.tools.web._resolve_public", private_dns)
     with pytest.raises(ToolRejected, match="非公有 IP"):
         await _fetch_url("https://example.com")
 
@@ -121,8 +121,8 @@ async def test_fetch_rejects_private_dns_and_redirect_target(monkeypatch):
     def redirect(request):
         return httpx.Response(302, headers={"location": "http://localhost/secret"}, request=request)
 
-    monkeypatch.setattr("tracefix.runtime.web_tools._resolve_public", public_dns)
-    monkeypatch.setattr("tracefix.runtime.web_tools._pinned_transport", lambda host, addresses: httpx.MockTransport(redirect))
+    monkeypatch.setattr("tracefix.tools.web._resolve_public", public_dns)
+    monkeypatch.setattr("tracefix.tools.web._pinned_transport", lambda host, addresses: httpx.MockTransport(redirect))
     with pytest.raises(ToolRejected, match="内部主机"):
         await _fetch_url("https://example.com")
     assert calls == ["example.com"]
@@ -133,13 +133,13 @@ async def test_fetch_rejects_header_and_body_limits(monkeypatch):
     async def resolve(host, port):
         return ["93.184.216.34"]
 
-    monkeypatch.setattr("tracefix.runtime.web_tools._resolve_public", resolve)
-    monkeypatch.setattr("tracefix.runtime.web_tools._pinned_transport", lambda host, addresses: httpx.MockTransport(
+    monkeypatch.setattr("tracefix.tools.web._resolve_public", resolve)
+    monkeypatch.setattr("tracefix.tools.web._pinned_transport", lambda host, addresses: httpx.MockTransport(
         lambda request: _response(request, headers={"x-huge": "x" * 70000})))
     with pytest.raises(ToolRejected, match="too_large"):
         await _fetch_url("https://example.com")
 
-    monkeypatch.setattr("tracefix.runtime.web_tools._pinned_transport", lambda host, addresses: httpx.MockTransport(
+    monkeypatch.setattr("tracefix.tools.web._pinned_transport", lambda host, addresses: httpx.MockTransport(
         lambda request: _response(request, body=b"x" * (1024 * 1024 + 1))))
     with pytest.raises(ToolRejected, match="too_large"):
         await _fetch_url("https://example.com")
@@ -151,7 +151,7 @@ async def test_search_domain_filter_rejects_private_and_invalid_results(monkeypa
         assert host == "example.com"
         return ["93.184.216.34"]
 
-    monkeypatch.setattr("tracefix.runtime.web_tools._resolve_public", public_dns)
+    monkeypatch.setattr("tracefix.tools.web._resolve_public", public_dns)
     arguments = WebSearchInput(query="tracefix", allowed_domains=["example.com"])
     output = await _filter_search_results([
         {"title": "ok", "url": "https://example.com/a", "snippet": "yes"},
@@ -174,7 +174,7 @@ async def test_fetch_rejects_unsafe_url_before_network(monkeypatch, url):
     async def forbidden_dns(host, port):
         raise AssertionError("invalid URL reached DNS")
 
-    monkeypatch.setattr("tracefix.runtime.web_tools._resolve_public", forbidden_dns)
+    monkeypatch.setattr("tracefix.tools.web._resolve_public", forbidden_dns)
     with pytest.raises(ToolRejected):
         await _fetch_url(url)
 
@@ -184,7 +184,7 @@ async def test_fetch_rejects_unsafe_url_before_network(monkeypatch, url):
                                       "224.0.0.1", "::1", "fc00::1", "fe80::1", "::ffff:127.0.0.1",
                                       "2001:db8::1", "64:ff9b::7f00:1"])
 async def test_resolver_rejects_non_public_addresses(monkeypatch, address):
-    monkeypatch.setattr("tracefix.runtime.web_tools.socket.getaddrinfo",
+    monkeypatch.setattr("tracefix.tools.web.socket.getaddrinfo",
                         lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 443))])
     with pytest.raises(ToolRejected, match="非公有 IP"):
         await _resolve_public("public.example", 443)
@@ -192,7 +192,7 @@ async def test_resolver_rejects_non_public_addresses(monkeypatch, address):
 
 @pytest.mark.asyncio
 async def test_resolver_checks_all_addresses_and_fails_closed(monkeypatch):
-    monkeypatch.setattr("tracefix.runtime.web_tools.socket.getaddrinfo", lambda *args, **kwargs: [
+    monkeypatch.setattr("tracefix.tools.web.socket.getaddrinfo", lambda *args, **kwargs: [
         (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
         (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443)),
     ])
@@ -254,8 +254,8 @@ async def test_fetch_validates_each_redirect_and_maximum_hops(monkeypatch):
         requests.append(str(request.url))
         return _response(request, 302, headers={"location": "https://next.example/path"})
 
-    monkeypatch.setattr("tracefix.runtime.web_tools._resolve_public", resolve)
-    monkeypatch.setattr("tracefix.runtime.web_tools._pinned_transport", lambda host, addresses: httpx.MockTransport(redirect))
+    monkeypatch.setattr("tracefix.tools.web._resolve_public", resolve)
+    monkeypatch.setattr("tracefix.tools.web._pinned_transport", lambda host, addresses: httpx.MockTransport(redirect))
     with pytest.raises(ToolRejected, match="重定向次数超限"):
         await _fetch_url("https://example.com")
     assert len(requests) == 6
@@ -272,8 +272,8 @@ async def test_fetch_network_errors_are_recoverable(monkeypatch, failure, messag
     def fail(request):
         raise failure
 
-    monkeypatch.setattr("tracefix.runtime.web_tools._resolve_public", resolve)
-    monkeypatch.setattr("tracefix.runtime.web_tools._pinned_transport", lambda host, addresses: httpx.MockTransport(fail))
+    monkeypatch.setattr("tracefix.tools.web._resolve_public", resolve)
+    monkeypatch.setattr("tracefix.tools.web._pinned_transport", lambda host, addresses: httpx.MockTransport(fail))
     with pytest.raises(ToolRejected, match=message):
         await _fetch_url("https://example.com")
 
@@ -283,10 +283,10 @@ async def test_fetch_rejects_binary_and_compressed_bodies(monkeypatch):
     async def resolve(host, port):
         return ["93.184.216.34"]
 
-    monkeypatch.setattr("tracefix.runtime.web_tools._resolve_public", resolve)
+    monkeypatch.setattr("tracefix.tools.web._resolve_public", resolve)
     for headers, message in [({"content-type": "image/png"}, "只允许文本"),
                              ({"content-type": "text/plain", "content-encoding": "gzip"}, "压缩响应")]:
-        monkeypatch.setattr("tracefix.runtime.web_tools._pinned_transport", lambda host, addresses: httpx.MockTransport(
+        monkeypatch.setattr("tracefix.tools.web._pinned_transport", lambda host, addresses: httpx.MockTransport(
             lambda request: _response(request, headers=headers)))
         with pytest.raises(ToolRejected, match=message):
             await _fetch_url("https://example.com")
@@ -298,8 +298,8 @@ async def test_unknown_length_stream_limit_stops_and_closes(monkeypatch):
         return ["93.184.216.34"]
 
     stream = _Chunks(b"x" * (1024 * 1024), b"y", b"must not be consumed")
-    monkeypatch.setattr("tracefix.runtime.web_tools._resolve_public", resolve)
-    monkeypatch.setattr("tracefix.runtime.web_tools._pinned_transport", lambda host, addresses: httpx.MockTransport(
+    monkeypatch.setattr("tracefix.tools.web._resolve_public", resolve)
+    monkeypatch.setattr("tracefix.tools.web._pinned_transport", lambda host, addresses: httpx.MockTransport(
         lambda request: httpx.Response(200, headers={"content-type": "text/plain"}, stream=stream)))
     with pytest.raises(ToolRejected, match="too_large"):
         await _fetch_url("https://example.com")
@@ -313,7 +313,7 @@ async def test_search_blocked_domain_strict_shape_and_private_dns(monkeypatch):
             raise ToolRejected("非公有 IP")
         return ["93.184.216.34"]
 
-    monkeypatch.setattr("tracefix.runtime.web_tools._resolve_public", resolve)
+    monkeypatch.setattr("tracefix.tools.web._resolve_public", resolve)
     output = await _filter_search_results([
         {"title": "blocked", "url": "https://sub.blocked.example", "snippet": "no"},
         {"title": "dns private", "url": "https://public-name.example", "snippet": "no"},
@@ -338,8 +338,8 @@ async def test_registered_web_tools_execute_with_output_validation(monkeypatch):
                                   phases=frozenset(options.pop("phases")), **options))
         handlers[name] = handler
 
-    monkeypatch.setattr("tracefix.runtime.web_tools._resolve_public", resolve)
-    monkeypatch.setattr("tracefix.runtime.web_tools._pinned_transport", lambda host, addresses: httpx.MockTransport(
+    monkeypatch.setattr("tracefix.tools.web._resolve_public", resolve)
+    monkeypatch.setattr("tracefix.tools.web._pinned_transport", lambda host, addresses: httpx.MockTransport(
         lambda request: _response(request)))
     register_web_tools(SimpleNamespace(web_search=search), None, {}, bind)
     pipeline = ToolPipeline(registry, handlers, Phase.EXPLORE)
@@ -369,8 +369,8 @@ async def test_brave_provider_uses_fixed_endpoint_key_and_domain_query(monkeypat
             body=b'{"web":{"results":[{"title":"Docs","url":"https://docs.example.com","description":"Reference"}]}}')
 
     monkeypatch.setenv("TRACEFIX_WEB_SEARCH_API_KEY", "test-provider-key")
-    monkeypatch.setattr("tracefix.runtime.web_tools._resolve_public", resolve)
-    monkeypatch.setattr("tracefix.runtime.web_tools._pinned_transport", lambda host, addresses: httpx.MockTransport(provider))
+    monkeypatch.setattr("tracefix.tools.web._resolve_public", resolve)
+    monkeypatch.setattr("tracefix.tools.web._pinned_transport", lambda host, addresses: httpx.MockTransport(provider))
     handler, _ = _registered()["WebSearch"]
     output = await handler(WebSearchInput(query="tracefix", allowed_domains=["example.com"]), "brave")
     assert [item.title for item in output.results] == ["Docs"]

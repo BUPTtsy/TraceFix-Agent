@@ -8,7 +8,7 @@ from tracefix.knowledge.memory import MemoryLibrary
 from tracefix.runtime.continuation import continuation_state, derive_run
 from tracefix.runtime.contracts import Contract, Phase, RunStatus, digest
 from tracefix.runtime.smoke import make_engine
-from tracefix.runtime.tools import ToolPipeline, ToolRegistry, ToolSpec
+from tracefix.tools.core import ToolPipeline, ToolRegistry, ToolSpec
 
 
 @pytest.mark.parametrize('derived', [False, True])

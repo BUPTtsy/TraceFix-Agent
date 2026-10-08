@@ -4,11 +4,11 @@ import pytest
 
 from tracefix.knowledge.context import SkillCatalog
 from tracefix.runtime.contracts import Contract, Phase, RunState
-from tracefix.runtime.discovery_tools import (SkillOutput, ToolSearchInput,
+from tracefix.tools.discovery import (SkillOutput, ToolSearchInput,
     register_discovery_tools, search_tools)
-from tracefix.runtime.effects import make_operation_executor
+from tracefix.tools.effects import make_operation_executor
 from tracefix.runtime.skills import SkillStore
-from tracefix.runtime.tools import ToolPipeline, ToolRegistry, ToolSpec, build_tool
+from tracefix.tools.core import ToolPipeline, ToolRegistry, ToolSpec, build_tool
 from tracefix.storage.artifacts import Artifacts
 from tracefix.storage.store import MemoryStore
 
@@ -100,7 +100,7 @@ def test_derived_run_does_not_inherit_planning_artifacts():
 @pytest.mark.asyncio
 async def test_unified_runtime_exposes_executable_tools_and_keeps_worker_scope(tmp_path, monkeypatch):
     from tracefix.runtime.smoke import make_engine
-    from tracefix.runtime.tool_handlers import build_runtime_tools
+    from tracefix.tools.handlers import build_runtime_tools
 
     monkeypatch.delenv('TRACEFIX_WEB_SEARCH_API_KEY', raising=False)
     engine, state = make_engine(tmp_path / 'runtime')
@@ -127,7 +127,7 @@ async def test_unified_runtime_exposes_executable_tools_and_keeps_worker_scope(t
 
 @pytest.mark.asyncio
 async def test_skill_failure_after_loading_is_unknown_instead_of_unexecuted(tmp_path):
-    from tracefix.runtime.tools import ToolOperationUnknown
+    from tracefix.tools.core import ToolOperationUnknown
 
     store = MemoryStore()
     state = RunState(scope_id='scope', url='https://example.com', goal='验证', phase=Phase.DIAGNOSE)

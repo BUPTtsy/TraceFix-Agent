@@ -1,6 +1,6 @@
 """向主管 Agent 暴露结构化委派与等待工具，不暴露任意命令入口。"""
 
-from tracefix.runtime.tools import ToolSpec
+from tracefix.tools.core import ToolSpec
 
 
 def supervisor_tools():

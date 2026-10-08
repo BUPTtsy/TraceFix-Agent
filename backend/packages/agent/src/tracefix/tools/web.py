@@ -17,7 +17,7 @@ import httpx
 from pydantic import Field, model_validator
 
 from tracefix.runtime.contracts import Contract, Phase
-from tracefix.runtime.tools import ToolRejected
+from tracefix.tools.core import ToolRejected
 
 MAX_BODY_BYTES = 1024 * 1024
 MAX_HEADER_BYTES = 64 * 1024

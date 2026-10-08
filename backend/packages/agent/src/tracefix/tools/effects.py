@@ -351,7 +351,7 @@ async def run_effect(kind, payload, *, timeout_s=45):
                 if 'unknown' in receipt:
                     raise EffectBoundaryError('副作用 worker 异常：' + receipt['unknown'])
                 if 'rejected' in receipt:
-                    from tracefix.runtime.tools import ToolRejected
+                    from tracefix.tools.core import ToolRejected
                     raise ToolRejected(receipt['rejected'])
                 if 'result' not in receipt:
                     raise EffectBoundaryError('副作用 IPC 回执缺少结果')

@@ -3,10 +3,10 @@ from types import SimpleNamespace
 import pytest
 
 from tracefix.runtime.contracts import Outcome, Phase, RunState, digest
-from tracefix.runtime.effects import EffectBoundaryError, make_operation_executor
-from tracefix.runtime.task_tools import (TaskCreateInput, TodoWriteInput,
+from tracefix.tools.effects import EffectBoundaryError, make_operation_executor
+from tracefix.tools.task import (TaskCreateInput, TodoWriteInput,
                                         register_task_tools)
-from tracefix.runtime.tools import (ToolPipeline, ToolProtocolError, ToolRegistry,
+from tracefix.tools.core import (ToolPipeline, ToolProtocolError, ToolRegistry,
                                    ToolSpec)
 from tracefix.storage.artifacts import Artifacts
 from tracefix.storage.store import MemoryStore, UnknownOperation
@@ -121,7 +121,7 @@ async def test_completed_task_can_be_created_again_with_new_call(task_runtime):
 
 @pytest.mark.asyncio
 async def test_task_count_limit_and_duplicate_pending_deduplication(task_runtime, monkeypatch):
-    from tracefix.runtime import task_tools
+    from tracefix.tools import task as task_tools
 
     monkeypatch.setattr(task_tools, 'MAX_TASKS', 2)
     engine, state = task_runtime
@@ -138,7 +138,7 @@ async def test_task_count_limit_and_duplicate_pending_deduplication(task_runtime
 
 @pytest.mark.asyncio
 async def test_metadata_merge_cannot_exceed_stored_limit(task_runtime, monkeypatch):
-    from tracefix.runtime import task_tools
+    from tracefix.tools import task as task_tools
 
     monkeypatch.setattr(task_tools, 'MAX_METADATA_BYTES', 70)
     engine, state = task_runtime

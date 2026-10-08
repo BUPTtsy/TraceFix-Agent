@@ -8,8 +8,8 @@ import pytest
 from tracefix.model.gateway import Gateway, ModelOutputError
 from tracefix.model import protocol
 from tracefix.runtime.contracts import Contract, Phase, digest
-from tracefix.runtime.tool_handlers import EmptyInput, MemorySearch, RuleGet
-from tracefix.runtime.tools import model_tool_name, ToolPipeline, ToolProtocolError, ToolRegistry, ToolSpec
+from tracefix.tools.handlers import EmptyInput, MemorySearch, RuleGet
+from tracefix.tools.core import model_tool_name, ToolPipeline, ToolProtocolError, ToolRegistry, ToolSpec
 
 
 class Result(Contract):
@@ -186,7 +186,7 @@ async def test_unknown_wire_alias_is_rejected_before_any_execution(monkeypatch):
 
 
 async def test_batch_rejected_submission_is_audited_before_context_retry(monkeypatch):
-    from tracefix.runtime.tools import ToolRejected
+    from tracefix.tools.core import ToolRejected
 
     requests = responses(monkeypatch, [completion([call('propose_patch')])])
     registry = ToolRegistry([ToolSpec('propose_patch', '提交补丁', EmptyInput,
@@ -271,7 +271,7 @@ async def test_batch_finish_exploration_accepts_current_observation_evidence(
         tmp_path, monkeypatch, reference_kind):
     from tracefix.runtime.contracts import Decision
     from tracefix.runtime.smoke import make_engine
-    from tracefix.runtime.tool_handlers import build_runtime_tools
+    from tracefix.tools.handlers import build_runtime_tools
 
     engine, state = make_engine(tmp_path)
     state.phase = Phase.EXPLORE

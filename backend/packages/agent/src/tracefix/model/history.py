@@ -4,7 +4,8 @@ import json
 from pydantic_core import to_json
 from tracefix.model.prompts import serialize_request
 from tracefix.runtime.contracts import digest
-from tracefix.runtime.tools import ToolRegistry, ToolSpec, model_tool_name
+from tracefix.tools.core import ToolRegistry, ToolSpec, model_tool_name
+from tracefix.tools.browser import browser_action, native_browser_tools
 
 
 class ModelProtocol:
@@ -58,53 +59,11 @@ class ModelProtocol:
 
     @staticmethod
     def _native_tools(schema):
-        # 工具 schema 只声明动作格式；实际执行仍受运行时策略控制。
-        from tracefix.runtime.contracts import BrowserAction, Decision
-        if schema not in {BrowserAction, Decision}:
-            return []
-        action_schema = BrowserAction.model_json_schema()
-        tools = []
-        for name, fields in {
-            'browser_navigate': ['value'],
-            'browser_click': ['observation_id', 'element_ref', 'locator'],
-            'browser_type': ['observation_id', 'element_ref', 'locator', 'value'],
-            'browser_select': ['observation_id', 'element_ref', 'locator', 'value'],
-            'browser_press': ['observation_id', 'value'],
-            'browser_snapshot': [],
-        }.items():
-            optional_fields = ['page_generation', 'preconditions', 'postconditions', 'wait']
-            properties = {field: copy.deepcopy(action_schema['properties'][field])
-                          for field in fields + optional_fields}
-            for field in fields:
-                property_schema = properties[field]
-                property_schema.pop('default', None)
-                if 'anyOf' in property_schema:
-                    property_schema.update(property_schema.pop('anyOf')[0])
-            tools.append({'type': 'function', 'function': {
-                'name': model_tool_name(name),
-                'description': 'Execute through TraceFix policy and MCP. Returns a fresh observation and screenshot evidence reference. value is the URL, text, selected value, or key for the named action.',
-                'parameters': {'type': 'object', 'properties': properties,
-                    'required': fields, 'additionalProperties': False, '$defs': action_schema.get('$defs', {})},
-            }})
-        return tools
+        return native_browser_tools(schema)
 
     @classmethod
     def browser_action(cls, name, arguments):
-        import jsonschema
-        from tracefix.runtime.contracts import BrowserAction
-        definitions = {tool['function']['name']: tool['function']['parameters']
-                       for tool in cls._native_tools(BrowserAction)}
-        name = model_tool_name(name) if isinstance(name, str) else name
-        if not isinstance(name, str) or name not in definitions:
-            raise ValueError('未知或未授权的浏览器工具：' + str(name))
-        try:
-            jsonschema.validate(arguments, definitions[name])
-        except jsonschema.ValidationError as error:
-            raise ValueError('工具参数校验失败：' + error.message) from error
-        kind = {'BrowserNavigate': 'navigate', 'BrowserClick': 'click',
-                'BrowserType': 'type', 'BrowserSelect': 'select', 'BrowserPress': 'press',
-                'BrowserSnapshot': 'observe'}[name]
-        return BrowserAction(kind=kind, **arguments)
+        return browser_action(name, arguments)
 
     @classmethod
     def _completed_history(cls, messages, native_tools, phase='DIAGNOSE'):

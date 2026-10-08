@@ -21,9 +21,9 @@ from tracefix.execution.workspace import Workspace
 from tracefix.knowledge.memory import MemoryLibrary, MemoryNote
 from tracefix.knowledge.scope import ScopeResolver
 from tracefix.runtime.contracts import Phase, RunState, digest
-from tracefix.runtime.effects import (EffectBoundaryError, file_resource, make_operation_executor,
+from tracefix.tools.effects import (EffectBoundaryError, file_resource, make_operation_executor,
                                      operation_identity, resources_intersect, run_effect)
-from tracefix.runtime.tool_handlers import build_runtime_tools
+from tracefix.tools.handlers import build_runtime_tools
 from tracefix.storage.store import MemoryStore, PostgresStore, UnknownOperation
 
 
@@ -350,7 +350,7 @@ async def test_spawn_local_production_handler_updates_parent_only(tmp_path):
 
 @pytest.mark.parametrize('changed', ['overlay', 'disk_with_overlay'])
 async def test_parent_overlay_change_during_prepare_is_not_overwritten(tmp_path, monkeypatch, changed):
-    import tracefix.runtime.local_tools as local_module
+    import tracefix.tools.local as local_module
 
     engine, state, source = local_engine(tmp_path)
     if changed == 'disk_with_overlay':
@@ -421,7 +421,7 @@ def _broken_receipt_worker(request, folder):
 
 @pytest.mark.parametrize('mode', ['crash', 'partial', 'corrupt', 'identity', 'missing-result'])
 async def test_worker_crash_and_ipc_errors_are_bounded_and_unknown(tmp_path, monkeypatch, mode):
-    import tracefix.runtime.effects as effects
+    import tracefix.tools.effects as effects
 
     monkeypatch.setattr(effects, '_effect_worker', _broken_receipt_worker)
     before = time.monotonic()
@@ -433,7 +433,7 @@ async def test_worker_crash_and_ipc_errors_are_bounded_and_unknown(tmp_path, mon
 
 @pytest.mark.parametrize('mode', ['normal', 'timeout', 'cancel'])
 async def test_worker_and_descendant_exit_confirmed_on_all_paths(tmp_path, monkeypatch, mode):
-    import tracefix.runtime.effects as effects
+    import tracefix.tools.effects as effects
 
     monkeypatch.setattr(effects, '_effect_worker', _late_worker)
     payload = dict(entered=str(tmp_path / 'entered'), late=str(tmp_path / 'late'),
@@ -474,7 +474,7 @@ async def test_production_timeout_cancel_blocks_new_call_and_epoch(tmp_path, can
             with pytest.raises(asyncio.CancelledError):
                 await task
         else:
-            from tracefix.runtime.tools import ToolOperationUnknown
+            from tracefix.tools.core import ToolOperationUnknown
             with pytest.raises(ToolOperationUnknown):
                 await task
         assert next(iter(engine.store.operations.values()))['status'] == 'UNKNOWN'
@@ -495,7 +495,7 @@ async def test_production_timeout_cancel_blocks_new_call_and_epoch(tmp_path, can
 
 
 async def test_parent_apply_requires_live_owned_fence(tmp_path, monkeypatch):
-    import tracefix.runtime.local_tools as local_module
+    import tracefix.tools.local as local_module
 
     engine, state, source = local_engine(tmp_path)
 
@@ -762,7 +762,7 @@ def test_owned_crashed_started_requires_exit_identity_then_manual_reconcile(ledg
 async def test_unserializable_request_and_rejected_worker_leave_no_worker():
     with pytest.raises(TypeError):
         await run_effect('local.prepare', {'callback': lambda: None})
-    from tracefix.runtime.tools import ToolRejected
+    from tracefix.tools.core import ToolRejected
     with pytest.raises(ToolRejected):
         await run_effect('local.prepare', {'tool': 'Edit', 'content': 'baseline',
             'arguments': {'old_string': 'missing', 'new_string': 'new', 'replace_all': False}})

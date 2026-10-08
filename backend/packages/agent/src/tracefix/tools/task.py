@@ -13,8 +13,8 @@ from typing import Any, Literal
 from pydantic import Field, model_validator
 
 from tracefix.runtime.contracts import Contract, Phase, digest
-from tracefix.runtime.effects import apply_effect_receipt
-from tracefix.runtime.tools import ToolRejected
+from tracefix.tools.effects import apply_effect_receipt
+from tracefix.tools.core import ToolRejected
 
 
 TaskStatus = Literal["pending", "in_progress", "completed"]

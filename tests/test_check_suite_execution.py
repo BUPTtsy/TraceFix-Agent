@@ -12,7 +12,7 @@ from tracefix.runtime.contracts import (
 )
 from tracefix.runtime.engine import Engine
 from tracefix.runtime.smoke import PNG, make_engine
-from tracefix.runtime.tool_handlers import build_runtime_tools
+from tracefix.tools.handlers import build_runtime_tools
 
 
 def suite_fixture(*, rules=(), mode='test', goal='页面应显示任务板且保存后出现反馈'):

@@ -12,7 +12,7 @@ from tracefix.model.gateway import Gateway, ModelError
 from tracefix.runtime.contracts import (BrowserAction, Decision, FileEdit, PatchProposal,
                                        Phase, RunState, TestSpec as Spec, digest)
 from tracefix.runtime.smoke import make_engine
-from tracefix.runtime.tool_handlers import build_runtime_tools
+from tracefix.tools.handlers import build_runtime_tools
 from tracefix.storage.store import MemoryStore
 
 

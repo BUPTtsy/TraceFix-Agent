@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from tracefix.model.gateway import Gateway
 from tracefix.runtime.contracts import BrowserAction
-from tracefix.runtime.tools import model_tool_name
+from tracefix.tools.core import model_tool_name
 
 
 def red_image():

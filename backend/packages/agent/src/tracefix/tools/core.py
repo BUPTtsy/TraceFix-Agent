@@ -1,4 +1,4 @@
-"""阶段受限的工具注册、完整批次校验与可审计执行。"""
+"""Agent 工具契约、阶段注册、完整批次校验与可审计执行。"""
 from __future__ import annotations
 
 import asyncio

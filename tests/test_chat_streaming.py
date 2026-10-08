@@ -11,7 +11,7 @@ from tracefix.model.chat import stream_tool_chat
 from tracefix.model import protocol
 from tracefix.agents.pydantic_ai_adapter import PydanticAIAdapterError
 from tracefix.runtime.contracts import Phase
-from tracefix.runtime.tools import ToolPipeline, ToolRegistry, ToolSpec
+from tracefix.tools.core import ToolPipeline, ToolRegistry, ToolSpec
 
 
 def sse(delta=None, finish=None):
@@ -181,7 +181,7 @@ async def test_jsonl_starts_empty_preserves_whole_turn_and_cancels_without_histo
     monkeypatch.setattr('tracefix.cli.main.load_projects', lambda path: {})
     monkeypatch.setattr('tracefix.cli.main.ScopeResolver',
         lambda projects, path: SimpleNamespace(context=lambda scope: SimpleNamespace(active_scope=scope)))
-    monkeypatch.setattr('tracefix.model.chat_tools.build_chat_tools', lambda *args, **kwargs: None)
+    monkeypatch.setattr('tracefix.tools.chat.build_chat_tools', lambda *args, **kwargs: None)
 
     async def fake_chat(message, history, project, library, tools, use_knowledge):
         histories.append((message, list(history)))

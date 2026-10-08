@@ -18,7 +18,7 @@ from tracefix.model.contracts import ModelError, ModelResult
 from tracefix.runtime.contracts import digest
 
 if TYPE_CHECKING:
-    from tracefix.runtime.tools import ToolSpec
+    from tracefix.tools.core import ToolSpec
 
 
 OutputT = TypeVar('OutputT', bound=BaseModel)
@@ -116,7 +116,7 @@ class PydanticAIAdapter:
                        on_event: Callable | None = None, message_history: Sequence | None = None,
                        agent_instructions: str | None = None, image: bytes | None = None,
                        **runtime_options) -> Any:
-        from tracefix.runtime.tools import ToolProtocolError, ToolRegistry, ToolRejected, ToolSpec
+        from tracefix.tools.core import ToolProtocolError, ToolRegistry, ToolRejected, ToolSpec
         from tracefix.runtime.contracts import BrowserAction, Decision
 
         trace = _RunTrace(messages=copy.deepcopy(list(message_history or ())))

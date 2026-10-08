@@ -17,7 +17,7 @@ from tracefix.model import protocol
 from tracefix.model.chat import stream_tool_chat
 from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
 from tracefix.runtime.contracts import BrowserAction, Decision
-from tracefix.runtime.tools import ToolPipeline, ToolRegistry, ToolResult, ToolSpec
+from tracefix.tools.core import ToolPipeline, ToolRegistry, ToolResult, ToolSpec
 
 
 class Output(BaseModel):

@@ -25,7 +25,7 @@ from tracefix.workers.scheduler import (
     WorkerHandle,
     WorkerScheduler,
 )
-from tracefix.workers.tools import supervisor_tools
+from tracefix.tools.supervisor import supervisor_tools
 from tracefix.workers.runtime import (
     ROLE_PHASES, ROLE_TOOLS, BrowserSandbox, BrowserSandboxFactory,
     HierarchyTrace, IsolatedGuiScout, SubAgentRejected, SubAgentRuntime, SubAgentTrace,

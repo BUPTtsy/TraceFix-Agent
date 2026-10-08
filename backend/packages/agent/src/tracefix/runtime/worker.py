@@ -5,9 +5,9 @@ import os
 from fnmatch import fnmatchcase
 
 from tracefix.runtime.contracts import Usage, digest, new_id
-from tracefix.runtime.effects import file_resource
+from tracefix.tools.effects import file_resource
 from tracefix.runtime.subtask_contracts import SubtaskResult, SubtaskSpec
-from tracefix.runtime.tool_handlers import build_runtime_tools
+from tracefix.tools.handlers import build_runtime_tools
 
 
 class ReadOnlyWorker:

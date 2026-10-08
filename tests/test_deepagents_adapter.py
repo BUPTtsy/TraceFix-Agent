@@ -20,7 +20,7 @@ from tracefix.agents.deepagents_adapter import (
     DeepAgentsReadonlyAdapter, investigation_model,
 )
 from tracefix.runtime.contracts import Phase, digest
-from tracefix.runtime.effects import file_resource
+from tracefix.tools.effects import file_resource
 from tracefix.runtime.smoke import make_engine
 from tracefix.runtime.subtask_contracts import SubtaskResult, SubtaskSpec
 from tracefix.runtime.worker import ReadOnlyWorker

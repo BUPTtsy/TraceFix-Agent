@@ -939,7 +939,7 @@ async def chat_jsonl(args):
                         'message_id': message_id, 'payload': redact(metadata)})
 
         try:
-            from tracefix.model.chat_tools import build_chat_tools
+            from tracefix.tools.chat import build_chat_tools
             pipeline = build_chat_tools(scopes, context, documents, artifacts, session_id,
                                         emit=tool_event, use_knowledge=use_knowledge)
             history = [item for turn in turns for item in turn]

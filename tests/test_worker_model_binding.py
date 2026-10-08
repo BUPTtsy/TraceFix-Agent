@@ -5,7 +5,7 @@ import pytest
 from tracefix.model.gateway import ModelResult
 from tracefix.runtime.contracts import BrowserAction, Decision, RunStatus
 from tracefix.runtime.smoke import PNG, make_engine
-from tracefix.runtime.tool_handlers import build_runtime_tools
+from tracefix.tools.handlers import build_runtime_tools
 from tracefix.workers.contracts import WorkerTask
 from tracefix.workers.runtime import IsolatedGuiScout
 

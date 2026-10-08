@@ -6,9 +6,9 @@ import pytest
 from tracefix.config import Project
 from tracefix.knowledge.documents import DocumentLibrary
 from tracefix.knowledge.scope import ScopeResolver
-from tracefix.model.chat_tools import MAX_FILE_BYTES, MAX_SCAN_FILES, build_chat_tools
+from tracefix.tools.chat import MAX_FILE_BYTES, MAX_SCAN_FILES, build_chat_tools
 from tracefix.runtime.contracts import Phase, digest
-from tracefix.runtime.tools import ToolProtocolError, estimate_tokens
+from tracefix.tools.core import ToolProtocolError, estimate_tokens
 from tracefix.storage.artifacts import Artifacts
 
 
@@ -112,10 +112,10 @@ async def test_chat_tools_reject_size_scan_limits_and_invalid_pattern(chat_tools
     source.unlink()
     for index in range(3):
         (root / f'{index}.txt').write_text('answer', encoding='utf-8')
-    monkeypatch.setattr('tracefix.model.chat_tools.MAX_SCAN_FILES', 2)
+    monkeypatch.setattr('tracefix.tools.chat.MAX_SCAN_FILES', 2)
     scan = await pipeline.execute('Glob', {'pattern': '**/*'}, 'scan-1')
     assert scan.is_error and '请指定更小的 path' in scan.error['message']
-    monkeypatch.setattr('tracefix.model.chat_tools.MAX_SCAN_FILES', MAX_SCAN_FILES)
+    monkeypatch.setattr('tracefix.tools.chat.MAX_SCAN_FILES', MAX_SCAN_FILES)
     invalid = await pipeline.execute('Grep', {'pattern': '['}, 'invalid-regex')
     assert invalid.is_error and invalid.executed is False
 
