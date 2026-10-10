@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from tempfile import TemporaryDirectory
 from pathlib import Path
+import json
+import subprocess
 import pytest
 
 from tracefix.rules import (Finding, Rule, RuleResolver, RuleLibrary, RuleSnapshot, RuleCoverage,
@@ -127,7 +129,9 @@ def test_scoped_findings_preserve_run_identity_and_repair_provenance(tmp_path):
     assert len(library.insights()) == 2
     fixed = findings[0].model_copy(update={"status": "fixed", "repair_run_id": "repair", "patch_hash": "hash",
         "verification_refs": ["validation.json"]})
-    library.save_finding(fixed)
+    with pytest.raises(ValueError, match="验证入口"):
+        library.save_finding(fixed)
+    library.save_verified_finding(fixed)
     assert library.finding(fixed.id).verification_refs == ["validation.json"]
     assert library.insights(scope_id="one")[0]["fixed"] == 1
     with pytest.raises(ValueError, match="归属"):
@@ -137,8 +141,9 @@ def test_scoped_findings_preserve_run_identity_and_repair_provenance(tmp_path):
 def test_evaluation_coverage_distinguishes_absent_inputs_and_unsupported_checks(tmp_path):
     rule = oracle_rule()
     assert evaluate_oracle_result(rule, {}, job_id="job").status == "not_completed"
-    assert evaluate_oracle_result(rule, {"console": []}, job_id="job").status == "checked_pass"
-    matched = evaluate_oracle_result(rule, {"console": "ERROR failed"}, job_id="job", run_id="run",
+    metadata = {"collection": {"channels": {"console": {"status": "available"}}}}
+    assert evaluate_oracle_result(rule, {"console": [], **metadata}, job_id="job").status == "checked_pass"
+    matched = evaluate_oracle_result(rule, {"console": "ERROR failed", **metadata}, job_id="job", run_id="run",
         scope_id="project", project_id="project", repo_id="repo", evidence_ref="evidence.json")
     assert matched.status == "matched"
     assert matched.findings[0].expected and matched.findings[0].actual
@@ -168,3 +173,76 @@ def test_repair_rule_coverage_requires_patch_and_verify():
     resolver = RuleResolver([complete])
     snapshot, _ = resolver.resolve_snapshot(run_id="run", project_id="project", phase="*")
     resolver.require_repair_coverage(snapshot, [rule.id])
+
+
+@pytest.mark.parametrize("metadata", [None, {"status": "truncated"}, {"status": "available", "upstream_truncated": True},
+    {"status": "available", "collector_truncated": True}])
+def test_incomplete_channels_cannot_pass(metadata):
+    observation = {"console": [], "collection": {"channels": {"console": metadata}}}
+    assert evaluate_oracle_result(oracle_rule(), observation, job_id="job").status == "not_completed"
+
+
+def test_unsupported_conditions_and_static_engines_cannot_pass():
+    metadata = {"collection": {"channels": {"snapshot": {"status": "available"}}}}
+    unknown = oracle_rule("dom", kind="dom_assertion", locator={"role": "button", "name": "Save"}, contains="NEVER")
+    assert evaluate_oracle_result(unknown, {"snapshot": '- button "Save"', **metadata}, job_id="job").status == "not_completed"
+    combined = oracle_rule("count", kind="dom_assertion", locator={"role": "button"}, condition="visible", count=0)
+    assert evaluate_oracle_result(combined, {"snapshot": "", **metadata}, job_id="job").status == "matched"
+    static = Rule(id="ast", name="AST", status="enabled", detection={"type": "static", "static": {"engine": "ast", "regex": "NEVER"}})
+    assert evaluate_static_result(static, [("main.ts", "anything")], job_id="job").status == "not_completed"
+
+
+def test_legacy_unhashed_body_and_snapshot_scope_rebinding_are_rejected():
+    rule = oracle_rule()
+    refs = [{"id": rule.id, "version": 1}]
+    with pytest.raises(ValueError, match="未纳入 hash"):
+        RuleSnapshot(run_id="run", format_version=1, refs=refs, rules=[rule], hash=digest(refs))
+    legacy = RuleSnapshot(run_id="run", format_version=1, refs=refs, hash=digest(refs))
+    with pytest.raises(ValueError, match="历史读取"):
+        RuleResolver([rule]).load_snapshot_rules(legacy)
+    resolver = RuleResolver([rule])
+    snapshot, _ = resolver.resolve_snapshot(run_id="run", project_id="project", scope_id="scope", repo_id="repo", phase="*")
+    with pytest.raises(ValueError, match="不属于当前"):
+        resolver.resolve_snapshot(run_id="child", project_id="project", repo_id="other", scope_id="scope", parent=snapshot, phase="*")
+    unbound = resolver.snapshot("unbound", [rule])
+    with pytest.raises(ValueError, match="不属于当前"):
+        resolver.load_snapshot_rules(unbound, scope_id="scope")
+
+
+@pytest.mark.parametrize("field,value", [("job_id", "foreign"), ("rule_id", "other"), ("rule_version", 2),
+    ("source", "guided"), ("source_base_commit", "foreign"), ("source_manifest", "foreign"), ("fingerprint", "foreign")])
+def test_finding_source_metadata_is_immutable(tmp_path, field, value):
+    library = RuleLibrary(tmp_path / "immutable.sqlite")
+    finding = Finding.from_failure(job_id="job", run_id="run", rule=oracle_rule(), title="问题", location={}, scope_id="scope")
+    library.save_finding(finding)
+    with pytest.raises(ValueError, match="换绑"):
+        library.save_finding(finding.model_copy(update={field: value}))
+    verified = finding.model_copy(update={"status": "fixed", "repair_run_id": "repair", "patch_hash": "patch", "verification_refs": ["check.json"]})
+    library.save_verified_finding(verified)
+    duplicate = library.save_finding(finding)
+    assert duplicate.status == "fixed" and duplicate.verification_refs == ["check.json"]
+    with pytest.raises(ValueError, match="修复来源"):
+        library.save_finding(verified.model_copy(update={"patch_hash": "foreign"}))
+
+
+def test_python_and_console_float_rule_history_roundtrip(tmp_path):
+    library = RuleLibrary(tmp_path / "float.sqlite")
+    rule = library.save_rule(oracle_rule("float-rule", kind="visual_threshold", ratio=1.0, tolerance=1e-7))
+    assert library.version(rule.id, 1).body_hash == rule.body_hash
+    script = """
+const {createConsoleService}=await import('./backend/packages/console-service/dist/dispatch.mjs');
+const service=createConsoleService({projectsPath:process.argv[2],dataRoot:process.argv[3],databasePath:process.argv[1]});
+const rule=service('rule',{id:'float-rule'});
+service('rule.update',{...rule,expectedVersion:1});
+service.close();
+"""
+    projects = tmp_path / "projects.json"
+    projects.write_text('{"projects":[]}', encoding="utf-8")
+    result = subprocess.run(["node", "--input-type=module", "-e", script, str(library.path), str(projects), str(tmp_path)],
+                            cwd=Path.cwd(), capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert library.version(rule.id, 2).detection.oracle["ratio"] == 1
+    with library.connect() as connection:
+        connection.execute("UPDATE rule_versions SET body=replace(body, '1e-7', '2e-7') WHERE rule_id=? AND version=2", (rule.id,))
+    with pytest.raises(ValueError, match="hash"):
+        library.version(rule.id, 2)

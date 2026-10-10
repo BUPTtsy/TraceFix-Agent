@@ -55,6 +55,8 @@ def evaluate_static_result(rule: Rule, files: Iterable[tuple[str, str]], *, job_
     if rule.detection.type != "static":
         return RuleEvaluation(status="not_applicable", reason="不是静态规则")
     config = rule.detection.static or {}
+    if set(config) - {"regex", "pattern", "path_globs", "message", "expected"}:
+        return RuleEvaluation(status="not_completed", reason="静态规则包含未实现的检测器或字段")
     expression = config.get("regex") or config.get("pattern")
     if not isinstance(expression, str) or not expression.strip():
         return RuleEvaluation(status="not_completed", reason="静态规则缺少可执行表达式")

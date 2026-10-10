@@ -8,6 +8,28 @@ function hash(value: any): string {
   return createHash('sha256').update(canonical(value)).digest('hex');
 }
 
+class StoredNumber {
+  constructor(readonly source: string) {}
+}
+
+function storedCanonical(body: string, python = false, select: (value: any) => any = value => value): string {
+  const parsed = JSON.parse(body, ((key: string, value: any, context: {source?: string}) =>
+    typeof value === 'number' && context?.source ? new StoredNumber(context.source) : value) as any);
+  function render(value: any): string {
+    if (value instanceof StoredNumber) {
+      return python ? value.source.replace(/e([+-])(\d)$/, 'e$10$2') : value.source;
+    }
+    if (Array.isArray(value)) return '[' + value.map(render).join(',') + ']';
+    if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + render(value[key])).join(',') + '}';
+    return JSON.stringify(value);
+  }
+  return render(select(parsed));
+}
+
+function storedHash(body: string, python = false, select: (value: any) => any = value => value): string {
+  return createHash('sha256').update(storedCanonical(body, python, select)).digest('hex');
+}
+
 function matchesScope(record: Data, fields: Data): boolean {
   return [['scope_id', 'scopeId'], ['project_id', 'projectId'], ['repo_id', 'repoId']]
     .every(([snake, camel]) => {
@@ -109,7 +131,7 @@ export class RuleDatabase {
     const row = this.store.db.prepare('SELECT body,body_hash FROM rule_versions WHERE rule_id=? AND version=?').get(id, version) as {body: string; body_hash: string} | undefined;
     if (!row) throw new DataError('规则版本不存在', 404);
     const rule = JSON.parse(row.body);
-    if (rule.id !== id || rule.version !== version || hash(rule) !== row.body_hash)
+    if (rule.id !== id || rule.version !== version || ![hash(rule), storedHash(row.body), storedHash(row.body, true)].includes(row.body_hash))
       throw new DataError('规则版本正文身份或 hash 不匹配', 409);
     return rule;
   }
@@ -188,7 +210,11 @@ export class RuleDatabase {
     const payload = snapshot.format_version >= 2 ? {refs, rules: snapshot.rules,
       body_hashes: snapshot.body_hashes, scope_id: snapshot.scope_id ?? null,
       project_id: snapshot.project_id ?? null, repo_id: snapshot.repo_id ?? null} : refs;
-    if (hash(payload) !== row.snapshot_hash) throw new DataError('rule snapshot hash 不匹配', 409);
+    const storedSnapshotHash = row.snapshot_data ? storedHash(row.snapshot_data, false, value => ({
+      refs: value.refs, rules: value.rules, body_hashes: value.body_hashes, scope_id: value.scope_id ?? null,
+      project_id: value.project_id ?? null, repo_id: value.repo_id ?? null})) : hash(refs);
+    if (snapshot.format_version >= 2 ? storedSnapshotHash !== row.snapshot_hash : hash(refs) !== row.snapshot_hash)
+      throw new DataError('rule snapshot hash 不匹配', 409);
     if (snapshot.format_version >= 2 && (!Array.isArray(snapshot.rules) ||
         snapshot.rules.length !== refs.length || Object.keys(snapshot.body_hashes || {}).length !== refs.length))
       throw new DataError('rule snapshot 正文或版本集合不一致', 409);
@@ -197,7 +223,8 @@ export class RuleDatabase {
       if (snapshot.format_version >= 2 && (snapshot.rules[index].id !== reference.id ||
           snapshot.rules[index].version !== reference.version ||
           hash(snapshot.rules[index]) !== hash(rule) ||
-          snapshot.body_hashes[`${reference.id}@${reference.version}`] !== hash(rule)))
+          snapshot.body_hashes[`${reference.id}@${reference.version}`] !==
+            storedHash(row.snapshot_data, false, value => value.rules[index])))
         throw new DataError('rule snapshot 冻结正文不匹配', 409);
     }
     return {...row, ...snapshot, snapshot_hash: snapshot.hash};

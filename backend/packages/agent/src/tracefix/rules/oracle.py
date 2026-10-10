@@ -110,23 +110,25 @@ def _dom(rule: Rule, config: dict, observation: dict, *, job_id: str, run_id: st
     locator = config.get("locator")
     matches = _locator_matches(snapshot, locator)
     condition = config.get("condition", "visible")
-    passed = bool(matches)
+    checks = [bool(matches)]
     if condition == "absent":
-        passed = not matches
+        checks = [not matches]
     elif condition in {"checked", "disabled", "enabled"} and matches:
-        passed = (f"[{condition}]" in matches[0]["attrs"] if condition != "enabled"
-                  else "[disabled]" not in matches[0]["attrs"])
-    if "text_matches" in config and matches:
-        passed = any(re.search(str(config["text_matches"]), item["name"]) for item in matches)
+        checks.append(f"[{condition}]" in matches[0]["attrs"] if condition != "enabled"
+                      else "[disabled]" not in matches[0]["attrs"])
+    if "text_matches" in config:
+        checks.append(any(re.search(str(config["text_matches"]), item["name"]) for item in matches))
     if "count" in config:
-        passed = len(matches) == int(config["count"])
-    if "attribute" in config and matches:
+        checks.append(len(matches) == int(config["count"]))
+    if "attribute" in config:
         attribute = config["attribute"]
         attr_name = attribute.get("name") if isinstance(attribute, dict) else str(attribute)
         attr_value = attribute.get("value") if isinstance(attribute, dict) else None
-        passed = bool(re.search(rf"\[{re.escape(attr_name)}(?:=([^\]]+))?\]", matches[0]["attrs"]))
+        passed = bool(matches) and bool(re.search(rf"\[{re.escape(attr_name)}(?:=([^\]]+))?\]", matches[0]["attrs"]))
         if passed and attr_value is not None:
             passed = str(attr_value) in matches[0]["attrs"]
+        checks.append(passed)
+    passed = all(checks)
     if passed:
         return []
     return [_finding(rule, job_id=job_id, run_id=run_id, title="页面元素不符合检测规则",
@@ -216,10 +218,21 @@ def evaluate_oracle_result(rule: Rule, observation: dict, *, job_id: str,
         return RuleEvaluation(status="not_applicable", reason="不是 Oracle 规则")
     config = rule.detection.oracle or {}
     kind = config.get("kind")
+    supported = {"kind", "ignore", "url_patterns", "urls", "forbidden_statuses", "locator", "condition",
+                 "text_matches", "count", "attribute", "trigger", "expect_any", "expected"}
+    if set(config) - supported or kind not in {"console_no_error", "network_status", "dom_assertion", "dom_after_action", "a11y_axe", "visual_threshold"}:
+        return RuleEvaluation(status="not_completed", reason="Oracle 配置包含未实现字段或能力")
     channel = {"console_no_error": "console", "network_status": "network",
                "dom_assertion": "snapshot", "dom_after_action": "snapshot"}.get(kind)
     if channel and (channel not in observation or observation[channel] is None):
         return RuleEvaluation(status="not_completed", reason=f"缺少确定性检查输入：{channel}")
+    if channel:
+        metadata = observation.get("collection", {}).get("channels", {}).get(channel)
+        if not isinstance(metadata, dict) or metadata.get("status") != "available" or any(
+                metadata.get(field) is True for field in ("upstream_truncated", "collector_truncated", "truncated")):
+            return RuleEvaluation(status="not_completed", reason=f"确定性通道不可用或不完整：{channel}")
+        if channel == "snapshot" and not isinstance(observation[channel], str):
+            return RuleEvaluation(status="not_completed", reason="DOM 快照输入类型无效")
     if kind == "dom_after_action":
         if not action:
             return RuleEvaluation(status="not_applicable", reason="尚未执行规则触发动作")
@@ -239,12 +252,18 @@ def evaluate_oracle_result(rule: Rule, observation: dict, *, job_id: str,
             return RuleEvaluation(status="not_completed", reason="动作后规则缺少可执行预期")
     if kind in {"dom_assertion", "dom_after_action"}:
         expectations = config.get("expect_any", []) if kind == "dom_after_action" else [config]
+        allowed = {"locator", "condition", "text_matches", "count", "attribute", "expected"}
+        if any(not isinstance(expectation, dict) or set(expectation) - (allowed | {"kind"}) for expectation in expectations):
+            return RuleEvaluation(status="not_completed", reason="DOM 预期包含未实现的配置")
         if any(not expectation.get("locator") or expectation.get("condition", "visible") not in {
                 "visible", "absent", "checked", "disabled", "enabled"} for expectation in expectations):
             return RuleEvaluation(status="not_completed", reason="DOM 规则缺少受支持的可执行条件或目标")
-    findings = evaluate_oracle(rule, observation, job_id=job_id, run_id=run_id,
-                               evidence_ref=evidence_ref, previous_observation=previous_observation,
-                               action=action, scope_id=scope_id, project_id=project_id, repo_id=repo_id)
+    try:
+        findings = evaluate_oracle(rule, observation, job_id=job_id, run_id=run_id,
+                                   evidence_ref=evidence_ref, previous_observation=previous_observation,
+                                   action=action, scope_id=scope_id, project_id=project_id, repo_id=repo_id)
+    except (ValueError, TypeError, AttributeError, re.error) as error:
+        return RuleEvaluation(status="not_completed", reason=f"Oracle 配置或输入无法执行：{error}")
     if findings:
         return RuleEvaluation(findings=findings, status="matched", reason="确定性规则检测到不符合项")
     if kind in {"a11y_axe", "visual_threshold"}:

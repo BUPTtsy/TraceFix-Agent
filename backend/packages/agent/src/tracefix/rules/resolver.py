@@ -83,15 +83,19 @@ class RuleResolver:
     def load_snapshot_rules(self, snapshot: RuleSnapshot, *, project_id: str | None = None,
                             repo_id: str | None = None, scope_id: str | None = None) -> list[Rule]:
         snapshot = RuleSnapshot.model_validate(snapshot.model_dump(mode="json"))
+        if snapshot.format_version < 2 and snapshot.rules:
+            raise ValueError("v1 rule snapshot 不允许携带未纳入 hash 的规则正文")
         for name, expected in (("project_id", project_id), ("repo_id", repo_id), ("scope_id", scope_id)):
             actual = getattr(snapshot, name)
-            if expected is not None and actual is not None and expected != actual:
+            if snapshot.format_version >= 2 and expected is not None and actual != expected:
                 raise ValueError(f"rule snapshot {name} 不属于当前项目或仓库")
         frozen = {RuleRef(id=rule.id, version=rule.version).key(): rule for rule in snapshot.rules}
         history = getattr(self.source, "version", None)
         current = {} if callable(history) else {rule.id: rule for rule in self._all()}
         result = []
         for reference in snapshot.refs:
+            if snapshot.format_version < 2 and not callable(history):
+                raise ValueError(f"v1 快照只能从规则历史读取：{reference.key()}")
             if callable(history):
                 rule = history(reference.id, reference.version)
             else:
@@ -174,6 +178,9 @@ class RuleResolver:
                          scope_id: str | None = None,
                          url: str | None = None, paths: Iterable[str] = (),
                          job_id: str | None = None) -> tuple[RuleSnapshot, list[Rule]]:
+        if parent:
+            self.load_snapshot_rules(parent, project_id=project_id, repo_id=repo_id,
+                                     scope_id=scope_id or project_id)
         rules = self.resolve(project_id=project_id, phase=phase, url=url, paths=paths,
                              job_id=job_id, run_id=run_id, inherited=parent,
                              additional=additional, rule_ids=rule_ids)

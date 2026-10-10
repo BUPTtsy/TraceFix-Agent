@@ -162,7 +162,7 @@ class RuleRef(Contract):
 class RuleSnapshot(Contract):
     run_id: str
     parent_run_id: str | None = None
-    format_version: int = Field(default=2, ge=1)
+    format_version: Literal[1, 2] = 2
     refs: list[RuleRef] = Field(default_factory=list)
     rules: list[Rule] = Field(default_factory=list)
     body_hashes: dict[str, str] = Field(default_factory=dict)
@@ -181,6 +181,8 @@ class RuleSnapshot(Contract):
 
     @model_validator(mode="after")
     def compute_hash(self):
+        if self.format_version == 1 and (self.rules or self.body_hashes):
+            raise ValueError("v1 rule snapshot 不允许携带未纳入 hash 的规则正文")
         if self.rules and not self.refs:
             self.refs = [RuleRef(id=rule.id, version=rule.version) for rule in self.rules]
         if self.format_version >= 2:

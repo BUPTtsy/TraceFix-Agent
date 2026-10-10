@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -16,6 +17,23 @@ from .models import Finding, Rule, RuleCoverage, RuleRef, RuleSnapshot
 
 def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+class _JSONNumber(str):
+    pass
+
+
+def _stored_body_hash(body: str) -> str:
+    def canonical(value):
+        if isinstance(value, _JSONNumber):
+            return str(value)
+        if isinstance(value, dict):
+            return "{" + ",".join(json.dumps(key, ensure_ascii=False) + ":" + canonical(value[key]) for key in sorted(value)) + "}"
+        if isinstance(value, list):
+            return "[" + ",".join(canonical(item) for item in value) + "]"
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    parsed = json.loads(body, parse_int=_JSONNumber, parse_float=_JSONNumber)
+    return hashlib.sha256(canonical(parsed).encode("utf-8")).hexdigest()
 
 
 class RuleConflictError(ValueError):
@@ -98,7 +116,7 @@ class RuleLibrary:
 
     def _body(self, row) -> Rule:
         rule = Rule.model_validate(json.loads(row["body"]))
-        if row["body_hash"] != rule.body_hash:
+        if row["body_hash"] not in {rule.body_hash, _stored_body_hash(row["body"])}:
             raise ValueError(f"规则版本正文 hash 不匹配：{rule.id}@{rule.version}")
         if rule.id != row["rule_id"] or rule.version != row["version"]:
             raise ValueError("规则版本正文身份不匹配")
@@ -258,6 +276,21 @@ class RuleLibrary:
                 old = Finding.model_validate(json.loads(row["data"]))
                 if (old.run_id, old.scope_id, old.project_id, old.repo_id) != (finding.run_id, finding.scope_id, finding.project_id, finding.repo_id):
                     raise RuleConflictError("Finding 的 Run 与项目仓库归属不可替换")
+                immutable = ("job_id", "run_id", "scope_id", "project_id", "repo_id", "rule_id",
+                             "rule_version", "source", "fingerprint", "source_base_commit", "source_manifest")
+                if any(getattr(old, field) != getattr(finding, field) for field in immutable):
+                    raise RuleConflictError("Finding 来源身份和指纹不可换绑")
+                if finding.status == "fixed" and old.status != "fixed":
+                    raise RuleConflictError("Finding 只有确定性验证入口可以标记 fixed")
+                if old.status == "fixed" and finding.status == "fixed" and (
+                        old.repair_run_id, old.patch_hash, old.verification_refs) != (
+                        finding.repair_run_id, finding.patch_hash, finding.verification_refs):
+                    raise RuleConflictError("已验证 Finding 的修复来源不可替换")
+                if old.status == "fixed" and finding.status != "fixed":
+                    finding.status = old.status
+                    finding.repair_run_id = old.repair_run_id
+                    finding.patch_hash = old.patch_hash
+                    finding.verification_refs = old.verification_refs
                 updates = finding.model_dump(mode="python", exclude={"id", "evidence_refs", "details"})
                 updates.update(evidence_refs=list(dict.fromkeys(old.evidence_refs + finding.evidence_refs)),
                                details={**old.details, **finding.details})
@@ -265,10 +298,30 @@ class RuleLibrary:
                 connection.execute("UPDATE findings SET status=?, data=?, updated_at=? WHERE id=?",
                                    (old.status, old.model_dump_json(), now, old.id))
                 return old
+            if finding.status == "fixed":
+                raise RuleConflictError("Finding 只有确定性验证入口可以标记 fixed")
             connection.execute("INSERT INTO findings VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                                (finding.id, finding.job_id, finding.run_id, finding.rule_id, finding.rule_version,
                                 finding.source, finding.severity, finding.status, key,
                                 finding.model_dump_json(), now, now))
+        return finding
+
+    def save_verified_finding(self, finding: Finding) -> Finding:
+        if finding.status != "fixed" or not finding.repair_run_id or not finding.patch_hash or not finding.verification_refs:
+            raise RuleConflictError("标记 fixed 必须提供修复 Run、patch hash 和验证证据")
+        existing = self.finding(finding.id)
+        if existing.status == "fixed" and (existing.repair_run_id, existing.patch_hash, existing.verification_refs) == (
+                finding.repair_run_id, finding.patch_hash, finding.verification_refs):
+            return existing
+        if existing.status == "fixed":
+            raise RuleConflictError("已验证 Finding 的修复来源不可替换")
+        immutable = ("job_id", "run_id", "scope_id", "project_id", "repo_id", "rule_id",
+                     "rule_version", "source", "fingerprint", "source_base_commit", "source_manifest")
+        if any(getattr(existing, field) != getattr(finding, field) for field in immutable):
+            raise RuleConflictError("Finding 来源身份和指纹不可换绑")
+        with self.connect() as connection:
+            connection.execute("UPDATE findings SET status=?, data=?, updated_at=? WHERE id=?",
+                ("fixed", finding.model_dump_json(), _timestamp(), finding.id))
         return finding
 
     def finding(self, finding_id: str) -> Finding:
