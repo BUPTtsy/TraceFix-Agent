@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 
@@ -15,6 +16,9 @@ from tracefix.config import load_projects
 from tracefix.knowledge.scope import ScopeResolver
 from tracefix.knowledge.memory import MemoryLibrary
 from tracefix.storage.artifacts import Artifacts
+from tracefix.cli.main import Session
+from tracefix.storage.store import MemoryStore
+from langgraph.checkpoint.memory import InMemorySaver
 from tracefix.repository_control import dispatch
 from tracefix.repository_registry import RepositoryError, RepositoryRegistry
 
@@ -225,3 +229,40 @@ def test_ref_is_resolved_again_for_new_run_and_snapshot_digest_is_checked(tmp_pa
     path.write_text(yaml.safe_dump(raw), encoding='utf-8')
     with pytest.raises(RepositoryError):
         load_projects(path)
+
+
+@pytest.mark.asyncio
+async def test_managed_session_consumes_frozen_registry_without_tty(tmp_path, monkeypatch):
+    root = _checkout(tmp_path, 'repo', 'acme/app')
+    data = tmp_path / 'data'
+    path = tmp_path / 'projects.yaml'
+    registry = RepositoryRegistry(path, authorized_roots=[tmp_path], data_root=data)
+    registry.register(_fields(root, 'app', 'acme/app'))
+    frozen = registry.freeze('app', 'service_run')
+    monkeypatch.setenv('TRACEFIX_API_KEY', 'test-only')
+    monkeypatch.delenv('TRACEFIX_CONSOLE_RUN_ID', raising=False)
+    args = SimpleNamespace(project='app', projects=frozen['projects_path'], profile=frozen['profile_path'],
+                           console_db=str(tmp_path / 'console.sqlite3'), data=str(data), goal='service test',
+                           mode='test', plain=True, url=None, spec=None, skills='skills', run=True,
+                           command=None, execution_mode='batch')
+    session = Session(args, MemoryStore(), InMemorySaver())
+    session.begin_console_run()
+    calls = []
+    monkeypatch.setattr('tracefix.cli.main.DockerRunner', lambda *arguments: SimpleNamespace(browser_command=lambda: []))
+    monkeypatch.setattr('tracefix.cli.main.MCPBrowser', lambda *arguments: SimpleNamespace())
+    monkeypatch.setattr('tracefix.cli.main.Gateway', lambda: SimpleNamespace())
+    async def drive(state):
+        calls.append(state.run_id)
+    session.drive = drive
+    await session.create_agent()
+    await session.task
+    state = session.state()
+    assert calls == ['service_run']
+    assert state.run_id == frozen['repository_config']['frozen_run_id']
+    assert session.engine.profile.source_commit == frozen['commit']
+    assert session.engine.memory.cross_run is False
+    assert session.engine.retriever.cross_run is False
+    registry.update('app', {'allowed_files': ['src/main.py'], 'credential_ref': 'deploy/changed'})
+    session.validate_workspace(state)
+    assert state.remote_config['credential_ref'] == 'deploy/github'
+    assert session.engine.workspace.allowed_files == ['src/**']
