@@ -384,7 +384,7 @@ class Session:
             self.args.profile = snapshot['profile_path']
             self.scopes = ScopeResolver(load_projects(Path(self.args.projects)), Path(self.args.projects))
             self.ctx = self.scopes.context(self.scope)
-            profile = load_profile(Path(self.args.profile))
+            profile = Profile.model_validate(snapshot['repository_config']['profile'])
         elif managed and reuse_workspace:
             expected = state.remote_config or {}
             current = project.repository_config

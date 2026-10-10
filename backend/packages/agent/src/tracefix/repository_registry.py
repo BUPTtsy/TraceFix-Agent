@@ -378,6 +378,13 @@ class RepositoryRegistry:
     @staticmethod
     def _frozen_result(config, registry):
         profile = registry.parent / (config['repo_id'] + '.yaml')
+        try:
+            profile = plain_root(profile)
+            saved_profile = Profile(**yaml.safe_load(profile.read_text(encoding='utf-8')))
+        except (OSError, ValueError, TypeError, yaml.YAMLError):
+            raise RepositoryError('FROZEN_PROFILE_MISMATCH', '冻结 Profile 文件无效或不可读取', 409) from None
+        if saved_profile.model_dump(mode='json') != config['profile']:
+            raise RepositoryError('FROZEN_PROFILE_MISMATCH', '冻结 Profile 文件与仓库快照不一致', 409)
         return {'repo_id': config['repo_id'], 'projectId': config['repo_id'], 'commit': config['commit'],
                 'config_digest': config['config_digest'], 'repository_config': deepcopy(config),
                 'projects_path': str(registry), 'profile_path': str(profile),

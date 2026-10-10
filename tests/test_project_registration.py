@@ -266,3 +266,18 @@ async def test_managed_session_consumes_frozen_registry_without_tty(tmp_path, mo
     session.validate_workspace(state)
     assert state.remote_config['credential_ref'] == 'deploy/github'
     assert session.engine.workspace.allowed_files == ['src/**']
+
+
+def test_frozen_profile_tamper_is_rejected_before_runtime(tmp_path):
+    root = _checkout(tmp_path, 'repo', 'acme/app')
+    registry = RepositoryRegistry(tmp_path / 'projects.yaml', authorized_roots=[tmp_path], data_root=tmp_path / 'data')
+    registry.register(_fields(root, 'app', 'acme/app'))
+    frozen = registry.freeze('app', 'run_profile')
+    profile_path = Path(frozen['profile_path'])
+    payload = yaml.safe_load(profile_path.read_text(encoding='utf-8'))
+    payload['commands']['start'] = ['unapproved', 'command']
+    profile_path.write_text(yaml.safe_dump(payload), encoding='utf-8')
+    for source in [registry, RepositoryRegistry(Path(frozen['projects_path']))]:
+        with pytest.raises(RepositoryError) as rejected:
+            source.freeze('app', 'run_profile')
+        assert rejected.value.code == 'FROZEN_PROFILE_MISMATCH'
