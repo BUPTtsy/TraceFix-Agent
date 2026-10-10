@@ -14,7 +14,7 @@ from tracefix.cli.control import close_watcher, watch_stop_requests
 from tracefix.cli.render import Renderer
 from tracefix.cli.workspace import WorkspaceCommands, command_parser
 from tracefix.console import project_catalog
-from tracefix.config import load_profile, load_projects
+from tracefix.config import Profile, load_profile, load_projects
 from tracefix.execution.browser import MCPBrowser
 from tracefix.execution.policy import Policy
 from tracefix.execution.runner import DockerRunner
@@ -32,6 +32,7 @@ from tracefix.runtime.engine import Engine
 from tracefix.runtime.continuation import continuation_state
 from tracefix.rules import RuleLibrary, RuleResolver
 from tracefix.remote import RemoteConfigStore, effective, prepare_checkout
+from tracefix.repository_registry import RepositoryRegistry
 from tracefix.storage.artifacts import Artifacts, redact, sanitize
 from tracefix.storage.presentation import label
 from tracefix.storage.store import PostgresStore
@@ -347,8 +348,13 @@ class Session:
         await self.ensure_runtime()
         if not os.getenv('TRACEFIX_API_KEY'):
             raise ValueError('请设置 TRACEFIX_API_KEY 环境变量')
-        profile = self.project_profile()
-        remote = state.remote_config if reuse_workspace else effective(self.remote_store.get(self.scope), self.session_remote.get(self.scope))
+        project = self.scopes.projects[self.scope]
+        managed = bool(project.repository_config and project.repository_config.get('version') == 1)
+        profile = (Profile.model_validate(project.repository_config['profile'])
+                   if managed else self.project_profile())
+        if managed and not reuse_workspace and not project.repository_config['enabled']:
+            raise PermissionError('仓库已禁用，不能启动新 Run')
+        remote = state.remote_config if reuse_workspace else None if managed else effective(self.remote_store.get(self.scope), self.session_remote.get(self.scope))
         if remote and not reuse_workspace:
             project = self.scopes.projects[self.scope]
             destination = Path(remote.get('destination') or project.root)
@@ -359,7 +365,8 @@ class Session:
         url = state.url if reuse_workspace else self.args.url or profile.url
         Policy(profile.allowed_origins).url(url)
         if state is None:
-            state = RunState(scope_id=self.scope, goal=self.goal, url=url, mode=self.mode,
+            state = RunState(run_id=(project.repository_config.get('frozen_run_id') if managed else None) or new_id('run'),
+                             scope_id=self.scope, goal=self.goal, url=url, mode=self.mode,
                              execution_mode=self.execution_mode,
                              parent_run_id=self.continuation_parent or self.parent_run_id,
                              continuation_instruction=self.continuation_instruction,
@@ -369,6 +376,23 @@ class Session:
             state.continuation_count = len(state.continuation_markers)
             state.abnormal_termination = bool(state.continuation_count)
             state.continuation_instruction = record.get('continuationInstruction')
+        if managed and not reuse_workspace:
+            snapshot = RepositoryRegistry(Path(self.args.projects), data_root=Path(self.args.data)).freeze(
+                self.scope, state.run_id)
+            state.remote_config = snapshot['repository_config']
+            self.args.projects = snapshot['projects_path']
+            self.args.profile = snapshot['profile_path']
+            self.scopes = ScopeResolver(load_projects(Path(self.args.projects)), Path(self.args.projects))
+            self.ctx = self.scopes.context(self.scope)
+            profile = load_profile(Path(self.args.profile))
+        elif managed and reuse_workspace:
+            expected = state.remote_config or {}
+            current = project.repository_config
+            if (expected.get('repo_id') != current.get('repo_id')
+                    or expected.get('config_digest') != current.get('config_digest')
+                    or expected.get('commit') != current.get('commit')
+                    or expected.get('root') != current.get('root')):
+                raise PermissionError('Run 仓库配置快照与恢复配置不一致')
         workspace_path = Path(self.args.data)/'workspaces'/state.run_id
         if reuse_workspace:
             workspace, source = self.validate_workspace(state)
@@ -412,6 +436,10 @@ class Session:
 
     def validate_workspace(self, state, workspace=None, source=None, data_root=None):
         source = source if source is not None else self.artifacts.json(self.scope, state.run_id, state.repo_snapshot_ref)
+        config = self.scopes.projects[self.ctx.active_scope].repository_config
+        if config:
+            if config.get('frozen_run_id') != state.run_id or source.get('repository_config') != config:
+                raise PermissionError('仓库配置快照与 Run 身份不一致')
         workspace = workspace or Workspace(Path(data_root or self.args.data)/'workspaces'/state.run_id,
                                            self.scopes.projects[self.scope].allowed_files)
         if state.scope_id != self.ctx.active_scope or state.source_manifest != digest(source):
@@ -428,8 +456,10 @@ class Session:
         embedding = None
         if os.getenv('TRACEFIX_EMBEDDING_URL'):
             embedding = EmbeddingAdapter(os.environ['TRACEFIX_EMBEDDING_URL'], os.environ['TRACEFIX_EMBEDDING_REVISION'])
-        memory = MemoryLibrary(Path(self.args.data) / 'memory.sqlite3')
-        retriever = Retriever(self.store, self.scopes, self.ctx, embedding, fallback=memory)
+        managed = bool(self.scopes.projects[self.scope].repository_config)
+        memory = MemoryLibrary(Path(self.args.data) / 'memory.sqlite3', cross_run=False if managed else None)
+        retriever = Retriever(self.store, self.scopes, self.ctx, embedding, fallback=memory,
+                              cross_run=False if managed else None)
         rule_library = RuleLibrary(self.documents.path)
         rule_resolver = RuleResolver(rule_library)
         self.engine = Engine(self.store, self.artifacts, self.scopes, self.ctx, profile, workspace,

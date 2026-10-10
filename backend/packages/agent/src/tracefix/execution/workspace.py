@@ -161,6 +161,9 @@ class Workspace:
             'source_tree': git(top, 'rev-parse', f'{resolved}^{{tree}}').decode().strip(),
             'workspace_root': str(workspace.root), 'workspace_repository': repository_binding(target),
             'entries': file_manifest(target)}
+        if project.repository_config:
+            from copy import deepcopy
+            snapshot['repository_config'] = deepcopy(project.repository_config)
         workspace.repository_snapshot = snapshot
         return workspace, snapshot
 
@@ -209,6 +212,13 @@ class Workspace:
         snapshot = self.require_repository_snapshot(snapshot)
         scopes.assert_current(ctx)
         project = scopes.projects[ctx.active_scope]
+        if project.repository_config:
+            from tracefix.repository_registry import validate_stored_config
+            validate_stored_config(project)
+            if snapshot.get('repository_config') != project.repository_config:
+                raise PermissionError('源码快照与冻结仓库配置不一致')
+            if snapshot['commit'] != project.repository_config['commit']:
+                raise PermissionError('源码快照 commit 与仓库配置不一致')
         source = plain_root(project.root)
         if (snapshot['scope_id'] != ctx.active_scope or snapshot['repo_id'] != project.repo_id
                 or snapshot['source_root'] != str(source)

@@ -17,6 +17,7 @@ class Project(Contract):
     allowed_files: list[str] = Field(default_factory=lambda: ["src/**", "server/**"])
     shared_paths: list[str] = Field(default_factory=list)
     agent_instructions: str = "AGENTS.md"
+    repository_config: dict | None = None
 
     @model_validator(mode="after")
     def validate_agent_instructions(self):
@@ -65,6 +66,11 @@ def load_projects(path: Path) -> dict[str, Project]:
     for item in data["projects"]:
         item["root"] = (path.parent / item["root"]).resolve()
         p = Project(**item)
+        if p.repository_config:
+            from tracefix.repository_registry import validate_stored_config
+            validate_stored_config(p)
+            if data.get('frozen_run_id') and p.repository_config.get('frozen_run_id') != data['frozen_run_id']:
+                raise ValueError('冻结注册表的 run_id 与仓库快照不一致')
         if p.id in projects:
             raise ValueError("项目 ID 重复")
         projects[p.id] = p
@@ -78,26 +84,18 @@ def load_profile(path: Path) -> Profile:
 def create_project(path: Path, project_id: str, root: str, repo_id: str,
                    allowed_files: list[str] | None = None) -> Project:
     """Create a local product project in the user-owned registry."""
-    raw = yaml.safe_load(path.read_text(encoding='utf-8')) if path.exists() else {'projects': []}
-    raw = raw or {'projects': []}
-    entries = raw.get('projects', [])
-    if any(item.get('id') == project_id for item in entries):
-        raise ValueError('项目 ID 已存在')
-    item = {'id': project_id, 'repo_id': repo_id, 'root': root,
-            'allowed_files': allowed_files or ['src/**', 'server/**'],
-            'memory_revision': 1, 'access_epoch': 1, 'agent_instructions': 'AGENTS.md'}
-    project = Project(**{**item, 'root': (path.parent / root).resolve() if not Path(root).is_absolute() else Path(root)})
-    entries.append(item)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump({'projects': entries}, allow_unicode=True, sort_keys=False), encoding='utf-8')
-    project.root.mkdir(parents=True, exist_ok=True)
-    return project
+    from tracefix.repository_registry import RepositoryRegistry
+    return RepositoryRegistry(path).create_legacy(project_id, root, repo_id, allowed_files)
 
 
 def save_profile(path: Path, fields: dict) -> Profile:
     """Validate and persist a complete project execution profile."""
-    payload = dict(fields)
-    profile = Profile(**payload)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(profile.model_dump(mode='json'), allow_unicode=True, sort_keys=False), encoding='utf-8')
+    from tracefix.repository_registry import RepositoryRegistry
+    registry = path.parent / 'projects.yaml'
+    if registry.exists():
+        return RepositoryRegistry(registry).configure_legacy(fields['project'], fields, path)
+    from tracefix.repository_registry import atomic_yaml, registry_lock
+    profile = Profile(**dict(fields))
+    with registry_lock(path):
+        atomic_yaml(path, profile.model_dump(mode='json'))
     return profile
