@@ -96,6 +96,7 @@ function isAlive(pid) {try {process.kill(pid, 0); return true;} catch {return fa
 const agentStopper = createAgentStopper({bridge, view: agentView,
   ownedProcess: () => ({id: agent.id, child: agentProcess}), isAlive});
 function pythonCommand() {
+  if (process.env.TRACEFIX_PYTHON) return process.env.TRACEFIX_PYTHON;
   const candidates = process.platform === 'win32' ? ['.venv\\Scripts\\python.exe', 'py'] : ['.venv/bin/python', 'python3'];
   return candidates.find(candidate => candidate === 'py' || existsSync(path.join(projectRoot, candidate))) || candidates[candidates.length - 1];
 }
@@ -117,6 +118,7 @@ async function startAgent(goal, mode, projectId, continuation = null, derived = 
   agent = await bridge('run.update', {id: runId, changes: {processControlId,
     stopRequestedAt: null, stopPreviousStatus: null, stopError: null}});
   const child = spawn(python, args, {cwd: projectRoot, env: {...process.env, TRACEFIX_CONSOLE_RUN_ID: runId,
+    PYTHONPATH: [path.join(projectRoot, 'backend/packages/agent/src'), process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
     TRACEFIX_PROCESS_CONTROL_ID: processControlId, TRACEFIX_CONTINUATION_ID: continuation ? agent.continuationId : ''},
     windowsHide: true, detached: process.platform !== 'win32'});
   agentProcess = child;
@@ -164,6 +166,12 @@ const server = http.createServer(async (req,res) => {
     if ((url.pathname.startsWith('/api/') || url.pathname === '/__reset') && !requireControl(req, res)) return;
     if (url.pathname === '/api/services' && req.method === 'GET') return send(res, 200, [{id: 'test', label: 'Test 测试'}, {id: 'repair', label: 'Repair 修复'}, {id: 'chat', label: 'Chat 对话'}]);
     if (url.pathname === '/api/projects' && req.method === 'GET') return send(res, 200, await bridge('projects'));
+    if (url.pathname === '/api/v1/repositories' && req.method === 'GET') return send(res, 200, await bridge('repositories'));
+    if (url.pathname === '/api/v1/repositories' && req.method === 'POST') return send(res, 201, await bridge('repository.create', await body(req)));
+    const repositoryMatch = url.pathname.match(/^\/api\/v1\/repositories\/([^/]+)$/);
+    if (repositoryMatch && req.method === 'GET') return send(res, 200, await bridge('repository', {id: decodeURIComponent(repositoryMatch[1])}));
+    if (repositoryMatch && req.method === 'PATCH') return send(res, 200, await bridge('repository.update',
+      {id: decodeURIComponent(repositoryMatch[1]), patch: await body(req)}));
     if (url.pathname === '/api/runs' && req.method === 'GET') return send(res, 200, await bridge('runs', {projectId: url.searchParams.get('projectId') || undefined}));
     const traceMatch = url.pathname.match(/^\/api\/runs\/([a-zA-Z0-9_-]+)\/trace$/);
     if (traceMatch && req.method === 'GET') return send(res, 200, await bridge('run.trace', {id: traceMatch[1], after: url.searchParams.get('after') || 0}));
@@ -292,7 +300,8 @@ const server = http.createServer(async (req,res) => {
     if (res.headersSent) return;
     const status = Number.isInteger(e.status) ? e.status : e.code === 'ENOENT' ? 404 : 500;
     if (status >= 500) console.error(`请求 ${requestId} 处理失败：`, e);
-    send(res, status, {error: status >= 500 ? '服务器内部错误' : status === 404 ? '资源不存在' : e.message, requestId});
+    send(res, status, {error: status >= 500 ? '服务器内部错误' : status === 404 ? '资源不存在' : e.message,
+      ...(e.code ? {code: e.code} : {}), requestId});
   }
 });
 await bridge('runs.import');

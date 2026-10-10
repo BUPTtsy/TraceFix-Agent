@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import {spawnSync} from 'node:child_process';
 
 type Entry = {indent: number; content: string};
 
@@ -67,35 +68,50 @@ export function loadConfig(filename: string): Record<string, any> {
   return content.trimStart().startsWith('{') ? JSON.parse(content) : parseConfig(content);
 }
 
+export interface RepositoryControlOptions {
+  engineRoot?: string; pythonCommand?: string; repositoryRoots?: string[]; dataRoot?: string;
+  repositoryTimeoutMs?: number;
+}
+
+export function repositoryControl(filename: string, operation: string, fields: Record<string, any> = {},
+                                  options: RepositoryControlOptions = {}): any {
+  const failure = (code: string, message: string, status = 503) => Object.assign(new Error(message), {code, status});
+  const engineRoot = path.resolve(options.engineRoot || process.env.TRACEFIX_ENGINE_ROOT || process.cwd());
+  const localPython = path.join(engineRoot, process.platform === 'win32' ? '.venv/Scripts/python.exe' : '.venv/bin/python');
+  const python = options.pythonCommand || process.env.TRACEFIX_PYTHON ||
+    (fs.existsSync(localPython) ? localPython : process.platform === 'win32' ? 'py' : 'python3');
+  const env = {...process.env, PYTHONIOENCODING: 'utf-8',
+    PYTHONPATH: [path.join(engineRoot, 'backend/packages/agent/src'), process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+    ...(options.dataRoot ? {TRACEFIX_DATA: path.resolve(options.dataRoot)} : {}),
+    ...(options.repositoryRoots ? {TRACEFIX_REPOSITORY_ROOTS: JSON.stringify(options.repositoryRoots.map(root => path.resolve(root)))} : {})};
+  const result = spawnSync(python, [...(python === 'py' ? ['-3.12'] : []), '-m', 'tracefix.repository_control'],
+    {cwd: engineRoot, env, input: JSON.stringify({operation, projects_path: path.resolve(filename), fields}),
+      encoding: 'utf8', windowsHide: true, timeout: options.repositoryTimeoutMs || 15000, maxBuffer: 1048576});
+  if (result.error) throw failure(result.error.code === 'ETIMEDOUT' ? 'repository_control_timeout' : 'repository_control_unavailable',
+    result.error.code === 'ETIMEDOUT' ? '仓库控制服务超时' : '仓库控制服务不可用');
+  let response;
+  try {response = JSON.parse(result.stdout);}
+  catch {throw failure('repository_control_protocol', '仓库控制服务响应无效');}
+  if (!response || typeof response !== 'object' || typeof response.ok !== 'boolean')
+    throw failure('repository_control_protocol', '仓库控制服务响应无效');
+  if (!response.ok) {
+    const error = response.error;
+    if (!error || typeof error.code !== 'string' || typeof error.message !== 'string' ||
+        ![400, 401, 403, 404, 409, 413, 503].includes(error.status))
+      throw failure('repository_control_protocol', '仓库控制服务响应无效');
+    throw failure(error.code, error.message, error.status);
+  }
+  if (result.status !== 0 || !Object.hasOwn(response, 'data'))
+    throw failure('repository_control_protocol', '仓库控制服务响应无效');
+  return response.data;
+}
+
 export function createProject(filename: string, id: string, root: string, repoId: string): Record<string, any> {
-  if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) throw new Error('项目 ID 无效');
-  const registry = fs.existsSync(filename) ? loadConfig(filename) : {projects: []};
-  if (!Array.isArray(registry.projects) || registry.projects.some((project: Record<string, any>) => project.id === id))
-    throw new Error('项目 ID 已存在或注册表无效');
-  const item = {id, repo_id: repoId, root, allowed_files: ['src/**', 'server/**'],
-    memory_revision: 1, access_epoch: 1, agent_instructions: 'AGENTS.md'};
-  const target = path.resolve(path.dirname(filename), root);
-  registry.projects.push(item);
-  fs.mkdirSync(path.dirname(filename), {recursive: true});
-  fs.writeFileSync(filename, JSON.stringify(registry, null, 2) + '\n');
-  fs.mkdirSync(target, {recursive: true});
-  return {...item, root: target};
+  return repositoryControl(filename, 'project.create', {id, root, repoId});
 }
 
 export function configureProject(filename: string, id: string, fields: Record<string, any>): Record<string, any> {
-  if (!(loadConfig(filename).projects || []).some((project: Record<string, any>) => project.id === id))
-    throw new Error('未注册的项目');
-  const commands = fields.commands;
-  if (['start', 'reset', 'static', 'unit', 'build'].some(name => !Array.isArray(commands?.[name]) || !commands[name].length))
-    throw new Error('项目命令不能为空');
-  const url = new URL(fields.url || 'http://app:3000');
-  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || !['', '/'].includes(url.pathname))
-    throw new Error('项目 URL 无效');
-  const profile = {project: id, source_commit: fields.sourceCommit || 'HEAD', url: url.origin,
-    allowed_origins: [url.origin], commands};
-  const profilePath = path.join(path.dirname(filename), `${id}.yaml`);
-  fs.writeFileSync(profilePath, JSON.stringify(profile, null, 2) + '\n');
-  return {...profile, profilePath};
+  return repositoryControl(filename, 'project.configure', {id, fields});
 }
 
 export function projectCatalog(projectsPath: string, dataRoot: string, displayRoot = process.cwd()): Record<string, any>[] {
@@ -131,14 +147,19 @@ export function projectCatalog(projectsPath: string, dataRoot: string, displayRo
   if (fs.existsSync(remotePath)) remote = JSON.parse(fs.readFileSync(remotePath, 'utf8')).projects || {};
   return projects.map((project: Record<string, any>) => {
     const root = path.resolve(path.dirname(registry), project.root);
-    const entry = profiles.get(project.id);
+    const repository = project.repository_config;
+    const entry = repository?.version === 1 && repository.profile ?
+      {filename: repository.profile_ref || null, profile: repository.profile} : profiles.get(project.id);
+    const enabled = repository?.enabled !== false && project.enabled !== false;
     let issue: string | null = null;
-    if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) issue = '目标目录不存在，请先初始化或 clone 项目';
+    if (!enabled) issue = '仓库已禁用';
+    else if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) issue = '目标目录不存在，请先初始化或 clone 项目';
     else if (!fs.existsSync(path.join(root, '.git'))) issue = '目标目录尚未初始化 Git';
     else if (!entry) issue = '缺少有效的项目 Profile' + (errors.has(project.id) ? ': ' + errors.get(project.id) : '');
     return {
       id: project.id, repoId: project.repo_id, root: path.relative(displayRoot, root) || '.',
-      profile: entry ? path.relative(displayRoot, entry.filename) : null, registry, url: entry?.profile.url || null,
+      profile: entry?.filename ? path.relative(displayRoot, path.resolve(path.dirname(registry), entry.filename)) : null,
+      registry, url: entry?.profile.url || null, enabled, repositoryConfigVersion: repository?.version || null,
       allowedFiles: project.allowed_files || [], commands: entry?.profile.commands || {}, remoteConfig: remote[project.id] || null,
       ready: issue === null, issue,
     };

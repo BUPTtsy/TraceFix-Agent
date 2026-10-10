@@ -3,14 +3,14 @@ import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {DatabaseSync} from 'node:sqlite';
 import {artifactIndex, evidenceClosure, readArtifact, readArtifactBytes} from './artifacts.js';
-import {loadConfig, projectCatalog} from './config.js';
+import {loadConfig, projectCatalog, repositoryControl, type RepositoryControlOptions} from './config.js';
 import {canContinue, ConsoleDatabase, DataError, timestamp} from './database.js';
 import {RuleDatabase} from './rules.js';
 import {classifyGuidance, guidanceUnsafe} from './guidance.js';
 
 type Data = Record<string, any>;
 
-export interface ConsoleOptions {projectsPath?: string; dataRoot?: string; databasePath?: string; displayRoot?: string}
+export interface ConsoleOptions extends RepositoryControlOptions {projectsPath?: string; databasePath?: string; displayRoot?: string}
 
 export function createConsoleService(options: ConsoleOptions = {}) {
   const projectsPath = path.resolve(options.projectsPath || process.env.TRACEFIX_PROJECTS || 'profiles/projects.yaml');
@@ -18,6 +18,8 @@ export function createConsoleService(options: ConsoleOptions = {}) {
   const database = new ConsoleDatabase(path.resolve(options.databasePath || process.env.TRACEFIX_CONSOLE_DB || path.join(dataRoot, 'console.sqlite3')));
   const rules = new RuleDatabase(database);
   const catalog = () => projectCatalog(projectsPath, dataRoot, options.displayRoot);
+  const repository = (operation: string, fields: Data = {}) => repositoryControl(projectsPath, operation, fields,
+    {...options, engineRoot: options.engineRoot || options.displayRoot, dataRoot});
   const artifactRoot = (run: Data) => path.join(run.dataRoot || dataRoot, 'artifacts');
   // 与 Python 运行时共用 guidance.sqlite3，Web 写入先排队，执行层在安全边界读取并应用。
   const guidanceDb = (run: Data) => {
@@ -117,6 +119,11 @@ export function createConsoleService(options: ConsoleOptions = {}) {
   }
 
   function dispatch(operation: string, fields: Data = {}): any {
+    if (operation === 'repositories') return repository('repository.list');
+    if (operation === 'repository') return repository('repository.get', {id: fields.id});
+    if (operation === 'repository.create') return repository('repository.register', fields);
+    if (operation === 'repository.update') return repository('repository.update', {id: fields.id, patch: fields.patch});
+    if (operation === 'repository.freeze') return repository('repository.freeze', {id: fields.id, run_id: fields.run_id});
     if (operation === 'runs.import') return importRuns();
     if (operation === 'chat.project') {
       if (typeof fields.projectId !== 'string' || !fields.projectId) throw new DataError('请选择已注册的项目');
@@ -162,9 +169,11 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     }
     if (operation === 'run.continue') {
       const previous = database.run(fields.id);
+      const project = catalog().find(item => item.id === previous.projectId);
+      if (project?.enabled === false) throw new DataError('仓库已禁用', 409);
       dispatch('run.trace', {id: fields.id});
       const record = database.continueRun(fields.id, fields.instruction);
-      const project = catalog().find(item => item.id === previous.projectId);
+      if (previous.repositorySnapshot) return record;
       return project ? database.updateRun(record.id, {profile: project.profile, registry: project.registry}) : record;
     }
     if (operation === 'artifact') {
@@ -197,11 +206,25 @@ export function createConsoleService(options: ConsoleOptions = {}) {
         if (!['enabled', 'draft'].includes(rule.status) ||
             (rule.scope.project_ids.length && !rule.scope.project_ids.includes(project.id))) throw new DataError('追加规则已停用或不属于当前项目');
       }
-      return database.updateRun(randomUUID(), {...fields, profile: project.profile, registry: project.registry,
+      const runId = randomUUID();
+      const frozen = project.repositoryConfigVersion === 1 ? repository('repository.freeze', {id: project.id, run_id: runId}) : null;
+      if (frozen && (frozen.repo_id !== project.id || frozen.projectId !== project.id ||
+          !/^[a-f0-9]{40,64}$/.test(frozen.commit) || typeof frozen.config_digest !== 'string' ||
+          typeof frozen.projects_path !== 'string' || typeof frozen.profile_path !== 'string' ||
+          !path.isAbsolute(frozen.projects_path) || !path.isAbsolute(frozen.profile_path)))
+        throw new DataError('仓库冻结响应无效', 503);
+      return database.updateRun(runId, {...fields, id: runId, projectId: project.id,
+        profile: frozen?.profile_path || project.profile, registry: frozen?.projects_path || project.registry,
+        repositorySnapshot: frozen,
         goal: fields.goal.trim(), ...(parentRunId ? {parentRunId} : {}), additionalRuleIds,
         status: 'running', phase: 'STARTING', outcome: null, finishedAt: null, origin: 'web', dataRoot}, true);
     }
-    if (operation === 'run.update') return database.updateRun(fields.id, fields.changes);
+    if (operation === 'run.update') {
+      const previous = database.run(fields.id);
+      if (previous.repositorySnapshot && ['repositorySnapshot', 'profile', 'registry', 'projectId', 'dataRoot', 'id']
+          .some(key => Object.hasOwn(fields.changes || {}, key))) throw new DataError('运行仓库快照不可修改', 409);
+      return database.updateRun(fields.id, fields.changes);
+    }
     if (operation === 'run.stop.request') return database.requestStop(fields.id, fields.processControlId);
     if (operation === 'run.stop.failed') return database.stopFailed(fields.id, fields);
     if (operation === 'run.ended') {
