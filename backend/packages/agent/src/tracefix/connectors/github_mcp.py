@@ -577,8 +577,9 @@ class GitHubMCPConnector:
                        or parts[:1] == [self.config.commit] and "/".join(parts[1:]) == request.path for parts in paths):
                 raise GitHubMCPError("binding_mismatch", "GitHub MCP 文件响应 commit 与 Run 快照不一致")
         if kind in _ISSUE_KINDS:
-            category = "issues" if kind == "issue" else "pull"
-            if request is None or payload.get("number") != request.number or not any(parts[:2] == [category, str(request.number)] for parts in paths):
+            categories = {"issues"} if kind == "issue" else {"pull", "pulls"}
+            if (request is None or payload.get("number") != request.number
+                    or not any(parts[:2] in ([category, str(request.number)] for category in categories) for parts in paths)):
                 raise GitHubMCPError("binding_mismatch", "GitHub MCP Issue/PR 响应编号不一致")
 
     def _bound_url(self, value: Any) -> list[str]:

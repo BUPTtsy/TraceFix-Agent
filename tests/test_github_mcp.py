@@ -450,6 +450,19 @@ async def test_malformed_source_url_returns_stable_error(mcp_mock):
         await connector.close()
 
 
+async def test_pull_request_accepts_bound_github_api_url(mcp_mock):
+    connector, session = await opened(mcp_mock)
+    session.hook = lambda name, arguments: response({
+        "number": 3, "url": "https://api.github.com/repos/owner/app/pulls/3",
+        "body": "explicit caller description", "title": "PR",
+    }) if name == "pull_request_read" else None
+    try:
+        context = await connector.read_context("pull_request", number=3)
+        assert context.source_url == "https://api.github.com/repos/owner/app/pulls/3"
+    finally:
+        await connector.close()
+
+
 async def test_exact_file_pattern_does_not_expand_to_children(mcp_mock):
     connector, session = await opened(mcp_mock, replace(config(), allowed_files=("src/value.ts",)))
     try:
