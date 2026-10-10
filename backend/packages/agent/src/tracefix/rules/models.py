@@ -25,6 +25,7 @@ FindingSource = Literal["oracle", "static", "guided", "user"]
 FindingStatus = Literal[
     "suspected", "reproduced", "not_reproducible", "fixed", "wont_fix", "false_positive",
 ]
+CoverageStatus = Literal["checked_pass", "matched", "not_completed", "not_applicable"]
 OracleKind = Literal[
     "console_no_error", "network_status", "dom_assertion", "dom_after_action",
     "a11y_axe", "visual_threshold",
@@ -145,6 +146,8 @@ class Rule(Contract):
             "id": self.id, "version": self.version, "severity": self.severity,
             "name": self.name, "category": self.category,
             "check": check, "fix_guidance": self.fix_guidance,
+            "tags": self.tags, "examples": self.examples,
+            "scope": self.scope.model_dump(mode="json"), "phases": self.phases,
         }
 
 
@@ -159,13 +162,47 @@ class RuleRef(Contract):
 class RuleSnapshot(Contract):
     run_id: str
     parent_run_id: str | None = None
+    format_version: int = Field(default=2, ge=1)
     refs: list[RuleRef] = Field(default_factory=list)
+    rules: list[Rule] = Field(default_factory=list)
+    body_hashes: dict[str, str] = Field(default_factory=dict)
+    scope_id: str | None = None
+    project_id: str | None = None
+    repo_id: str | None = None
     hash: str = ""
     created_at: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def legacy_format(cls, value):
+        if isinstance(value, dict) and "format_version" not in value and "rules" not in value:
+            return {**value, "format_version": 1}
+        return value
+
     @model_validator(mode="after")
     def compute_hash(self):
-        expected = digest([ref.model_dump(mode="json") for ref in self.refs])
+        if self.rules and not self.refs:
+            self.refs = [RuleRef(id=rule.id, version=rule.version) for rule in self.rules]
+        if self.format_version >= 2:
+            if len({ref.id for ref in self.refs}) != len(self.refs):
+                raise ValueError("rule snapshot 中规则 id 重复")
+            frozen_refs = [RuleRef(id=rule.id, version=rule.version) for rule in self.rules]
+            if frozen_refs != self.refs:
+                raise ValueError("rule snapshot 正文与规则版本集合不一致")
+            hashes = {ref.key(): rule.body_hash for ref, rule in zip(self.refs, self.rules)}
+            if self.body_hashes and self.body_hashes != hashes:
+                raise ValueError("rule snapshot body hash 与冻结正文不一致")
+            self.body_hashes = hashes
+            expected = digest({
+                "refs": [ref.model_dump(mode="json") for ref in self.refs],
+                "rules": [rule.model_dump(mode="json") for rule in self.rules],
+                "body_hashes": self.body_hashes,
+                "scope_id": self.scope_id,
+                "project_id": self.project_id,
+                "repo_id": self.repo_id,
+            })
+        else:
+            expected = digest([ref.model_dump(mode="json") for ref in self.refs])
         if self.hash and self.hash != expected:
             raise ValueError("rule snapshot hash 与规则版本集合不一致")
         self.hash = expected
@@ -176,25 +213,59 @@ class Finding(Contract):
     id: str = Field(default_factory=lambda: new_id("finding"))
     job_id: str
     run_id: str | None = None
+    scope_id: str | None = None
+    project_id: str | None = None
+    repo_id: str | None = None
     rule_id: str | None = None
     rule_version: int | None = Field(default=None, ge=1)
     source: FindingSource
     severity: RuleSeverity
     title: str = Field(min_length=1, max_length=240)
+    expected: str = ""
+    actual: str = ""
     location: dict[str, Any] = Field(default_factory=dict)
     evidence_refs: list[str] = Field(default_factory=list)
     status: FindingStatus = "suspected"
     fingerprint: str
     details: dict[str, Any] = Field(default_factory=dict)
+    source_base_commit: str | None = None
+    source_manifest: str | None = None
+    repair_run_id: str | None = None
+    patch_hash: str | None = None
+    verification_refs: list[str] = Field(default_factory=list)
 
     @classmethod
     def from_failure(cls, *, job_id: str, run_id: str | None, rule: Rule | None,
                      title: str, location: dict[str, Any], evidence_refs: list[str] | None = None,
-                     details: dict[str, Any] | None = None, failure_signature: Any = None):
+                     details: dict[str, Any] | None = None, failure_signature: Any = None,
+                     scope_id: str | None = None, project_id: str | None = None,
+                     repo_id: str | None = None, expected: str = "", actual: str = "",
+                     source: FindingSource | None = None):
         rule_id = rule.id if rule else None
         rule_version = rule.version if rule else None
-        fingerprint = digest([rule_id, location, failure_signature or title])
+        fingerprint = digest([scope_id, project_id, repo_id, rule_id, location, failure_signature or title])
         return cls(job_id=job_id, run_id=run_id, rule_id=rule_id, rule_version=rule_version,
-                   source=rule.source if rule else "user", severity=rule.severity if rule else "minor",
+                   scope_id=scope_id, project_id=project_id, repo_id=repo_id,
+                   source=source or (rule.source if rule else "user"), severity=rule.severity if rule else "minor",
                    title=title, location=location, evidence_refs=evidence_refs or [],
-                   fingerprint=fingerprint, details=details or {})
+                   expected=expected, actual=actual, fingerprint=fingerprint, details=details or {})
+
+
+class RuleCoverage(Contract):
+    run_id: str
+    rule_id: str
+    rule_version: int = Field(ge=1)
+    phase: str
+    status: CoverageStatus
+    scope_id: str | None = None
+    project_id: str | None = None
+    repo_id: str | None = None
+    reason: str = ""
+    evidence_refs: list[str] = Field(default_factory=list)
+    finding_ids: list[str] = Field(default_factory=list)
+
+
+class RuleEvaluation(Contract):
+    findings: list[Finding] = Field(default_factory=list)
+    status: CoverageStatus
+    reason: str = ""

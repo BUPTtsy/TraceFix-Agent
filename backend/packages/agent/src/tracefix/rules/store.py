@@ -9,7 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .models import Finding, Rule, RuleRef, RuleSnapshot
+from tracefix.runtime.contracts import digest
+
+from .models import Finding, Rule, RuleCoverage, RuleRef, RuleSnapshot
 
 
 def _timestamp() -> str:
@@ -62,7 +64,15 @@ class RuleLibrary:
               version INTEGER NOT NULL, items TEXT NOT NULL, created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS rule_coverage (
+              run_id TEXT NOT NULL, rule_id TEXT NOT NULL, version INTEGER NOT NULL,
+              phase TEXT NOT NULL, data TEXT NOT NULL, updated_at TEXT NOT NULL,
+              PRIMARY KEY(run_id, rule_id, version, phase)
+            );
             """)
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(rule_run_snapshots)")}
+            if "snapshot_data" not in columns:
+                connection.execute("ALTER TABLE rule_run_snapshots ADD COLUMN snapshot_data TEXT")
         self.seed_builtins()
 
     def seed_builtins(self) -> list[Rule]:
@@ -87,7 +97,12 @@ class RuleLibrary:
             connection.close()
 
     def _body(self, row) -> Rule:
-        return Rule.model_validate(json.loads(row["body"]))
+        rule = Rule.model_validate(json.loads(row["body"]))
+        if row["body_hash"] != rule.body_hash:
+            raise ValueError(f"规则版本正文 hash 不匹配：{rule.id}@{rule.version}")
+        if rule.id != row["rule_id"] or rule.version != row["version"]:
+            raise ValueError("规则版本正文身份不匹配")
+        return rule
 
     def rules(self, *, project_id: str | None = None, include_archived: bool = False,
               status: str | None = None, query: str = "") -> list[Rule]:
@@ -101,10 +116,7 @@ class RuleLibrary:
             rows = connection.execute(f"SELECT id, current_version FROM rules{where} ORDER BY updated_at DESC", params).fetchall()
         result = []
         for row in rows:
-            try:
-                rule = self.version(row["id"], row["current_version"])
-            except (FileNotFoundError, ValueError):
-                continue
+            rule = self.version(row["id"], row["current_version"])
             scope = rule.scope
             if project_id and scope.project_ids and project_id not in scope.project_ids:
                 continue
@@ -122,7 +134,7 @@ class RuleLibrary:
 
     def version(self, rule_id: str, version: int) -> Rule:
         with self.connect() as connection:
-            row = connection.execute("SELECT body FROM rule_versions WHERE rule_id=? AND version=?", (rule_id, version)).fetchone()
+            row = connection.execute("SELECT rule_id, version, body, body_hash FROM rule_versions WHERE rule_id=? AND version=?", (rule_id, version)).fetchone()
         if row is None:
             raise FileNotFoundError("规则版本不存在")
         return self._body(row)
@@ -198,11 +210,20 @@ class RuleLibrary:
             connection.execute("DELETE FROM rules WHERE id=?", (rule_id,))
 
     def save_snapshot(self, snapshot: RuleSnapshot) -> RuleSnapshot:
+        from .resolver import RuleResolver
+        snapshot = RuleSnapshot.model_validate(snapshot.model_dump(mode="json"))
+        RuleResolver(self).load_snapshot_rules(snapshot, project_id=snapshot.project_id,
+                                               scope_id=snapshot.scope_id, repo_id=snapshot.repo_id)
         with self.connect() as connection:
-            connection.execute("INSERT OR REPLACE INTO rule_run_snapshots VALUES (?,?,?,?,?)",
+            old = connection.execute("SELECT snapshot_hash FROM rule_run_snapshots WHERE run_id=?", (snapshot.run_id,)).fetchone()
+            if old:
+                if old["snapshot_hash"] != snapshot.hash:
+                    raise RuleConflictError("活动 Run 的规则快照不可替换")
+                return snapshot
+            connection.execute("INSERT INTO rule_run_snapshots (run_id,parent_run_id,snapshot_hash,refs,created_at,snapshot_data) VALUES (?,?,?,?,?,?)",
                                (snapshot.run_id, snapshot.parent_run_id, snapshot.hash,
                                 json.dumps([ref.model_dump(mode="json") for ref in snapshot.refs], ensure_ascii=False),
-                                snapshot.created_at or _timestamp()))
+                                snapshot.created_at or _timestamp(), snapshot.model_dump_json()))
             for ref in snapshot.refs:
                 connection.execute("INSERT OR REPLACE INTO rule_assignments VALUES (?,?,?,?)",
                                    (snapshot.run_id, ref.id, ref.version, snapshot.created_at or _timestamp()))
@@ -213,8 +234,13 @@ class RuleLibrary:
             row = connection.execute("SELECT * FROM rule_run_snapshots WHERE run_id=?", (run_id,)).fetchone()
         if row is None:
             return None
+        if row["snapshot_data"]:
+            fields = json.loads(row["snapshot_data"])
+            fields.update(run_id=row["run_id"], parent_run_id=row["parent_run_id"], hash=row["snapshot_hash"],
+                          refs=json.loads(row["refs"]))
+            return RuleSnapshot.model_validate(fields)
         refs = [RuleRef.model_validate(ref) for ref in json.loads(row["refs"])]
-        return RuleSnapshot(run_id=run_id, parent_run_id=row["parent_run_id"], refs=refs,
+        return RuleSnapshot(run_id=run_id, parent_run_id=row["parent_run_id"], format_version=1, refs=refs,
                             hash=row["snapshot_hash"], created_at=row["created_at"])
 
     def run_rules(self, run_id: str) -> list[RuleRef]:
@@ -224,41 +250,68 @@ class RuleLibrary:
 
     def save_finding(self, finding: Finding) -> Finding:
         now = _timestamp()
+        finding = Finding.model_validate(finding.model_dump(mode="json"))
+        key = digest([finding.scope_id, finding.project_id, finding.repo_id, finding.run_id, finding.fingerprint])
         with self.connect() as connection:
-            row = connection.execute("SELECT data FROM findings WHERE fingerprint=?", (finding.fingerprint,)).fetchone()
+            row = connection.execute("SELECT id, data FROM findings WHERE id=? OR fingerprint=?", (finding.id, key)).fetchone()
             if row:
                 old = Finding.model_validate(json.loads(row["data"]))
-                if finding.status != old.status or finding.evidence_refs:
-                    old = old.model_copy(update={"status": finding.status, "evidence_refs": list(dict.fromkeys(old.evidence_refs + finding.evidence_refs)), "details": {**old.details, **finding.details}})
-                    connection.execute("UPDATE findings SET status=?, data=?, updated_at=? WHERE fingerprint=?",
-                                       (old.status, old.model_dump_json(), now, old.fingerprint))
+                if (old.run_id, old.scope_id, old.project_id, old.repo_id) != (finding.run_id, finding.scope_id, finding.project_id, finding.repo_id):
+                    raise RuleConflictError("Finding 的 Run 与项目仓库归属不可替换")
+                updates = finding.model_dump(mode="python", exclude={"id", "evidence_refs", "details"})
+                updates.update(evidence_refs=list(dict.fromkeys(old.evidence_refs + finding.evidence_refs)),
+                               details={**old.details, **finding.details})
+                old = old.model_copy(update=updates)
+                connection.execute("UPDATE findings SET status=?, data=?, updated_at=? WHERE id=?",
+                                   (old.status, old.model_dump_json(), now, old.id))
                 return old
             connection.execute("INSERT INTO findings VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                                (finding.id, finding.job_id, finding.run_id, finding.rule_id, finding.rule_version,
-                                finding.source, finding.severity, finding.status, finding.fingerprint,
+                                finding.source, finding.severity, finding.status, key,
                                 finding.model_dump_json(), now, now))
         return finding
 
+    def finding(self, finding_id: str) -> Finding:
+        with self.connect() as connection:
+            row = connection.execute("SELECT data FROM findings WHERE id=?", (finding_id,)).fetchone()
+        if row is None:
+            raise FileNotFoundError("Finding 不存在")
+        return Finding.model_validate(json.loads(row["data"]))
+
     def findings(self, *, rule_id: str | None = None, run_id: str | None = None,
-                 status: str | None = None, limit: int = 100) -> list[Finding]:
+                 status: str | None = None, limit: int = 100, scope_id: str | None = None,
+                 project_id: str | None = None, repo_id: str | None = None) -> list[Finding]:
         clauses, params = [], []
         for key, value in (("rule_id", rule_id), ("run_id", run_id), ("status", status)):
             if value is not None: clauses.append(key + "=?"); params.append(value)
+        for key, value in (("scope_id", scope_id), ("project_id", project_id), ("repo_id", repo_id)):
+            if value is not None:
+                clauses.append(f"json_extract(data, '$.{key}')=?")
+                params.append(value)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self.connect() as connection:
             rows = connection.execute(f"SELECT data FROM findings{where} ORDER BY created_at DESC LIMIT ?", [*params, max(1, min(limit, 1000))]).fetchall()
         return [Finding.model_validate(json.loads(row["data"])) for row in rows]
 
-    def insights(self, *, from_time: str | None = None, to_time: str | None = None) -> list[dict[str, Any]]:
+    def insights(self, *, from_time: str | None = None, to_time: str | None = None,
+                 scope_id: str | None = None, project_id: str | None = None,
+                 repo_id: str | None = None) -> list[dict[str, Any]]:
         clauses, params = [], []
         if from_time: clauses.append("created_at >= ?"); params.append(from_time)
         if to_time: clauses.append("created_at <= ?"); params.append(to_time)
+        for key, value in (("scope_id", scope_id), ("project_id", project_id), ("repo_id", repo_id)):
+            if value is not None:
+                clauses.append(f"json_extract(data, '$.{key}')=?")
+                params.append(value)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self.connect() as connection:
-            rows = connection.execute(f"SELECT rule_id, status, COUNT(*) AS count FROM findings{where} GROUP BY rule_id, status", params).fetchall()
-        grouped: dict[str, dict[str, Any]] = {}
+            rows = connection.execute(f"SELECT rule_id, status, json_extract(data, '$.scope_id') AS scope_id, json_extract(data, '$.project_id') AS project_id, json_extract(data, '$.repo_id') AS repo_id, COUNT(*) AS count FROM findings{where} GROUP BY scope_id, project_id, repo_id, rule_id, status", params).fetchall()
+        grouped: dict[tuple, dict[str, Any]] = {}
         for row in rows:
-            item = grouped.setdefault(row["rule_id"] or "__unscoped__", {"rule_id": row["rule_id"], "total": 0, "reproduced": 0, "false_positive": 0, "fixed": 0})
+            key = (row["scope_id"], row["project_id"], row["repo_id"], row["rule_id"])
+            item = grouped.setdefault(key, {"rule_id": row["rule_id"], "scope_id": row["scope_id"],
+                "project_id": row["project_id"], "repo_id": row["repo_id"], "total": 0,
+                "reproduced": 0, "false_positive": 0, "fixed": 0})
             item["total"] += row["count"]; item[row["status"]] = row["count"]
         for item in grouped.values():
             total = item["total"] or 1
@@ -266,6 +319,22 @@ class RuleLibrary:
             item["false_positive_rate"] = item.get("false_positive", 0) / total
             item["fix_rate"] = item.get("fixed", 0) / total
         return list(grouped.values())
+
+    def save_coverage(self, coverage: RuleCoverage | dict) -> RuleCoverage:
+        coverage = RuleCoverage.model_validate(coverage)
+        with self.connect() as connection:
+            connection.execute("INSERT OR REPLACE INTO rule_coverage VALUES (?,?,?,?,?,?)",
+                (coverage.run_id, coverage.rule_id, coverage.rule_version, coverage.phase,
+                 coverage.model_dump_json(), _timestamp()))
+        return coverage
+
+    def coverage(self, run_id: str, *, scope_id: str | None = None,
+                 project_id: str | None = None, repo_id: str | None = None) -> list[RuleCoverage]:
+        with self.connect() as connection:
+            rows = connection.execute("SELECT data FROM rule_coverage WHERE run_id=? ORDER BY rule_id, phase", (run_id,)).fetchall()
+        records = [RuleCoverage.model_validate(json.loads(row["data"])) for row in rows]
+        filters = (("scope_id", scope_id), ("project_id", project_id), ("repo_id", repo_id))
+        return [record for record in records if all(value is None or getattr(record, key) == value for key, value in filters)]
 
     def save_rule_set(self, fields: dict[str, Any], set_id: str | None = None) -> dict[str, Any]:
         now = _timestamp(); set_id = set_id or str(uuid.uuid4())

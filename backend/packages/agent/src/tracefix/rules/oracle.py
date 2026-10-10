@@ -7,8 +7,9 @@ from fnmatch import fnmatchcase
 from typing import Any
 
 from tracefix.execution.browser import elements
+from tracefix.runtime.contracts import digest
 
-from .models import Finding, Rule
+from .models import Finding, Rule, RuleEvaluation
 
 
 def _payload_lines(value: Any) -> list[Any]:
@@ -133,7 +134,7 @@ def _dom(rule: Rule, config: dict, observation: dict, *, job_id: str, run_id: st
                      details={"condition": condition, "matches": len(matches), "config": config})]
 
 
-def evaluate_oracle(rule: Rule, observation: dict, *, job_id: str, run_id: str | None = None,
+def _evaluate_oracle(rule: Rule, observation: dict, *, job_id: str, run_id: str | None = None,
                     evidence_ref: str | None = None, previous_observation: dict | None = None,
                     action: dict | None = None) -> list[Finding]:
     """Evaluate one Oracle rule against an observation and return Findings.
@@ -186,3 +187,66 @@ def evaluate_oracle(rule: Rule, observation: dict, *, job_id: str, run_id: str |
                          location={"url": observation.get("url")}, evidence_ref=evidence_ref,
                          details={"kind": kind, "failure": internal_failure})]
     return []
+
+
+def evaluate_oracle(rule: Rule, observation: dict, *, job_id: str, run_id: str | None = None,
+                    evidence_ref: str | None = None, previous_observation: dict | None = None,
+                    action: dict | None = None, scope_id: str | None = None,
+                    project_id: str | None = None, repo_id: str | None = None) -> list[Finding]:
+    findings = _evaluate_oracle(rule, observation, job_id=job_id, run_id=run_id,
+                                evidence_ref=evidence_ref, previous_observation=previous_observation,
+                                action=action)
+    config = rule.detection.oracle or {}
+    for finding in findings:
+        finding.scope_id, finding.project_id, finding.repo_id = scope_id, project_id, repo_id
+        finding.fingerprint = digest([scope_id, project_id, repo_id, finding.rule_id,
+                                      finding.location, finding.details])
+        finding.expected = str(config.get("expected") or f"满足 {rule.name}：{json.dumps(config, ensure_ascii=False, sort_keys=True)}")
+        finding.actual = str(finding.details.get("message") or finding.details.get("failure") or json.dumps(finding.details, ensure_ascii=False, sort_keys=True))
+        finding.details["rule_context"] = rule.summary()
+    return findings
+
+
+def evaluate_oracle_result(rule: Rule, observation: dict, *, job_id: str,
+                           run_id: str | None = None, evidence_ref: str | None = None,
+                           previous_observation: dict | None = None,
+                           action: dict | None = None, scope_id: str | None = None,
+                           project_id: str | None = None, repo_id: str | None = None) -> RuleEvaluation:
+    if rule.detection.type != "oracle":
+        return RuleEvaluation(status="not_applicable", reason="不是 Oracle 规则")
+    config = rule.detection.oracle or {}
+    kind = config.get("kind")
+    channel = {"console_no_error": "console", "network_status": "network",
+               "dom_assertion": "snapshot", "dom_after_action": "snapshot"}.get(kind)
+    if channel and (channel not in observation or observation[channel] is None):
+        return RuleEvaluation(status="not_completed", reason=f"缺少确定性检查输入：{channel}")
+    if kind == "dom_after_action":
+        if not action:
+            return RuleEvaluation(status="not_applicable", reason="尚未执行规则触发动作")
+        trigger = config.get("trigger", {})
+        if trigger and action.get("kind") != trigger.get("action"):
+            return RuleEvaluation(status="not_applicable", reason="当前动作不匹配规则触发器")
+        trigger_locator = trigger.get("locator", {})
+        locator = action.get("locator") or {}
+        if trigger_locator.get("role") and trigger_locator["role"] != locator.get("role"):
+            return RuleEvaluation(status="not_applicable", reason="当前动作目标不匹配规则触发器")
+        try:
+            if trigger_locator.get("name_regex") and not re.search(str(trigger_locator["name_regex"]), str(locator.get("name", ""))):
+                return RuleEvaluation(status="not_applicable", reason="当前动作目标不匹配规则触发器")
+        except re.error:
+            return RuleEvaluation(status="not_completed", reason="规则触发正则无效")
+        if not config.get("expect_any"):
+            return RuleEvaluation(status="not_completed", reason="动作后规则缺少可执行预期")
+    if kind in {"dom_assertion", "dom_after_action"}:
+        expectations = config.get("expect_any", []) if kind == "dom_after_action" else [config]
+        if any(not expectation.get("locator") or expectation.get("condition", "visible") not in {
+                "visible", "absent", "checked", "disabled", "enabled"} for expectation in expectations):
+            return RuleEvaluation(status="not_completed", reason="DOM 规则缺少受支持的可执行条件或目标")
+    findings = evaluate_oracle(rule, observation, job_id=job_id, run_id=run_id,
+                               evidence_ref=evidence_ref, previous_observation=previous_observation,
+                               action=action, scope_id=scope_id, project_id=project_id, repo_id=repo_id)
+    if findings:
+        return RuleEvaluation(findings=findings, status="matched", reason="确定性规则检测到不符合项")
+    if kind in {"a11y_axe", "visual_threshold"}:
+        return RuleEvaluation(status="not_completed", reason="当前执行面未提供该 Oracle 的确定性验证器")
+    return RuleEvaluation(status="checked_pass")
