@@ -100,14 +100,14 @@ class ContextAssembler:
     排查确认模型实际看到的内容。
     """
 
-    ORDER = ('policy', 'project_instructions', 'detection_rules', 'skill_index', 'skills',
+    ORDER = ('policy', 'project_instructions', 'detection_rules', 'repair_source', 'skill_index', 'skills',
              'goal', 'test_spec', 'task', 'user_guidance', 'review_guidance', 'working_memory',
              'job_memory', 'retrieved_memory', 'code_insights', 'cards', 'observation',
              'recent_steps', 'recent_action_results', 'instruction')
     PROTECTED = {'policy', 'project_instructions', 'goal', 'test_spec', 'task',
                  'scope', 'phase', 'patch_hash', 'evidence_refs', 'available_evidence_refs',
                  'allowed_files', 'allowed_urls', 'authorized_actions', 'rule_snapshot_hash',
-                 'detection_rules', 'user_guidance', 'review_guidance', 'guidance_policy',
+                 'detection_rules', 'repair_source', 'user_guidance', 'review_guidance', 'guidance_policy',
                  'effective_constraints', 'ack_required', 'guidance_ack_required', 'instruction'}
     OPTIONAL = ('recent_steps', 'recent_action_results', 'observation', 'code_insights',
                 'cards', 'retrieved_memory', 'repair_memory', 'job_memory',

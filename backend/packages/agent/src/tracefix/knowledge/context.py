@@ -35,6 +35,8 @@ def build_context(state, spec, observation=None, cards=None, pairs=None, max_cha
                  "available_evidence_refs": available_evidence_refs, "goal": state.goal,
                  "detection_rules": detection_rules,
                  "rule_snapshot_hash": getattr(state, "rule_snapshot_hash", "")}
+    if getattr(state, 'repair_source', None) is not None:
+        protected['repair_source'] = state.repair_source.model_dump(mode='json')
     protected['user_guidance'] = [entry.model_dump(mode='json') for entry in active_guidance(state)]
     protected['effective_constraints'] = [entry.model_dump(mode='json') for entry in getattr(state, 'guidance_constraints', [])]
     result = {**protected, "observation": observation, "cards": [], "recent_action_results": []}

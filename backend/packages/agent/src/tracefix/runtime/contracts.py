@@ -323,6 +323,10 @@ class GUIIssue(Contract):
     expected: str = Field(min_length=1, max_length=1200)
     actual: str = Field(min_length=1, max_length=1200)
     evidence_refs: list[str] = Field(min_length=1, max_length=20)
+    rule_refs: list[str] = Field(default_factory=list, max_length=1,
+        description='At most one minimal source rule id from the current injected detection_rules. '
+                    'Never invent un-injected ids or copy Decision.rule_refs. An empty list means a free GUI observation. '
+                    'Split multiple rule matches into separate issues.')
 
 
 class Decision(Contract):
@@ -388,11 +392,47 @@ class Validation(Contract):
     replay_plan_hash: str = Field(min_length=1)
 
 
+class FindingRepairSource(Contract):
+    source_run_id: str = Field(min_length=1,
+        description='Uniquely resolved internal Run identity, never an inferred control-plane id.')
+    source_finding_ids: list[str] = Field(min_length=1)
+    source_scope_id: str = Field(min_length=1)
+    source_project_id: str | None = None
+    source_repo_id: str | None = None
+    source_base_commit: str = Field(pattern=r'^(?:[a-f0-9]{40}|[a-f0-9]{64})$',
+        description='Original source repository commit, distinct from the exported workspace HEAD.')
+    source_workspace_base_commit: str | None = Field(default=None, pattern=r'^(?:[a-f0-9]{40}|[a-f0-9]{64})$')
+    source_manifest: str = Field(min_length=1)
+    source_repo_snapshot_ref: str = Field(min_length=1)
+    source_repo_snapshot: dict
+    source_rule_snapshot_ref: str = Field(min_length=1)
+    source_rule_snapshot_hash: str = Field(min_length=1)
+    source_rule_snapshot: dict
+    source_rule_refs: list[dict] = Field(default_factory=list)
+    source_evidence_refs: list[str] = Field(min_length=1)
+    source_evidence_hashes: dict[str, str] = Field(default_factory=dict)
+    findings: list[dict] = Field(min_length=1)
+    replay_plan: list[dict] = Field(default_factory=list)
+    failure_feedback: list[dict] = Field(default_factory=list)
+    target_base_commit: str | None = Field(default=None, pattern=r'^(?:[a-f0-9]{40}|[a-f0-9]{64})$')
+    revision_rebound: bool = False
+
+    @model_validator(mode='after')
+    def unique_source_findings(self):
+        if len(self.source_finding_ids) != len(set(self.source_finding_ids)):
+            raise ValueError('来源 Finding id 不可重复')
+        if [finding.get('id') for finding in self.findings] != self.source_finding_ids:
+            raise ValueError('来源 Finding 正文与选择的 id 不一致')
+        return self
+
+
 class RunState(Contract):
     # 状态快照保存引用，完整证据与模型响应存放在对应 artifact 中。
     schema_version: str = SCHEMA_VERSION
     run_id: str = Field(default_factory=lambda: new_id("run"))
     scope_id: str
+    project_id: str | None = None
+    repo_id: str | None = None
     goal: str
     job_id: str | None = None
     parent_run_id: str | None = None
@@ -482,7 +522,11 @@ class RunState(Contract):
     rule_snapshot_ref: str | None = None
     rule_snapshot_hash: str = ""
     rule_refs: list[dict] = Field(default_factory=list)
+    rule_ids: list[str] = Field(default_factory=list,
+        description='Append selected rules to the current project mandatory rules; never replace them.')
     additional_rule_ids: list[str] = Field(default_factory=list)
+    rule_coverage: list[dict] = Field(default_factory=list)
+    repair_source: FindingRepairSource | None = None
     guidance: list[Guidance] = Field(default_factory=list)
     # 已应用的强制约束持续参与动作/补丁检查，不因模型确认而解除。
     guidance_constraints: list[GuidanceConstraints] = Field(default_factory=list)

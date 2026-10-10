@@ -1,4 +1,4 @@
-from tracefix.runtime.contracts import Phase, RunState, RunStatus, new_id
+from tracefix.runtime.contracts import Phase, RunState, RunStatus, Usage, new_id
 
 
 def can_continue(status, outcome=None):
@@ -34,7 +34,8 @@ def continuation_state(previous, instruction, markers, *, process_ended=False):
 
 
 def derive_run(previous: RunState, *, goal: str | None = None, url: str | None = None,
-               mode: str | None = None, additional_rule_ids: list[str] | None = None,
+               mode: str | None = None, rule_ids: list[str] | None = None,
+               additional_rule_ids: list[str] | None = None,
                run_id: str | None = None) -> RunState:
     """Create a child Run while carrying the parent's frozen rule set.
 
@@ -53,6 +54,10 @@ def derive_run(previous: RunState, *, goal: str | None = None, url: str | None =
         'phase': Phase.PREPARE,
         'run_status': RunStatus.RUNNING,
         'revision': 0,
+        'continuation_instruction': None,
+        'continuation_count': 0,
+        'abnormal_termination': False,
+        'continuation_markers': [],
         'outcome': None,
         'error': None,
         'error_details': None,
@@ -61,6 +66,15 @@ def derive_run(previous: RunState, *, goal: str | None = None, url: str | None =
         'report_ref': None,
         'test_spec_ref': None,
         'test_spec_hash': '',
+        'check_plan_ref': None,
+        'check_plan_hash': '',
+        'check_result_refs': [],
+        'initial_check_result_refs': [],
+        'check_suite_stage': None,
+        'check_suite_completed': False,
+        'check_suite_patch_hash': None,
+        'overall_status': None,
+        'check_summary': {},
         'replay_plan_ref': None,
         'exploration_plan_ref': None,
         'reproduction_plan_frozen': False,
@@ -68,14 +82,19 @@ def derive_run(previous: RunState, *, goal: str | None = None, url: str | None =
         'task_board_ref': None,
         'todo_list_ref': None,
         'observation_ref': None,
+        'reproduction_binding_ref': None,
         'evidence_refs': [],
         'hypothesis_refs': [],
         'working_set_refs': [],
         'patch_ref': None,
+        'staged_candidate_refs': [],
         'patch_hash': None,
         'patch_base_commit': None,
         'validation_refs': [],
         'baseline_validation_refs': [],
+        'behavior_check_refs': [],
+        'subtask_refs': [],
+        'failed_candidate_signatures': [],
         'pending_action': None,
         'approval_ref': None,
         'step': 0,
@@ -102,9 +121,13 @@ def derive_run(previous: RunState, *, goal: str | None = None, url: str | None =
         'reproduced': False,
         'source_aligned': False,
         'environment_digest': '',
+        'budget': Usage(),
         'rule_snapshot_ref': None,
         'rule_snapshot_hash': '',
+        'rule_ids': list(dict.fromkeys(rule_ids or [])),
         'additional_rule_ids': list(dict.fromkeys(additional_rule_ids or [])),
+        'rule_coverage': [],
+        'repair_source': None,
         # 子 Run 从空引导队列开始；父 Run 的约束仍随状态副本继承。
         'guidance': [],
         'superseded_by_run_id': None,
