@@ -136,7 +136,7 @@ test('Run 冻结仓库 Profile 与 commit，A 到 B 到 A 的证据和配置不�
   service('repository.create', alpha);
   service('repository.create', beta);
   const first = service('run.create', {projectId: 'alpha', mode: 'test', goal: '检查 A'});
-  const middle = service('run.create', {projectId: 'beta', mode: 'repair', goal: '检查 B', repositorySnapshot: {repo_id: 'alpha'}});
+  const middle = service('run.create', {projectId: 'beta', mode: 'repair', goal: '检查 B'});
   const frozenProfile = fs.readFileSync(first.profile, 'utf8');
   const frozenRegistry = fs.readFileSync(first.registry, 'utf8');
   assert.equal(first.repositorySnapshot.repo_id, 'alpha');
@@ -174,6 +174,58 @@ test('Run 冻结仓库 Profile 与 commit，A 到 B 到 A 的证据和配置不�
   assert.throws(() => service('run.create', {projectId: 'alpha', mode: 'test', goal: '禁止新启动'}));
   assert.throws(() => service('run.continue', {id: first.id, instruction: '禁止续启动'}), error => error.status === 409);
   assert.equal(fs.readFileSync(first.registry, 'utf8'), frozenRegistry);
+});
+
+test('Run 控制入口拒绝调用方伪造身份、仓库快照和证据归属', context => {
+  const fixtureData = fixture(context);
+  if (!fixtureData) return;
+  const {service, repository, dataRoot} = fixtureData;
+  service('repository.create', repository('alpha'));
+  service('repository.create', repository('beta'));
+  const original = service('run.create', {projectId: 'alpha', mode: 'test', goal: '合法 A'});
+  const forged = {id: original.id, consoleRunId: original.id, agentRunId: 'run_other',
+    reportRef: '0001_report.json', artifacts: [{ref: '0001_report.json'}],
+    repositorySnapshot: original.repositorySnapshot, registry: original.registry, profile: original.profile,
+    dataRoot: 'other', repoSnapshotRef: 'other/repository.json', memorySnapshotRef: 'other/memory.json',
+    sourceManifest: {repo_id: 'alpha'}, evidenceRefs: ['0001_report.json'],
+    inheritedEvidenceRefs: ['0001_report.json'], scopeId: 'alpha', startedAt: '1900-01-01',
+    logs: ['伪造日志'], knowledge: ['伪造证据'], status: 'completed', phase: 'FINALIZE',
+    outcome: 'FIX_VERIFIED', finishedAt: '1900-01-01', origin: 'artifact'};
+  const created = service('run.create', {...forged, projectId: 'beta', mode: 'repair', goal: '  合法 B  ',
+    parentRunId: '', additionalRuleIds: []});
+  assert.notEqual(created.id, original.id);
+  assert.equal(created.projectId, 'beta');
+  assert.equal(created.mode, 'repair');
+  assert.equal(created.goal, '合法 B');
+  assert.equal(created.repositorySnapshot.repo_id, 'beta');
+  assert.notEqual(created.registry, original.registry);
+  assert.notEqual(created.profile, original.profile);
+  assert.equal(created.dataRoot, dataRoot);
+  assert.equal(created.status, 'running');
+  assert.equal(created.phase, 'STARTING');
+  assert.equal(created.outcome, null);
+  assert.equal(created.finishedAt, null);
+  assert.equal(created.origin, 'web');
+  assert.notEqual(created.startedAt, forged.startedAt);
+  assert.deepEqual(created.logs, []);
+  assert.deepEqual(created.knowledge, []);
+  assert.deepEqual(created.additionalRuleIds, []);
+  const injectedKeys = ['consoleRunId', 'agentRunId', 'reportRef', 'artifacts', 'repoSnapshotRef',
+    'memorySnapshotRef', 'sourceManifest', 'evidenceRefs', 'inheritedEvidenceRefs', 'scopeId', 'parentRunId'];
+  for (const record of [created, service('runs', {projectId: 'beta'})[0]])
+    for (const key of injectedKeys) assert.equal(Object.hasOwn(record, key), false, key);
+  assert.deepEqual(service('run', {id: created.id}).artifacts, []);
+  assert.deepEqual(service('run', {id: original.id}).repositorySnapshot, original.repositorySnapshot);
+  assert.equal(service('runs', {projectId: 'alpha'}).length, 1);
+  const beforeUpdate = service('runs', {projectId: 'beta'})[0];
+  for (const key of ['agentRunId', 'reportRef', 'artifacts', 'repositorySnapshot', 'profile', 'registry',
+    'projectId', 'dataRoot', 'id', 'consoleRunId', 'repoSnapshotRef', 'memorySnapshotRef', 'sourceManifest',
+    'evidenceRefs', 'inheritedEvidenceRefs', 'scopeId', 'parentRunId']) {
+    assert.throws(() => service('run.update', {id: created.id, changes: {[key]: null, status: 'completed'}}),
+      error => error.status === 409, key);
+    assert.deepEqual(service('runs', {projectId: 'beta'})[0], beforeUpdate);
+  }
+  assert.equal(service('run.update', {id: created.id, changes: {status: 'failed', outcome: 'INFRA_FAILURE'}}).status, 'failed');
 });
 
 test('旧注册 helper 委托同一权威入口并保持未就绪项目兼容', context => {

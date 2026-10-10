@@ -213,7 +213,7 @@ export function createConsoleService(options: ConsoleOptions = {}) {
           typeof frozen.projects_path !== 'string' || typeof frozen.profile_path !== 'string' ||
           !path.isAbsolute(frozen.projects_path) || !path.isAbsolute(frozen.profile_path)))
         throw new DataError('仓库冻结响应无效', 503);
-      return database.updateRun(runId, {...fields, id: runId, projectId: project.id,
+      return database.updateRun(runId, {id: runId, projectId: project.id, mode: fields.mode,
         profile: frozen?.profile_path || project.profile, registry: frozen?.projects_path || project.registry,
         repositorySnapshot: frozen,
         goal: fields.goal.trim(), ...(parentRunId ? {parentRunId} : {}), additionalRuleIds,
@@ -221,8 +221,10 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     }
     if (operation === 'run.update') {
       const previous = database.run(fields.id);
-      if (previous.repositorySnapshot && ['repositorySnapshot', 'profile', 'registry', 'projectId', 'dataRoot', 'id']
-          .some(key => Object.hasOwn(fields.changes || {}, key))) throw new DataError('运行仓库快照不可修改', 409);
+      if (previous.repositorySnapshot && ['agentRunId', 'reportRef', 'artifacts', 'repositorySnapshot', 'profile',
+        'registry', 'projectId', 'dataRoot', 'id', 'consoleRunId', 'repoSnapshotRef', 'memorySnapshotRef',
+        'sourceManifest', 'evidenceRefs', 'inheritedEvidenceRefs', 'scopeId', 'parentRunId']
+          .some(key => Object.hasOwn(fields.changes || {}, key))) throw new DataError('运行身份、证据归属和仓库快照不可修改', 409);
       return database.updateRun(fields.id, fields.changes);
     }
     if (operation === 'run.stop.request') return database.requestStop(fields.id, fields.processControlId);
