@@ -30,6 +30,7 @@ class DockerRunner:
         self.profile, self.workspace, self.run_id = profile, workspace, run_id
         self.name = 'tf-' + run_id
         self.network = self.name + '-net'
+        self.dependency_volume = self.name + '-node-modules'
         self.resolved_image_ids = None
         self._browser_command = None
         self._browser_image_index = None
@@ -119,13 +120,14 @@ class DockerRunner:
             await self._resolve_image_ids()
         self._started = True
         await self.docker('network', 'create', '--internal', '--label', 'tracefix.run='+self.run_id, self.network)
+        await self.docker('volume', 'create', '--label', 'tracefix.run='+self.run_id, self.dependency_volume)
         await self.docker('run', '-d', '--name', self.name, '--network', self.network, '--network-alias', 'app',
             '--label', 'tracefix.run='+self.run_id, '--user', container_user(),
             '--cap-drop=ALL', '--security-opt=no-new-privileges', '--pids-limit=128', '--memory=1g', '--cpus=2',
             '--read-only', '--tmpfs', '/tmp:rw,nosuid,size=128m,mode=1777',
             '--tmpfs', '/app/dist:rw,nosuid,size=128m,mode=1777',
             '--mount', bind_mount(self.workspace.root),
-            '--mount', 'type=volume,dst=/app/node_modules,readonly',
+            '--mount', 'type=volume,src='+self.dependency_volume+',dst=/app/node_modules,readonly',
             '-e', 'NODE_PATH=/deps/node_modules', '-e', 'TRACEFIX_SOURCE='+source_manifest,
             self.resolved_image_ids['app'], *self.profile.commands['start'])
         return await self.health()
@@ -166,6 +168,7 @@ class DockerRunner:
         try:
             await self.docker('rm', '-f', '-v', self.name, check=False)
             await self.docker('rm', '-f', self.name+'-browser', check=False)
+            await self.docker('volume', 'rm', self.dependency_volume, check=False)
             await self.docker('network', 'rm', self.network, check=False)
         finally:
             # continuation 可复用固定镜像 ID 重新启动；最终 runtime=True 仍须读取真实容器。

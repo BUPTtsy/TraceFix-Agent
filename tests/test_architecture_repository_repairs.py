@@ -329,6 +329,8 @@ async def test_runner_accepts_bound_export_and_allowed_continuation(tmp_path):
     image_call = ('image', 'inspect', profile.image, profile.browser_image)
     network_call = ('network', 'create', '--internal', '--label',
                     'tracefix.run=' + runner.run_id, runner.network)
+    volume_call = ('volume', 'create', '--label', 'tracefix.run=' + runner.run_id,
+                   runner.dependency_volume)
     start_call = ('run', '-d', '--name', runner.name, '--network', runner.network,
         '--network-alias', 'app', '--label', 'tracefix.run=' + runner.run_id,
         '--user', container_user(), '--cap-drop=ALL', '--security-opt=no-new-privileges',
@@ -336,7 +338,7 @@ async def test_runner_accepts_bound_export_and_allowed_continuation(tmp_path):
         '--tmpfs', '/tmp:rw,nosuid,size=128m,mode=1777',
         '--tmpfs', '/app/dist:rw,nosuid,size=128m,mode=1777',
         '--mount', bind_mount(workspace.root),
-        '--mount', 'type=volume,dst=/app/node_modules,readonly',
+        '--mount', 'type=volume,src=' + runner.dependency_volume + ',dst=/app/node_modules,readonly',
         '-e', 'NODE_PATH=/deps/node_modules', '-e', 'TRACEFIX_SOURCE=' + source_manifest,
         app_image_id, *profile.commands['start'])
     health_code = "let ok=false;for(let i=0;i<30;i++){try{const r=await fetch(process.argv[1]);if(r.ok){ok=true;break}}catch{}await new Promise(r=>setTimeout(r,500))}if(!ok)process.exit(1);console.log('健康检查通过')"
@@ -349,6 +351,7 @@ async def test_runner_accepts_bound_export_and_allowed_continuation(tmp_path):
     outputs = {
         image_call: json.dumps([{'Id': app_image_id}, {'Id': browser_image_id}]),
         network_call: 'c' * 64,
+        volume_call: runner.dependency_volume,
         start_call: 'd' * 64,
         health_call: '健康检查通过\n',
         version_call: json.dumps({'source_manifest': source_manifest}),
@@ -373,7 +376,7 @@ async def test_runner_accepts_bound_export_and_allowed_continuation(tmp_path):
 
     runner.docker = docker
     assert (await runner.start(source_manifest))['passed']
-    assert calls == [image_call, network_call, start_call, health_call]
+    assert calls == [image_call, network_call, volume_call, start_call, health_call]
     environment_digest = digest({
         'profile': profile.model_dump(), 'image_ids': [app_image_id, browser_image_id]})
     assert runner.resolved_image_ids == {'app': app_image_id, 'browser': browser_image_id}
@@ -388,8 +391,8 @@ async def test_runner_accepts_bound_export_and_allowed_continuation(tmp_path):
     assert (await runner.start(source_manifest))['passed']
     assert await runner.version() == source_manifest
     assert await runner.inspect_images(runtime=True) == environment_digest
-    assert calls == [image_call, network_call, start_call, health_call, version_call, runtime_call,
-                     network_call, start_call, health_call, version_call, runtime_call]
+    assert calls == [image_call, network_call, volume_call, start_call, health_call, version_call, runtime_call,
+                     network_call, volume_call, start_call, health_call, version_call, runtime_call]
     assert sum(args[:2] == ('image', 'inspect') for args in calls) == 1
     assert sum(args[:2] == ('network', 'create') for args in calls) == 2
 

@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -406,6 +407,8 @@ async def test_runner_prepares_nested_mountpoints_before_readonly_bind(tmp_path,
     image_call = ('image', 'inspect', profile.image, profile.browser_image)
     network_call = ('network', 'create', '--internal', '--label',
                     'tracefix.run=' + runner.run_id, runner.network)
+    volume_call = ('volume', 'create', '--label', 'tracefix.run=' + runner.run_id,
+                   runner.dependency_volume)
     start_call = ('run', '-d', '--name', runner.name, '--network', runner.network,
         '--network-alias', 'app', '--label', 'tracefix.run=' + runner.run_id,
         '--user', container_user(), '--cap-drop=ALL', '--security-opt=no-new-privileges',
@@ -413,7 +416,7 @@ async def test_runner_prepares_nested_mountpoints_before_readonly_bind(tmp_path,
         '--tmpfs', '/tmp:rw,nosuid,size=128m,mode=1777',
         '--tmpfs', '/app/dist:rw,nosuid,size=128m,mode=1777',
         '--mount', bind_mount(workspace.root),
-        '--mount', 'type=volume,dst=/app/node_modules,readonly',
+        '--mount', 'type=volume,src=' + runner.dependency_volume + ',dst=/app/node_modules,readonly',
         '-e', 'NODE_PATH=/deps/node_modules', '-e', 'TRACEFIX_SOURCE=' + state.source_manifest,
         app_image_id, *profile.commands['start'])
     health_code = "let ok=false;for(let i=0;i<30;i++){try{const r=await fetch(process.argv[1]);if(r.ok){ok=true;break}}catch{}await new Promise(r=>setTimeout(r,500))}if(!ok)process.exit(1);console.log('健康检查通过')"
@@ -426,6 +429,7 @@ async def test_runner_prepares_nested_mountpoints_before_readonly_bind(tmp_path,
     outputs = {
         image_call: json.dumps([{'Id': app_image_id}, {'Id': browser_image_id}]),
         network_call: 'c' * 64,
+        volume_call: runner.dependency_volume,
         start_call: 'd' * 64,
         health_call: '健康检查通过\n',
         version_call: json.dumps({'source_manifest': state.source_manifest}),
@@ -459,20 +463,51 @@ async def test_runner_prepares_nested_mountpoints_before_readonly_bind(tmp_path,
     assert browser_command[browser_image_index] == browser_image_id
     assert profile.browser_image not in browser_command
     assert (await runner.start(state.source_manifest))['passed']
-    assert len(calls) == 4
+    assert len(calls) == 5
     assert calls[0] == image_call
     assert calls[1][:2] == ('network', 'create')
-    assert calls[2][0] == 'run'
-    assert '--read-only' in calls[2]
-    assert '/app/dist:rw,nosuid,size=128m,mode=1777' in calls[2]
-    assert 'type=volume,dst=/app/node_modules,readonly' in calls[2]
-    assert 'TRACEFIX_SOURCE=' + state.source_manifest in calls[2]
-    assert calls[2][-3:] == (app_image_id, *profile.commands['start'])
-    assert profile.image not in calls[2]
-    assert calls[3][:2] == ('exec', runner.name)
+    assert calls[2] == volume_call
+    assert calls[3][0] == 'run'
+    assert '--read-only' in calls[3]
+    assert '/app/dist:rw,nosuid,size=128m,mode=1777' in calls[3]
+    assert 'type=volume,src=' + runner.dependency_volume + ',dst=/app/node_modules,readonly' in calls[3]
+    assert 'TRACEFIX_SOURCE=' + state.source_manifest in calls[3]
+    assert calls[3][-3:] == (app_image_id, *profile.commands['start'])
+    assert profile.image not in calls[3]
+    assert calls[4][:2] == ('exec', runner.name)
     assert await runner.version() == state.source_manifest
     assert await runner.inspect_images(runtime=True) == environment_digest
-    assert calls == [image_call, network_call, start_call, health_call, version_call, runtime_call]
+    assert calls == [image_call, network_call, volume_call, start_call, health_call, version_call, runtime_call]
+
+
+@pytest.mark.skipif(os.getenv('TRACEFIX_TEST_LOCAL_DOCKER') != '1', reason='opt-in Docker test')
+async def test_real_runner_seeds_readonly_dependencies_and_removes_volume(tmp_path):
+    engine, state = make_engine(tmp_path / 'engine')
+    profile = Profile(project='b', source_commit='HEAD', image='tracefix-bugboard:1.0',
+        browser_image='tracefix-browser:1.0', commands={
+            'start': ['node', '-e', "require('node:http').createServer((req,res)=>res.end(JSON.stringify({source_manifest:process.env.TRACEFIX_SOURCE}))).listen(3000,'0.0.0.0')"],
+            **{name: ['node', name] for name in ('reset', 'static', 'unit', 'build')}})
+    runner = DockerRunner(profile, engine.workspace, state.run_id)
+    try:
+        assert (await runner.start(state.source_manifest))['passed']
+        assert await runner.version() == state.source_manifest
+        info = await runner.docker('container', 'inspect', runner.name)
+        mounts = json.loads(info['output'])[0]['Mounts']
+        dependencies = next(mount for mount in mounts if mount['Destination'] == '/app/node_modules')
+        assert dependencies['Type'] == 'volume'
+        assert dependencies['Name'] == runner.dependency_volume
+        assert dependencies['RW'] is False
+        result = await runner.docker('exec', runner.name, 'node', '-e',
+            "const assert=require('node:assert/strict'),fs=require('node:fs');"
+            "assert.ok(fs.existsSync('/app/node_modules/typescript/bin/tsc'));"
+            "assert.ok(require.resolve('react').startsWith('/app/node_modules/'));"
+            "for(const path of ['/app/node_modules/tracefix-write-probe','/app/app.py'])"
+            "assert.throws(()=>fs.writeFileSync(path,'changed'),error=>error.code==='EROFS')")
+        assert result['passed']
+        engine.workspace.check_frozen(engine.source)
+    finally:
+        await runner.close()
+    assert not (await runner.docker('volume', 'inspect', runner.dependency_volume, check=False))['passed']
 
 
 def test_runner_rejects_non_directory_mountpoint(tmp_path):

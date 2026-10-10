@@ -275,6 +275,12 @@ async def test_cleanup_retains_pins_for_continuation_but_live_never_falls_back(d
 
     runner.docker = docker
     await runner.close()
+    assert calls == [
+        ('rm', '-f', '-v', runner.name),
+        ('rm', '-f', runner.name + '-browser'),
+        ('volume', 'rm', runner.dependency_volume),
+        ('network', 'rm', runner.network),
+    ]
     assert not runner._started and runner.actual_digest == ''
     assert runner.resolved_image_ids == {'app': APP_IMAGE, 'browser': BROWSER_IMAGE}
     expected = digest({'profile': runner.profile.model_dump(), 'image_ids': [APP_IMAGE, BROWSER_IMAGE]})
@@ -284,6 +290,35 @@ async def test_cleanup_retains_pins_for_continuation_but_live_never_falls_back(d
     assert not any(call[:2] == ('image', 'inspect') for call in calls)
     await runner.start(digest(runner.workspace.require_repository_snapshot()))
     assert runner._started and APP_IMAGE in next(call for call in calls if call[0] == 'run')
+
+
+async def test_start_failure_removes_dependency_volume_and_cleanup_is_idempotent(docker_runner):
+    runner = docker_runner
+    runner._bind_image_ids([APP_IMAGE, BROWSER_IMAGE])
+    calls = []
+
+    async def docker(*args, **kwargs):
+        calls.append((args, kwargs))
+        if args[0] == 'run':
+            raise RuntimeError('app start failed')
+        return {'passed': True, 'exit_code': 0, 'output': ''}
+
+    runner.docker = docker
+    with pytest.raises(RuntimeError, match='app start failed'):
+        await runner.start(digest(runner.workspace.require_repository_snapshot()))
+    assert (('volume', 'create', '--label', 'tracefix.run=' + runner.run_id,
+             runner.dependency_volume), {}) in calls
+    calls.clear()
+    await runner.close()
+    await runner.close()
+    expected = [
+        (('rm', '-f', '-v', runner.name), {'check': False}),
+        (('rm', '-f', runner.name + '-browser'), {'check': False}),
+        (('volume', 'rm', runner.dependency_volume), {'check': False}),
+        (('network', 'rm', runner.network), {'check': False}),
+    ]
+    assert calls == expected * 2
+    assert not runner._started and runner.actual_digest == ''
 
 
 @pytest.mark.parametrize('role', [0, 1])
