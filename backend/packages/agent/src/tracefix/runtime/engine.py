@@ -23,7 +23,8 @@ from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
 from tracefix.model.chat_completions import reasoning_records
 from tracefix.knowledge.context import SkillCatalog, build_context
 from tracefix.knowledge.selection import select_documents
-from tracefix.rules import Finding, RuleResolver, RuleSnapshot, evaluate_oracle, evaluate_static
+from tracefix.rules import (Finding, RuleResolver, RuleSnapshot, evaluate_oracle, evaluate_oracle_result,
+                            evaluate_static, evaluate_static_result)
 from tracefix.rules.resolver import render_rule_context, rule_applies
 from tracefix.runtime.contracts import (BudgetExceeded, BrowserAction, CheckJudgement, CheckPlan,
     CheckResult, Decision, GoalCheckDraft, Outcome,
@@ -289,9 +290,15 @@ class Engine:
             return None
         if s.rule_snapshot_ref:
             try:
-                return RuleSnapshot.model_validate(self.get(s, s.rule_snapshot_ref))
-            except (FileNotFoundError, ValueError):
-                pass
+                snapshot = RuleSnapshot.model_validate(self.get(s, s.rule_snapshot_ref))
+            except (OSError, KeyError, ValueError) as error:
+                raise ValueError('冻结规则快照不可读或 hash 不匹配') from error
+            if (snapshot.run_id != s.run_id or snapshot.hash != s.rule_snapshot_hash
+                    or [ref.model_dump(mode='json') for ref in snapshot.refs] != s.rule_refs):
+                raise ValueError('冻结规则快照与当前 Run 绑定不匹配')
+            return snapshot
+        if s.repair_source:
+            return RuleSnapshot.model_validate(s.repair_source.source_rule_snapshot)
         if s.rule_refs:
             return RuleSnapshot(run_id=s.parent_run_id or s.run_id, parent_run_id=None,
                                 refs=s.rule_refs, hash=s.rule_snapshot_hash or "")
@@ -420,16 +427,7 @@ class Engine:
         if not self.rule_resolver:
             return []
         snapshot = self._rule_snapshot(s)
-        rules = []
-        if snapshot:
-            for ref in snapshot.refs:
-                try:
-                    rule = self.rule_resolver.by_id(ref.id)
-                    if rule.version != ref.version and self.rule_library:
-                        rule = self.rule_library.version(ref.id, ref.version)
-                    rules.append(rule)
-                except (KeyError, FileNotFoundError) as error:
-                    raise ValueError(f'冻结规则版本不可用：{ref.id}@{ref.version}') from error
+        rules = self.rule_resolver.load_snapshot_rules(snapshot, **self.rule_scope(s)) if snapshot else []
         observation = observation if observation is not None else self.get(s, s.observation_ref) if s.observation_ref else {}
         paths = list(self.workspace.files()) if paths is None else list(paths)
         return [rule for rule in rules if rule_applies(rule, phase=phase or str(s.phase),
@@ -445,18 +443,191 @@ class Engine:
         return {**context, 'detection_rules': injection, 'rule_snapshot_hash': s.rule_snapshot_hash}
 
     def ensure_rule_snapshot(self, s):
-        if not self.rule_resolver or s.rule_snapshot_ref:
+        if not self.rule_resolver:
+            if s.rule_ids or s.additional_rule_ids or s.rule_refs or s.rule_snapshot_ref:
+                raise ValueError('已选规则缺少规则解析器，无法冻结或读取')
+            return s
+        if s.rule_snapshot_ref:
+            self.rule_resolver.load_snapshot_rules(self._rule_snapshot(s), **self.rule_scope(s))
             return s
         parent = self._rule_snapshot(s)
         snapshot, rules = self.rule_resolver.resolve_snapshot(
-            run_id=s.run_id, project_id=s.scope_id, phase="*", parent=parent,
-            additional=s.additional_rule_ids, url=s.url, paths=self.workspace.files())
+            run_id=s.run_id, phase="*", parent=parent, **self.rule_scope(s),
+            rule_ids=s.rule_ids, additional=s.additional_rule_ids, url=s.url,
+            paths=self.workspace.files(), job_id=s.job_id)
         ref = self.put(s, snapshot.model_dump(mode="json"), name="检测规则快照")
         delta = {"rule_snapshot_ref": ref, "rule_snapshot_hash": snapshot.hash,
                  "rule_refs": [item.model_dump(mode="json") for item in snapshot.refs]}
         if self.rule_library:
             self.rule_library.save_snapshot(snapshot)
-        return self.changed(s, **delta)
+        s = self.changed(s, **delta)
+        for rule in rules:
+            self.record_rule_coverage(s, rule, 'not_completed', reason='尚未执行冻结规则')
+        return s
+
+    def rule_scope(self, s):
+        source = getattr(self, 'source', {}) or {}
+        return {'scope_id': s.scope_id, 'project_id': s.project_id or s.scope_id,
+                'repo_id': s.repo_id or source.get('repo_id')}
+
+    def selected_repair_rule_ids(self, s):
+        selected = list(s.rule_ids) + list(s.additional_rule_ids)
+        if s.repair_source:
+            selected.extend(item.get('rule_id') for item in s.repair_source.findings if item.get('rule_id'))
+        return list(dict.fromkeys(selected))
+
+    def require_repair_rule_coverage(self, s):
+        selected = self.selected_repair_rule_ids(s)
+        if selected:
+            if not self.rule_resolver:
+                raise ValueError('修复规则覆盖不足：缺少规则解析器')
+            snapshot = self._rule_snapshot(s)
+            self.rule_resolver.require_repair_coverage(snapshot, selected)
+            rules = self.rule_resolver.load_snapshot_rules(snapshot, **self.rule_scope(s))
+            observation = self.get(s, s.observation_ref) if s.observation_ref else {}
+            paths = list(self.workspace.files())
+            missing = [rule.id for rule in rules if rule.id in selected and any(
+                not rule_applies(rule, phase=phase, url=observation.get('url') or s.url, paths=paths)
+                for phase in ('PATCH', 'VERIFY'))]
+            if missing:
+                raise ValueError('修复规则覆盖不足：PATCH/VERIFY 页面或路径不适用：' + ', '.join(missing))
+
+    def source_acceptance_ready(self, s):
+        if not s.repair_source:
+            return True
+        rules = {rule.id: rule for rule in self.frozen_check_rules(s)}
+        return all(item.get('rule_id') in rules
+                   and rules[item['rule_id']].version == item.get('rule_version')
+                   and rules[item['rule_id']].detection.type in {'oracle', 'static'}
+                   and item.get('source') in {'oracle', 'static'}
+                   for item in s.repair_source.findings)
+
+    def source_rule_trials_passed(self, s):
+        if not s.repair_source:
+            return True
+        signatures = [self.get(s, ref) for ref in s.evidence_refs if '来源问题复现结果' in ref]
+        if len(signatures) < 3:
+            return False
+        selected = [item.get('id') for item in s.repair_source.findings]
+        for finding_id in selected:
+            failures = Counter(item.get('signatures', {}).get(finding_id) for item in signatures[-3:]
+                               if item.get('signatures', {}).get(finding_id) not in {None, 'PASS', 'INCONCLUSIVE'})
+            if max(failures.values(), default=0) < 2:
+                return False
+        return bool(selected)
+
+    def source_finding_trial_signatures(self, s, checks):
+        signatures = {}
+        for item in checks:
+            try:
+                failures = json.loads(item.actual) if item.status == 'fail' and item.fallback is None else []
+            except (TypeError, ValueError):
+                failures = []
+            if not isinstance(failures, list):
+                failures = []
+            for source_finding in s.repair_source.findings:
+                if source_finding.get('rule_id') != item.id:
+                    continue
+                finding_id = source_finding['id']
+                match = next((finding for finding in failures if isinstance(finding, dict)
+                              and all(finding.get(key) == source_finding.get(key) for key in
+                                      ('rule_id', 'rule_version', 'title', 'location', 'actual'))), None)
+                if match is None:
+                    signatures[finding_id] = 'PASS' if item.status == 'pass' else 'INCONCLUSIVE'
+                else:
+                    signatures[finding_id] = digest({key: match.get(key) for key in
+                        ('rule_id', 'rule_version', 'title', 'location', 'expected', 'actual', 'details')})
+        return signatures
+
+    def record_rule_coverage(self, s, rule, status, *, reason='', evidence_refs=(), finding_ids=(), phase=None):
+        from tracefix.rules.models import RuleCoverage
+        record = RuleCoverage(run_id=s.run_id, rule_id=rule.id, rule_version=rule.version,
+            phase=phase or str(s.phase), status=status, reason=reason,
+            evidence_refs=list(dict.fromkeys(evidence_refs)), finding_ids=list(dict.fromkeys(finding_ids)),
+            **self.rule_scope(s))
+        key = (record.rule_id, record.phase)
+        s.rule_coverage = [item for item in s.rule_coverage
+                           if (item['rule_id'], item['phase']) != key] + [record.model_dump(mode='json')]
+        if self.rule_library:
+            self.rule_library.save_coverage(record)
+        self.store.save(s)
+        return record
+
+    def rules_fully_checked(self, s, phase):
+        snapshot = self._rule_snapshot(s) if getattr(self, 'rule_resolver', None) else None
+        if not snapshot:
+            return not s.rule_ids and not s.additional_rule_ids
+        coverage = {item['rule_id']: item for item in s.rule_coverage if item['phase'] == str(phase)}
+        return all(reference.id in coverage
+                   and coverage[reference.id]['rule_version'] == reference.version
+                   and coverage[reference.id]['status'] in {'checked_pass', 'not_applicable'}
+                   and bool(coverage[reference.id]['evidence_refs'])
+                   and bool(coverage[reference.id].get('reason'))
+                   and all(self.bundle_exists(s, ref) for ref in coverage[reference.id]['evidence_refs'])
+                   for reference in snapshot.refs)
+
+    def bind_finding(self, s, finding, rule=None, *, evidence_refs=None):
+        scope = self.rule_scope(s)
+        references = finding.evidence_refs if evidence_refs is None else evidence_refs
+        references = list(dict.fromkeys(ref for ref in references if self.bundle_exists(s, ref)))
+        details = dict(finding.details)
+        expected = finding.expected or details.get('expected') or (rule.name if rule else '')
+        actual = finding.actual or details.get('actual') or details.get('message') or details.get('match') or finding.title
+        details.update(expected=expected, actual=actual)
+        return finding.model_copy(update={**scope, 'run_id': s.run_id,
+            'source_base_commit': (getattr(self, 'source', {}) or {}).get('commit'),
+            'source_manifest': s.source_manifest, 'expected': str(expected), 'actual': str(actual),
+            'evidence_refs': references, 'details': details,
+            'fingerprint': digest([scope, s.run_id, finding.rule_id, finding.rule_version,
+                                   finding.location, finding.fingerprint])})
+
+    def validate_repair_source_binding(self, s, snapshot):
+        source = s.repair_source
+        if not source:
+            return
+        self.read_source_findings(s)
+        if (source.source_scope_id != s.scope_id
+                or source.source_project_id != (s.project_id or s.scope_id)
+                or source.source_repo_id and source.source_repo_id != snapshot.get('repo_id')):
+            raise ValueError('Repair 来源 repo/project/scope 与运行仓库不一致')
+        if snapshot.get('commit') != source.target_base_commit:
+            raise ValueError('Repair 来源 revision 未显式重新绑定')
+        if not source.revision_rebound and snapshot.get('files') != source.source_repo_snapshot.get('files'):
+            raise ValueError('Repair 来源源码快照与独立工作区不一致')
+        if s.patch_base_commit and s.patch_base_commit != snapshot.get('workspace_repository', {}).get('head'):
+            raise ValueError('Repair 独立工作区补丁基线不一致')
+        if s.outcome == Outcome.FIX_VERIFIED or s.validation_refs and not s.patch_hash:
+            raise ValueError('Repair 不得继承来源 Run 的验证结论')
+
+    def read_source_findings(self, s):
+        from tracefix.runtime.finding_source import validate_finding_repair_source
+        if not self.rule_library or not self.rule_resolver:
+            raise ValueError('Finding Repair 来源无法读取：缺少规则或 Finding 持久化')
+        return validate_finding_repair_source(s, load_run=self.store.load,
+            load_finding=self.rule_library.finding, artifacts=self.artifacts,
+            rule_resolver=self.rule_resolver)
+
+    def finish_source_findings(self, s, *, verified):
+        """Update source Findings only after a bound deterministic verification gate."""
+        source = getattr(s, 'repair_source', None)
+        if not source or not self.rule_library:
+            return []
+        result = []
+        validation_refs = list(s.validation_refs)
+        findings = self.read_source_findings(s)
+        for finding in findings:
+            update = {'repair_run_id': s.run_id, 'patch_hash': s.patch_hash,
+                      'verification_refs': validation_refs}
+            if verified and finding.rule_id and any(
+                    finding.rule_id == cov.get('rule_id') and cov.get('status') == 'checked_pass'
+                    and cov.get('rule_version') == finding.rule_version
+                    and cov.get('phase') == str(Phase.VERIFY) for cov in s.rule_coverage):
+                update['status'] = 'fixed'
+            finding = finding.model_copy(update=update)
+            finding = (self.rule_library.save_verified_finding(finding) if update.get('status') == 'fixed'
+                       else self.rule_library.save_finding(finding))
+            result.append(finding)
+        return result
 
     def validate_rule_refs(self, s, refs):
         allowed = {rule.id for rule in self.active_rules(s)}
@@ -581,6 +752,12 @@ class Engine:
     def verification_passed(self, s, *, sampled_environment_digest=None):
         """只验证工作区及已采样摘要；最终执行门禁必须调用异步 live helper。"""
         try:
+            self.require_repair_rule_coverage(s)
+            if (s.repair_source and not s.reproduced
+                    or s.repair_source and not self.source_acceptance_ready(s)
+                    or s.repair_source and not self.source_rule_trials_passed(s)
+                    or not self.rules_fully_checked(s, Phase.VERIFY)):
+                return False
             # 纯证据检查仍须重读冻结工作区、完整补丁差异和已采样环境摘要。
             self.workspace.check_frozen(self.source)
             current_patch_hash = digest(
@@ -932,6 +1109,8 @@ class Engine:
     async def model_call(self, s, schema, ctx, image=None, validate_output=None):
         ctx = {**ctx, 'phase': str(s.phase), 'execution_mode': s.execution_mode,
                'workspace_root': str(self.workspace.root)}
+        if s.repair_source:
+            ctx['repair_source'] = s.repair_source.model_dump(mode='json')
         # Worker calls select locally; never replace the shared supervisor model.
         selected_model = (self.worker_model if ctx.get('worker_depth') == 1
                           and not ctx.get('worker_same_model')
@@ -951,6 +1130,9 @@ class Engine:
                 allowed = set(ctx.get('detection_rules', {}).get('rule_ids', []))
                 if set(candidate.rule_refs) - allowed:
                     raise ModelOutputError('模型引用了当前动态注入集合之外的规则')
+                for issue in getattr(candidate, 'issues', []):
+                    if set(issue.rule_refs) - allowed:
+                        raise ModelOutputError('GUIIssue 引用了当前动态注入集合之外的规则')
 
         validate_output = validate_candidate
         if s.continuation_instruction:
@@ -1270,7 +1452,7 @@ class Engine:
                 for finding in evaluate_oracle(rule, raw, job_id=s.run_id, run_id=s.run_id,
                                                evidence_ref=observation_ref, previous_observation=previous,
                                                action=current_action):
-                    saved = self.rule_library.save_finding(finding)
+                    saved = self.rule_library.save_finding(self.bind_finding(s, finding, rule))
                     self.event(s, 'finding.created', {'finding_id': saved.id, 'rule_id': saved.rule_id,
                                                      'rule_version': saved.rule_version,
                                                      'status': saved.status, 'evidence_ref': observation_ref,
@@ -1740,6 +1922,9 @@ class Engine:
             if s.scope_id != self.context.active_scope:
                 raise PermissionError('运行状态与当前 scope 不一致')
             snapshot = self.workspace.require_repository_snapshot(self.source)
+            self.validate_repair_source_binding(s, snapshot)
+            if s.mode == 'repair':
+                self.require_repair_rule_coverage(s)
             if digest(snapshot) != s.source_manifest:
                 raise PermissionError('运行状态与源码快照摘要不一致')
             if not s.repo_snapshot_ref or self.get(s, s.repo_snapshot_ref) != snapshot:
@@ -1808,21 +1993,32 @@ class Engine:
         return self.output(s, 'prelude')
 
     def record_gui_issues(self, s, decision, observation):
+        rules = {rule.id: rule for rule in self.active_rules(s, observation=observation)}
+        for issue in decision.issues:
+            if len(issue.rule_refs) > 1 or set(issue.rule_refs) - rules.keys():
+                raise ValueError('GUIIssue 来源规则必须是当前冻结快照内实际注入的单条规则')
         for issue in decision.issues:
             references = normalize_decision_evidence_refs(
                 issue.evidence_refs, [], s.observation_ref, observation)
             if not references:
                 continue
             location = {'url': observation.get('url') or s.url}
-            finding = Finding(job_id=s.job_id or s.run_id, run_id=s.run_id, source='guided', severity='minor',
+            rule = rules.get(issue.rule_refs[0]) if issue.rule_refs else None
+            finding = Finding(job_id=s.job_id or s.run_id, run_id=s.run_id, source='guided',
+                rule_id=rule.id if rule else None, rule_version=rule.version if rule else None,
+                severity=rule.severity if rule else 'minor',
                 title=issue.title, location=location, evidence_refs=references,
                 fingerprint=digest([s.run_id, issue.title, issue.expected, issue.actual, location]),
                 details={'expected': issue.expected, 'actual': issue.actual})
+            finding = self.bind_finding(s, finding, rule)
             if self.rule_library:
                 finding = self.rule_library.save_finding(finding)
             self.event(s, 'finding.created', {'finding_id': finding.id, 'source': finding.source,
                 'status': finding.status, 'finding': finding.model_dump(mode='json'),
                 'expectation': issue.expected})
+            if rule:
+                self.record_rule_coverage(s, rule, 'matched', evidence_refs=references,
+                    finding_ids=[finding.id], reason='模型提出有规则来源的待复现候选')
 
     async def decide(self, s, _):
         spec = self.spec(s)
@@ -1893,15 +2089,7 @@ class Engine:
         snapshot = self._rule_snapshot(s)
         if not snapshot:
             return []
-        rules = []
-        for reference in snapshot.refs:
-            rule = self.rule_resolver.by_id(reference.id)
-            if rule.version != reference.version:
-                if not self.rule_library:
-                    raise ValueError(f'冻结规则版本不可用：{reference.id}@{reference.version}')
-                rule = self.rule_library.version(reference.id, reference.version)
-            rules.append(rule)
-        return rules
+        return self.rule_resolver.load_snapshot_rules(snapshot, **self.rule_scope(s))
 
     async def ensure_check_plan(self, s):
         if s.check_plan_ref:
@@ -2053,6 +2241,8 @@ class Engine:
         refs = [s.observation_ref] if s.observation_ref else []
         status, actual, error, fallback = 'error', '', None, None
         files = []
+        findings = []
+        rule = None
         try:
             if item.extraction_error:
                 raise ValueError('用户目标提炼失败：' + item.extraction_error)
@@ -2081,12 +2271,18 @@ class Engine:
                     findings = []
                     for value in applicable:
                         refs.append(value['observation_ref'])
-                        findings.extend(evaluate_oracle(rule, value['observation'],
+                        evaluation = evaluate_oracle_result(rule, value['observation'],
                             job_id=s.job_id or s.run_id, run_id=s.run_id,
-                            evidence_ref=value['observation_ref'], action=value.get('action')))
+                            evidence_ref=value['observation_ref'], action=value.get('action'), **self.rule_scope(s))
+                        if evaluation.status == 'not_completed':
+                            raise RuntimeError(evaluation.reason)
+                        if evaluation.status == 'not_applicable':
+                            continue
+                        findings.extend(evaluation.findings)
                     status = 'fail' if findings else 'pass'
                     actual = json.dumps([value.model_dump(mode='json') for value in findings], ensure_ascii=False)
                     for finding in findings:
+                        finding = self.bind_finding(s, finding, rule)
                         if self.rule_library:
                             finding = self.rule_library.save_finding(finding)
                         self.event(s, 'finding.created', {'finding_id': finding.id,
@@ -2108,13 +2304,32 @@ class Engine:
                     else:
                         if not (config.get('regex') or config.get('pattern')):
                             raise ValueError('静态规则缺少 regex/pattern 或代码分析 detector')
-                        findings = evaluate_static(rule, files, job_id=s.job_id or s.run_id, run_id=s.run_id)
+                        evaluation = evaluate_static_result(rule, files, job_id=s.job_id or s.run_id,
+                            run_id=s.run_id, **self.rule_scope(s))
+                        if evaluation.status == 'not_completed':
+                            raise RuntimeError(evaluation.reason)
+                        if evaluation.status == 'not_applicable':
+                            raise ValueError('静态检查作用域没有实际匹配文件：' + evaluation.reason)
+                        findings = evaluation.findings
                         status = 'fail' if findings else 'pass'
                         actual = json.dumps([value.model_dump(mode='json') for value in findings], ensure_ascii=False)
-                    refs.append(self.put(s, {'files': [{'path': path, 'content_hash': digest(content)}
-                        for path, content in files], 'result': actual}, name='代码结构检查证据'))
+                    source_ref = self.put(s, {'scope_id': s.scope_id, 'run_id': s.run_id,
+                        'source_manifest': s.source_manifest, 'patch_hash': s.patch_hash,
+                        'files': [{'path': path, 'content_hash': digest(content)}
+                        for path, content in files], 'result': actual}, name='代码结构检查证据')
+                    refs.append(source_ref)
+                    for finding in findings:
+                        finding = self.bind_finding(s, finding, rule, evidence_refs=[source_ref])
+                        if self.rule_library:
+                            finding = self.rule_library.save_finding(finding)
+                        self.event(s, 'finding.created', {'finding_id': finding.id,
+                            'finding': finding.model_dump(mode='json'), 'rule_id': rule.id,
+                            'expectation': finding.expected})
                 else:
                     status, actual, refs = await self.model_check(s, item, observation, refs)
+                    if status == 'pass':
+                        status = 'inconclusive'
+                        actual = 'guided 规则仅形成模型候选，缺少可执行验收：' + actual
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -2130,8 +2345,11 @@ class Engine:
                     refs.append(source_ref)
                     status, actual, refs = await self.model_check(s, item, observation, refs,
                         reason=error, files=files)
+                    if item.source == 'rule' and status == 'pass':
+                        status = 'inconclusive'
+                        actual = '确定性检测器未完成，模型回退不能证明规则通过：' + actual
                     fallback['status'] = status
-                    error = None
+                    error = None if item.source != 'rule' else error
                 except asyncio.CancelledError:
                     raise
                 except Exception as fallback_error:
@@ -2160,6 +2378,14 @@ class Engine:
             ref = self.put(s, result.model_dump(mode='json'), name='逐项检查结果')
             s = self.changed(s, check_result_refs=s.check_result_refs + [ref],
                 evidence_refs=list(dict.fromkeys(s.evidence_refs + result.evidence_refs + [ref])))
+            if item.source == 'rule':
+                from tracefix.rules.models import Rule
+                coverage_status = ('matched' if result.status == 'fail' else 'checked_pass'
+                    if result.status == 'pass' and item.detector in {'oracle', 'static'}
+                    and result.fallback is None else 'not_completed')
+                self.record_rule_coverage(s, Rule.model_validate(item.detection), coverage_status,
+                    phase='VERIFY' if s.check_suite_stage == 'verify' else 'EXPLORE',
+                    evidence_refs=result.evidence_refs + [ref], reason=result.error or result.actual)
             self.event(s, 'check.completed', {'artifact_ref': ref, **result.model_dump(mode='json')})
             return self.output(s, 'prelude')
         overall, summary = summarize_checks(plan, results)
@@ -2178,12 +2404,19 @@ class Engine:
             return await self.complete_verification(s)
         if s.mode == 'test':
             outcome = (Outcome.BUG_CONFIRMED if any(result.status == 'fail' for result in results)
-                else Outcome.INCONCLUSIVE if overall in {'FAILED', 'INCONCLUSIVE'} else Outcome.NO_BUG_FOUND)
+                else Outcome.INCONCLUSIVE if overall in {'FAILED', 'INCONCLUSIVE'}
+                or not self.rules_fully_checked(s, Phase.EXPLORE) else Outcome.NO_BUG_FOUND)
             return self.output(self.changed(s, phase=Phase.FINALIZE, outcome=outcome), 'prelude')
         if any(result.status == 'fail' for result in results):
+            if s.repair_source and not self.source_acceptance_ready(s):
+                return self.output(self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.INCONCLUSIVE,
+                    error='选中 Finding 缺少逐问题的确定性验收绑定',
+                    error_details={'integration_blocker': 'finding_executable_acceptance_missing'}), 'prelude')
             s = await self.freeze_reproduction_plan(s)
-            return self.output(self.changed(s, phase=Phase.DIAGNOSE, pending_action=None), 'prelude')
-        outcome = Outcome.INCONCLUSIVE if overall in {'FAILED', 'INCONCLUSIVE'} else Outcome.NO_BUG_FOUND
+            phase = Phase.REPRODUCE if s.repair_source else Phase.DIAGNOSE
+            return self.output(self.changed(s, phase=phase, pending_action=None), 'prelude')
+        outcome = (Outcome.INCONCLUSIVE if overall in {'FAILED', 'INCONCLUSIVE'}
+                   or not self.rules_fully_checked(s, Phase.EXPLORE) or s.repair_source else Outcome.NO_BUG_FOUND)
         return self.output(self.changed(s, phase=Phase.FINALIZE, outcome=outcome), 'prelude')
 
     async def reset(self, s):
@@ -2231,12 +2464,26 @@ class Engine:
                 return self.output(s, 'prelude')
         else:
             r, ref = self.check(s, self.spec(s).assertions)
+        if s.repair_source:
+            plan = self.check_plan(s)
+            selected = {item.get('rule_id') for item in s.repair_source.findings}
+            checks = [await self.evaluate_check_item(s, item) for item in plan.items
+                      if item.source == 'rule' and item.id in selected]
+            source_signatures = self.source_finding_trial_signatures(s, checks)
+            source_ref = self.put(s, {'scope_id': s.scope_id, 'run_id': s.run_id,
+                'source_manifest': s.source_manifest, 'test_spec_hash': s.test_spec_hash,
+                'signatures': source_signatures, 'checks': [item.model_dump(mode='json') for item in checks]},
+                name='来源问题复现结果')
+            s = self.changed(s, evidence_refs=list(dict.fromkeys(s.evidence_refs + [source_ref]
+                + [ref for item in checks for ref in item.evidence_refs])))
         signatures = s.failure_signatures + [digest(r['assertions']) if not r['passed'] else 'PASS']
         trials = s.trial + 1
         s = self.changed(s, trial=trials, replay_index=0, evidence_refs=s.evidence_refs+[ref], failure_signatures=signatures)
         if trials == 3:
             failures = Counter(value for value in signatures[-3:] if value != 'PASS')
             stable = max(failures.values(), default=0) >= 2
+            if s.repair_source:
+                stable = self.source_rule_trials_passed(s)
             if stable and s.mode == 'repair':
                 s = self.changed(s, phase=Phase.DIAGNOSE, reproduced=True)
             else:
@@ -2276,7 +2523,8 @@ class Engine:
                 'scope_id': s.scope_id, 'url': s.url,
                 'preconditions': [item.model_dump(mode='json') for item in self.spec(s).executable_preconditions]},
                 name='复现绑定')
-            return self.changed(s, exploration_plan_ref=s.replay_plan_ref,
+            plan_ref = s.replay_plan_ref or self.put(s, [], name='冻结复现计划')
+            return self.changed(s, exploration_plan_ref=s.replay_plan_ref, replay_plan_ref=plan_ref,
                                 reproduction_binding_ref=binding, reproduction_plan_frozen=True)
         selection = await self.model_call(s, ReproductionPlan, {
             'test_spec': self.spec(s).model_dump(), 'goal': s.goal,
@@ -2308,6 +2556,10 @@ class Engine:
                             reproduction_binding_ref=binding, reproduction_plan_frozen=True)
 
     async def diagnose(self, s, _):
+        if s.mode == 'repair':
+            self.require_repair_rule_coverage(s)
+            if s.repair_source and not s.reproduced:
+                raise ValueError('Finding Repair 必须在独立 Run 内重新稳定复现后诊断')
         self.warn_retrieval_degraded(s)
         self.workspace.check_frozen(self.source)
         overlay = s.source_manifest + (':' + s.patch_hash if s.patch_hash else '')
@@ -2346,8 +2598,16 @@ class Engine:
                 except (OSError, PermissionError, ValueError):
                     continue
             for rule in self.active_rules(s, str(Phase.DIAGNOSE)):
-                for finding in evaluate_static(rule, files, job_id=s.run_id, run_id=s.run_id):
-                    saved = self.rule_library.save_finding(finding)
+                findings = evaluate_static(rule, files, job_id=s.run_id, run_id=s.run_id)
+                source_ref = self.put(s, {'scope_id': s.scope_id, 'run_id': s.run_id,
+                    'source_manifest': s.source_manifest, 'patch_hash': s.patch_hash,
+                    'files': [{'path': path, 'content_hash': digest(content)} for path, content in files]},
+                    name='静态规则诊断证据') if findings else None
+                if source_ref:
+                    s.evidence_refs = list(dict.fromkeys(s.evidence_refs + [source_ref]))
+                for finding in findings:
+                    saved = self.rule_library.save_finding(self.bind_finding(s, finding, rule,
+                        evidence_refs=[source_ref]))
                     self.event(s, 'finding.created', {'finding_id': saved.id, 'rule_id': saved.rule_id,
                                                      'rule_version': saved.rule_version, 'source': 'static',
                                                      'finding': saved.model_dump(mode='json'),
@@ -2626,6 +2886,10 @@ class Engine:
     async def patch(self, s, _):
         self.scopes.assert_current(self.context)
         self.sync_guidance(s)
+        self.require_repair_rule_coverage(s)
+        if s.repair_source and (not s.reproduced or not self.source_acceptance_ready(s)
+                               or not self.source_rule_trials_passed(s)):
+            raise ValueError('Finding Repair 必须重新复现，不能复用来源 Run 的修复结论')
         if s.check_plan_ref:
             from tracefix.runtime.verification import initial_check_failure
             if not initial_check_failure(s, lambda ref: self.bundle_exists(s, ref),
@@ -2653,6 +2917,7 @@ class Engine:
         return self.output(s, 'prelude')
 
     async def verify(self, s, _):
+        self.require_repair_rule_coverage(s)
         self.workspace.check_frozen(self.source)
         if digest(self.workspace.diff(s.patch_base_commit or 'HEAD').encode()) != s.patch_hash:
             raise PermissionError('补丁在验证开始后发生了变化')
@@ -2761,6 +3026,9 @@ class Engine:
         return self.output(s, 'check_suite')
 
     async def complete_verification(self, s):
+        if not self.rules_fully_checked(s, Phase.VERIFY):
+            return self.output(self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.INCONCLUSIVE,
+                error='冻结规则覆盖未完成或缺少可执行验收，保留未验证候选补丁'), 'finalize')
         if not await self.runtime_verification_passed(s):
             s = self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.INFRA_FAILURE,
                              run_status=RunStatus.RUNNING,
@@ -2839,6 +3107,9 @@ class Engine:
         return self.output(s, 'prelude')
 
     async def finalize(self, s, _):
+        if s.outcome == Outcome.NO_BUG_FOUND and not self.rules_fully_checked(s, Phase.EXPLORE):
+            s = self.changed(s, outcome=Outcome.INCONCLUSIVE,
+                error='必检规则覆盖不足，不能输出 NO_BUG_FOUND')
         if s.outcome is None:
             s = self.changed(s, outcome=Outcome.INCONCLUSIVE,
                              error=s.error or '未形成确定性验收结论')
@@ -2853,7 +3124,13 @@ class Engine:
         verified = False
         if s.outcome == Outcome.FIX_VERIFIED:
             try:
+                self.require_repair_rule_coverage(s)
                 verified = (patch_available and digest(diff_text.encode()) == s.patch_hash
+                            and self.rules_fully_checked(s, Phase.VERIFY)
+                            and (not s.repair_source or s.reproduced)
+                            and self.source_acceptance_ready(s)
+                            and self.source_rule_trials_passed(s)
+                            and s.error != '用户已取消'
                             and await self.runtime_verification_passed(s))
             except (OSError, ValueError, KeyError):
                 verified = False
@@ -2863,6 +3140,16 @@ class Engine:
                     error_details={'terminal_reason': 'final_verification_invalid',
                                    'patch_export_error': diff_error})
         patch_verification = ('verified' if verified else 'unverified' if patch_available else 'none')
+        try:
+            source_findings = self.finish_source_findings(s, verified=verified)
+        except (OSError, ValueError, KeyError) as error:
+            source_findings = []
+            if verified:
+                verified = False
+                s = self.changed(s, outcome=Outcome.INFRA_FAILURE,
+                    error='来源 Finding 或证据已变化，拒绝回写已验证修复',
+                    error_details={'integration_blocker': 'finding_source_invalid', 'reason': str(error)})
+                patch_verification = 'unverified' if patch_available else 'none'
         summaries = {
             Outcome.FIX_VERIFIED: '修复补丁通过全部确定性验证，可供后续流程消费。',
             Outcome.NO_BUG_FOUND: '本次测试规范未发现缺陷，未生成修复补丁。',
@@ -2922,6 +3209,12 @@ class Engine:
                    'reasoning_refs': s.reasoning_refs,
                    'context_manifest_refs': s.context_manifest_refs,
                    'compaction_refs': s.compaction_refs,
+                  'project_id': s.project_id or s.scope_id, 'repo_id': self.rule_scope(s)['repo_id'],
+                  'rule_ids': s.rule_ids, 'additional_rule_ids': s.additional_rule_ids,
+                  'rule_snapshot_ref': s.rule_snapshot_ref, 'rule_snapshot_hash': s.rule_snapshot_hash,
+                  'rule_refs': s.rule_refs, 'rule_coverage': s.rule_coverage,
+                  'repair_source': s.repair_source.model_dump(mode='json') if s.repair_source else None,
+                  'source_findings': [finding.model_dump(mode='json') for finding in source_findings],
                   'agent_instructions_ref': s.agent_instructions_ref,
                   'agent_instructions_hash': s.agent_instructions_hash,
                   'agent_instructions_path': s.agent_instructions_path,
@@ -2940,6 +3233,24 @@ class Engine:
                               initial_check_summary=initial['check_summary'])
             except (OSError, ValueError, KeyError, TypeError) as error:
                 report.update(overall_status='FAILED', check_results_error=sanitize(str(error))[:1500])
+        try:
+            snapshot = self._rule_snapshot(s)
+            report['rule_snapshot'] = snapshot.model_dump(mode='json') if snapshot else None
+            report['findings'] = [finding.model_dump(mode='json') for finding in
+                self.rule_library.findings(run_id=s.run_id, scope_id=s.scope_id)] if self.rule_library else [
+                event['payload']['finding'] for event in self.store.trace(s.run_id, s.scope_id)
+                if event['type'] == 'finding.created' and event['payload'].get('finding')]
+        except (OSError, ValueError, KeyError) as error:
+            report['rules_error'] = sanitize(str(error))[:1500]
+        report['provenance'] = {'scope_id': s.scope_id, 'project_id': s.project_id or s.scope_id,
+            'repo_id': self.rule_scope(s)['repo_id'], 'run_id': s.run_id,
+            'repo_snapshot_ref': s.repo_snapshot_ref, 'source_manifest': s.source_manifest,
+            'base_commit': self.source.get('commit'), 'patch_base_commit': s.patch_base_commit,
+            'rule_snapshot_hash': s.rule_snapshot_hash, 'rule_snapshot_ref': s.rule_snapshot_ref,
+            'finding_ids': [item['id'] for item in report.get('findings', [])],
+            'repair_source': report['repair_source'], 'patch_hash': s.patch_hash,
+            'verification_refs': list(s.validation_refs), 'check_result_refs': list(s.check_result_refs),
+            'evidence_refs': list(s.evidence_refs), 'verified': verified}
         report['behavior_scenarios_error'] = None
         if s.test_spec_ref:
             try:
