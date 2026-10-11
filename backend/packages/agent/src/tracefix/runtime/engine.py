@@ -2269,6 +2269,7 @@ class Engine:
                     if not applicable:
                         raise RuntimeError('检测器缺少完整通道、触发动作或已实现能力')
                     findings = []
+                    completed_evaluations = 0
                     for value in applicable:
                         refs.append(value['observation_ref'])
                         evaluation = evaluate_oracle_result(rule, value['observation'],
@@ -2278,7 +2279,10 @@ class Engine:
                             raise RuntimeError(evaluation.reason)
                         if evaluation.status == 'not_applicable':
                             continue
+                        completed_evaluations += 1
                         findings.extend(evaluation.findings)
+                    if not completed_evaluations:
+                        raise RuntimeError('Oracle 规则在当前观察中未完成任何确定性检查')
                     status = 'fail' if findings else 'pass'
                     actual = json.dumps([value.model_dump(mode='json') for value in findings], ensure_ascii=False)
                     for finding in findings:

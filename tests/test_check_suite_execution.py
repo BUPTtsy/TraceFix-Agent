@@ -46,13 +46,18 @@ def suite_fixture(*, rules=(), mode='test', goal='页面应显示任务板且保
     engine.verification_context = lambda current: {'plan_hash': digest([])}
     engine.store = SimpleNamespace(trace=lambda *arguments: [], save=lambda current: None)
     engine.spec = lambda current: TestSpec.model_validate(records[current.test_spec_ref])
-    state.observation_ref = put(state, {
+    observation = {
         'id': 'obs-current', 'type': 'gui_observation', 'url': state.url,
         'snapshot': '- heading "Task board" [ref=e1]\n- button "Save" [ref=e2]',
         'console': '[{"level":"error","message":"save failed"}]', 'network': '',
-        'screenshot_ref': 'page.png', 'collection': {'channels': {
-            'snapshot': 'available', 'console': 'available', 'network': 'available'}},
-    })
+        'screenshot_ref': 'page.png',
+    }
+    observation['collection'] = {'version': 1, 'captured_at': 1.0, 'channels': {
+        channel: {'status': 'available', 'captured_at': 1.0, 'content_version': digest(observation[channel]),
+            'provider_characters': len(observation[channel]), 'collector_characters': len(observation[channel]),
+            'upstream_truncated': False, 'collector_truncated': False}
+        for channel in ('snapshot', 'console', 'network')}}
+    state.observation_ref = put(state, observation)
     plan = make_check_plan(state, list(rules), GoalCheckDraft(
         name='任务板与保存反馈检查', criteria=goal))
     state.check_plan_ref = put(state, plan.model_dump(mode='json'))
@@ -102,7 +107,11 @@ async def test_blocker_failure_does_not_skip_other_rules_or_user_goal():
     results = [records[reference] for reference in finished.check_result_refs]
     assert [item['id'] for item in results] == [item.id for item in engine.check_plan(finished).items]
     assert results[0]['status'] == 'fail'
-    assert all(item['status'] == 'pass' for item in results[1:])
+    assert [item['status'] for item in results] == ['fail', 'pass', 'inconclusive', 'pass']
+    coverage = {item['rule_id']: item['status'] for item in finished.rule_coverage}
+    assert coverage == {'console-blocker': 'matched', 'source-check': 'checked_pass', 'feedback-check': 'not_completed'}
+    assert results[2]['fallback'] is None
+    assert '缺少可执行验收' in results[2]['actual']
     assert finished.overall_status == 'FAILED'
     assert finished.check_summary['coverage_complete'] is True
     assert finished.phase == Phase.FINALIZE
@@ -122,9 +131,12 @@ async def test_source_read_failure_still_uses_model_with_screenshot():
     engine.workspace.read = unavailable_source
     item = engine.check_plan(state).items[0]
     result = await engine.evaluate_check_item(state, item)
-    assert result.status == 'pass'
+    assert result.status == 'inconclusive'
     assert result.fallback is not None and result.fallback['attempted'] is True
     assert result.fallback['source'] == 'multimodal'
+    assert result.fallback['status'] == 'inconclusive'
+    assert 'source adapter unavailable' in result.error
+    assert '模型回退不能证明规则通过' in result.actual
     assert model_calls
     assert model_calls[-1]['image'] == PNG
     assert 'source adapter unavailable' in model_calls[-1]['context']['fallback_reason']
@@ -261,6 +273,36 @@ async def test_verify_oracle_ignores_observations_from_previous_patch():
     assert result.status == 'pass'
     assert 'stale-observation.json' not in result.evidence_refs
     assert json.loads(result.actual) == []
+
+
+async def test_oracle_without_matching_trigger_does_not_pass_after_all_observations_are_skipped():
+    rule = Rule(id='feedback-trigger', name='操作反馈', status='enabled',
+        detection=RuleDetection(type='oracle', oracle={'kind': 'dom_after_action',
+            'trigger': {'locator': {'role': 'button'}},
+            'expect_any': [{'locator': {'role': 'status'}, 'condition': 'visible'}]}))
+    engine, state, records, events, model_calls = suite_fixture(rules=[rule])
+    action = {'kind': 'click', 'locator': {'role': 'button', 'name': 'Save'}}
+    engine.phase_observations = lambda current, phase: [{
+        'observation_ref': current.observation_ref, 'observation': records[current.observation_ref], 'action': action}]
+    result = await engine.evaluate_check_item(state, engine.check_plan(state).items[0])
+    assert result.status == 'inconclusive'
+    assert result.fallback['status'] == 'inconclusive'
+    assert '未完成' in result.error
+    assert not any(kind == 'finding.created' for kind, payload in events)
+
+
+@pytest.mark.parametrize('metadata', [None, 'available', {'status': 'truncated'},
+    {'status': 'available', 'upstream_truncated': True}, {'status': 'available', 'collector_truncated': True}])
+async def test_incomplete_oracle_channels_remain_inconclusive_despite_model_pass(metadata):
+    engine, state, records, events, model_calls = suite_fixture(rules=[console_rule()])
+    records[state.observation_ref]['console'] = '[]'
+    records[state.observation_ref]['collection']['channels']['console'] = metadata
+    result = await engine.evaluate_check_item(state, engine.check_plan(state).items[0])
+    assert result.status == 'inconclusive'
+    assert result.fallback['status'] == 'inconclusive'
+    assert '模型回退不能证明规则通过' in result.actual
+    assert model_calls
+    assert not any(kind == 'finding.created' for kind, payload in events)
 
 
 @pytest.mark.parametrize('phase', [Phase.EXPLORE, Phase.DIAGNOSE, Phase.VERIFY])
