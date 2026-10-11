@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 import swagger from '@fastify/swagger';
-import {timingSafeEqual} from 'node:crypto';
+import {timingSafeEqual, randomUUID} from 'node:crypto';
 import path from 'node:path';
 import * as schemas from './schemas.mjs';
 
@@ -29,7 +29,8 @@ export function publicError(error, requestId) {
 }
 
 export async function createApi({bridge, controller, token, legacyHandler, logger = false}) {
-  const app = Fastify({logger, bodyLimit: 1600000, ajv: {customOptions: {removeAdditional: false, coerceTypes: false, useDefaults: false}}});
+  const app = Fastify({logger, genReqId: () => randomUUID(), bodyLimit: 1600000,
+    ajv: {customOptions: {removeAdditional: false, coerceTypes: false, useDefaults: false}}});
   await app.register(swagger, {openapi: {info: {title: 'TraceFix beta control plane', version: '1.0.0'},
     components: {securitySchemes: {controlToken: {type: 'http', scheme: 'bearer'}}}, security: [{controlToken: []}]}});
   app.addHook('onRequest', async (request, reply) => {

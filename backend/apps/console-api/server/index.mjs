@@ -60,7 +60,7 @@ async function body(req) {
 }
 function send(res, status, value) {
   if (status >= 400 && typeof value?.error === 'string') value = {code: value.code || 'REQUEST_FAILED',
-    message: value.error, retryable: false, requestId: value.requestId || crypto.randomUUID()};
+    message: value.error, retryable: false, requestId: value.requestId || res.getHeader('x-request-id') || crypto.randomUUID()};
   res.writeHead(status, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(value));
 }
 function loopback(req) {

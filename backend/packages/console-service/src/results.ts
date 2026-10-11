@@ -30,7 +30,6 @@ export function executorResult(value: Data, run: Data, view?: Data, patchBytes?:
       verification: report ? {overall_status: report.overall_status ?? null, check_summary: report.check_summary ?? null,
         patch_verification: report.patch_verification ?? 'none', validation_refs: report.validation_refs ?? []} : null}};
 }
-
 export function resultView(run: Data, findings: Data[]): Data {
   const report = run.issueReport;
   const recorded = run.executionResult;
