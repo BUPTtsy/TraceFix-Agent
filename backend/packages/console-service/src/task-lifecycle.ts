@@ -129,8 +129,10 @@ export function normalizeTask(fields: Data, projects: Data[]): Data {
         throw taskError('INVALID_FINDING_ACCEPTANCE', '验收场景必须包含中间和最终断言', 400);
       return scenario.steps.map((step: Data) => step.action);
     })];
+    const authorizationSchema: Data = findingAcceptanceSchema.$defs.AcceptanceSpec.properties.authorized_actions;
+    const authorizedActions = accepted.spec.authorized_actions ?? authorizationSchema.default ?? authorizationSchema.items.enum;
     if (actions.some((action: Data) => action.kind === 'finish' || action.observation_id != null || action.element_ref != null || action.page_generation != null ||
-        !accepted.spec.authorized_actions?.includes(action.kind)))
+        !authorizedActions.includes(action.kind)))
       throw taskError('INVALID_FINDING_ACCEPTANCE', '验收动作不能引用旧页面或跳过执行', 400);
   }
   if (fields.create_and_start !== undefined && typeof fields.create_and_start !== 'boolean')

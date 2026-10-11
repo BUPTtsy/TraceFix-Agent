@@ -415,6 +415,12 @@ test('Finding 验收模板存入 Task、绑定唯一内部来源并透传新的 
   }
   for (const patch of [{verified: true}, {schema_version: true}, {test_code: 'arbitrary code'}])
     assert.equal((await request('POST', '/api/v1/tasks', {...input, finding_acceptance: {...acceptance, ...patch}})).statusCode, 400);
+  for (const authorized_actions of [['navigate', 'observe', 'finish'], []]) {
+    const response = await request('POST', '/api/v1/tasks', {...input,
+      finding_acceptance: {...acceptance, spec: {...acceptanceSpec, authorized_actions}}});
+    assert.equal(response.statusCode, 400, response.body);
+    assert.equal(response.json().code, 'INVALID_FINDING_ACCEPTANCE', response.body);
+  }
   for (const patch of [{source_run_id: 'wrong_internal'}, {commit: 'd'.repeat(40)}, {run_id: 'historical_repair'}]) {
     const wrong = await create({...input, finding_acceptance: {...acceptance, ...patch}});
     assert.equal((await request('POST', '/api/v1/tasks/' + wrong.task.id + '/start', {})).statusCode, 409);
@@ -431,6 +437,17 @@ test('Finding 验收模板存入 Task、绑定唯一内部来源并透传新的 
   assert.equal(fake.calls[0].request.execution.executionMode, 'batch');
   assert.equal(fake.calls[0].request.finding_acceptance.spec_hash, acceptance.spec_hash);
   await finish(started, 'INCONCLUSIVE');
+  const defaultSpec = {...acceptanceSpec};
+  delete defaultSpec.authorized_actions;
+  const defaultAcceptance = {...acceptance, spec: defaultSpec};
+  const withDefaults = await create({...input, finding_acceptance: defaultAcceptance});
+  assert.deepEqual(withDefaults.task.definition.finding_acceptance, defaultAcceptance);
+  const defaultStarted = (await request('POST', '/api/v1/tasks/' + withDefaults.task.id + '/start', {})).json();
+  assert.equal(fake.calls.length, 2);
+  assert.deepEqual(fake.calls[1].request.finding_acceptance, {...defaultAcceptance, run_id: defaultStarted.run.id});
+  assert.equal(Object.hasOwn(fake.calls[1].request.finding_acceptance.spec, 'authorized_actions'), false);
+  assert.equal(fake.calls[1].request.finding_acceptance.spec_hash, defaultAcceptance.spec_hash);
+  await finish(defaultStarted, 'INCONCLUSIVE');
 });
 
 test('OpenAPI、统一错误与 token/loopback 边界', async context => {
