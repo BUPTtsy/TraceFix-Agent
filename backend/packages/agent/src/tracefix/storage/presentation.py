@@ -138,12 +138,18 @@ def report_page(report, *, artifacts=None, scope_id=None, run_id=None):
     def render(value, key=''):
         if isinstance(value, list) and key.endswith('_refs'):
             return '<ul>'+''.join('<li>'+render(ref, 'artifact_ref')+'</li>' for ref in value)+'</ul>'
-        if isinstance(value, str) and key.endswith('_ref'):
+        if isinstance(value, str) and value and key.endswith('_ref'):
             return f'<a href="{quote(value, safe="")}">{html.escape(value)}</a>'
+        if key == 'provenance' and isinstance(value, dict):
+            return '<dl>'+''.join('<dt>'+html.escape(label(name))+'</dt><dd>'
+                +render(item, 'provenance' if isinstance(item, (dict, list)) and not name.endswith('_refs')
+                        else name)+'</dd>' for name, item in value.items())+'</dl>'
+        if key == 'provenance' and isinstance(value, list):
+            return '<ul>'+''.join('<li>'+render(item, 'provenance')+'</li>' for item in value)+'</ul>'
         return '<pre>'+html.escape(json.dumps(readable(value), ensure_ascii=False, indent=2))+'</pre>'
 
     technical_keys = {'schema_version', 'run_id', 'patch_hash', 'source_manifest',
-                      'environment_digest', 'agent_instructions_hash'}
+                      'environment_digest', 'agent_instructions_hash', 'provenance'}
     summary, technical = [], []
     for key, value in report.items():
         if key in {'issues', 'check_plan', 'check_results', 'initial_check_results', 'images', 'image_errors'}:
