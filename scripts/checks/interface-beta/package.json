@@ -1,0 +1,14 @@
+{
+  "name": "tracefix-interface-beta-checks",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test unit/*.test.mjs",
+    "test:browser": "node --test integration/*.test.mjs",
+    "run": "node runner.mjs"
+  },
+  "dependencies": {
+    "@playwright/test": "1.64.0"
+  }
+}
