@@ -163,12 +163,14 @@ export class TaskLifecycle {
       throw taskError('EXECUTOR_BUSY', '单执行器正在运行其他 Run', 409,
         !lease || this.store.run(lease.run_id).outcome !== 'UNKNOWN');
   }
-  start(id: string, fields: Data, key: string | undefined, ownerId: string, namespace = 'explicit'): Data {
+  start(id: string, fields: Data, key: string | undefined, ownerId: string, namespace = 'explicit', expectedVersion?: number): Data {
     return this.store.transaction(() => {
       const scope = 'start:' + namespace + ':' + id;
       const previous = this.replay(scope, key, fields);
       if (previous) return previous;
       const task = this.task(id);
+      if (expectedVersion !== undefined && task.version !== expectedVersion)
+        throw taskError('TASK_CHANGED', '创建后的 Task 已编辑，请显式 start 当前定义');
       if (Object.keys(fields).length) throw taskError('INVALID_START', 'start 正文必须为空对象', 400);
       this.assertIdle();
       if (active.has(task.status)) throw taskError('TASK_ACTIVE', 'Task 已在执行');

@@ -35,6 +35,7 @@ function fakeExecutor() {
     const child = new EventEmitter();
     child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
     child.pid = failSpawn ? undefined : 91000 + calls.length;
+    child.kill = () => true;
     child.exitCode = null; child.signalCode = null;
     const call = {command, args, options, child, request: null};
     calls.push(call);
@@ -198,6 +199,23 @@ test('create_and_start busy 返回已创建 Task 查询地址；重放可在空�
   assert.equal((await create(payload, 'combined')).run.id, started.run.id);
   assert.equal(fake.calls.length, 2);
   await finish(started);
+});
+
+test('create_and_start 未启动的 Task 编辑后，重放原请求不能启动修改后的定义', async context => {
+  const {request, create, finish, fake} = await fixture(context);
+  const first = await create();
+  const running = (await request('POST', '/api/v1/tasks/' + first.task.id + '/start', {})).json();
+  const payload = {...body, create_and_start: true};
+  const busy = await request('POST', '/api/v1/tasks', payload, 'combined-edit');
+  const id = busy.json().taskId;
+  assert.equal((await request('PUT', '/api/v1/tasks/' + id, {...body, goal: '编辑之后的新目标'})).statusCode, 200);
+  await finish(running);
+  const replay = await request('POST', '/api/v1/tasks', payload, 'combined-edit');
+  assert.equal(replay.statusCode, 409); assert.equal(replay.json().code, 'TASK_CHANGED');
+  assert.equal(fake.calls.length, 1);
+  const explicit = (await request('POST', '/api/v1/tasks/' + id + '/start', {})).json();
+  assert.equal(explicit.task.definition.goal, '编辑之后的新目标');
+  await finish(explicit);
 });
 
 test('错 Task 停止不影响其他运行；停止并发与重复请求幂等且精确定位 Run', async context => {

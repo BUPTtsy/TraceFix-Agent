@@ -27,9 +27,9 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
       if (process.env[name]) text = text.replaceAll(process.env[name], '[REDACTED]');
     return text;
   };
-  async function start(id, body = {}, key, namespace = 'explicit') {
+  async function start(id, body = {}, key, namespace = 'explicit', expectedVersion) {
     await bridge('task.recover', {isAlive});
-    const value = await bridge('task.start', {id, body, key, namespace, ownerId});
+    const value = await bridge('task.start', {id, body, key, namespace, ownerId, expectedVersion});
     if (value.replayed) {
       const run = await bridge('run.record', {id: value.run.id});
       return {task: {...value.task, status: run.status, updatedAt: run.updatedAt || value.task.updatedAt}, run, replayed: true};
@@ -114,6 +114,7 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
       if (!entry || entry.id !== id) throw failure('STOP_UNAVAILABLE', '当前 API 不拥有该 Task 的执行进程');
       const record = await bridge('run.stop.request', {id: run.id, processControlId: run.processControlId});
       if (record.status === 'stopping') {
+        if (process.platform !== 'win32') entry.child.kill('SIGTERM');
         entry.timer = setTimeout(async () => {
           try {
             const latest = await bridge('run.record', {id: run.id});

@@ -128,7 +128,7 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     if (operation === 'task.create') return tasks.create(fields.body, fields.key);
     if (operation === 'task.create.check') return tasks.checkCreate(fields.body, fields.key);
     if (operation === 'task.update') return tasks.update(fields.id, fields.body);
-    if (operation === 'task.start') return tasks.start(fields.id, fields.body || {}, fields.key, fields.ownerId, fields.namespace);
+    if (operation === 'task.start') return tasks.start(fields.id, fields.body || {}, fields.key, fields.ownerId, fields.namespace, fields.expectedVersion);
     if (operation === 'task.start.check') return tasks.checkStart(fields.id, fields.body || {}, fields.key);
     if (operation === 'task.launching') return tasks.launchIntent(fields.id, fields.runId, fields.ownerId);
     if (operation === 'task.spawned') return tasks.spawned(fields.id, fields.runId, fields.ownerId, fields.pid);

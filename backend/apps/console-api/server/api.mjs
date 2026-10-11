@@ -53,7 +53,7 @@ export async function createApi({bridge, controller, token, legacyHandler, logge
     reply.header('location', '/api/v1/tasks/' + created.task.id);
     if (!request.body.create_and_start) return reply.code(201).send({...created, run: null});
     try {
-      const started = await controller.start(created.task.id, {}, request.headers['idempotency-key'], 'create-start');
+      const started = await controller.start(created.task.id, {}, request.headers['idempotency-key'], 'create-start', created.task.version);
       return reply.code(201).send(started);
     } catch (error) {throw Object.assign(error, {taskId: created.task.id});}
   }, async request => {if (request.headers['idempotency-key']) await bridge('task.create.check', {
