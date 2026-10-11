@@ -313,6 +313,7 @@ const legacyHandler = async (req,res) => {
 await bridge('runs.import');
 setInterval(() => bridge('runs.import').catch(error => console.error('后台导入运行记录失败：', error)), 60000).unref();
 for (const record of await bridge('runs')) {
+  if (record.taskId) continue;
   if (['running', 'stopping', 'paused', 'waiting_input', 'waiting_approval'].includes(record.status)) {
     if (record.pid && isAlive(record.pid)) agent = {...record, logs: []};
     else await bridge('run.ended', {id: record.id, error: 'API 重启后检测到 Agent 进程已退出'});

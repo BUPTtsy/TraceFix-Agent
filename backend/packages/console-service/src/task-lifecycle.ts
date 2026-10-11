@@ -26,9 +26,9 @@ export function normalizeTask(fields: Data, projects: Data[]): Data {
     throw taskError('INVALID_PROJECT', '项目不存在、存在歧义或别名冲突', 400);
   const project = matches[0][0];
   if (!project.ready) throw taskError('PROJECT_NOT_READY', '项目尚未就绪或已禁用', 409);
-  if (!['test', 'repair'].includes(fields.mode) || typeof fields.goal !== 'string' || !fields.goal.trim() || fields.goal.trim().length > 4000)
+  if (!['test', 'repair'].includes(fields.mode) || typeof fields.goal !== 'string' || fields.goal.trim().length < 5 || fields.goal.trim().length > 4000)
     throw taskError('INVALID_TASK', '目标或模式无效', 400);
-  if (/\b(?:sk|rk)-[a-z0-9_-]{16,}\b|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]{8,}/i.test(JSON.stringify(fields)))
+  if (/\b(?:sk|rk)-[a-z0-9_-]{16,}\b|\bgh[pousr]_[a-z0-9]{20,}\b|\bgithub_pat_[a-z0-9_]{20,}\b|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]{8,}/i.test(JSON.stringify(fields)))
     throw taskError('TASK_CONTAINS_CREDENTIALS', 'Task 不允许包含真实凭据', 400);
   const execution = fields.execution;
   if (!execution || typeof execution !== 'object' || Array.isArray(execution) ||
@@ -41,11 +41,14 @@ export function normalizeTask(fields: Data, projects: Data[]): Data {
     if (typeof execution.url !== 'string' || execution.url.length > 2048 || !['http:', 'https:'].includes(url.protocol) || url.username || url.password)
       throw taskError('INVALID_URL', '执行 URL 不允许携带凭据', 400);
   }
-  if (execution.spec !== undefined && (typeof execution.spec !== 'string' || !execution.spec.trim() || execution.spec.length > 32000))
-    throw taskError('INVALID_SPEC', 'spec 必须是最多 32000 字的文本', 400);
+  if (execution.spec !== undefined && (!execution.spec || typeof execution.spec !== 'object' || Array.isArray(execution.spec) ||
+      Buffer.byteLength(JSON.stringify(execution.spec)) > 32768 ||
+      Object.keys(execution.spec).some(key => !['goal', 'preconditions', 'executable_preconditions', 'authorized_actions', 'assertions',
+        'regression_plan', 'regression_assertions', 'behavior_scenarios', 'guidance_ack'].includes(key))))
+    throw taskError('INVALID_SPEC', 'spec 必须是最大 32 KiB 的结构化 TestSpec', 400);
   const list = (value: any, label: string, limit = 50) => {
     if (value === undefined) return [];
-    if (!Array.isArray(value) || value.length > limit || value.some(id => typeof id !== 'string' || !id || id.length > 200))
+    if (!Array.isArray(value) || value.length > limit || value.some(id => typeof id !== 'string' || !id || id.length > 160))
       throw taskError('INVALID_TASK', label + ' 无效', 400);
     return [...new Set(value)];
   };
@@ -56,14 +59,14 @@ export function normalizeTask(fields: Data, projects: Data[]): Data {
   if (fields.source_run_id !== undefined && (typeof fields.source_run_id !== 'string' || !fields.source_run_id || fields.source_run_id.length > 200))
     throw taskError('INVALID_SOURCE', '来源 Run 无效', 400);
   const sourceFindingIds = list(fields.source_finding_ids, '来源 Finding', 100);
-  if (sourceFindingIds.length && !fields.source_run_id || fields.source_run_id && fields.mode !== 'repair')
+  if (Boolean(sourceFindingIds.length) !== Boolean(fields.source_run_id) || fields.source_run_id && fields.mode !== 'repair')
     throw taskError('INVALID_SOURCE', '来源 Finding 必须绑定 Repair 的来源 Run', 400);
   const reads = fields.github_reads ?? [];
   if (!Array.isArray(reads) || reads.length > 50 || reads.some(read => {
     if (!read || typeof read !== 'object' || Array.isArray(read) ||
         Object.keys(read).some(key => !['source_kind', 'path', 'number'].includes(key))) return true;
-    if (!['metadata', 'commit', 'file', 'issue', 'pull_request'].includes(read.source_kind)) return true;
-    if (['metadata', 'commit'].includes(read.source_kind)) return read.path !== undefined || read.number !== undefined;
+    if (!['commit', 'file', 'issue', 'pull_request'].includes(read.source_kind)) return true;
+    if (read.source_kind === 'commit') return read.path !== undefined || read.number !== undefined;
     if (read.source_kind === 'file') return read.number !== undefined || typeof read.path !== 'string' ||
       !read.path || read.path.length > 1024 || /[\\:\x00-\x1f]/.test(read.path) || read.path.startsWith('/') ||
       read.path.split('/').some((part: string) => !part || part === '.' || part === '..' || /^\.env(?:\.|$)/i.test(part));
@@ -155,8 +158,10 @@ export class TaskLifecycle {
     return this.store.db.prepare('SELECT * FROM console_executor WHERE slot=1').get() as Data || null;
   }
   assertIdle(): void {
-    if (this.lease() || this.store.runs().some(run => active.has(run.status) || run.pid))
-      throw taskError('EXECUTOR_BUSY', '单执行器正在运行其他 Run', 409, true);
+    const lease = this.lease();
+    if (lease || this.store.runs().some(run => active.has(run.status) || run.pid))
+      throw taskError('EXECUTOR_BUSY', '单执行器正在运行其他 Run', 409,
+        !lease || this.store.run(lease.run_id).outcome !== 'UNKNOWN');
   }
   start(id: string, fields: Data, key: string | undefined, ownerId: string, namespace = 'explicit'): Data {
     return this.store.transaction(() => {
@@ -181,6 +186,12 @@ export class TaskLifecycle {
       this.remember(scope, key, fields, value);
       return value;
     });
+  }
+  checkStart(id: string, fields: Data, key?: string): void {
+    this.replay('start:explicit:' + id, key, fields);
+  }
+  checkCreate(fields: Data, key?: string): void {
+    this.replay('create', key, fields);
   }
   launchIntent(id: string, runId: string, ownerId: string): void {
     const result = this.store.db.prepare("UPDATE console_executor SET phase='launching' WHERE slot=1 AND task_id=? AND run_id=? AND owner_id=? AND phase='reserved'")

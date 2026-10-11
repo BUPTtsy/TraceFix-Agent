@@ -136,7 +136,10 @@ test('Run 冻结仓库 Profile 与 commit，A 到 B 到 A 的证据和配置不�
   service('repository.create', alpha);
   service('repository.create', beta);
   const first = service('run.create', {projectId: 'alpha', mode: 'test', goal: '检查 A'});
+  assert.throws(() => service('run.create', {projectId: 'beta', mode: 'repair', goal: '检查 B'}), error => error.code === 'EXECUTOR_BUSY');
+  service('run.ended', {id: first.id, error: '测试串行执行边界'});
   const middle = service('run.create', {projectId: 'beta', mode: 'repair', goal: '检查 B'});
+  service('run.ended', {id: middle.id, error: '测试串行执行边界'});
   const frozenProfile = fs.readFileSync(first.profile, 'utf8');
   const frozenRegistry = fs.readFileSync(first.registry, 'utf8');
   assert.equal(first.repositorySnapshot.repo_id, 'alpha');
@@ -153,6 +156,7 @@ test('Run 冻结仓库 Profile 与 commit，A 到 B 到 A 的证据和配置不�
   service('repository.update', {id: 'alpha', patch: {default_ref: 'HEAD', credential_ref: 'github_updated',
     allowed_files: ['src/app.js'], profile: {...alpha.profile, health_path: '/ready'}}});
   const last = service('run.create', {projectId: 'alpha', mode: 'test', goal: '再次检查 A'});
+  service('run.ended', {id: last.id, error: '测试串行执行边界'});
   assert.equal(last.repositorySnapshot.commit, git(alpha.root, 'rev-parse', 'HEAD'));
   assert.notEqual(last.repositorySnapshot.commit, first.repositorySnapshot.commit);
   assert.equal(last.repositorySnapshot.repository_config.credential_ref, 'github_updated');
@@ -183,6 +187,7 @@ test('Run 控制入口拒绝调用方伪造身份、仓库快照和证据归属'
   service('repository.create', repository('alpha'));
   service('repository.create', repository('beta'));
   const original = service('run.create', {projectId: 'alpha', mode: 'test', goal: '合法 A'});
+  service('run.ended', {id: original.id, error: '测试串行执行边界'});
   const forged = {id: original.id, consoleRunId: original.id, agentRunId: 'run_other',
     reportRef: '0001_report.json', artifacts: [{ref: '0001_report.json'}],
     repositorySnapshot: original.repositorySnapshot, registry: original.registry, profile: original.profile,

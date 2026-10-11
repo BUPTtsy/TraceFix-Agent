@@ -20,7 +20,8 @@ export function controlAuthorized(request, token = process.env.TRACEFIX_CONTROL_
 
 export function publicError(error, requestId) {
   const status = error.validation ? 400 : error.status ?? error.statusCode ?? (error.code === 'ENOENT' ? 404 : 500);
-  return {status, body: {code: error.validation ? 'VALIDATION_ERROR' : error.code || (status === 404 ? 'NOT_FOUND' : 'INTERNAL_ERROR'),
+  return {status, body: {code: error.validation ? 'VALIDATION_ERROR' : error.code ||
+    ({400: 'INVALID_REQUEST', 404: 'NOT_FOUND', 409: 'CONFLICT', 422: 'UNPROCESSABLE_REQUEST', 503: 'SERVICE_UNAVAILABLE'}[status] || 'INTERNAL_ERROR'),
     message: status >= 500 ? '服务暂不可用' : error.message || '请求失败',
     retryable: error.retryable === true, requestId,
     ...(error.taskId ? {taskId: error.taskId, taskUrl: '/api/v1/tasks/' + error.taskId} : {}),
@@ -42,7 +43,7 @@ export async function createApi({bridge, controller, token, legacyHandler, logge
     reply.code(failure.status).send(failure.body);
   });
   app.setNotFoundHandler((request, reply) => reply.code(404).send({code: 'NOT_FOUND', message: '接口不存在', retryable: false, requestId: request.id}));
-  const route = (method, url, schema, handler) => app.route({method, url, schema, handler});
+  const route = (method, url, schema, handler, preValidation) => app.route({method, url, schema, handler, preValidation});
   const response = (status, success) => ({[status]: success, ...schemas.errors});
   const listQuery = {type: 'object', additionalProperties: false, properties: {projectId: {type: 'string', maxLength: 128}}};
   route('GET', '/api/v1/openapi.json', {hide: true}, async () => app.swagger());
@@ -54,14 +55,17 @@ export async function createApi({bridge, controller, token, legacyHandler, logge
       const started = await controller.start(created.task.id, {}, request.headers['idempotency-key'], 'create-start');
       return reply.code(201).send(started);
     } catch (error) {throw Object.assign(error, {taskId: created.task.id});}
-  });
+  }, async request => {if (request.headers['idempotency-key']) await bridge('task.create.check', {
+    body: request.body || {}, key: request.headers['idempotency-key']});});
   route('GET', '/api/v1/tasks', {querystring: listQuery, response: response(200, {type: 'array', items: schemas.task})},
     request => bridge('tasks', request.query));
   route('GET', '/api/v1/tasks/:id', {params: schemas.params, response: response(200, schemas.task)}, request => bridge('task', request.params));
   route('PUT', '/api/v1/tasks/:id', {params: schemas.params, body: schemas.taskInput, response: response(200, schemas.task)},
     request => bridge('task.update', {id: request.params.id, body: request.body}));
   route('POST', '/api/v1/tasks/:id/start', {params: schemas.params, body: schemas.empty, headers: schemas.idempotency, response: response(202, schemas.mutation)},
-    async (request, reply) => reply.code(202).send(await controller.start(request.params.id, request.body || {}, request.headers['idempotency-key'])));
+    async (request, reply) => reply.code(202).send(await controller.start(request.params.id, request.body || {}, request.headers['idempotency-key'])),
+    async request => {if (request.headers['idempotency-key']) await bridge('task.start.check', {
+      id: request.params.id, body: request.body || {}, key: request.headers['idempotency-key']});});
   route('POST', '/api/v1/tasks/:id/stop', {params: schemas.params, body: schemas.empty,
     response: {...response(200, schemas.mutation), 202: schemas.mutation}},
     async (request, reply) => {const stopped = await controller.stop(request.params.id); return reply.code(stopped.status).send(stopped.value);});
@@ -109,20 +113,25 @@ function registerRuleRoutes(route, bridge) {
   const anyResponse = status => ({[status]: schemas.genericObject, ...schemas.errors});
   const listResponse = {200: {type: 'array', items: schemas.genericObject}, ...schemas.errors};
   for (const prefix of ['/api/v1/rules', '/api/rules']) {
-    route('GET', prefix, {response: listResponse}, request => bridge('rules', request.query));
-    route('POST', prefix, {body: schemas.genericObject, response: anyResponse(201)}, async (request, reply) => reply.code(201).send(await bridge('rule.create', request.body)));
+    route('GET', prefix, {querystring: schemas.ruleQuery, response: listResponse}, request => bridge('rules', {
+      ...request.query, includeArchived: request.query.includeArchived === 'true'}));
+    route('POST', prefix, {body: schemas.ruleInput, response: anyResponse(201)}, async (request, reply) => reply.code(201).send(await bridge('rule.create', request.body)));
     route('GET', prefix + '/insights', {response: listResponse}, request => bridge('rule.insights', request.query));
     route('GET', prefix + '/:id', {params: schemas.params, response: anyResponse(200)}, request => bridge('rule', request.params));
-    route('PUT', prefix + '/:id', {params: schemas.params, body: schemas.genericObject, response: anyResponse(200)}, request => bridge('rule.update', {...request.body, id: request.params.id}));
+    route('PUT', prefix + '/:id', {params: schemas.params, body: schemas.ruleInput, response: anyResponse(200)}, request => bridge('rule.update', {...request.body, id: request.params.id}));
     route('DELETE', prefix + '/:id', {params: schemas.params, response: anyResponse(200)}, request => bridge('rule.delete', request.params));
     for (const suffix of ['versions', 'preview', 'findings']) {
       route('GET', prefix + '/:id/' + suffix, {params: schemas.params, response: suffix === 'preview' ? anyResponse(200) : listResponse},
         request => bridge('rule.' + suffix, {...request.query, id: request.params.id, ruleId: request.params.id}));
     }
     for (const [action, status] of [['publish', 'enabled'], ['disable', 'disabled'], ['archive', 'archived'], ['rollback', null]]) {
-      route('POST', prefix + '/:id/' + action, {params: schemas.params, body: schemas.genericObject, response: anyResponse(200)},
+      route('POST', prefix + '/:id/' + action, {params: schemas.params, body: action === 'rollback' ? {...schemas.ruleAction, required: ['version']} : schemas.ruleAction, response: anyResponse(200)},
         request => bridge(status ? 'rule.status' : 'rule.rollback', {id: request.params.id, status,
           expectedVersion: request.body.expectedVersion, version: request.body.version}));
     }
+  }
+  for (const prefix of ['/api/v1/rule-sets', '/api/rule-sets']) {
+    route('GET', prefix, {response: listResponse}, () => bridge('rule-sets'));
+    route('POST', prefix, {body: schemas.genericObject, response: anyResponse(201)}, async (request, reply) => reply.code(201).send(await bridge('rule-set.save', request.body)));
   }
 }

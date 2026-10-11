@@ -30,7 +30,10 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
   async function start(id, body = {}, key, namespace = 'explicit') {
     await bridge('task.recover', {isAlive});
     const value = await bridge('task.start', {id, body, key, namespace, ownerId});
-    if (value.replayed) return {task: await bridge('task', {id}), run: await bridge('run', {id: value.run.id}), replayed: true};
+    if (value.replayed) {
+      const run = await bridge('run.record', {id: value.run.id});
+      return {task: {...value.task, status: run.status, updatedAt: run.updatedAt || value.task.updatedAt}, run, replayed: true};
+    }
     const {task, run} = value;
     await bridge('task.launching', {id, runId: run.id, ownerId});
     let child;
@@ -39,6 +42,7 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
         {cwd: projectRoot, windowsHide: true, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'],
           env: {...process.env, TRACEFIX_CONSOLE_RUN_ID: run.id, TRACEFIX_PROCESS_CONTROL_ID: run.processControlId,
             TRACEFIX_DATA: run.dataRoot, TRACEFIX_CONSOLE_DB: run.consoleDatabasePath,
+            TRACEFIX_SERVICE_DATA_ROOT: run.dataRoot, TRACEFIX_SERVICE_CONSOLE_DB: run.consoleDatabasePath,
             PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1',
             PYTHONPATH: [path.join(projectRoot, 'backend/packages/agent/src'), process.env.PYTHONPATH].filter(Boolean).join(path.delimiter)}});
     } catch {
@@ -67,22 +71,18 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
       clearTimeout(flushTimer); clearTimeout(entry.timer);
       try {
         await flush();
-        const latest = await bridge('run', {id: run.id});
+        const latest = await bridge('run.record', {id: run.id});
         let result = null;
         try {
           const parsed = JSON.parse(output);
-          if (!overflow && parsed.schema_version === 1 && parsed.task_id === id && parsed.run_id === run.id &&
-              parsed.repo_id === run.projectId && typeof parsed.settled === 'boolean' && typeof parsed.outcome === 'string' &&
-              Array.isArray(parsed.findings) && parsed.verification && typeof parsed.verification === 'object') result = parsed;
+          if (!overflow) result = await bridge('run.executor-result', {id: run.id, result: parsed});
         } catch {}
         const cancelled = latest.status === 'stopping' || latest.stopRequestedAt;
-        const completed = result?.settled === true && result.outcome !== 'UNKNOWN';
         const changes = {exitCode: code, signal, finishedAt: new Date().toISOString(), processControlId: null,
           stopRequestedAt: null, stopPreviousStatus: null,
           ...(processError ? {status: 'failed', outcome: 'INFRA_FAILURE', error: processError} :
             cancelled ? {status: 'cancelled', outcome: 'CANCELLED', error: {code: 'CANCELLED', message: '执行已取消', retryable: false}} :
-              result ? {status: completed ? 'completed' : 'unknown', outcome: result.outcome, executionResult: result,
-                error: result.error ?? null} : !active.has(latest.status) ? {} :
+              result ? result :
                 {status: 'unknown', outcome: 'UNKNOWN', error: {code: 'EXECUTOR_RESULT_MISSING', message: '执行已退出，缺少可确认的最终结果', retryable: false}})};
         await bridge('task.finish', {id, runId: run.id, ownerId, changes});
       } catch (error) {reportError('保存执行结果失败：', error);}
@@ -107,7 +107,7 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
     const pending = (async () => {
       const task = await bridge('task', {id});
       if (!task.currentRunId) return {status: 200, value: {task, run: null, replayed: true}};
-      const run = await bridge('run', {id: task.currentRunId});
+      const run = await bridge('run.record', {id: task.currentRunId});
       if (!active.has(run.status)) return {status: 200, value: {task, run, replayed: true}};
       if (run.status === 'stopping') return {status: 202, value: {task, run, replayed: true}};
       const entry = owned.get(run.id);
@@ -116,7 +116,7 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
       if (record.status === 'stopping') {
         entry.timer = setTimeout(async () => {
           try {
-            const latest = await bridge('run', {id: run.id});
+            const latest = await bridge('run.record', {id: run.id});
             if (owned.get(run.id) !== entry || latest.status !== 'stopping' || latest.stopRequestedAt !== record.stopRequestedAt) return;
             await terminate(entry.child, {isAlive});
           } catch (error) {

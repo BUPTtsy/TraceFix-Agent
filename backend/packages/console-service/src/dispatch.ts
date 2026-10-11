@@ -8,7 +8,7 @@ import {canContinue, ConsoleDatabase, DataError, timestamp} from './database.js'
 import {RuleDatabase} from './rules.js';
 import {classifyGuidance, guidanceUnsafe} from './guidance.js';
 import {TaskLifecycle, normalizeTask, taskError} from './task-lifecycle.js';
-import {resultView} from './results.js';
+import {resultView, executorResult} from './results.js';
 
 type Data = Record<string, any>;
 
@@ -126,8 +126,10 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     if (operation === 'tasks') return tasks.tasks(fields.projectId);
     if (operation === 'task') return tasks.task(fields.id);
     if (operation === 'task.create') return tasks.create(fields.body, fields.key);
+    if (operation === 'task.create.check') return tasks.checkCreate(fields.body, fields.key);
     if (operation === 'task.update') return tasks.update(fields.id, fields.body);
     if (operation === 'task.start') return tasks.start(fields.id, fields.body || {}, fields.key, fields.ownerId, fields.namespace);
+    if (operation === 'task.start.check') return tasks.checkStart(fields.id, fields.body || {}, fields.key);
     if (operation === 'task.launching') return tasks.launchIntent(fields.id, fields.runId, fields.ownerId);
     if (operation === 'task.spawned') return tasks.spawned(fields.id, fields.runId, fields.ownerId, fields.pid);
     if (operation === 'task.finish') return tasks.finish(fields.id, fields.runId, fields.ownerId, fields.changes);
@@ -160,6 +162,14 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     if (operation === 'runs') return database.runs(fields.projectId).map(({logs, ...run}) =>
       ({...run, canContinue: canContinue(run.status, run.outcome)}));
     if (operation === 'run') return runView(fields.id);
+    if (operation === 'run.record') return database.run(fields.id);
+    if (operation === 'run.executor-result') {
+      const record = database.run(fields.id);
+      const view = fields.result?.report_ref ? runView(fields.id) : undefined;
+      const ref = view?.issueReport?.patch_diff_ref;
+      const bytes = ref ? Buffer.from(dispatch('artifact', {id: fields.id, ref}).content, 'base64') : undefined;
+      return executorResult(fields.result, record, view, bytes);
+    }
     if (operation === 'run.findings') {
       const record = database.run(fields.id);
       return record.agentRunId ? rules.findings({runId: record.agentRunId, limit: 1000}) : [];
@@ -188,10 +198,11 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     }
     if (operation === 'run.continue') {
       const previous = database.run(fields.id);
+      if (previous.taskId) throw taskError('TASK_RESTART_REQUIRED', 'Task 的重新执行必须使用 start 新建 Run', 409);
       const project = catalog().find(item => item.id === previous.projectId);
       if (project?.enabled === false) throw new DataError('仓库已禁用', 409);
       dispatch('run.trace', {id: fields.id});
-      const record = database.continueRun(fields.id, fields.instruction);
+      const record = database.continueRun(fields.id, fields.instruction, () => tasks.assertIdle());
       if (previous.repositorySnapshot) return record;
       return project ? database.updateRun(record.id, {profile: project.profile, registry: project.registry}) : record;
     }
@@ -200,11 +211,16 @@ export function createConsoleService(options: ConsoleOptions = {}) {
       if (!record.artifacts.some((entry: Data) => entry.ref === fields.ref)) throw new DataError('只允许读取此 Run 的报告或补丁');
       return {encoding: 'base64', content: readArtifactBytes(artifactRoot(record), record.projectId, record.agentRunId, fields.ref).toString('base64')};
     }
-    if (operation === 'run.create' || operation === 'run.prepare') {
-      if (operation === 'run.create') tasks.assertIdle();
+    if (operation === 'run.create') return database.transaction(() => {
+      tasks.assertIdle();
+      const record = dispatch('run.prepare', {...fields, _runId: randomUUID(), _legacy: true});
+      database.db.prepare('INSERT INTO console_runs VALUES (?,?)').run(record.id, JSON.stringify(record));
+      return record;
+    });
+    if (operation === 'run.prepare') {
       const project = catalog().find(item => item.id === fields.projectId);
       if (!project?.ready) throw new DataError(project?.issue || '请选择已注册的项目');
-      if (operation === 'run.prepare' && project.repositoryConfigVersion !== 1)
+      if (!fields._legacy && project.repositoryConfigVersion !== 1)
         throw taskError('REPOSITORY_FREEZE_REQUIRED', 'Task 执行需要 B1 仓库注册与冻结', 409);
       if (typeof fields.goal !== 'string' || !fields.goal.trim() || fields.goal.trim().length > 4000 ||
           !['test', 'repair'].includes(fields.mode)) throw new DataError('运行目标或模式无效');
@@ -236,7 +252,7 @@ export function createConsoleService(options: ConsoleOptions = {}) {
           throw taskError('SOURCE_FINDING_NOT_FOUND', '来源 Finding 不属于指定 Run', 404);
         fields = {...fields, source_run_id: source.agentRunId};
       }
-      const runId = operation === 'run.prepare' ? fields._runId : randomUUID();
+      const runId = fields._runId;
       const frozen = project.repositoryConfigVersion === 1 ? repository('repository.freeze', {id: project.id, run_id: runId}) : null;
       if (frozen && (frozen.repo_id !== project.id || frozen.projectId !== project.id ||
           !/^[a-f0-9]{40,64}$/.test(frozen.commit) || typeof frozen.config_digest !== 'string' ||
@@ -253,13 +269,14 @@ export function createConsoleService(options: ConsoleOptions = {}) {
         ...(fields.source_run_id ? {source_run_id: fields.source_run_id} : {}),
         status: 'running', phase: 'STARTING', outcome: null, finishedAt: null, startedAt: timestamp(),
         knowledge: [], logs: [], origin: 'web', dataRoot, consoleDatabasePath: database.filename};
-      return operation === 'run.prepare' ? record : database.updateRun(runId, record, true);
+      return record;
     }
     if (operation === 'run.update') {
       const previous = database.run(fields.id);
       if (previous.repositorySnapshot && ['agentRunId', 'reportRef', 'artifacts', 'repositorySnapshot', 'profile',
         'registry', 'projectId', 'dataRoot', 'id', 'consoleRunId', 'repoSnapshotRef', 'memorySnapshotRef',
-        'sourceManifest', 'evidenceRefs', 'inheritedEvidenceRefs', 'scopeId', 'parentRunId']
+        'sourceManifest', 'evidenceRefs', 'inheritedEvidenceRefs', 'scopeId', 'parentRunId', 'taskId', 'execution',
+        'executionMode', 'source_run_id', 'source_finding_ids', 'github_reads', 'consoleDatabasePath']
           .some(key => Object.hasOwn(fields.changes || {}, key))) throw new DataError('运行身份、证据归属和仓库快照不可修改', 409);
       return database.updateRun(fields.id, fields.changes);
     }

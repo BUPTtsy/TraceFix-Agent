@@ -17,7 +17,9 @@ const projectRoot = fileURLToPath(new URL('../../../../', import.meta.url));
 const bundle = await build({entryPoints: [path.join(projectRoot, 'backend/packages/console-service/src/dispatch.ts')],
   bundle: true, platform: 'node', format: 'esm', write: false});
 const {createConsoleService} = await import('data:text/javascript;base64,' + Buffer.from(bundle.outputFiles[0].text).toString('base64'));
-const body = {projectId: 'alpha', mode: 'test', goal: '测试页面输入行为', execution: {executionMode: 'batch', url: 'http://app:3000', spec: '检查保存反馈'}};
+const spec = {goal: '检查页面保存反馈', assertions: [{locator: {role: 'status', name: 'Saved'}, condition: 'visible'}],
+  regression_assertions: [{locator: {role: 'status', name: 'Saved'}, condition: 'visible'}]};
+const body = {projectId: 'alpha', mode: 'test', goal: '测试页面输入行为', execution: {executionMode: 'batch', url: 'http://app:3000', spec}};
 const headers = {authorization: 'Bearer beta-test-token'};
 
 function git(root, ...args) {
@@ -50,7 +52,7 @@ function fakeExecutor() {
     return child;
   }
   return {calls, spawn, fail() {failSpawn = true;},
-    isAlive: pid => calls.some(call => call.child.pid === pid && call.child.exitCode === null),
+    isAlive: pid => pid === process.pid || calls.some(call => call.child.pid === pid && call.child.exitCode === null),
     terminate: async child => child.finish(undefined, null)};
 }
 
@@ -87,9 +89,32 @@ async function fixture(context) {
   };
   const finish = async (started, outcome = 'FIX_VERIFIED', settled = true) => {
     const call = fake.calls.find(item => item.request?.run_id === started.run.id);
+    const runDirectory = path.join(dataRoot, 'artifacts', 'alpha', started.run.id);
+    fs.mkdirSync(runDirectory, {recursive: true});
+    const index = {};
+    const artifact = (ref, value, label) => {
+      const bytes = Buffer.from(typeof value === 'string' ? value : JSON.stringify(value));
+      fs.writeFileSync(path.join(runDirectory, ref), bytes);
+      index[ref] = {'用途': label, '字节数': bytes.length, SHA256: createHash('sha256').update(bytes).digest('hex')};
+    };
+    const diff = '--- a/src/App.tsx\n+++ b/src/App.tsx\n@@ -1 +1 @@\n-export const App = () => null;\n+export const App = () => "fixed";\n';
+    const patchRef = outcome === 'FIX_VERIFIED' ? '0002_patch.diff' : null;
+    if (patchRef) artifact(patchRef, diff, '收尾_补丁');
+    const runStatus = settled ? 'COMPLETED' : 'ABNORMAL';
+    const report = {run_id: started.run.id, scope_id: 'alpha', run_status: runStatus, outcome,
+      patch_diff_ref: patchRef, patch_available: Boolean(patchRef), patch_verification: patchRef ? 'verified' : 'none',
+      check_summary: {total: 1, passed: 1}, check_results: [], overall_status: 'PASSED'};
+    artifact('0001_report.json', report, '收尾_修复报告数据');
+    fs.writeFileSync(path.join(runDirectory, '文件索引.json'), JSON.stringify(index));
+    const database = new DatabaseSync(databasePath);
+    const record = JSON.parse(database.prepare('SELECT data FROM console_runs WHERE id=?').get(started.run.id).data);
+    database.prepare('UPDATE console_runs SET data=? WHERE id=?').run(JSON.stringify({...record,
+      agentRunId: started.run.id, reportRef: '0001_report.json', status: runStatus.toLowerCase(), outcome}), started.run.id);
+    database.close();
     call.child.finish({schema_version: 1, task_id: started.task.id, run_id: started.run.id, repo_id: 'alpha',
-      outcome, settled, findings: [], ruleCoverage: {summary: {total: 1, passed: 1}}, patch: null,
-      verification: {overall_status: 'PASSED'}, error: null, provenance: {executor: 'explicit-test-double'}});
+      run_status: runStatus, outcome, terminal: true, report_ref: '0001_report.json', report,
+      patch_diff_ref: patchRef, diff: patchRef ? diff : null, patch_available: Boolean(patchRef),
+      patch_verification: patchRef ? 'verified' : 'none', error: null});
     await controller.drain();
   };
   return {root, target, dataRoot, databasePath, service, serviceOptions, bridge, app, controller, fake, request, create, finish};
@@ -120,7 +145,7 @@ test('Fastify Task lifecycle: 创建不执行、start、活动编辑、终态编
   const result = (await request('GET', '/api/v1/runs/' + started.run.id + '/result')).json();
   assert.equal(result.outcome, 'FIX_VERIFIED'); assert.equal(result.settled, true);
   assert.equal((await request('GET', '/api/v1/tasks/' + created.task.id)).json().status, 'completed');
-  assert.equal((await request('PUT', '/api/v1/tasks/' + created.task.id, {...body, goal: '新目标'})).json().status, 'created');
+  assert.equal((await request('PUT', '/api/v1/tasks/' + created.task.id, {...body, goal: '新一轮测试目标'})).json().status, 'created');
   const second = (await request('POST', '/api/v1/tasks/' + created.task.id + '/start', {}, 'second')).json();
   assert.notEqual(second.run.id, started.run.id);
   assert.equal((await request('GET', '/api/v1/runs/' + started.run.id + '/result')).json().outcome, 'FIX_VERIFIED');
@@ -133,7 +158,7 @@ test('并发创建/start、响应重放、正文冲突和 API 重建均只绑定
   assert.ok(responses.every(response => response.statusCode === 201));
   const id = responses[0].json().task.id;
   assert.equal(new Set(responses.map(response => response.json().task.id)).size, 1);
-  assert.equal((await request('POST', '/api/v1/tasks', {...body, goal: '冲突'}, 'create')).json().code, 'IDEMPOTENCY_CONFLICT');
+  assert.equal((await request('POST', '/api/v1/tasks', {...body, goal: '冲突的测试目标'}, 'create')).json().code, 'IDEMPOTENCY_CONFLICT');
   const starts = await Promise.all(Array.from({length: 8}, () => request('POST', '/api/v1/tasks/' + id + '/start', {}, 'start')));
   assert.ok(starts.every(response => response.statusCode === 202), starts.map(response => response.body).join('\n'));
   assert.equal(fake.calls.length, 1);
@@ -146,7 +171,9 @@ test('并发创建/start、响应重放、正文冲突和 API 重建均只绑定
   context.after(() => rebuilt.close());
   const replay = await rebuilt.inject({method: 'POST', url: '/api/v1/tasks/' + id + '/start', headers: {...headers, 'idempotency-key': 'start'}, payload: {}});
   assert.equal(replay.statusCode, 202); assert.equal(replay.json().run.id, started.run.id); assert.equal(fake.calls.length, 1);
-  assert.equal((await request('POST', '/api/v1/tasks/' + id + '/start', {goal: 'inject'}, 'start')).statusCode, 400);
+  const restartedCreate = await rebuilt.inject({method: 'POST', url: '/api/v1/tasks', headers: {...headers, 'idempotency-key': 'create'}, payload: body});
+  assert.equal(restartedCreate.statusCode, 201); assert.equal(restartedCreate.json().task.id, id);
+  assert.equal((await request('POST', '/api/v1/tasks/' + id + '/start', {goal: 'inject'}, 'start')).statusCode, 409);
   const other = await create();
   const busy = await request('POST', '/api/v1/tasks/' + other.task.id + '/start', {}, 'busy');
   assert.equal(busy.statusCode, 409); assert.equal(busy.json().code, 'EXECUTOR_BUSY');
@@ -187,6 +214,62 @@ test('错 Task 停止不影响其他运行；停止并发与重复请求幂等�
   assert.equal(final.statusCode, 200); assert.equal(final.json().run.id, started.run.id);
   const result = (await request('GET', '/api/v1/runs/' + started.run.id + '/result')).json();
   assert.equal(result.outcome, 'CANCELLED'); assert.equal(result.settled, true);
+});
+
+test('不同 Task 并发 start 和旧 run.create 都遵守同一执行互斥', async context => {
+  const {request, create, finish, fake, service} = await fixture(context);
+  const tasks = await Promise.all([create(), create()]);
+  const responses = await Promise.all(tasks.map(value => request('POST', '/api/v1/tasks/' + value.task.id + '/start', {}, 'race')));
+  assert.deepEqual(responses.map(response => response.statusCode).sort(), [202, 409]);
+  assert.equal(fake.calls.length, 1);
+  assert.throws(() => service('run.create', {projectId: 'alpha', mode: 'test', goal: '旧入口运行目标'}), error => error.code === 'EXECUTOR_BUSY');
+  const started = responses.find(response => response.statusCode === 202).json();
+  assert.throws(() => service('run.continue', {id: started.run.id, instruction: '旧路径继续执行'}), error => error.code === 'TASK_RESTART_REQUIRED');
+  await finish(started);
+});
+
+test('B 形状失败输出即使退出码非零也保持明确结果；伪造成功不得替代证据', async context => {
+  const {request, create, fake, controller} = await fixture(context);
+  const {task} = await create();
+  const first = (await request('POST', '/api/v1/tasks/' + task.id + '/start', {})).json();
+  fake.calls[0].child.finish({schema_version: 1, task_id: task.id, run_id: first.run.id, repo_id: 'alpha',
+    terminal: true, run_status: 'FAILED', outcome: 'INFRA_FAILURE', report_ref: null, report: null,
+    patch_diff_ref: null, diff: null, patch_available: false, patch_verification: 'none', error: {code: 'configuration_missing'}}, 1);
+  await controller.drain();
+  const failure = (await request('GET', '/api/v1/runs/' + first.run.id + '/result')).json();
+  assert.equal(failure.outcome, 'INFRA_FAILURE'); assert.equal(failure.settled, true);
+  assert.equal(failure.error.code, 'configuration_missing');
+  const second = (await request('POST', '/api/v1/tasks/' + task.id + '/start', {})).json();
+  fake.calls[1].child.finish({schema_version: 1, task_id: task.id, run_id: second.run.id, repo_id: 'alpha',
+    terminal: true, run_status: 'COMPLETED', outcome: 'FIX_VERIFIED', report_ref: null,
+    patch_available: true, patch_verification: 'verified', diff: 'forged'}, 0);
+  await controller.drain();
+  const forged = (await request('GET', '/api/v1/runs/' + second.run.id + '/result')).json();
+  assert.equal(forged.outcome, 'UNKNOWN'); assert.equal(forged.settled, false); assert.equal(forged.error.retryable, false);
+});
+
+test('v1 artifacts 保留闭包、归属与 hash 检查；events 使用稳定序号', async context => {
+  const {request, create, finish, dataRoot, service} = await fixture(context);
+  const {task} = await create();
+  const first = (await request('POST', '/api/v1/tasks/' + task.id + '/start', {})).json();
+  await finish(first);
+  const second = (await request('POST', '/api/v1/tasks/' + task.id + '/start', {})).json();
+  await finish(second, 'NO_BUG_FOUND');
+  const patch = '/api/v1/runs/' + first.run.id + '/artifacts/0002_patch.diff';
+  assert.equal((await request('GET', patch)).statusCode, 200);
+  assert.equal((await request('GET', patch.replace(first.run.id, second.run.id))).statusCode, 400);
+  assert.ok((await request('GET', '/api/v1/runs/' + first.run.id + '/artifacts/..%2F..%2Fprofiles.yaml')).statusCode >= 400);
+  const filename = path.join(dataRoot, 'artifacts', 'alpha', first.run.id, '0002_patch.diff');
+  fs.appendFileSync(filename, 'tampered');
+  assert.equal((await request('GET', patch)).statusCode, 400);
+  assert.equal((await request('GET', '/api/v1/runs/' + first.run.id + '/result')).statusCode, 400);
+  const untouched = service('run.record', {id: second.run.id});
+  assert.equal(untouched.outcome, 'NO_BUG_FOUND');
+  const database = new DatabaseSync(path.join(dataRoot, 'console.sqlite3'));
+  database.prepare('INSERT INTO console_events VALUES (?,?,?,?)').run(second.run.id, 1, 'fixture', JSON.stringify({seq: 1, type: 'fixture.finished'}));
+  database.close();
+  assert.equal((await request('GET', '/api/v1/runs/' + second.run.id + '/events')).json()[0].seq, 1);
+  assert.deepEqual((await request('GET', '/api/v1/runs/' + second.run.id + '/events?after=1')).json(), []);
 });
 
 test('spawn 失败结构化保存；同 start 键重放不再次 spawn', async context => {

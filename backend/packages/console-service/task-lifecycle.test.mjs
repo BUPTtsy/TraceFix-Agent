@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {build} from 'esbuild';
+import {spawn} from 'node:child_process';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const bundle = await build({stdin: {contents: "export * from './src/task-lifecycle.ts'; export * from './src/database.ts';",
@@ -40,7 +41,7 @@ test('Task 创建不运行；终态编辑后 start 新建 Run 并保留历史', 
   assert.throws(() => tasks.update(task.id, input), error => error.code === 'TASK_ACTIVE');
   tasks.spawned(task.id, first.run.id, 'owner', 1234);
   tasks.finish(task.id, first.run.id, 'owner', {status: 'failed', outcome: 'INFRA_FAILURE'});
-  assert.equal(tasks.update(task.id, {...input, goal: '第二轮'}).status, 'created');
+  assert.equal(tasks.update(task.id, {...input, goal: '第二轮执行目标'}).status, 'created');
   const second = tasks.start(task.id, {}, 'second', 'owner');
   assert.notEqual(first.run.id, second.run.id);
   assert.equal(store.run(first.run.id).outcome, 'INFRA_FAILURE');
@@ -91,6 +92,38 @@ test('API owner 退出但执行进程仍存活时保持单执行器预留', cont
   assert.throws(() => tasks.update(task.id, input), error => error.code === 'TASK_ACTIVE');
   tasks.recover(() => false);
   assert.equal(tasks.lease(), null);
+});
+
+test('spawn 与 PID 落盘间崩溃不能自动释放无法确认的执行器', context => {
+  const {tasks, store} = fixture(context);
+  const {task} = tasks.create(input);
+  const started = tasks.start(task.id, {}, 'launching', 'owner');
+  tasks.launchIntent(task.id, started.run.id, 'owner');
+  store.db.prepare('UPDATE console_executor SET owner_pid=-1 WHERE slot=1').run();
+  assert.ok(tasks.recover(() => false));
+  assert.equal(store.run(started.run.id).outcome, 'UNKNOWN');
+  assert.equal(store.run(started.run.id).error.retryable, false);
+  assert.throws(() => tasks.start(task.id, {}, 'next', 'other'), error => error.code === 'EXECUTOR_BUSY' && error.retryable === false);
+});
+
+test('两个 API 进程竞争同 start 幂等键；进程退出后重建保留绑定', async context => {
+  const {tasks, store} = fixture(context);
+  const {task} = tasks.create(input, 'process-create');
+  const execute = phase => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [path.join(directory, 'fixtures/task-process.mjs')], {windowsHide: true, stdio: ['pipe', 'pipe', 'pipe']});
+    let output = '', errors = '';
+    child.stdout.on('data', chunk => {output += chunk;}); child.stderr.on('data', chunk => {errors += chunk;});
+    child.once('error', reject);
+    child.once('close', code => {if (code) reject(new Error(errors)); else {try {resolve(JSON.parse(output));} catch (error) {reject(error);}}});
+    child.stdin.end(JSON.stringify({databasePath: store.filename, taskId: task.id, key: 'process-start', phase}));
+  });
+  const started = await Promise.all([execute('reserved'), execute('reserved')]);
+  assert.equal(started[0].run.id, started[1].run.id);
+  assert.equal(store.runs().length, 1);
+  tasks.recover(pid => {try {process.kill(pid, 0); return true;} catch {return false;}});
+  assert.equal(tasks.task(task.id).status, 'unknown');
+  assert.equal(store.run(started[0].run.id).error.retryable, false);
+  assert.equal((await execute('reserved')).run.id, started[0].run.id);
 });
 
 test('Task 正文拒绝执行权限注入、交互模式和未集成验收绑定', () => {
