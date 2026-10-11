@@ -31,7 +31,8 @@ export function publicError(error, requestId) {
 export async function createApi({bridge, controller, token, legacyHandler, logger = false}) {
   const app = Fastify({logger, genReqId: () => randomUUID(), bodyLimit: 1600000,
     ajv: {customOptions: {removeAdditional: false, coerceTypes: false, useDefaults: false}}});
-  await app.register(swagger, {openapi: {info: {title: 'TraceFix beta control plane', version: '1.0.0'},
+  app.addSchema(schemas.findingAcceptance);
+  await app.register(swagger, {openapi: {openapi: '3.1.0', info: {title: 'TraceFix beta control plane', version: '1.0.0'},
     components: {securitySchemes: {controlToken: {type: 'http', scheme: 'bearer'}}}, security: [{controlToken: []}]}});
   app.addHook('onRequest', async (request, reply) => {
     reply.header('cache-control', 'no-store').header('x-request-id', request.id);

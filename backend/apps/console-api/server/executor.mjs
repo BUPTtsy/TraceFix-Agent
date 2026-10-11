@@ -13,7 +13,7 @@ export function executionRequest(task, run) {
     mode: task.definition.mode, goal: task.definition.goal, execution: task.definition.execution,
     additional_rule_ids: task.definition.additionalRuleIds, repository_snapshot: run.repositorySnapshot,
     source_run_id: run.source_run_id ?? null, source_finding_ids: task.definition.source_finding_ids,
-    github_reads: task.definition.github_reads, finding_acceptance: null};
+    github_reads: task.definition.github_reads, finding_acceptance: run.finding_acceptance ?? null};
 }
 
 export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAlive = alive,
@@ -118,7 +118,8 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
         entry.timer = setTimeout(async () => {
           try {
             const latest = await bridge('run.record', {id: run.id});
-            if (owned.get(run.id) !== entry || latest.status !== 'stopping' || latest.stopRequestedAt !== record.stopRequestedAt) return;
+            if (owned.get(run.id) !== entry || latest.status !== 'stopping' ||
+                latest.processControlId !== record.processControlId || latest.stopRequestedAt !== record.stopRequestedAt) return;
             await terminate(entry.child, {isAlive});
           } catch (error) {
             await bridge('run.stop.failed', {id: run.id, processControlId: run.processControlId,

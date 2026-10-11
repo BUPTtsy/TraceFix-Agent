@@ -1,5 +1,6 @@
 import {createHash, randomUUID} from 'node:crypto';
 import {ConsoleDatabase, DataError, timestamp} from './database.js';
+import findingAcceptanceSchema from '../../agent/src/tracefix/service/finding_acceptance.schema.json';
 
 type Data = Record<string, any>;
 const active = new Set(['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping']);
@@ -11,6 +12,37 @@ function canonical(value: any): string {
   if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map(key =>
     JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}';
   return JSON.stringify(value);
+}
+
+function validateAcceptanceShape(value: any, schema: Data = findingAcceptanceSchema,
+  root: Data = findingAcceptanceSchema, path = 'finding_acceptance'): void {
+  const invalid = () => {throw taskError('INVALID_FINDING_ACCEPTANCE', path + ' 不符合冻结验收 schema', 400);};
+  if (schema.$ref) return validateAcceptanceShape(value,
+    schema.$ref.split('/').slice(1).reduce((current: Data, key: string) => current[key], root), root, path);
+  if (schema.anyOf) {
+    if (!schema.anyOf.some((candidate: Data) => {
+      try {validateAcceptanceShape(value, candidate, root, path); return true;} catch {return false;}
+    })) invalid();
+    return;
+  }
+  if (schema.const !== undefined && value !== schema.const || schema.enum && !schema.enum.includes(value)) invalid();
+  const type = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+  if (schema.type && (schema.type === 'integer' ? !Number.isSafeInteger(value) : type !== schema.type)) invalid();
+  if (type === 'object') {
+    if (schema.additionalProperties === false && Object.keys(value).some(key => !(key in schema.properties))) invalid();
+    if ((schema.required || []).some((key: string) => !(key in value) && !(path === 'finding_acceptance' && key === 'run_id'))) invalid();
+    for (const [key, item] of Object.entries(value)) if (schema.properties?.[key])
+      validateAcceptanceShape(item, schema.properties[key], root, path + '.' + key);
+  } else if (type === 'array') {
+    if (schema.minItems !== undefined && value.length < schema.minItems || schema.maxItems !== undefined && value.length > schema.maxItems) invalid();
+    for (const [index, item] of value.entries()) validateAcceptanceShape(item, schema.items, root, path + '[' + index + ']');
+  } else if (type === 'string') {
+    if (schema.minLength !== undefined && value.length < schema.minLength || schema.maxLength !== undefined && value.length > schema.maxLength ||
+        schema.pattern && !new RegExp(schema.pattern).test(value)) invalid();
+  } else if (type === 'number') {
+    if (!Number.isFinite(value) || schema.minimum !== undefined && value < schema.minimum || schema.maximum !== undefined && value > schema.maximum ||
+        schema.exclusiveMinimum !== undefined && value <= schema.exclusiveMinimum) invalid();
+  }
 }
 
 export function normalizeTask(fields: Data, projects: Data[]): Data {
@@ -72,13 +104,38 @@ export function normalizeTask(fields: Data, projects: Data[]): Data {
       read.path.split('/').some((part: string) => !part || part === '.' || part === '..' || /^\.env(?:\.|$)/i.test(part));
     return read.path !== undefined || !Number.isSafeInteger(read.number) || read.number < 1;
   })) throw taskError('INVALID_GITHUB_READ', 'GitHub 读取仅允许受控只读引用', 400);
-  if (fields.finding_acceptance !== undefined)
-    throw taskError('ACCEPTANCE_NOT_INTEGRATED', 'finding_acceptance 等待 C 提供严格验收适配', 422);
+  if (fields.finding_acceptance !== undefined) {
+    validateAcceptanceShape(fields.finding_acceptance);
+    const accepted = fields.finding_acceptance;
+    if (!fields.source_run_id || accepted.repo_id !== project.id || accepted.source_scope_id !== project.id ||
+        accepted.spec.goal !== fields.goal.trim() ||
+        canonical(accepted.findings.map((item: Data) => item.finding_id)) !== canonical(sourceFindingIds))
+      throw taskError('INVALID_FINDING_ACCEPTANCE', '验收模板与来源 Finding、项目或目标不一致', 400);
+    if (execution.spec !== undefined && canonical(execution.spec) !== canonical(accepted.spec))
+      throw taskError('INVALID_FINDING_ACCEPTANCE', 'execution.spec 不能覆盖冻结验收规范', 400);
+    const scenarioIds = accepted.spec.behavior_scenarios.map((scenario: Data) => scenario.id);
+    const referenced = accepted.findings.flatMap((finding: Data) => [finding.original_scenario_id,
+      ...finding.guards.map((guard: Data) => guard.scenario_id)]);
+    if (new Set(scenarioIds).size !== scenarioIds.length || new Set(accepted.findings.map((finding: Data) => finding.finding_id)).size !== accepted.findings.length ||
+        canonical([...new Set(referenced)].sort()) !== canonical([...scenarioIds].sort()) ||
+        accepted.findings.some((finding: Data) => Boolean(finding.rule_id) !== Boolean(finding.rule_version) ||
+          new Set(finding.guards.map((guard: Data) => guard.kind)).size !== 3 ||
+          new Set([finding.original_scenario_id, ...finding.guards.map((guard: Data) => guard.scenario_id)]).size !== finding.guards.length + 1))
+      throw taskError('INVALID_FINDING_ACCEPTANCE', '验收问题与正常、逆向、刷新场景必须完整唯一绑定', 400);
+    const actions = [...accepted.spec.regression_plan, ...accepted.spec.behavior_scenarios.flatMap((scenario: Data) => {
+      if (!scenario.steps.at(-1).assertions?.length || scenario.steps.length > 1 && !scenario.steps.slice(0, -1).some((step: Data) => step.assertions?.length))
+        throw taskError('INVALID_FINDING_ACCEPTANCE', '验收场景必须包含中间和最终断言', 400);
+      return scenario.steps.map((step: Data) => step.action);
+    })];
+    if (actions.some((action: Data) => action.kind === 'finish' || action.observation_id != null || action.element_ref != null || action.page_generation != null ||
+        !accepted.spec.authorized_actions?.includes(action.kind)))
+      throw taskError('INVALID_FINDING_ACCEPTANCE', '验收动作不能引用旧页面或跳过执行', 400);
+  }
   if (fields.create_and_start !== undefined && typeof fields.create_and_start !== 'boolean')
     throw taskError('INVALID_TASK', 'create_and_start 必须是布尔值', 400);
   return {projectId: project.id, mode: fields.mode, goal: fields.goal.trim(), execution: {...execution},
     additionalRuleIds, source_run_id: fields.source_run_id ?? null, source_finding_ids: sourceFindingIds,
-    github_reads: reads};
+    github_reads: reads, ...(fields.finding_acceptance !== undefined ? {finding_acceptance: fields.finding_acceptance} : {})};
 }
 
 export class TaskLifecycle {
@@ -175,10 +232,24 @@ export class TaskLifecycle {
       this.assertIdle();
       if (active.has(task.status)) throw taskError('TASK_ACTIVE', 'Task 已在执行');
       const runId = randomUUID(), now = timestamp();
+      const template = task.definition.finding_acceptance;
+      if (template?.run_id && template.run_id !== runId)
+        throw taskError('INVALID_FINDING_ACCEPTANCE', '验收模板不能绑定其他或历史 Repair Run', 409);
       const prepared = this.prepareRun(task.definition, runId);
+      if (template) {
+        const source = this.store.runs().filter(record => record.projectId === task.definition.projectId &&
+          [record.id, record.agentRunId].includes(task.definition.source_run_id));
+        const config = prepared.repositorySnapshot?.repository_config;
+        if (source.length !== 1 || source[0].agentRunId !== template.source_run_id ||
+            prepared.source_run_id !== template.source_run_id || prepared.repositorySnapshot?.commit !== template.commit ||
+            template.source_repo_id !== config?.owner + '/' + config?.repo)
+          throw taskError('INVALID_FINDING_ACCEPTANCE', '验收模板与唯一来源 Run、仓库或开始 revision 不一致', 409);
+      }
       const run = {...prepared, taskId: task.id, execution: task.definition.execution,
         source_run_id: prepared.source_run_id ?? task.definition.source_run_id, source_finding_ids: task.definition.source_finding_ids,
-        github_reads: task.definition.github_reads, processControlId: randomUUID(), updatedAt: now};
+        github_reads: task.definition.github_reads,
+        ...(template ? {finding_acceptance: {...template, run_id: runId}} : {}),
+        processControlId: randomUUID(), updatedAt: now};
       this.writeRun(run);
       const updated = {...task, status: 'starting', currentRunId: runId,
         runIds: [...task.runIds, runId], updatedAt: now};

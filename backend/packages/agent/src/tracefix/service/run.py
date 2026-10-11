@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import signal
+import sqlite3
 import sys
 from contextlib import AsyncExitStack, redirect_stderr, redirect_stdout
 from types import SimpleNamespace
@@ -21,7 +22,8 @@ from tracefix.runtime.contracts import Outcome, Phase, RunState, RunStatus
 from tracefix.runtime.finding_source import rebind_finding_repair_revision
 from tracefix.service.config import ServiceSettings, validate_snapshot
 from tracefix.service.contracts import ServiceRequest
-from tracefix.service.finding import RunBoundFindings, finding_repair_state, validate_acceptance
+from tracefix.service.finding import (RunBoundFindings, finding_repair_state,
+                                     strict_acceptance_adapter, validate_acceptance)
 from tracefix.service.resources import RunServices
 from tracefix.service.results import (ServiceError, TERMINAL_STATUSES, failure_result,
                                      preserve_report_diff, serialize_result)
@@ -29,6 +31,21 @@ from tracefix.storage.artifacts import redact
 
 
 MAX_REQUEST_BYTES = 2_097_152
+
+
+async def watch_service_stop(documents, request, process_control_id, task, *, interval=0.2):
+    while True:
+        try:
+            record = await asyncio.to_thread(documents.run, request.run_id)
+        except (OSError, sqlite3.Error):
+            record = {}
+        if (record.get('id') == request.run_id and record.get('taskId') == request.task_id
+                and record.get('projectId') == request.repo_id
+                and record.get('processControlId') == process_control_id
+                and record.get('status') == 'stopping' and record.get('stopRequestedAt')):
+            task.cancel()
+            return
+        await asyncio.sleep(interval)
 
 
 def claim_console(request, settings):
@@ -42,6 +59,10 @@ def claim_console(request, settings):
             or record.get('taskId') not in {None, request.task_id}
             or record.get('status') not in {'queued', 'pending', 'starting', 'running'}):
         raise ServiceError('run_identity_conflict', '共享 Run 索引身份或状态冲突')
+    process_control_id = os.getenv('TRACEFIX_PROCESS_CONTROL_ID')
+    if process_control_id and (os.getenv('TRACEFIX_CONSOLE_RUN_ID') != request.run_id
+            or record is None or record.get('processControlId') != process_control_id):
+        raise ServiceError('run_identity_conflict', '进程控制身份不属于当前 Run')
     directory = settings.data_root / 'service-requests' / request.run_id
     try:
         directory.mkdir(parents=True, exist_ok=False)
@@ -119,9 +140,10 @@ async def terminal_failure(session, state, code, *, cancelled=False):
 
 
 async def execute_request(request, settings, *, session_factory=Session,
-                          services_factory=RunServices, acceptance_adapter=None):
+                          services_factory=RunServices, acceptance_adapter=strict_acceptance_adapter):
     identity = {'task_id': request.task_id, 'run_id': request.run_id, 'repo_id': request.repo_id}
     session, documents, state = None, None, None
+    stop_watcher = None
     services = services_factory(request, settings)
     resources = AsyncExitStack()
     result = failure_result(**identity)
@@ -149,6 +171,10 @@ async def execute_request(request, settings, *, session_factory=Session,
         session.runtime_services = services
         session.console_run_id, session.web_console_run_id = request.run_id, None
         session.session_remote = {}
+        process_control_id = os.getenv('TRACEFIX_PROCESS_CONTROL_ID')
+        if process_control_id:
+            stop_watcher = asyncio.create_task(watch_service_stop(DocumentLibrary(settings.console_db), request,
+                process_control_id, asyncio.current_task()))
         stage = 'infrastructure_error'
         await session.ensure_runtime()
         require_new_internal_run(session.store, request.run_id)
@@ -175,6 +201,7 @@ async def execute_request(request, settings, *, session_factory=Session,
                     and not (accepted and accepted.allow_revision_rebind)):
                 raise ServiceError('revision_rebind_required', '改变来源 revision 必须显式重绑并重新冻结验收')
         services.finding_acceptance = accepted
+        services.bind_session(session)
         stage = 'infrastructure_error'
         spec = accepted.spec if accepted else request.execution.spec
         if spec is not None:
@@ -226,6 +253,12 @@ async def execute_request(request, settings, *, session_factory=Session,
             except Exception:
                 pass
     finally:
+        if stop_watcher is not None:
+            stop_watcher.cancel()
+            try:
+                await stop_watcher
+            except asyncio.CancelledError:
+                pass
         await services.aclose()
         if services.cleanup_errors:
             result = failure_result(**identity, code='cleanup_failed')

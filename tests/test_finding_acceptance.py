@@ -332,6 +332,16 @@ async def test_actual_playwright_freezes_and_rejects_cancellation_regression(acc
             self.end_headers()
             self.wfile.write(json.dumps({'checked': app['checked']}).encode())
 
+        def do_POST(self):
+            if self.path != '/__reset':
+                self.send_error(404)
+                return
+            app['checked'] = False
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{}')
+
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()

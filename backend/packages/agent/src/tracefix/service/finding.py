@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from tracefix.runtime.finding_acceptance import FrozenFindingAcceptance, freeze_finding_acceptance
 from tracefix.runtime.finding_source import SourceRunIdentity, create_finding_repair_run
 from tracefix.service.contracts import ServiceTestSpec
 from tracefix.service.results import ServiceError
 
 
-@dataclass(frozen=True)
+@dataclass
 class VerifiedFindingAcceptance:
     run_id: str
     repo_id: str
@@ -16,6 +17,22 @@ class VerifiedFindingAcceptance:
     source_finding_ids: tuple[str, ...]
     spec: ServiceTestSpec
     allow_revision_rebind: bool = False
+    frozen: FrozenFindingAcceptance | None = None
+    reproduction_ref: str | None = None
+    verification_ref: str | None = None
+
+
+def strict_acceptance_adapter(request, state, snapshot):
+    try:
+        frozen = freeze_finding_acceptance(request.finding_acceptance, state, snapshot)
+        accepted = frozen.acceptance
+        return VerifiedFindingAcceptance(run_id=request.run_id, repo_id=request.repo_id,
+            commit=accepted.commit, source_run_id=accepted.source_run_id,
+            source_finding_ids=tuple(item.finding_id for item in accepted.findings),
+            spec=ServiceTestSpec.model_validate(accepted.spec.model_dump(mode='json')),
+            allow_revision_rebind=accepted.allow_revision_rebind, frozen=frozen)
+    except (ValueError, TypeError, KeyError):
+        raise ServiceError('finding_acceptance_invalid', 'Finding 验收规范或冻结来源无效') from None
 
 
 class RunBoundFindings:
@@ -67,4 +84,11 @@ def validate_acceptance(accepted, request, state):
             or accepted.source_finding_ids != tuple(request.source_finding_ids)):
         raise ServiceError('finding_acceptance_invalid', 'C 验收适配与冻结 Run/来源不一致')
     ServiceTestSpec.model_validate(accepted.spec.model_dump(mode='json'))
+    if accepted.frozen is None:
+        raise ServiceError('finding_acceptance_invalid', 'Finding 验收缺少严格冻结规范')
+    verified = strict_acceptance_adapter(request, state, request.repository_snapshot.model_dump(exclude_none=True))
+    if (accepted.frozen != verified.frozen or accepted.spec != verified.spec
+            or accepted.allow_revision_rebind != verified.allow_revision_rebind
+            or accepted.reproduction_ref is not None or accepted.verification_ref is not None):
+        raise ServiceError('finding_acceptance_invalid', '验收适配不能继承来源或请求的成功结论')
     return accepted

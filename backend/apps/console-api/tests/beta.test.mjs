@@ -316,7 +316,7 @@ test('exit 0 或日志措辞不推断成功；不确定结果不自动重试', a
   assert.equal((await request('GET', '/api/v1/runs/' + next.run.id + '/result')).json().outcome, 'INCONCLUSIVE');
 });
 
-test('Task schema 拒绝快照、命令、凭据、交互模式和未集成验收；执行 URL 须符合冻结白名单', async context => {
+test('Task schema 拒绝快照、命令、凭据、交互模式和不完整验收；执行 URL 须符合冻结白名单', async context => {
   const {request, fake, create} = await fixture(context);
   for (const extra of [{repository_snapshot: {}}, {profile: 'host'}, {commands: ['sh']}, {env: {TOKEN: 'fake'}},
     {credential_ref: 'real'}, {github_reads: [{source_kind: 'file', path: 'src/App.tsx', server: 'sh'}]},
@@ -326,7 +326,7 @@ test('Task schema 拒绝快照、命令、凭据、交互模式和未集成验�
     assert.equal(response.statusCode, 400, response.body); assert.equal(response.json().retryable, false);
     assert.ok(response.json().requestId); assert.ok(response.json().code);
   }
-  assert.equal((await request('POST', '/api/v1/tasks', {...body, finding_acceptance: {schema_version: 1}})).statusCode, 422);
+  assert.equal((await request('POST', '/api/v1/tasks', {...body, finding_acceptance: {schema_version: 1}})).statusCode, 400);
   const unapproved = await create({...body, execution: {executionMode: 'batch', url: 'https://unapproved.example'}});
   assert.equal((await request('POST', '/api/v1/tasks/' + unapproved.task.id + '/start', {})).statusCode, 403);
   assert.equal(fake.calls.length, 0);
@@ -357,12 +357,63 @@ test('来源 Run/Finding 和追加规则经归属校验后传递 B；拒绝跨 R
   assert.equal((await request('POST', '/api/v1/tasks/' + forged.task.id + '/start', {})).statusCode, 404);
 });
 
+test('Finding 验收模板存入 Task、绑定唯一内部来源并透传新的 Repair Run；非法绑定拒绝', async context => {
+  const {request, create, fake, databasePath, finish, service, target} = await fixture(context);
+  const source = service('run.create', {projectId: 'alpha', mode: 'test', goal: '来源测试'});
+  const database = new DatabaseSync(databasePath);
+  const sourceRecord = JSON.parse(database.prepare('SELECT data FROM console_runs WHERE id=?').get(source.id).data);
+  const internal = 'run_acceptance_source';
+  database.prepare('UPDATE console_runs SET data=? WHERE id=?').run(JSON.stringify({...sourceRecord,
+    status: 'completed', agentRunId: internal, outcome: 'BUG_CONFIRMED'}), source.id);
+  const finding = {id: 'finding_acceptance_source', run_id: internal, scope_id: 'alpha', status: 'reproduced'};
+  database.prepare('INSERT INTO findings VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(finding.id, 'job', internal, null, null,
+    'user', 'major', finding.status, 'fingerprint', JSON.stringify(finding), new Date().toISOString(), new Date().toISOString());
+  database.close();
+  const goal = '验收任务完成取消和刷新持久化';
+  const check = condition => ({locator: {role: 'checkbox', name: 'Complete task'}, condition});
+  const navigate = {action: {kind: 'navigate', value: 'http://app:3000'}, assertions: [check('unchecked')]};
+  const click = condition => ({action: {kind: 'click', locator: check(condition).locator}, assertions: [check(condition)]});
+  const acceptanceSpec = {goal, authorized_actions: ['navigate', 'click', 'observe', 'finish'],
+    assertions: [check('checked')], regression_plan: [navigate.action], regression_assertions: [check('unchecked')],
+    behavior_scenarios: [{id: 'original', steps: [navigate, click('checked')]},
+      {id: 'normal', steps: [navigate, {action: {kind: 'observe'}, assertions: [check('unchecked')]}]},
+      {id: 'reverse', steps: [navigate, click('checked'), click('unchecked')]},
+      {id: 'refresh', steps: [navigate, click('checked'), {action: navigate.action, assertions: [check('checked')]}]}]};
+  const acceptance = {schema_version: 1, repo_id: 'alpha', commit: git(target, 'rev-parse', 'HEAD'),
+    source_run_id: internal, source_scope_id: 'alpha', source_repo_id: 'fixture/alpha',
+    source_commit: git(target, 'rev-parse', 'HEAD'), source_manifest: 'a'.repeat(64), source_rule_snapshot_hash: 'b'.repeat(64),
+    findings: [{finding_id: finding.id, fingerprint: 'fingerprint', expected: '完成后保持勾选', actual: '没有保持',
+      evidence_refs: ['0001_来源.png'], original_scenario_id: 'original', guards: [
+        {kind: 'normal', scenario_id: 'normal'}, {kind: 'reverse', scenario_id: 'reverse'}, {kind: 'refresh', scenario_id: 'refresh'}]}],
+    spec: acceptanceSpec, spec_hash: 'c'.repeat(64)};
+  const input = {projectId: 'alpha', mode: 'repair', goal, execution: {executionMode: 'batch'},
+    source_run_id: source.id, source_finding_ids: [finding.id], finding_acceptance: acceptance};
+  for (const patch of [{verified: true}, {schema_version: true}, {test_code: 'arbitrary code'}])
+    assert.equal((await request('POST', '/api/v1/tasks', {...input, finding_acceptance: {...acceptance, ...patch}})).statusCode, 400);
+  for (const patch of [{source_run_id: 'wrong_internal'}, {commit: 'd'.repeat(40)}, {run_id: 'historical_repair'}]) {
+    const wrong = await create({...input, finding_acceptance: {...acceptance, ...patch}});
+    assert.equal((await request('POST', '/api/v1/tasks/' + wrong.task.id + '/start', {})).statusCode, 409);
+    assert.equal(fake.calls.length, 0);
+  }
+  const created = await create(input, 'acceptance-create');
+  assert.deepEqual(created.task.definition.finding_acceptance, acceptance);
+  assert.equal((await request('POST', '/api/v1/tasks', {...input,
+    finding_acceptance: {...acceptance, source_manifest: 'd'.repeat(64)}}, 'acceptance-create')).statusCode, 409);
+  const started = (await request('POST', '/api/v1/tasks/' + created.task.id + '/start', {}, 'acceptance-start')).json();
+  assert.equal(fake.calls.length, 1);
+  assert.deepEqual(fake.calls[0].request.finding_acceptance, {...acceptance, run_id: started.run.id});
+  assert.equal(fake.calls[0].request.source_run_id, internal);
+  assert.equal(fake.calls[0].request.execution.executionMode, 'batch');
+  assert.equal(fake.calls[0].request.finding_acceptance.spec_hash, acceptance.spec_hash);
+  await finish(started, 'INCONCLUSIVE');
+});
+
 test('OpenAPI、统一错误与 token/loopback 边界', async context => {
   const {app, bridge, controller, request} = await fixture(context);
   assert.equal((await app.inject({url: '/api/v1/tasks'})).statusCode, 401);
   assert.equal((await app.inject({url: '/api/v1/tasks', headers: {...headers, origin: 'https://foreign.example'}})).statusCode, 401);
   const schema = (await request('GET', '/api/v1/openapi.json')).json();
-  assert.match(schema.openapi, /^3\./);
+  assert.equal(schema.openapi, '3.1.0');
   for (const endpoint of ['/api/v1/tasks', '/api/v1/tasks/{id}/start', '/api/v1/tasks/{id}/stop',
     '/api/v1/runs/{id}/findings', '/api/v1/runs/{id}/result', '/api/v1/runs/{id}/events', '/api/v1/rules']) assert.ok(schema.paths[endpoint], endpoint);
   const failed = await app.inject({method: 'POST', url: '/api/v1/tasks', headers: {...headers, 'content-type': 'application/json'}, payload: '{'});

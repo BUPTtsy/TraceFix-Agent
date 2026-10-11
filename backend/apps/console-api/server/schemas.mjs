@@ -1,3 +1,8 @@
+import strictFindingAcceptance from '../../../packages/agent/src/tracefix/service/finding_acceptance.schema.json' with {type: 'json'};
+
+export const findingAcceptance = {...strictFindingAcceptance, $id: 'tracefix.finding-acceptance-template/1',
+  required: strictFindingAcceptance.required.filter(key => key !== 'run_id')};
+
 const text = {type: 'string', minLength: 1, maxLength: 200};
 const object = {type: 'object', additionalProperties: true};
 const nullableObject = {anyOf: [object, {type: 'null'}]};
@@ -42,7 +47,7 @@ export const taskInput = {type: 'object', additionalProperties: false, required:
       spec: testSpec}},
     additionalRuleIds: {...ids, maxItems: 50}, rule_ids: {...ids, maxItems: 50}, source_run_id: text,
     source_finding_ids: ids, github_reads: {type: 'array', maxItems: 50, items: githubRead},
-    finding_acceptance: {...object, description: 'Reserved versioned binding; rejected with 422 until C integrates its strict schema.'},
+    finding_acceptance: {$ref: findingAcceptance.$id},
     create_and_start: {type: 'boolean'}}};
 export const task = {type: 'object', additionalProperties: false,
   required: ['id', 'definition', 'status', 'version', 'currentRunId', 'runIds', 'createdAt', 'updatedAt'], properties: {
@@ -82,7 +87,13 @@ export const ruleInput = {type: 'object', additionalProperties: false, required:
       [key, {type: 'array', maxItems: key === 'frameworks' ? 30 : 100, items: {type: 'string'}}]))}},
   phases: {type: 'array', maxItems: 10, items: {type: 'string', minLength: 1}},
   detection: {type: 'object', additionalProperties: false, required: ['type'], properties: {
-    type: {type: 'string', enum: ['oracle', 'static', 'guided']}, oracle: nullableObject, static: nullableObject, guided: nullableObject}},
+    type: {type: 'string', enum: ['oracle', 'static', 'guided']}, oracle: nullableObject, static: nullableObject, guided: nullableObject},
+    allOf: [
+      {if: {properties: {type: {const: 'oracle'}}}, then: {required: ['oracle'], properties: {oracle: {
+        type: 'object', minProperties: 1, required: ['kind'], properties: {kind: {type: 'string', enum: [
+          'console_no_error', 'network_status', 'dom_assertion', 'dom_after_action', 'a11y_axe', 'visual_threshold']}}, additionalProperties: true}}}},
+      ...['static', 'guided'].map(kind => ({if: {properties: {type: {const: kind}}}, then: {
+        required: [kind], properties: {[kind]: {type: 'object', minProperties: 1, additionalProperties: true}}}}))]},
   fix_guidance: {type: 'string', maxLength: 4096}, examples: {type: 'object', additionalProperties: {type: 'string'}},
   tags: {type: 'array', maxItems: 30, items: {type: 'string', minLength: 1}}, owner: {type: 'string', maxLength: 160},
   author: {type: 'string'}, org_id: {type: 'string'}, changeNote: {type: 'string'}, change_note: {type: 'string'},

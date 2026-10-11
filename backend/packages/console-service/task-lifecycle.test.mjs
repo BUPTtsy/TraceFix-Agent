@@ -126,13 +126,13 @@ test('两个 API 进程竞争同 start 幂等键；进程退出后重建保留�
   assert.equal((await execute('reserved')).run.id, started[0].run.id);
 });
 
-test('Task 正文拒绝执行权限注入、交互模式和未集成验收绑定', () => {
+test('Task 正文拒绝执行权限注入、交互模式和不完整验收绑定', () => {
   const normalize = fields => normalizeTask(fields, projects);
   for (const field of ['repository_snapshot', 'repositorySnapshot', 'profile', 'commands', 'credential_ref', 'env', 'dataRoot'])
     assert.throws(() => normalize({...input, [field]: 'forged'}), error => error.status === 400, field);
   assert.throws(() => normalize({...input, execution: {executionMode: 'interactive'}}), error => error.code === 'UNSUPPORTED_EXECUTION_MODE');
   assert.throws(() => normalize({...input, execution: {executionMode: 'batch', url: 'https://user:pass@example.com'}}), error => error.code === 'INVALID_URL');
   assert.throws(() => normalize({...input, github_reads: [{source_kind: 'file', path: 'src/App.tsx', command: 'sh'}]}), error => error.code === 'INVALID_GITHUB_READ');
-  assert.throws(() => normalize({...input, finding_acceptance: {schema_version: 1}}), error => error.status === 422);
+  assert.throws(() => normalize({...input, finding_acceptance: {schema_version: 1}}), error => error.status === 400);
   assert.throws(() => normalize({...input, projectId: 'different'}), error => error.code === 'INVALID_PROJECT');
 });

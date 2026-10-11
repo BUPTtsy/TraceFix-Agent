@@ -3,10 +3,11 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import AliasChoices, ConfigDict, Field, model_validator
 
 from tracefix.connectors.github_mcp import GitHubReadRequest, validate_snapshot_binding
 from tracefix.runtime.contracts import Contract, TestSpec
+from tracefix.runtime.finding_acceptance import FindingAcceptance
 
 
 _IDENTITY = r'^[A-Za-z0-9_-]{1,80}$'
@@ -33,9 +34,18 @@ class ServiceTestSpec(TestSpec):
 
 
 class ExecutionRequest(Contract):
-    mode: Literal['batch'] = 'batch'
+    mode: Literal['batch'] = Field(default='batch', validation_alias=AliasChoices('executionMode', 'mode'))
     url: str | None = Field(default=None, max_length=2048)
     spec: ServiceTestSpec | None = None
+
+    @model_validator(mode='before')
+    @classmethod
+    def matching_aliases(cls, value):
+        if isinstance(value, dict) and 'executionMode' in value and 'mode' in value:
+            if value['executionMode'] != value['mode']:
+                raise ValueError('executionMode 与 mode 不能矛盾')
+            return {key: item for key, item in value.items() if key != 'mode'}
+        return value
 
 
 class GitHubRead(Contract):
@@ -88,7 +98,7 @@ class ServiceRequest(Contract):
     source_run_id: str | None = Field(default=None, pattern=_IDENTITY)
     source_finding_ids: list[str] = Field(default_factory=list, max_length=256)
     github_reads: list[GitHubRead] = Field(default_factory=list, max_length=64)
-    finding_acceptance: dict[str, Any] | None = None
+    finding_acceptance: FindingAcceptance | None = None
 
     @model_validator(mode='before')
     @classmethod
@@ -110,6 +120,15 @@ class ServiceRequest(Contract):
             raise ValueError('来源 Finding 只可用于独立 Repair')
         if self.finding_acceptance is not None and not self.source_run_id:
             raise ValueError('Finding 验收必须绑定来源 Run')
+        if self.finding_acceptance is not None:
+            accepted = self.finding_acceptance
+            if (accepted.run_id != self.run_id or accepted.repo_id != self.repo_id
+                    or accepted.commit != snapshot.commit
+                    or accepted.source_run_id != self.source_run_id
+                    or [item.finding_id for item in accepted.findings] != self.source_finding_ids):
+                raise ValueError('Finding 验收与服务 Run、revision 或来源不一致')
+            if self.execution.spec is not None and self.execution.spec.model_dump(mode='json') != accepted.spec.model_dump(mode='json'):
+                raise ValueError('execution.spec 不能覆盖冻结验收规范')
         for values in (self.additional_rule_ids, self.source_finding_ids):
             if any(not item.strip() or len(item) > 160 for item in values) or len(values) != len(set(values)):
                 raise ValueError('规则和 Finding 标识必须非空且唯一')

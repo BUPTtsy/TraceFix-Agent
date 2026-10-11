@@ -1,9 +1,12 @@
 from copy import deepcopy
+import json
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from tracefix.runtime.contracts import Outcome, RunState, RunStatus, digest
+from tracefix.runtime.finding_acceptance import FindingAcceptance
 from tracefix.service.contracts import ServiceRequest
 from tracefix.service.results import ServiceError, preserve_report_diff, serialize_result
 from tracefix.storage.artifacts import Artifacts
@@ -46,6 +49,26 @@ def test_frozen_snapshot_is_validated_before_execution():
         changed['repository_snapshot']['repository_config'][key] = 'forged'
         with pytest.raises(ValidationError):
             ServiceRequest.model_validate(changed)
+
+
+@pytest.mark.parametrize('execution', [
+    {'executionMode': 'batch'}, {'mode': 'batch'}, {'executionMode': 'batch', 'mode': 'batch'},
+])
+def test_execution_mode_alias_matches_api_transport(execution):
+    assert ServiceRequest.model_validate({**request_payload(), 'execution': execution}).execution.mode == 'batch'
+
+
+@pytest.mark.parametrize('execution', [
+    {'executionMode': 'batch', 'mode': 'interactive'}, {'executionMode': 'interactive', 'mode': 'batch'},
+])
+def test_execution_alias_conflict_is_rejected(execution):
+    with pytest.raises(ValidationError):
+        ServiceRequest.model_validate({**request_payload(), 'execution': execution})
+
+
+def test_api_acceptance_schema_is_generated_from_runtime_contract():
+    path = Path(__file__).resolve().parents[1] / 'backend/packages/agent/src/tracefix/service/finding_acceptance.schema.json'
+    assert json.loads(path.read_text(encoding='utf-8')) == FindingAcceptance.model_json_schema()
 
 
 def test_regular_test_does_not_require_github_credential_reference():

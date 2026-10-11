@@ -9,6 +9,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 from langgraph.checkpoint.memory import InMemorySaver
 
 from tracefix.cli.main import Session
@@ -21,7 +22,8 @@ from tracefix.runtime.contracts import Outcome, RunState, digest
 from tracefix.runtime.smoke import FakeBrowser, FakeModel, FakeRunner
 from tracefix.service.config import ServiceSettings, validate_snapshot
 from tracefix.service.contracts import ServiceRequest
-from tracefix.service.finding import VerifiedFindingAcceptance
+from tracefix.service.finding import VerifiedFindingAcceptance, strict_acceptance_adapter
+from tracefix.runtime.finding_acceptance import AcceptanceSpec
 from tracefix.service.resources import RunServices
 from tracefix.service.run import execute_request
 from tracefix.storage.store import MemoryStore
@@ -248,6 +250,33 @@ async def create_source(fixture):
     return library, finding
 
 
+def acceptance_payload(fixture, request, finding, *, allow_revision_rebind=False):
+    source = fixture.store.load(finding.run_id, 'alpha')
+    expected = finding.expected or finding.details.get('expected')
+    actual = finding.actual or finding.details.get('actual')
+    heading = {'locator': {'role': 'heading', 'name': 'Task board'}, 'condition': 'visible'}
+    checkbox = {'locator': {'role': 'checkbox', 'name': 'Complete task'}, 'condition': 'checked'}
+    navigate = {'action': {'kind': 'navigate', 'value': source.url}, 'assertions': [heading]}
+    observe = {'action': {'kind': 'observe'}, 'assertions': [heading]}
+    spec = AcceptanceSpec(goal=request.goal, assertions=[checkbox], regression_plan=[navigate['action']],
+        regression_assertions=[heading], behavior_scenarios=[
+            {'id': 'original', 'steps': [navigate, {'action': {'kind': 'observe'}, 'assertions': [checkbox]}]},
+            {'id': 'normal', 'steps': [navigate, observe]},
+            {'id': 'reverse', 'steps': [navigate, observe]},
+            {'id': 'refresh', 'steps': [navigate, navigate]}])
+    return {'schema_version': 1, 'run_id': request.run_id, 'repo_id': 'alpha',
+        'commit': request.repository_snapshot.commit, 'source_run_id': source.run_id,
+        'source_scope_id': 'alpha', 'source_repo_id': 'owner/app',
+        'source_commit': finding.source_base_commit, 'source_manifest': source.source_manifest,
+        'source_rule_snapshot_hash': source.rule_snapshot_hash, 'allow_revision_rebind': allow_revision_rebind,
+        'findings': [{'finding_id': finding.id, 'fingerprint': finding.fingerprint,
+            'expected': expected, 'actual': actual, 'rule_id': finding.rule_id, 'rule_version': finding.rule_version,
+            'evidence_refs': finding.evidence_refs, 'original_scenario_id': 'original', 'guards': [
+                {'kind': 'normal', 'scenario_id': 'normal'}, {'kind': 'reverse', 'scenario_id': 'reverse'},
+                {'kind': 'refresh', 'scenario_id': 'refresh'}]}],
+        'spec': spec.model_dump(mode='json'), 'spec_hash': digest(spec)}
+
+
 async def test_finding_repair_reexports_source_and_does_not_inherit_success(service_fixture):
     fixture = service_fixture
     library, finding = await create_source(fixture)
@@ -275,10 +304,9 @@ async def test_finding_repair_reexports_source_and_does_not_inherit_success(serv
 async def test_unverified_json_acceptance_and_implicit_revision_change_rejected(service_fixture):
     fixture = service_fixture
     _, finding = await create_source(fixture)
-    request = fixture.request('repair_untrusted', mode='repair', source_run_id='source_run',
-        source_finding_ids=[finding.id], finding_acceptance={'verified': True})
-    result = await execute_request(request, fixture.settings, session_factory=fixture.factory)
-    assert result['error']['code'] == 'finding_acceptance_unavailable'
+    with pytest.raises(ValidationError):
+        fixture.request('repair_untrusted', mode='repair', source_run_id='source_run',
+            source_finding_ids=[finding.id], finding_acceptance={'verified': True})
     (fixture.root / 'src/value.ts').write_text('export const persisted = false;\nexport const revision = 2;\n')
     git(fixture.root, 'add', 'src/value.ts')
     commit_workspace(fixture.root, '显式新版本')
@@ -296,13 +324,13 @@ async def test_explicit_revision_change_requires_typed_bound_acceptance(service_
     git(fixture.root, 'add', 'src/value.ts')
     commit_workspace(fixture.root, '重新冻结验收版本')
     request = fixture.request('repair_rebound', mode='repair', source_run_id='source_run',
-        source_finding_ids=[finding.id], finding_acceptance={'acceptance_id': 'c-validated'})
+        source_finding_ids=[finding.id])
+    payload = acceptance_payload(fixture, request, finding, allow_revision_rebind=True)
+    request = ServiceRequest.model_validate({**request.model_dump(mode='json'), 'finding_acceptance': payload,
+        'execution': {'executionMode': 'batch', 'spec': payload['spec']}})
 
     def accepted(request, state, snapshot):
-        return VerifiedFindingAcceptance(run_id=request.run_id, repo_id=request.repo_id,
-            commit=snapshot['commit'], source_run_id=state.repair_source.source_run_id,
-            source_finding_ids=tuple(request.source_finding_ids), spec=request.execution.spec,
-            allow_revision_rebind=True)
+        return strict_acceptance_adapter(request, state, snapshot)
 
     result = await execute_request(request, fixture.settings, session_factory=fixture.factory,
                                    acceptance_adapter=accepted)
@@ -362,6 +390,9 @@ async def test_no_engine_context_consumption_is_reported_as_integration_failure(
     class CachedServices(RunServices):
         async def prepare(self):
             self._prepared = True
+
+        async def reference_documents(self, state):
+            return []
 
     result = await execute_request(fixture.request(github_reads=[{'source_kind': 'commit'}]),
         fixture.settings, session_factory=fixture.factory, services_factory=CachedServices)
