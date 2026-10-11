@@ -264,6 +264,9 @@ class GitHubMCPConnector:
         self._worker = asyncio.create_task(self._serve(environment))
         try:
             await asyncio.wait_for(self._ready, self.config.timeout_seconds)
+        except asyncio.CancelledError:
+            await self.close()
+            raise
         except asyncio.TimeoutError:
             await self.close()
             raise GitHubMCPError("timeout", "GitHub MCP 初始化超时") from None
@@ -274,6 +277,9 @@ class GitHubMCPConnector:
             raise GitHubMCPError("connect_failed", "GitHub MCP 连接失败") from None
         try:
             return await self.health()
+        except asyncio.CancelledError:
+            await self.close()
+            raise
         except Exception:
             await self.close()
             raise
@@ -432,7 +438,7 @@ class GitHubMCPConnector:
             raise GitHubMCPError("not_ready", "GitHub MCP 尚未就绪")
         try:
             result = await self._enqueue("commit", self._arguments("commit", {}))
-            payload = self._payload(result)
+            payload = self._payload(result, kind='commit')
             self._verify_payload(payload, "commit")
         except GitHubMCPError:
             raise
@@ -465,7 +471,7 @@ class GitHubMCPConnector:
             kind = request.source_kind
             arguments = self._arguments(kind, {"path": request.path, "number": request.number, "method": request.method})
             result = await self._enqueue(kind, arguments)
-            payload = self._payload(result)
+            payload = self._payload(result, kind=kind, request=request)
             self._verify_payload(payload, kind, request)
         payload = self._redact(payload)
         content, source_id, source_url = self._content(payload, request)
@@ -503,6 +509,8 @@ class GitHubMCPConnector:
                    "issue_number": values.get("number"), "pullNumber": values.get("number"),
                    "number": values.get("number"), "method": "get"}
         arguments = {key: value for key, value in aliases.items() if key in properties and value is not None}
+        if kind == 'commit' and 'detail' in properties:
+            arguments['detail'] = 'none'
         missing = [key for key in schema.get("required", []) if key not in arguments]
         if missing:
             raise GitHubMCPError("schema_error", "GitHub MCP 请求 schema 不支持绑定参数")
@@ -524,7 +532,8 @@ class GitHubMCPConnector:
             self._state = "failed"
             raise GitHubMCPError("timeout", "GitHub MCP 工具调用超时") from None
 
-    def _payload(self, result: Any) -> Any:
+    def _payload(self, result: Any, *, kind: str | None = None,
+                 request: GitHubReadRequest | None = None) -> Any:
         if getattr(result, "isError", False):
             structured = getattr(result, "structuredContent", None)
             if isinstance(structured, Mapping) and structured.get("status") in {401, 403}:
@@ -536,21 +545,58 @@ class GitHubMCPConnector:
                 failure = None
             if isinstance(failure, Mapping) and failure.get("status") in {401, 403}:
                 raise GitHubMCPError("permission_denied", "GitHub MCP 无权读取仓库")
+            if re.search(r'\b(?:401|403)\b', texts):
+                raise GitHubMCPError("permission_denied", "GitHub MCP 无权读取仓库")
             raise GitHubMCPError("remote_error", "GitHub MCP 只读工具返回错误")
         structured = getattr(result, "structuredContent", None)
         if structured is not None:
             if len(json.dumps(structured, ensure_ascii=False, default=str).encode("utf-8")) > self.config.max_response_bytes * 16:
                 raise GitHubMCPError("response_too_large", "GitHub MCP 响应超过传输解析上限")
-            return structured
+            return self._adapt_payload(structured, kind, request)
         blocks = getattr(result, "content", None) or []
         texts = [getattr(block, "text", "") for block in blocks if getattr(block, "type", "text") == "text"]
         raw = "\n".join(texts)
         if len(raw.encode("utf-8")) > self.config.max_response_bytes * 16:
             raise GitHubMCPError("response_too_large", "GitHub MCP 响应超过传输解析上限")
+        if kind == 'file' and any(getattr(block, 'type', '') == 'resource' for block in blocks):
+            return self._adapt_payload({'content': [block.model_dump(mode='json') for block in blocks]}, kind, request)
         try:
-            return json.loads(raw)
+            return self._adapt_payload(json.loads(raw), kind, request)
         except (TypeError, json.JSONDecodeError):
             return {"content": raw}
+
+    def _adapt_payload(self, payload: Any, kind: str | None, request: GitHubReadRequest | None):
+        if kind == 'issue' and isinstance(payload, Mapping) and 'issue' in payload:
+            if payload.get('method') != 'get' or set(payload) - {'method', 'issue'}:
+                raise GitHubMCPError('schema_error', 'GitHub MCP Issue 包装响应无效')
+            payload = payload['issue']
+        if kind != 'file' or not isinstance(payload, Mapping) or not isinstance(payload.get('content'), list):
+            return payload
+        if set(payload) != {'content'} or request is None:
+            raise GitHubMCPError('schema_error', 'GitHub MCP 文件包装响应无效')
+        resources = []
+        for block in payload['content']:
+            if not isinstance(block, Mapping) or block.get('type') not in {'text', 'resource'}:
+                raise GitHubMCPError('schema_error', 'GitHub MCP 文件需要内嵌文本资源')
+            if block.get('type') == 'resource':
+                resources.append(block.get('resource'))
+        if len(resources) != 1 or not isinstance(resources[0], Mapping):
+            raise GitHubMCPError('schema_error', 'GitHub MCP 文件资源不唯一')
+        resource = resources[0]
+        parsed = urlsplit(str(resource.get('uri') or ''))
+        parts = [unquote(part) for part in parsed.path.strip('/').split('/')]
+        if (parsed.scheme != 'repo' or parsed.netloc.casefold() != self.config.owner.casefold()
+                or parsed.query or parsed.fragment or parsed.username or parsed.password
+                or parts[:4] != [self.config.repo, 'sha', self.config.commit, 'contents']
+                or '/'.join(parts[4:]) != request.path):
+            raise GitHubMCPError('binding_mismatch', 'GitHub MCP 文件资源仓库/commit/path 不一致')
+        if resource.get('blob') is not None or not isinstance(resource.get('text', ''), str):
+            raise GitHubMCPError('schema_error', 'GitHub MCP 文件资源必须为文本')
+        content = resource.get('text', '')
+        if len(content.encode('utf-8')) > self.config.max_response_bytes * 16:
+            raise GitHubMCPError('response_too_large', 'GitHub MCP 响应超过传输解析上限')
+        return {'path': request.path, 'content': content, 'encoding': 'utf-8',
+                'html_url': f'https://github.com/{self.config.owner}/{self.config.repo}/blob/{self.config.commit}/{request.path}'}
 
     def _verify_payload(self, payload: Any, kind: str, request: GitHubReadRequest | None = None):
         if not isinstance(payload, Mapping):
