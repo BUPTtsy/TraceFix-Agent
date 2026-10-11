@@ -139,6 +139,10 @@ def report_page(report, *, artifacts=None, scope_id=None, run_id=None):
         if isinstance(value, list) and key.endswith('_refs'):
             return '<ul>'+''.join('<li>'+render(ref, 'artifact_ref')+'</li>' for ref in value)+'</ul>'
         if isinstance(value, str) and value and key.endswith('_ref'):
+            if artifacts is not None and (not (scope_id or report.get('scope_id'))
+                    or not (run_id or report.get('run_id')) or not artifacts.exists(
+                        scope_id or report.get('scope_id'), run_id or report.get('run_id'), value)):
+                return '<span>'+html.escape(value)+'</span>'
             return f'<a href="{quote(value, safe="")}">{html.escape(value)}</a>'
         if key == 'provenance' and isinstance(value, dict):
             return '<dl>'+''.join('<dt>'+html.escape(label(name))+'</dt><dd>'

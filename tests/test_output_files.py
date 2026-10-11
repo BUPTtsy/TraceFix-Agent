@@ -91,6 +91,27 @@ def test_terminal_shortens_checksums_but_preserves_old_evidence_refs():
     assert checksum[:12]+'…' in output
 
 
+def test_report_provenance_links_only_intact_current_run_artifacts(tmp_path):
+    artifacts = Artifacts(tmp_path)
+    reference = artifacts.put('demo', 'run_1', {'file': 'src/value.ts'}, label='源码片段')
+    other = artifacts.put('other', 'run_2', {'file': 'private.ts'}, label='另一项源码')
+    missing = '9999_缺失源码.json'
+    unsafe = '../0001_报告.json'
+    page = report_page({'scope_id': 'demo', 'run_id': 'run_1',
+        'provenance': {'evidence_refs': [reference, other, missing, unsafe]}}, artifacts=artifacts)
+    assert f'href="{quote(reference, safe="")}"' in page
+    for invalid in (other, missing, unsafe):
+        assert f'href="{quote(invalid, safe="")}"' not in page
+        assert invalid in page
+    artifacts._path('demo', 'run_1', reference).write_bytes(b'corrupt')
+    damaged = report_page({'scope_id': 'demo', 'run_id': 'run_1',
+        'provenance': {'evidence_refs': [reference]}}, artifacts=artifacts)
+    assert f'href="{quote(reference, safe="")}"' not in damaged
+    unidentified = report_page({'provenance': {'evidence_refs': [reference]}}, artifacts=artifacts)
+    assert f'href="{quote(reference, safe="")}"' not in unidentified
+    assert reference in unidentified
+
+
 async def test_complete_run_outputs_linked_chinese_report_and_logs(tmp_path):
     engine, state = make_engine(tmp_path)
     await engine.run(state)

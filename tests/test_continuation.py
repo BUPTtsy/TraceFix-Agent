@@ -83,6 +83,7 @@ async def test_two_continuations_keep_identity_trace_budget_and_reports(engine_s
     assert final.budget.model_calls > stopped.budget.model_calls
     assert any(item['rule_id'] == 'ci_source_guard' and item['status'] == 'checked_pass'
                and item['phase'] == 'EXPLORE' for item in final.rule_coverage)
+    assert final.check_summary['coverage_complete'] and final.check_summary['passed'] == 2
     assert final.revision > stopped.revision
     assert final.parent_run_id is None
     assert len(web(session, 'runs')) == 1
@@ -179,6 +180,31 @@ async def test_continuation_revalidates_existing_patch(engine_session):
     completed = {event['payload']['operation_id'] for event in trace[len(previous_trace):]
                  if event['type'] == 'tool.completed'}
     assert set(verification_operations) <= completed
+
+
+async def test_continuation_failed_revalidation_cannot_reuse_old_approval(engine_session, monkeypatch):
+    session, engine, state = engine_session
+    engine.browser.bugfree = False
+    await session.drive(state)
+    pending = session.state()
+    assert pending.run_status == RunStatus.WAITING_APPROVAL
+    engine.workspace.branch('tracefix/' + pending.run_id)
+    pending.run_status = RunStatus.FAILED
+    pending.outcome = Outcome.INFRA_FAILURE
+    engine.store.save(pending)
+    session.publish_console()
+    monkeypatch.setattr('tracefix.cli.main.DockerRunner',
+                        lambda *args: FakeRunner(state.source_manifest, fail='static'))
+    await session.continue_task(session.console_run_id, '重新检查失败的静态验证')
+    await session.task
+    resumed = session.state()
+    static_validation = session.engine.get(resumed, resumed.validation_refs[0])
+    assert static_validation['kind'] == 'static' and not static_validation['passed']
+    assert resumed.run_status != RunStatus.WAITING_APPROVAL
+    assert resumed.outcome != Outcome.FIX_VERIFIED
+    assert resumed.approval_ref is None and resumed.patch_hash == pending.patch_hash
+    assert resumed.replay_plan_ref == pending.replay_plan_ref
+    assert resumed.initial_check_result_refs == pending.initial_check_result_refs
 
 
 @pytest.mark.parametrize('has_initial_failures', [False, True])
