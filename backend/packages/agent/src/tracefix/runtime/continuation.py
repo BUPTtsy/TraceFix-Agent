@@ -10,13 +10,18 @@ def can_continue(status, outcome=None):
 def continuation_state(previous, instruction, markers, *, process_ended=False):
     if not can_continue(previous.run_status, previous.outcome) and not process_ended:
         raise ValueError('只有非成功结束的任务可以继续')
-    keep_patch = bool(previous.patch_hash and previous.reproduced and previous.replay_plan_ref)
+    keep_patch = bool(previous.patch_hash and previous.replay_plan_ref
+                      and (previous.reproduced or previous.initial_check_result_refs))
     return RunState.model_validate({**previous.model_dump(),
         'phase': Phase.PREPARE, 'run_status': RunStatus.RUNNING, 'revision': previous.revision + 1,
         'outcome': None, 'error': None, 'report_ref': None, 'pending_action': None, 'approval_ref': None,
         'error_details': None, 'diagnosis_retry_count': 0, 'diagnosis_feedback_refs': [],
         'step': 0, 'trial': 0, 'replay_index': 0, 'validation_index': 0,
         'validation_refs': [], 'baseline_validation_refs': [], 'observation_ref': None,
+        'check_result_refs': [], 'check_suite_stage': None, 'check_suite_completed': False,
+        'check_suite_patch_hash': None, 'overall_status': None, 'check_summary': {},
+        'initial_check_result_refs': previous.initial_check_result_refs if keep_patch else [],
+        'rule_coverage': [],
         'failure_signatures': [], 'action_fingerprints': [], 'local_branch': None,
         'loop_state_fingerprints': [], 'loop_error_signatures': [], 'loop_no_progress_steps': 0,
         'loop_warnings': [], 'loop_evidence': None, 'loop_cause': previous.loop_cause,
