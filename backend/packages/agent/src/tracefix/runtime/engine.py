@@ -41,7 +41,8 @@ from tracefix.runtime.validation_feedback import (ValidationFeedback, build_vali
 from tracefix.runtime.verification import verification_binding
 from tracefix.tools.effects import file_resource, make_operation_executor
 from tracefix.runtime.event_adapter import EventAdapter, EventCursor
-from tracefix.runtime.recovery import RecoveryAction, RecoveryController, classify_cause, has_real_progress
+from tracefix.runtime.recovery import (RecoveryAction, RecoveryCause, RecoveryController,
+                                      classify_cause, has_real_progress)
 from tracefix.runtime.diagnosis import (DiagnosisDraft, DiagnosisReport, binding_from_observation,
     symptom_query, validate_report)
 from tracefix.runtime.checks import make_check_plan, oracle_ready, scope_matches, summarize_checks
@@ -219,6 +220,7 @@ class Engine:
     LOOP_ERROR_LIMIT = 5
     LOOP_NO_PROGRESS_WARNING = 20
     LOOP_NO_PROGRESS_LIMIT = 40
+    LOOP_RECOVERY_GRACE_STEPS = 4
     DIAGNOSIS_RETRY_LIMIT = 3
 
     def __init__(self, store, artifacts, scopes, context, profile, workspace, runner,
@@ -242,6 +244,7 @@ class Engine:
         self._trace_sequences = {}
         self.event_adapter = EventAdapter(store)
         self.recovery = RecoveryController()
+        self.runtime_services = None
         self.skills = SkillCatalog(Path(__file__).resolve().parents[5] / 'skills')
         self.skill_store = SkillStore(self.artifacts)
         self.graph = self._graph(checkpointer)
@@ -849,40 +852,78 @@ class Engine:
     def read_events(self, s, cursor=None):
         return self.event_adapter.read(s.run_id, s.scope_id, cursor)
 
+    def _observation_progress(self, s, before_ref, after_ref):
+        before = self.get(s, before_ref) if before_ref else None
+        after = self.get(s, after_ref) if after_ref else None
+        if not before or not after:
+            return False
+        if any(before.get(key) is not None and after.get(key) is not None
+               for key in ('assertions', 'business_state')):
+            return has_real_progress(
+                {key: before.get(key) for key in ('assertions', 'business_state')},
+                {key: after.get(key) for key in ('assertions', 'business_state')},
+            )
+        return has_real_progress(
+            {'snapshot': stable_snapshot(before.get('snapshot', '')),
+             'assertions': before.get('assertions'), 'business_state': before.get('business_state')},
+            {'snapshot': stable_snapshot(after.get('snapshot', '')),
+             'assertions': after.get('assertions'), 'business_state': after.get('business_state')},
+        )
+
+    def _verification_results(self, s, refs):
+        values = {}
+        for ref in refs:
+            record = self.get(s, ref)
+            if not isinstance(record, dict):
+                continue
+            identity = digest([record.get('kind') or record.get('detector'),
+                               record.get('scenario_id') or record.get('id')])
+            result = {key: record[key] for key in ('passed', 'status', 'assertions') if key in record}
+            if result:
+                values[identity] = result
+        return values
+
     def changed(self, s, **delta):
         persisted = self.store.load(s.run_id, s.scope_id)
+        explicit = bool(delta.pop('_semantic_progress', False))
         if 'loop_no_progress_steps' not in delta:
-            explicit = bool(delta.pop('_semantic_progress', False))
             progressed = explicit
-            meaningful_fields = {
-                'validation_refs', 'behavior_check_refs', 'reproduced', 'source_aligned',
-                'check_plan_ref', 'check_result_refs', 'check_suite_completed',
-            }
+            meaningful_fields = {'check_plan_ref'}
             progressed = progressed or any(
                 field in delta and delta[field] != getattr(s, field)
                 for field in meaningful_fields
             )
             if not progressed and 'observation_ref' in delta and delta['observation_ref'] != s.observation_ref:
-                before = self.get(s, s.observation_ref) if s.observation_ref else None
-                after = self.get(s, delta['observation_ref']) if delta['observation_ref'] else None
-                if before and after:
-                    progressed = has_real_progress(
-                        {'snapshot': stable_snapshot(before.get('snapshot', '')),
-                         'assertions': before.get('assertions'),
-                         'business_state': before.get('business_state')},
-                        {'snapshot': stable_snapshot(after.get('snapshot', '')),
-                         'assertions': after.get('assertions'),
-                         'business_state': after.get('business_state')},
-                    )
+                progressed = self._observation_progress(s, s.observation_ref, delta['observation_ref'])
             if not progressed:
                 for field in ('reproduced', 'source_aligned'):
                     if field in delta and delta[field] is True and delta[field] != getattr(s, field):
                         progressed = True
                         break
-            if not progressed and 'validation_refs' in delta:
-                progressed = (delta['validation_refs'] != s.validation_refs
-                              and bool(delta['validation_refs']))
+            frontier = dict((s.loop_evidence or {}).get('verification_results') or {})
+            for field in ('validation_refs', 'behavior_check_refs', 'check_result_refs'):
+                if field not in delta:
+                    continue
+                before = {**self._verification_results(s, getattr(s, field)), **frontier.get(field, {})}
+                after = self._verification_results(s, delta[field])
+                progressed = progressed or any(
+                    has_real_progress(before.get(identity, {}), result)
+                    for identity, result in after.items()
+                )
+                frontier[field] = {**before, **after}
+            if frontier:
+                delta['loop_evidence'] = {**(s.loop_evidence or {}), **(delta.get('loop_evidence') or {}),
+                                          'verification_results': frontier}
             delta['loop_no_progress_steps'] = 0 if progressed else s.loop_no_progress_steps + 1
+            if progressed:
+                episodes = [dict(entry) for entry in delta.get('recovery_episodes', s.recovery_episodes)]
+                for entry in episodes:
+                    if entry.get('status') == 'continued' and not entry.get('progress'):
+                        entry.update(progress=True, status='progressed', progress_revision=s.revision + 1)
+                delta['recovery_episodes'] = episodes
+                delta.setdefault('loop_state_fingerprints', [])
+                delta.setdefault('loop_error_signatures', [])
+                delta.setdefault('action_fingerprints', [])
         new = reduce_state(s, persisted.revision, **delta)
         self.store.save(new)
         self.event(new, 'state.changed', {'phase': new.phase, 'status': new.run_status})
@@ -931,7 +972,13 @@ class Engine:
         if error_count >= self.LOOP_ERROR_LIMIT:
             signals.append({'kind': 'error_repeated', 'signature': s.last_error_signature,
                             'count': error_count})
-        if s.loop_no_progress_steps >= self.LOOP_NO_PROGRESS_LIMIT:
+        grace = any(
+            entry.get('status') == 'continued' and not entry.get('progress')
+            and s.loop_no_progress_steps - entry.get('evidence', {}).get('no_progress_steps', 0)
+                < self.LOOP_RECOVERY_GRACE_STEPS
+            for entry in s.recovery_episodes
+        )
+        if s.loop_no_progress_steps >= self.LOOP_NO_PROGRESS_LIMIT and not grace:
             signals.append({'kind': 'no_progress', 'steps': s.loop_no_progress_steps})
         warnings = []
         if state_count == self.LOOP_STATE_WARNING:
@@ -972,7 +1019,8 @@ class Engine:
                 return False, {'status': 'unavailable', 'interface': 'browser.observe'}
             try:
                 ref = await self.capture(s, await observe())
-                return True, {'status': 'observed', 'observation_ref': ref, 'observation_changed': True}
+                return True, {'status': 'observed', 'observation_ref': ref,
+                              'business_changed': self._observation_progress(s, s.observation_ref, ref)}
             except Exception as error:
                 return False, {'status': 'unavailable', 'interface': 'browser.observe',
                                'error': sanitize(error_message(error))[:300]}
@@ -993,10 +1041,13 @@ class Engine:
                     'state_tail': (s.loop_state_fingerprints + [fingerprint])[-12:],
                     'action_tail': s.action_fingerprints[-12:],
                     'error_tail': s.loop_error_signatures[-12:],
-                    'step': s.step, 'cause': cause.value}
-        episode_key = digest([cause.value, fingerprint,
-                              s.last_error_signature,
-                              s.pending_action.get('kind') if isinstance(s.pending_action, dict) else None])
+                    'step': s.step, 'cause': cause.value,
+                    'no_progress_steps': s.loop_no_progress_steps}
+        if (s.loop_evidence or {}).get('verification_results'):
+            evidence['verification_results'] = s.loop_evidence['verification_results']
+        episode_key = self.recovery.active_episode_id(s.recovery_episodes, cause)
+        if episode_key is None:
+            episode_key = digest([s.run_id, cause.value, s.revision])
         evidence['semantic_repeat_key'] = episode_key
         decision = self.recovery.decide(cause, s.recovery_episodes, evidence=evidence,
                                         episode_id=episode_key)
@@ -1022,7 +1073,7 @@ class Engine:
                 target_phase = Phase.DIAGNOSE
             delta = {
                 'loop_state_fingerprints': [], 'loop_error_signatures': [],
-                'loop_no_progress_steps': 0, 'loop_warnings': s.loop_warnings + warnings,
+                'action_fingerprints': [], 'loop_warnings': s.loop_warnings + warnings,
                 'loop_evidence': evidence, 'loop_cause': cause.value,
                 'recovery_episodes': episodes, 'last_error_signature': None,
                 'error': None, 'error_details': {'recovery': evidence['recovery'], 'cause': cause.value},
@@ -1030,12 +1081,22 @@ class Engine:
             }
             if action_evidence.get('observation_ref'):
                 delta['observation_ref'] = action_evidence['observation_ref']
-            if action_evidence.get('child_settled') or action_evidence.get('observation_changed'):
+            if action_evidence.get('child_settled') or action_evidence.get('business_changed'):
                 delta['_semantic_progress'] = True
             if target_phase != s.phase:
                 delta['phase'] = target_phase
             s = self.changed(s, **delta)
             self.event(s, 'recovery.started', evidence)
+            return s
+        if cause in {RecoveryCause.UNKNOWN, RecoveryCause.CANCELLED}:
+            cancelled = cause == RecoveryCause.CANCELLED
+            s = self.changed(s, loop_evidence=evidence, loop_cause=cause.value,
+                recovery_episodes=episodes, phase=Phase.FINALIZE, pending_action=None,
+                outcome=Outcome.INCONCLUSIVE if cancelled else Outcome.INFRA_FAILURE,
+                error='用户已取消' if cancelled else s.error or 'UNKNOWN_OPERATION',
+                error_details={**(s.error_details or {}), 'recovery': evidence['recovery'],
+                               'requires_manual_review': not cancelled})
+            self.event(s, 'recovery.stopped', evidence)
             return s
         s = self.changed(s, loop_state_fingerprints=s.loop_state_fingerprints + [fingerprint],
                          loop_warnings=s.loop_warnings + warnings,
@@ -1111,6 +1172,12 @@ class Engine:
                'workspace_root': str(self.workspace.root)}
         if s.repair_source:
             ctx['repair_source'] = s.repair_source.model_dump(mode='json')
+        if self.runtime_services is not None:
+            references = await self.runtime_services.reference_documents(s)
+            if not isinstance(references, list) or any(not isinstance(item, dict) for item in references):
+                raise ValueError('Run reference_documents 必须是文档列表')
+            references = copy.deepcopy(list(ctx.get('reference_documents') or []) + references)
+            ctx['reference_documents'] = list({digest(item): item for item in references}.values())
         # Worker calls select locally; never replace the shared supervisor model.
         selected_model = (self.worker_model if ctx.get('worker_depth') == 1
                           and not ctx.get('worker_same_model')
@@ -3310,6 +3377,22 @@ class Engine:
         return self.output(s, 'end')
 
     async def run(self, state=None, resume=None):
+        close_services = True
+        try:
+            result = await self._run_graph(state, resume)
+            current = self.store.load(self.current_run, self.context.active_scope)
+            close_services = current.run_status not in {
+                RunStatus.PAUSED, RunStatus.WAITING_INPUT, RunStatus.WAITING_APPROVAL,
+            }
+            return result
+        except GraphInterrupt:
+            close_services = False
+            raise
+        finally:
+            if close_services and self.runtime_services is not None:
+                await self.runtime_services.aclose()
+
+    async def _run_graph(self, state=None, resume=None):
         run_id = state.run_id if state else self.current_run
         self.current_run = run_id
         config = {'configurable': {'thread_id': run_id}, 'recursion_limit': 1500}
