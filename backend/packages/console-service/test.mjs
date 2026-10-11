@@ -77,7 +77,7 @@ test('派生 Run 校验快照、项目与追加规则，并保持 Python 共享�
   const parent = dispatch('run.create', {projectId: 'alpha', goal: '父任务', mode: 'test'});
   dispatch('run.update', {id: parent.id, changes: {agentRunId: 'run_parent', status: 'completed'}});
   assert.throws(() => dispatch('run.create', {projectId: 'alpha', goal: '子任务', mode: 'test', parentRunId: parent.id}), error => error.status === 409);
-  const python = process.platform === 'win32' ? path.resolve('../../../.venv/Scripts/python.exe') : path.resolve('../../../.venv/bin/python');
+  const python = process.env.TRACEFIX_PYTHON || (process.platform === 'win32' ? path.resolve('../../../.venv/Scripts/python.exe') : path.resolve('../../../.venv/bin/python'));
   if (!fs.existsSync(python)) return context.skip('需要本地 Python 引擎环境验证共享数据库');
   const script = `import json,sys
 from tracefix.rules import RuleLibrary, RuleResolver, render_rule_context
@@ -105,6 +105,7 @@ print(json.dumps({'refs':[ref.model_dump() for ref in snapshot.refs],
   assert.deepEqual(child.additionalRuleIds, [extra.id]);
   assert.deepEqual(dispatch('run', {id: parent.id}).ruleSnapshot.refs, data.refs);
   assert.throws(() => dispatch('rule.delete', {id: 'builtin_empty_state'}), error => error.status === 409);
+  dispatch('run.ended', {id: child.id, error: '串行测试结束后验证无效追加规则'});
   assert.throws(() => dispatch('run.create', {projectId: 'alpha', goal: '子任务', mode: 'test', parentRunId: parent.id,
     additionalRuleIds: 'invalid'}), error => error.status === 400);
 });
