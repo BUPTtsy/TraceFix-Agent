@@ -114,6 +114,8 @@ async def test_delegate_tools_are_strict_and_parallel(offline_gateway):
         'AgentDelegate', 'AgentJoin']
     parameters = requests[0]['tools'][0]['function']['parameters']
     assert parameters['additionalProperties'] is False
+    assert all(tool['function']['parameters']['additionalProperties'] is False
+               for tool in requests[0]['tools'])
     assert {'task_id', 'role', 'objective', 'prompt', 'phase', 'allowed_tools',
             'expected_output', 'completion_criteria', 'constraints'} <= set(parameters['required'])
     assert '<supervisor_tool_protocol>' in requests[0]['messages'][0]['content']
@@ -189,6 +191,7 @@ async def test_gateway_validates_structured_output_and_accounts_actual_usage(off
     assert result.value.kind=='finish'
     assert usage==[actual_usage] and calls==['deepseek-chat']
     assert result.usage == actual_usage
+    assert result.model_revision == 'test-revision'
     assert len(requests) == 1 and remaining == []
     assert requests[0]['thinking'] == {'type': 'enabled'}
     assert any(tool['function']['name'] == 'BrowserSnapshot' for tool in requests[0]['tools'])
@@ -376,6 +379,44 @@ async def test_gateway_rejects_non_object_provider_payloads_without_retry(offlin
     assert audits[0]['body'] == payload
     assert errors[0]['message'] == message
     assert errors[0]['retryable'] is False and errors[0]['will_retry'] is False
+
+
+async def test_gateway_output_correction_keeps_logical_exchange_and_usage(offline_gateway):
+    requests, remaining = offline_gateway([
+        _provider_response('{"kind":"invalid"}', usage={
+            'prompt_tokens': 3, 'completion_tokens': 1, 'total_tokens': 4}),
+        _provider_response(usage={'prompt_tokens': 5, 'completion_tokens': 2,
+                                  'total_tokens': 7}),
+    ])
+    attempts, usages = [], []
+    result = await Gateway(key='ci', max_attempts=2).generate(BrowserAction, {},
+        on_attempt=lambda model, request, number: attempts.append(request),
+        on_usage=usages.append)
+    assert result.value.kind == 'finish'
+    assert len(requests) == len(attempts) == 2 and remaining == []
+    assert attempts[0]['logical_exchange_id'] == attempts[1]['logical_exchange_id']
+    assert [request['attempt'] for request in attempts] == [1, 2]
+    assert [usage['total_tokens'] for usage in usages] == [4, 7]
+    assert result.usage['total_tokens'] == 11
+    assert requests[1]['messages'] != requests[0]['messages']
+
+
+async def test_gateway_output_correction_stops_at_configured_attempt_bound(offline_gateway):
+    requests, remaining = offline_gateway([
+        _provider_response('{"kind":"invalid"}', usage={
+            'prompt_tokens': 3, 'completion_tokens': 1, 'total_tokens': 4}),
+        _provider_response('{"kind":"invalid"}', usage={
+            'prompt_tokens': 5, 'completion_tokens': 2, 'total_tokens': 7}),
+        _provider_response(),
+    ])
+    executed = []
+    with pytest.raises(ModelOutputError) as raised:
+        await Gateway(key='ci', max_attempts=2).generate(BrowserAction, {},
+            tool_executor=lambda *arguments: executed.append(arguments))
+    assert len(requests) == 2 and len(remaining) == 1 and executed == []
+    assert raised.value.category == 'output_validation'
+    assert raised.value.details['usage']['total_tokens'] == 11
+    assert raised.value.details['will_retry'] is False
 
 
 async def test_teacher_locator_that_repeatedly_cannot_bind_ends_loop_detected(tmp_path):
