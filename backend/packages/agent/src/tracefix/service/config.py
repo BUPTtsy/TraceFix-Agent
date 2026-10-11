@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -42,7 +43,7 @@ class ServiceSettings:
 
     def resolve_credential(self, reference):
         key = self.credential_env.get(reference)
-        value = os.getenv(key) if key else None
+        value = os.getenv(key) if key and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key) else None
         if not value:
             raise ServiceError('credential_unavailable', '冻结 credential_ref 未配置部署凭据')
         return {'GITHUB_PERSONAL_ACCESS_TOKEN': value}

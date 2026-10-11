@@ -18,9 +18,26 @@ class VerifiedFindingAcceptance:
     allow_revision_rebind: bool = False
 
 
+class RunBoundFindings:
+    def __init__(self, library, services):
+        self.library, self.services = library, services
+
+    def __getattr__(self, name):
+        return getattr(self.library, name)
+
+    def save_verified_finding(self, finding):
+        try:
+            self.services.require_context_consumed()
+        except ServiceError:
+            raise ValueError('必需 GitHub 上下文未被 Engine 消费，拒绝已验证 Finding 回写') from None
+        return self.library.save_verified_finding(finding)
+
+
 def source_identities(documents, external_id):
     records = [record for record in documents.runs()
                if external_id in {record['id'], record.get('agentRunId')}]
+    if len(records) != 1:
+        raise ValueError('来源 Run 必须唯一解析')
     return [SourceRunIdentity(run_id=record['agentRunId'], scope_id=record['projectId'])
             for record in records if record.get('agentRunId') and record.get('projectId')]
 

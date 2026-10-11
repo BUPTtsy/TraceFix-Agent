@@ -8,7 +8,6 @@ import os
 import signal
 import sys
 from contextlib import AsyncExitStack, redirect_stderr, redirect_stdout
-from pathlib import Path
 from types import SimpleNamespace
 
 from pydantic import ValidationError
@@ -18,13 +17,14 @@ from tracefix.connectors import GitHubMCPError
 from tracefix.execution.policy import Policy
 from tracefix.knowledge.documents import DocumentLibrary, timestamp
 from tracefix.rules import RuleLibrary, RuleResolver
-from tracefix.runtime.contracts import Outcome, Phase, RunState, RunStatus, digest
+from tracefix.runtime.contracts import Outcome, Phase, RunState, RunStatus
 from tracefix.runtime.finding_source import rebind_finding_repair_revision
 from tracefix.service.config import ServiceSettings, validate_snapshot
 from tracefix.service.contracts import ServiceRequest
-from tracefix.service.finding import finding_repair_state, validate_acceptance
+from tracefix.service.finding import RunBoundFindings, finding_repair_state, validate_acceptance
 from tracefix.service.resources import RunServices
-from tracefix.service.results import ServiceError, TERMINAL_STATUSES, failure_result, serialize_result
+from tracefix.service.results import (ServiceError, TERMINAL_STATUSES, failure_result,
+                                     preserve_report_diff, serialize_result)
 from tracefix.storage.artifacts import redact
 
 
@@ -73,7 +73,20 @@ def safe_result(value, settings):
                     item = item.replace(secret, '[REDACTED]')
         return item
 
-    return scrub(redact(value))
+    result = scrub(redact(value))
+    if value.get('diff') is not None:
+        result['diff'] = scrub(value['diff'])
+    return result
+
+
+def require_new_internal_run(store, run_id):
+    connection = getattr(store, 'conn', None)
+    if connection is not None:
+        exists = connection.execute('SELECT 1 FROM runs WHERE id=%s', (run_id,)).fetchone() is not None
+    else:
+        exists = run_id in store.runs
+    if exists:
+        raise ServiceError('run_identity_conflict', '内部 Run 已存在，不能覆盖或重放')
 
 
 async def terminal_failure(session, state, code, *, cancelled=False):
@@ -117,7 +130,10 @@ async def execute_request(request, settings, *, session_factory=Session,
         snapshot = validate_snapshot(request, settings)
         config = snapshot['repository_config']
         url = request.execution.url or config['profile']['url']
-        Policy(config['allowed_urls']).url(url)
+        try:
+            Policy(config['allowed_urls']).url(url)
+        except (PermissionError, ValueError):
+            raise ServiceError('execution_denied', '服务 URL 超出冻结配置') from None
         args = SimpleNamespace(project=request.repo_id, projects=snapshot['projects_path'],
             profile=snapshot['profile_path'], plain=True, goal=request.goal, mode=request.mode,
             execution_mode='batch', data=str(settings.data_root), console_db=str(settings.console_db),
@@ -126,6 +142,8 @@ async def execute_request(request, settings, *, session_factory=Session,
         stage = 'configuration_missing'
         if not settings.database_url and session_factory is Session:
             raise ServiceError('configuration_missing', '服务缺少独立配置的数据库连接')
+        if not os.getenv('TRACEFIX_API_KEY'):
+            raise ServiceError('configuration_missing', '服务缺少部署模型凭据')
         session = session_factory(args, None, None)
         session.runtime_stack = resources
         session.runtime_services = services
@@ -133,12 +151,7 @@ async def execute_request(request, settings, *, session_factory=Session,
         session.session_remote = {}
         stage = 'infrastructure_error'
         await session.ensure_runtime()
-        try:
-            session.store.load(request.run_id, request.repo_id)
-        except (KeyError, PermissionError):
-            pass
-        else:
-            raise ServiceError('run_identity_conflict', '内部 Run 已存在，不能覆盖或重放')
+        require_new_internal_run(session.store, request.run_id)
         stage = 'run_identity_conflict'
         documents, request_root = claim_console(request, settings)
         state = RunState(run_id=request.run_id, scope_id=request.repo_id, project_id=request.repo_id,
@@ -173,6 +186,7 @@ async def execute_request(request, settings, *, session_factory=Session,
         await services.prepare()
         stage = 'infrastructure_error'
         state = await session.create_agent(state, frozen_snapshot=snapshot, start=False)
+        session.engine.rule_library = RunBoundFindings(session.engine.rule_library, services)
         if state.repair_source:
             original = state
             source = session.artifacts.json(state.scope_id, state.run_id, state.repo_snapshot_ref)
@@ -187,6 +201,9 @@ async def execute_request(request, settings, *, session_factory=Session,
         latest = session.state()
         if latest.run_id != request.run_id or latest.run_status not in TERMINAL_STATUSES:
             raise ServiceError('nonterminal_run', '服务 batch 未到达绑定 Run 的终态')
+        services.require_context_consumed()
+        latest = preserve_report_diff(latest, session.artifacts, session.engine.workspace)
+        session.store.save(latest)
         result = serialize_result(latest, session.artifacts, task_id=request.task_id, repo_id=request.repo_id)
     except BaseException as error:
         if not isinstance(error, (Exception, asyncio.CancelledError)):
@@ -195,6 +212,11 @@ async def execute_request(request, settings, *, session_factory=Session,
         code = ('cancelled' if cancelled else error.code
                 if isinstance(error, (ServiceError, GitHubMCPError)) else stage)
         result = failure_result(**identity, code=code, cancelled=cancelled)
+        if documents is None and code in {'configuration_missing', 'infrastructure_error'}:
+            try:
+                documents, _ = claim_console(request, settings)
+            except Exception:
+                pass
         if session is not None and state is not None and code != 'run_identity_conflict':
             try:
                 failed = await terminal_failure(session, state, code, cancelled=cancelled)
@@ -205,13 +227,22 @@ async def execute_request(request, settings, *, session_factory=Session,
                 pass
     finally:
         await services.aclose()
+        if services.cleanup_errors:
+            result = failure_result(**identity, code='cleanup_failed')
+            if session is not None and state is not None:
+                try:
+                    failed = await terminal_failure(session, state, 'cleanup_failed')
+                    failed = preserve_report_diff(failed, session.artifacts, session.engine.workspace)
+                    session.store.save(failed)
+                    result = serialize_result(failed, session.artifacts,
+                                              task_id=request.task_id, repo_id=request.repo_id)
+                except Exception:
+                    pass
+            result['cleanup_errors'] = services.cleanup_errors
         try:
             await resources.aclose()
         except Exception:
-            services.cleanup_errors.append({'code': 'runtime_close_failed'})
-        if services.cleanup_errors:
-            result.update(run_status='FAILED', outcome='INFRA_FAILURE',
-                          error={'code': 'cleanup_failed'}, cleanup_errors=services.cleanup_errors)
+            result = failure_result(**identity, code='runtime_close_failed')
         if documents is not None:
             try:
                 documents.update_run(request.run_id, {'status': result['run_status'].lower(),
@@ -239,6 +270,8 @@ async def run_with_signals(request, settings):
 
 
 def main(argv=None):
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
     result = failure_result(code='invalid_request')
     with open(os.devnull, 'w', encoding='utf-8') as discarded:
         with redirect_stdout(discarded), redirect_stderr(discarded):

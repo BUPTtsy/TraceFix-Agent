@@ -61,6 +61,31 @@ class GitHubMCPError(RuntimeError):
         super().__init__(message)
 
 
+def validate_snapshot_binding(snapshot: Mapping[str, Any]):
+    if not isinstance(snapshot, Mapping):
+        raise ValueError('repository snapshot 无效')
+    repository = snapshot.get('repository_config')
+    if not isinstance(repository, Mapping):
+        raise ValueError('repository snapshot 无效')
+    commit = str(snapshot.get('commit') or '')
+    repo_id = snapshot.get('repo_id')
+    if (not isinstance(repo_id, str) or snapshot.get('projectId', repo_id) != repo_id
+            or repository.get('repo_id') != repo_id or repository.get('projectId') != repo_id
+            or not commit or repository.get('commit') != commit):
+        raise ValueError('repository snapshot commit 不一致')
+    for key in ('owner', 'repo', 'allowed_files', 'credential_ref', 'default_ref'):
+        if key in snapshot and snapshot[key] != repository.get(key):
+            raise ValueError('repository snapshot 配置绑定不一致')
+    expected_digest = digest({key: value for key, value in repository.items()
+                              if key not in {'config_digest', 'frozen_run_id', 'snapshot_digest'}})
+    if repository.get('config_digest') != expected_digest or snapshot.get('config_digest') != expected_digest:
+        raise ValueError('repository snapshot 配置摘要不一致')
+    if not repository.get('frozen_run_id') or repository.get('snapshot_digest') != digest({
+            key: value for key, value in repository.items() if key != 'snapshot_digest'}):
+        raise ValueError('repository snapshot 冻结摘要不一致')
+    return repository
+
+
 @dataclass(frozen=True)
 class GitHubMCPConfig:
     """部署侧 connector 配置；模型不能修改其中任何字段。"""
@@ -117,28 +142,9 @@ class GitHubMCPConfig:
                       max_response_bytes: int = 1_048_576,
                       env_keys: list[str] | tuple[str, ...] = ()):
         """从 B1 冻结快照建立绑定，不读取任意当前项目配置。"""
-        if not isinstance(snapshot, Mapping):
-            raise ValueError("repository snapshot 无效")
-        repository = snapshot.get("repository_config")
-        if not isinstance(repository, Mapping):
-            raise ValueError("repository snapshot 无效")
+        repository = validate_snapshot_binding(snapshot)
         commit = str(snapshot.get("commit") or "")
-        configured_commit = str(repository.get("commit") or "")
         repo_id = snapshot.get("repo_id")
-        if (not isinstance(repo_id, str) or snapshot.get("projectId", repo_id) != repo_id
-                or repository.get("repo_id") != repo_id or repository.get("projectId") != repo_id
-                or not configured_commit or configured_commit != commit):
-            raise ValueError("repository snapshot commit 不一致")
-        for key in ("owner", "repo", "allowed_files", "credential_ref", "default_ref"):
-            if key in snapshot and snapshot[key] != repository.get(key):
-                raise ValueError("repository snapshot 配置绑定不一致")
-        expected_digest = digest({key: value for key, value in repository.items()
-                                  if key not in {"config_digest", "frozen_run_id", "snapshot_digest"}})
-        if repository.get("config_digest") != expected_digest or snapshot.get("config_digest") != expected_digest:
-            raise ValueError("repository snapshot 配置摘要不一致")
-        if not repository.get("frozen_run_id") or repository.get("snapshot_digest") != digest({
-                key: value for key, value in repository.items() if key != "snapshot_digest"}):
-            raise ValueError("repository snapshot 冻结摘要不一致")
         return cls(
             command=tuple(command), args=tuple(args),
             repo_id=repo_id,

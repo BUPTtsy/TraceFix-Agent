@@ -18,6 +18,8 @@ class RunServices:
         self._resources = []
         self._close_task = None
         self._prepared = False
+        self._context_consumed = False
+        self.finding_acceptance = None
         self.cleanup_errors = []
 
     def own(self, resource):
@@ -56,7 +58,12 @@ class RunServices:
         if (state.run_id != self.run_id or state.scope_id != self.repo_id
                 or not self._prepared or self._close_task is not None):
             raise ServiceError('context_binding_invalid', 'GitHub 上下文不属于活动 Run')
+        self._context_consumed = True
         return copy.deepcopy(self._documents)
+
+    def require_context_consumed(self):
+        if self.request.github_reads and not self._context_consumed:
+            raise ServiceError('runtime_services_not_integrated', 'Engine 尚未消费本 Run 的 GitHub 上下文接缝')
 
     async def _close(self):
         for resource in reversed(self._resources):

@@ -23,6 +23,7 @@ tracefix = "tracefix.cli.main:main"
 where = ["backend/packages/agent/src"]
 [tool.setuptools.package-data]
 "tracefix.storage" = ["*.sql"]
+"tracefix.service" = ["service.env.example"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["backend/packages/agent/src"]

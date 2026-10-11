@@ -1,11 +1,11 @@
 import asyncio
+import io
 import json
 import os
 import subprocess
 import sys
 from copy import deepcopy
 from dataclasses import replace
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -16,8 +16,8 @@ from tracefix.connectors import GitHubMCPError
 from tracefix.execution.workspace import commit_workspace, git
 from tracefix.knowledge.documents import DocumentLibrary
 from tracefix.repository_registry import RepositoryRegistry, config_digest
-from tracefix.rules import Rule, RuleLibrary
-from tracefix.runtime.contracts import Outcome, digest
+from tracefix.rules import Finding, Rule, RuleLibrary
+from tracefix.runtime.contracts import Outcome, RunState, digest
 from tracefix.runtime.smoke import FakeBrowser, FakeModel, FakeRunner
 from tracefix.service.config import ServiceSettings, validate_snapshot
 from tracefix.service.contracts import ServiceRequest
@@ -25,6 +25,30 @@ from tracefix.service.finding import VerifiedFindingAcceptance
 from tracefix.service.resources import RunServices
 from tracefix.service.run import execute_request
 from tracefix.storage.store import MemoryStore
+from tests.test_github_mcp import mcp_mock
+
+
+def test_service_terminal_uses_utf8_with_windows_output_encoding(service_fixture, monkeypatch):
+    from tracefix.service import run
+    from tracefix.service.results import failure_result
+
+    fixture = service_fixture
+    request = fixture.request()
+    output = io.BytesIO()
+    stream = io.TextIOWrapper(output, encoding='cp1252')
+    monkeypatch.setattr(sys, 'stdout', stream)
+    monkeypatch.setattr(sys, 'stdin', io.TextIOWrapper(io.BytesIO(request.model_dump_json().encode('utf-8'))))
+    monkeypatch.setattr(ServiceSettings, 'from_environment', lambda: fixture.settings)
+
+    async def failed(*args):
+        return {**failure_result(run_id=request.run_id), 'message': '运行基础设施不可用'}
+
+    monkeypatch.setattr(run, 'run_with_signals', failed)
+    assert run.main(['--request-stdin']) == 1
+    stream.flush()
+    encoded = output.getvalue()
+    assert len(encoded.splitlines()) == 1
+    assert json.loads(encoded.decode('utf-8'))['message'] == '运行基础设施不可用'
 
 
 @pytest.fixture
@@ -37,6 +61,9 @@ def service_fixture(tmp_path, monkeypatch):
     commit_workspace(root, '测试基线')
     git(root, 'remote', 'add', 'origin', 'https://github.com/owner/app.git')
     settings = ServiceSettings(tmp_path / 'data', tmp_path / 'console.sqlite3')
+    rule_library = RuleLibrary(settings.console_db)
+    for rule in rule_library.rules():
+        rule_library.save_rule(rule.model_copy(update={'status': 'disabled'}), rule_id=rule.id)
     registry = RepositoryRegistry(tmp_path / 'profiles/projects.yaml',
                                   authorized_roots=[root], data_root=settings.data_root)
     registry.register({'repo_id': 'alpha', 'root': str(root), 'owner': 'owner', 'repo': 'app',
@@ -60,12 +87,13 @@ def service_fixture(tmp_path, monkeypatch):
     def runner(profile, workspace, run_id):
         resource = FakeRunner(digest(workspace.repository_snapshot))
         resource.workspace = workspace
+        resource.run_id = run_id
         resource.browser_command = lambda: []
         runners.append(resource)
         return resource
 
     def browser(*args):
-        resource = FakeBrowser(runners[-1].workspace, bugfree=True)
+        resource = FakeBrowser(runners[-1].workspace, bugfree=not runners[-1].run_id.startswith('repair'))
         browsers.append(resource)
         return resource
 
@@ -133,6 +161,25 @@ async def test_runtime_failure_finalizes_before_store_closes(service_fixture, mo
     assert result['run_status'] == 'FAILED' and result['report_ref']
     assert 'fake-service-model-key' not in json.dumps(result)
     assert fixture.runners[0].closed and fixture.browsers[0].closed
+
+
+async def test_service_preserves_unknown_browser_receipt_without_replay(service_fixture, monkeypatch):
+    from tracefix.execution.browser import MCPActionUnknown, MCPConnectionError
+    fixture = service_fixture
+    attempts = []
+
+    async def lose_receipt(browser, action):
+        attempts.append(action.kind)
+        raise MCPActionUnknown('service-unknown-action', action.kind, MCPConnectionError('lost receipt'))
+
+    monkeypatch.setattr(FakeBrowser, 'action', lose_receipt)
+    request = fixture.request()
+    result = await execute_request(request, fixture.settings, session_factory=fixture.factory)
+    assert result['run_status'] == 'FAILED' and result['error']['status'] == 'UNKNOWN_OPERATION'
+    assert len(attempts) == 1
+    assert any(operation['status'] == 'UNKNOWN' for operation in fixture.store.operations.values())
+    repeated = await execute_request(request, fixture.settings, session_factory=fixture.factory)
+    assert repeated['error']['code'] == 'run_identity_conflict' and len(attempts) == 1
 
 
 async def test_partial_factory_initialization_closes_browser_and_runner(service_fixture, monkeypatch):
@@ -209,6 +256,9 @@ async def test_finding_repair_reexports_source_and_does_not_inherit_success(serv
     fixture.store.save(source)
     request = fixture.request('repair_run', mode='repair', source_run_id='source_run',
                               source_finding_ids=[finding.id])
+    request.execution.spec.assertions = [request.execution.spec.assertions[0].model_copy(update={
+        'locator': request.execution.spec.assertions[0].locator.model_copy(update={
+            'role': 'checkbox', 'name': 'Complete task'}), 'condition': 'checked'})]
     result = await execute_request(request, fixture.settings, session_factory=fixture.factory)
     assert result['report_ref'], result
     state = fixture.store.load('repair_run', 'alpha')
@@ -216,6 +266,8 @@ async def test_finding_repair_reexports_source_and_does_not_inherit_success(serv
     assert fixture.runners[-1].workspace.root != fixture.runners[0].workspace.root
     assert state.repair_source.target_base_commit == request.repository_snapshot.commit
     assert not state.repair_source.revision_rebound
+    assert state.reproduced and state.trial == 3 and state.outcome == Outcome.FIX_VERIFIED, result
+    assert library.finding(finding.id).status == 'fixed'
     assert state.repair_source.findings[0]['fix_guidance'] == '将真实保存结果持久化'
     assert fixture.runners[-1].closed
 
@@ -235,6 +287,154 @@ async def test_unverified_json_acceptance_and_implicit_revision_change_rejected(
     result = await execute_request(request, fixture.settings, session_factory=fixture.factory)
     assert result['error']['code'] == 'revision_rebind_required'
     assert len(fixture.runners) == 1
+
+
+async def test_explicit_revision_change_requires_typed_bound_acceptance(service_fixture):
+    fixture = service_fixture
+    _, finding = await create_source(fixture)
+    (fixture.root / 'src/value.ts').write_text('export const persisted = false;\nexport const revision = 2;\n')
+    git(fixture.root, 'add', 'src/value.ts')
+    commit_workspace(fixture.root, '重新冻结验收版本')
+    request = fixture.request('repair_rebound', mode='repair', source_run_id='source_run',
+        source_finding_ids=[finding.id], finding_acceptance={'acceptance_id': 'c-validated'})
+
+    def accepted(request, state, snapshot):
+        return VerifiedFindingAcceptance(run_id=request.run_id, repo_id=request.repo_id,
+            commit=snapshot['commit'], source_run_id=state.repair_source.source_run_id,
+            source_finding_ids=tuple(request.source_finding_ids), spec=request.execution.spec,
+            allow_revision_rebind=True)
+
+    result = await execute_request(request, fixture.settings, session_factory=fixture.factory,
+                                   acceptance_adapter=accepted)
+    state = fixture.store.load(request.run_id, request.repo_id)
+    assert state.repair_source.revision_rebound and state.repair_source.target_base_commit == request.repository_snapshot.commit
+    assert result['report_ref'] and len(fixture.runners) == 2
+    assert fixture.sessions[-1].engine.runtime_services.finding_acceptance.commit == request.repository_snapshot.commit
+
+
+@pytest.mark.parametrize('damage', ['wrong_source', 'cross_repo', 'corrupt_hash', 'ambiguous_identity'])
+async def test_service_rejects_source_before_new_workspace(service_fixture, damage):
+    fixture = service_fixture
+    library, finding = await create_source(fixture)
+    if damage in {'wrong_source', 'cross_repo'}:
+        finding = library.save_finding(finding.model_copy(update={'id': 'other_finding',
+            'run_id' if damage == 'wrong_source' else 'repo_id': 'another'}))
+    elif damage == 'corrupt_hash':
+        session = fixture.sessions[-1]
+        state = fixture.store.load('source_run', 'alpha')
+        session.artifacts._path('alpha', 'source_run', state.observation_ref).write_bytes(b'corrupted')
+    else:
+        DocumentLibrary(fixture.settings.console_db).update_run('duplicate', {
+            'projectId': 'alpha', 'agentRunId': 'source_run'}, create=True)
+    request = fixture.request('repair_rejected', mode='repair', source_run_id='source_run',
+                              source_finding_ids=[finding.id])
+    result = await execute_request(request, fixture.settings, session_factory=fixture.factory)
+    assert result['error']['code'] == 'finding_source_invalid' and len(fixture.runners) == 1
+
+
+async def test_guided_finding_remains_inconclusive_without_c_acceptance(service_fixture):
+    fixture = service_fixture
+    library = RuleLibrary(fixture.settings.console_db)
+    rule = library.save_rule(Rule(id='guided_feedback', name='检查可访问反馈', status='enabled',
+        scope={'project_ids': ['alpha']}, phases=['EXPLORE', 'DIAGNOSE', 'PATCH', 'VERIFY'],
+        detection={'type': 'guided', 'guided': {'prompt': '检查页面是否显示结果'}}, fix_guidance='增加可访问提示'))
+    await execute_request(fixture.request('source_run', additional_rule_ids=['guided_feedback']),
+                          fixture.settings, session_factory=fixture.factory)
+    source = fixture.store.load('source_run', 'alpha')
+    finding = library.save_finding(Finding(id='finding_guided', job_id='task_alpha',
+        run_id=source.run_id, scope_id='alpha', project_id='alpha', repo_id='owner/app',
+        rule_id=rule.id, rule_version=rule.version, source='guided', severity='major',
+        title='缺少可访问反馈', expected='出现操作反馈', actual='没有操作反馈',
+        location={'url': source.url}, evidence_refs=[source.observation_ref], fingerprint='guided',
+        source_base_commit=fixture.request('source_run').repository_snapshot.commit,
+        source_manifest=source.source_manifest))
+    request = fixture.request('repair_guided', mode='repair', source_run_id='source_run',
+                              source_finding_ids=[finding.id])
+    result = await execute_request(request, fixture.settings, session_factory=fixture.factory)
+    assert result['outcome'] == 'INCONCLUSIVE'
+    assert library.finding(finding.id).status != 'fixed'
+    assert not fixture.store.load(request.run_id, 'alpha').patch_hash
+
+
+async def test_no_engine_context_consumption_is_reported_as_integration_failure(service_fixture):
+    fixture = service_fixture
+
+    class CachedServices(RunServices):
+        async def prepare(self):
+            self._prepared = True
+
+    result = await execute_request(fixture.request(github_reads=[{'source_kind': 'commit'}]),
+        fixture.settings, session_factory=fixture.factory, services_factory=CachedServices)
+    assert result['run_status'] == 'FAILED' and result['error']['code'] == 'runtime_services_not_integrated'
+
+
+async def test_missing_database_still_publishes_managed_terminal(service_fixture):
+    fixture = service_fixture
+    result = await execute_request(fixture.request(), fixture.settings)
+    assert result['error']['code'] == 'configuration_missing' and result['terminal']
+    record = DocumentLibrary(fixture.settings.console_db).run('run_alpha')
+    assert record['managed'] and record['status'] == 'failed' and record['pid'] is None
+
+
+async def test_cross_scope_internal_run_is_never_overwritten(service_fixture):
+    fixture = service_fixture
+    original = RunState(run_id='run_alpha', scope_id='another_scope', goal='保护已有任务状态', url='http://app:3000')
+    fixture.store.save(original)
+    result = await execute_request(fixture.request(), fixture.settings, session_factory=fixture.factory)
+    assert result['error']['code'] == 'run_identity_conflict'
+    assert fixture.store.load('run_alpha', 'another_scope') == original
+
+
+async def test_cleanup_failure_updates_authoritative_terminal(service_fixture):
+    fixture = service_fixture
+
+    class FailedCloseServices(RunServices):
+        async def aclose(self):
+            await super().aclose()
+            self.cleanup_errors.append({'code': 'resource_close_failed'})
+
+    result = await execute_request(fixture.request(), fixture.settings, session_factory=fixture.factory,
+                                   services_factory=FailedCloseServices)
+    assert result['run_status'] == 'FAILED' and result['error']['code'] == 'cleanup_failed'
+    assert fixture.store.load('run_alpha', 'alpha').outcome == Outcome.INFRA_FAILURE
+    assert result['report']['outcome'] == 'INFRA_FAILURE'
+
+
+async def test_c_context_seam_combines_cached_reads_with_engine_calls(service_fixture, mcp_mock, monkeypatch):
+    from tracefix.runtime.engine import Engine
+    fixture = service_fixture
+    settings = replace(fixture.settings, credential_env={'deployment/alpha': 'BETA_GITHUB_SECRET'})
+    monkeypatch.setenv('BETA_GITHUB_SECRET', 'only-in-deployment')
+    original = Engine.model_call
+    consumed = []
+
+    async def integrate(engine, state, schema, context, *args, **kwargs):
+        documents = await engine.runtime_services.reference_documents(state)
+        context = {**context, 'reference_documents': [*context.get('reference_documents', []), *documents]}
+        consumed.extend(documents)
+        return await original(engine, state, schema, context, *args, **kwargs)
+
+    monkeypatch.setattr(Engine, 'model_call', integrate)
+    result = await execute_request(fixture.request(github_reads=[{'source_kind': 'file', 'path': 'src/value.ts'}]),
+                                   settings, session_factory=fixture.factory)
+    assert result['run_status'] == 'COMPLETED' and consumed
+    assert all(item['untrusted'] and item['provenance']['run_id'] == 'run_alpha' for item in consumed)
+    assert sum(name == 'get_file_contents' for name, _ in mcp_mock.sessions[0].calls) == 1
+    assert mcp_mock.sessions[0].closed
+
+
+def test_valid_stdin_request_emits_terminal_on_configuration_failure(service_fixture):
+    fixture = service_fixture
+    request = fixture.request()
+    environment = {**os.environ, 'TRACEFIX_SERVICE_DATA_ROOT': str(fixture.settings.data_root),
+                   'TRACEFIX_SERVICE_CONSOLE_DB': str(fixture.settings.console_db)}
+    environment.pop('TRACEFIX_SERVICE_DATABASE_URL', None)
+    process = subprocess.run([sys.executable, '-m', 'tracefix.service.run', '--request-stdin'],
+        input=request.model_dump_json().encode('utf-8'), capture_output=True, env=environment, timeout=30)
+    assert process.returncode == 1 and not process.stderr and len(process.stdout.splitlines()) == 1
+    result = json.loads(process.stdout)
+    assert result['task_id'] == request.task_id and result['run_id'] == request.run_id
+    assert result['error']['code'] == 'configuration_missing'
 
 
 @pytest.mark.parametrize('payload', [b'{broken', b'{"token":"secret"}', b'[]', b'a' * 2_097_153],

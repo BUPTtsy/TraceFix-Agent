@@ -5,14 +5,14 @@ from typing import Any, Literal
 
 from pydantic import ConfigDict, Field, model_validator
 
-from tracefix.connectors.github_mcp import GitHubMCPConfig, GitHubReadRequest
+from tracefix.connectors.github_mcp import GitHubReadRequest, validate_snapshot_binding
 from tracefix.runtime.contracts import Contract, TestSpec
 
 
 _IDENTITY = r'^[A-Za-z0-9_-]{1,80}$'
-_SECRET_KEYS = frozenset({'api_key', 'apikey', 'access_token', 'token', 'password',
-                          'authorization', 'credentials', 'client_secret', 'private_key'})
-_TOKEN = re.compile(r'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}')
+_SECRET_KEYS = frozenset({'api_key', 'apikey', 'access_token', 'token', 'password', 'secret',
+                          'authorization', 'credentials', 'client_secret', 'private_key', 'cookie'})
+_TOKEN = re.compile(r'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}')
 
 
 def reject_credentials(value: Any):
@@ -65,7 +65,7 @@ class RepositorySnapshot(Contract):
 
     @model_validator(mode='after')
     def frozen_binding(self):
-        GitHubMCPConfig.from_snapshot(self.model_dump(exclude_none=True), command=('deployment',))
+        validate_snapshot_binding(self.model_dump(exclude_none=True))
         if self.snapshot is not None and self.snapshot != self.repository_config:
             raise ValueError('冻结快照副本不一致')
         if self.registry is not None and self.registry != self.projects_path:
@@ -94,6 +94,8 @@ class ServiceRequest(Contract):
     @classmethod
     def no_plaintext_credentials(cls, value):
         reject_credentials(value)
+        if isinstance(value, dict) and type(value.get('schema_version')) is not int:
+            raise ValueError('schema_version 必须为整数 1')
         return value
 
     @model_validator(mode='after')
