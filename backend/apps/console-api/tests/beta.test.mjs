@@ -332,6 +332,26 @@ test('Task schema 拒绝快照、命令、凭据、交互模式和不完整验�
   assert.equal(fake.calls.length, 0);
 });
 
+test('Task 项目缺失返回 404；来源条件在公开 schema 校验并保持无副作用', async context => {
+  const {request, fake, service} = await fixture(context);
+  const missing = await request('POST', '/api/v1/tasks', {...body, projectId: 'absent'});
+  assert.equal(missing.statusCode, 404, missing.body);
+  assert.equal(missing.json().code, 'PROJECT_NOT_FOUND');
+  const malformed = await request('POST', '/api/v1/tasks', {...body, projectId: ''});
+  assert.equal(malformed.statusCode, 400, malformed.body);
+  for (const patch of [{source_run_id: 'source', source_finding_ids: ['finding']},
+    {mode: 'repair', source_run_id: 'source'}, {mode: 'repair', source_run_id: 'source', source_finding_ids: []},
+    {mode: 'repair', source_finding_ids: ['finding']}]) {
+    const response = await request('POST', '/api/v1/tasks', {...body, projectId: 'absent', ...patch});
+    assert.equal(response.statusCode, 400, response.body);
+    assert.equal(response.json().code, 'VALIDATION_ERROR', response.body);
+  }
+  assert.equal(fake.calls.length, 0);
+  assert.deepEqual(service('tasks'), []);
+  const permitted = await request('POST', '/api/v1/tasks', {...body, source_finding_ids: []});
+  assert.equal(permitted.statusCode, 201, permitted.body);
+});
+
 test('来源 Run/Finding 和追加规则经归属校验后传递 B；拒绝跨 Run 来源', async context => {
   const {request, create, fake, databasePath, finish, service} = await fixture(context);
   const source = service('run.create', {projectId: 'alpha', mode: 'test', goal: '来源测试'});
@@ -388,6 +408,11 @@ test('Finding 验收模板存入 Task、绑定唯一内部来源并透传新的 
     spec: acceptanceSpec, spec_hash: 'c'.repeat(64)};
   const input = {projectId: 'alpha', mode: 'repair', goal, execution: {executionMode: 'batch'},
     source_run_id: source.id, source_finding_ids: [finding.id], finding_acceptance: acceptance};
+  for (const patch of [{mode: 'test'}, {source_run_id: undefined}, {source_finding_ids: []}]) {
+    const response = await request('POST', '/api/v1/tasks', {...input, ...patch});
+    assert.equal(response.statusCode, 400, response.body);
+    assert.equal(response.json().code, 'VALIDATION_ERROR', response.body);
+  }
   for (const patch of [{verified: true}, {schema_version: true}, {test_code: 'arbitrary code'}])
     assert.equal((await request('POST', '/api/v1/tasks', {...input, finding_acceptance: {...acceptance, ...patch}})).statusCode, 400);
   for (const patch of [{source_run_id: 'wrong_internal'}, {commit: 'd'.repeat(40)}, {run_id: 'historical_repair'}]) {

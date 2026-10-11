@@ -134,5 +134,18 @@ test('Task 正文拒绝执行权限注入、交互模式和不完整验收绑定
   assert.throws(() => normalize({...input, execution: {executionMode: 'batch', url: 'https://user:pass@example.com'}}), error => error.code === 'INVALID_URL');
   assert.throws(() => normalize({...input, github_reads: [{source_kind: 'file', path: 'src/App.tsx', command: 'sh'}]}), error => error.code === 'INVALID_GITHUB_READ');
   assert.throws(() => normalize({...input, finding_acceptance: {schema_version: 1}}), error => error.status === 400);
-  assert.throws(() => normalize({...input, projectId: 'different'}), error => error.code === 'INVALID_PROJECT');
+  assert.throws(() => normalize({...input, projectId: 'different'}), error => error.code === 'PROJECT_NOT_FOUND' && error.status === 404);
+});
+
+test('项目缺失为 404；格式错误、别名冲突与歧义保持 400', () => {
+  const catalog = [...projects, {id: 'beta', repoId: 'second', ready: true}];
+  for (const fields of [{...input, repo_id: 'absent'}, {...input, projectId: 'absent'}])
+    assert.throws(() => normalizeTask(fields, catalog), error => error.code === 'PROJECT_NOT_FOUND' && error.status === 404);
+  for (const fields of [{...input, repo_id: ''}, {...input, repo_id: 123}, {...input, projectId: 'beta'}])
+    assert.throws(() => normalizeTask(fields, catalog), error => error.code === 'INVALID_PROJECT' && error.status === 400);
+  assert.throws(() => normalizeTask(input, [...catalog, {id: 'repo', repoId: 'third', ready: true}]),
+    error => error.code === 'INVALID_PROJECT' && error.status === 400);
+  assert.throws(() => normalizeTask(input, [{...projects[0], ready: false}]),
+    error => error.code === 'PROJECT_NOT_READY' && error.status === 409);
+  assert.equal(normalizeTask({...input, projectId: 'alpha', repositoryId: 'repo'}, catalog).projectId, 'alpha');
 });

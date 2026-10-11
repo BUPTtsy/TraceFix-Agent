@@ -54,8 +54,10 @@ export function normalizeTask(fields: Data, projects: Data[]): Data {
   if (!ids.length || ids.some(id => typeof id !== 'string' || !id || id.length > 128))
     throw taskError('INVALID_PROJECT', '必须指定已注册项目', 400);
   const matches = ids.map(id => projects.filter(item => item.id === id || item.repoId === id));
-  if (matches.some(items => items.length !== 1) || new Set(matches.map(items => items[0].id)).size !== 1)
-    throw taskError('INVALID_PROJECT', '项目不存在、存在歧义或别名冲突', 400);
+  if (matches.some(items => items.length > 1) || new Set(matches.flatMap(items => items.map(item => item.id))).size > 1)
+    throw taskError('INVALID_PROJECT', '项目存在歧义或别名冲突', 400);
+  if (matches.some(items => items.length === 0))
+    throw taskError('PROJECT_NOT_FOUND', '项目不存在', 404);
   const project = matches[0][0];
   if (!project.ready) throw taskError('PROJECT_NOT_READY', '项目尚未就绪或已禁用', 409);
   if (!['test', 'repair'].includes(fields.mode) || typeof fields.goal !== 'string' || fields.goal.trim().length < 5 || fields.goal.trim().length > 4000)

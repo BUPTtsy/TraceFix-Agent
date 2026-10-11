@@ -39,7 +39,17 @@ const githubRead = {type: 'object', additionalProperties: false, required: ['sou
     {properties: {source_kind: {enum: ['commit']}}, not: {anyOf: [{required: ['path']}, {required: ['number']}]}}]};
 
 export const taskInput = {type: 'object', additionalProperties: false, required: ['mode', 'goal', 'execution'],
-  anyOf: [{required: ['projectId']}, {required: ['repo_id']}, {required: ['repositoryId']}], properties: {
+  anyOf: [{required: ['projectId']}, {required: ['repo_id']}, {required: ['repositoryId']}],
+  allOf: [
+    {if: {required: ['mode'], properties: {mode: {const: 'test'}}}, then: {
+      not: {anyOf: [{required: ['source_run_id']}, {required: ['finding_acceptance']}]},
+      properties: {source_finding_ids: {type: 'array', maxItems: 0}}}},
+    {if: {required: ['source_run_id']}, then: {required: ['source_finding_ids'],
+      properties: {mode: {const: 'repair'}, source_finding_ids: {type: 'array', minItems: 1}}}},
+    {if: {required: ['source_finding_ids'], properties: {source_finding_ids: {type: 'array', minItems: 1}}},
+      then: {required: ['source_run_id'], properties: {mode: {const: 'repair'}}}},
+    {if: {required: ['finding_acceptance']}, then: {required: ['source_run_id', 'source_finding_ids'],
+      properties: {mode: {const: 'repair'}, source_finding_ids: {type: 'array', minItems: 1}}}}], properties: {
     projectId: {...text, maxLength: 128}, repo_id: {...text, maxLength: 128}, repositoryId: {...text, maxLength: 128},
     mode: {type: 'string', enum: ['test', 'repair']}, goal: {type: 'string', minLength: 5, maxLength: 4000},
     execution: {type: 'object', additionalProperties: false, required: ['executionMode'], properties: {
