@@ -1,4 +1,3 @@
-import http from 'node:http';
 import fs from 'node:fs/promises';
 import {existsSync, readFileSync} from 'node:fs';
 import path from 'node:path';
@@ -12,6 +11,8 @@ import {childRunning, createAgentStopper, stopCapabilities} from './agent-stop.m
 import crypto from 'node:crypto';
 import {DatabaseSync} from 'node:sqlite';
 import {build} from 'esbuild';
+import {createApi, publicError} from './api.mjs';
+import {createExecutor} from './executor.mjs';
 
 const dataFile = process.env.BUGBOARD_DATA || path.join(os.tmpdir(), 'tracefix-bugboard-data.json');
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../frontend/apps/web/dist');
@@ -44,18 +45,24 @@ const dataService = createConsoleService({projectsPath: path.resolve(projectRoot
   dataRoot: path.resolve(projectRoot, process.env.TRACEFIX_DATA), databasePath: path.resolve(projectRoot, process.env.TRACEFIX_CONSOLE_DB),
   displayRoot: projectRoot});
 const bridge = (operation, fields) => Promise.resolve().then(() => dataService(operation, fields));
+const executor = createExecutor({bridge, projectRoot});
 let agent = {status: 'idle', pid: null, goal: '', mode: 'test', startedAt: null, finishedAt: null, exitCode: null, signal: null, logs: []};
 let agentProcess = null;
 let launching = false;
 const persist = () => fs.writeFile(dataFile, JSON.stringify(tasks));
 let mutation = Promise.resolve();
 async function body(req) {
+  if (req.tracefixBody !== undefined) return req.tracefixBody;
   const chunks = []; let bytes = 0;
   for await (const chunk of req) {bytes += chunk.length; if (bytes > 1600000) throw Object.assign(new Error('请求内容过大'), {status: 413}); chunks.push(chunk);}
   try {return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');}
   catch (error) {if (error instanceof SyntaxError) throw Object.assign(new Error('请求 JSON 无效'), {status: 400}); throw error;}
 }
-function send(res, status, value) {res.writeHead(status, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(value));}
+function send(res, status, value) {
+  if (status >= 400 && typeof value?.error === 'string') value = {code: value.code || 'REQUEST_FAILED',
+    message: value.error, retryable: false, requestId: value.requestId || crypto.randomUUID()};
+  res.writeHead(status, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(value));
+}
 function loopback(req) {
   const address = req.socket.remoteAddress || '';
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
@@ -157,8 +164,8 @@ async function chatCompletion(message, history, projectId, useKnowledge, res) {
     } finally {database.close();}
   }});
 }
-const server = http.createServer(async (req,res) => {
-  const requestId = crypto.randomUUID();
+const legacyHandler = async (req,res) => {
+  const requestId = req.tracefixRequestId || crypto.randomUUID();
   try {
     const url = new URL(req.url, 'http://localhost');
     if (url.pathname === '/health') return send(res, 200, {ok:true});
@@ -300,10 +307,9 @@ const server = http.createServer(async (req,res) => {
     if (res.headersSent) return;
     const status = Number.isInteger(e.status) ? e.status : e.code === 'ENOENT' ? 404 : 500;
     if (status >= 500) console.error(`请求 ${requestId} 处理失败：`, e);
-    send(res, status, {error: status >= 500 ? '服务器内部错误' : status === 404 ? '资源不存在' : e.message,
-      ...(e.code ? {code: e.code} : {}), requestId});
+    send(res, status, publicError(e, requestId).body);
   }
-});
+};
 await bridge('runs.import');
 setInterval(() => bridge('runs.import').catch(error => console.error('后台导入运行记录失败：', error)), 60000).unref();
 for (const record of await bridge('runs')) {
@@ -312,4 +318,6 @@ for (const record of await bridge('runs')) {
     else await bridge('run.ended', {id: record.id, error: 'API 重启后检测到 Agent 进程已退出'});
   }
 }
-server.listen(Number(process.env.PORT || 3000), process.env.TRACEFIX_CONTROL_HOST || '127.0.0.1');
+await executor.recover();
+const server = await createApi({bridge, controller: executor, legacyHandler});
+await server.listen({port: Number(process.env.PORT || 3000), host: process.env.TRACEFIX_CONTROL_HOST || '127.0.0.1'});

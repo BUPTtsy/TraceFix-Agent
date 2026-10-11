@@ -8,6 +8,7 @@ import {canContinue, ConsoleDatabase, DataError, timestamp} from './database.js'
 import {RuleDatabase} from './rules.js';
 import {classifyGuidance, guidanceUnsafe} from './guidance.js';
 import {TaskLifecycle, normalizeTask, taskError} from './task-lifecycle.js';
+import {resultView} from './results.js';
 
 type Data = Record<string, any>;
 
@@ -126,7 +127,8 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     if (operation === 'task') return tasks.task(fields.id);
     if (operation === 'task.create') return tasks.create(fields.body, fields.key);
     if (operation === 'task.update') return tasks.update(fields.id, fields.body);
-    if (operation === 'task.start') return tasks.start(fields.id, fields.body || {}, fields.key, fields.ownerId);
+    if (operation === 'task.start') return tasks.start(fields.id, fields.body || {}, fields.key, fields.ownerId, fields.namespace);
+    if (operation === 'task.launching') return tasks.launchIntent(fields.id, fields.runId, fields.ownerId);
     if (operation === 'task.spawned') return tasks.spawned(fields.id, fields.runId, fields.ownerId, fields.pid);
     if (operation === 'task.finish') return tasks.finish(fields.id, fields.runId, fields.ownerId, fields.changes);
     if (operation === 'task.recover') return tasks.recover(fields.isAlive);
@@ -158,6 +160,11 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     if (operation === 'runs') return database.runs(fields.projectId).map(({logs, ...run}) =>
       ({...run, canContinue: canContinue(run.status, run.outcome)}));
     if (operation === 'run') return runView(fields.id);
+    if (operation === 'run.findings') {
+      const record = database.run(fields.id);
+      return record.agentRunId ? rules.findings({runId: record.agentRunId, limit: 1000}) : [];
+    }
+    if (operation === 'run.result') return resultView(runView(fields.id), dispatch('run.findings', {id: fields.id}));
     if (operation === 'run.trace') {
       const record = database.run(fields.id);
       if (!database.runEvents(record.id).length && record.agentRunId) {
@@ -236,13 +243,16 @@ export function createConsoleService(options: ConsoleOptions = {}) {
           typeof frozen.projects_path !== 'string' || typeof frozen.profile_path !== 'string' ||
           !path.isAbsolute(frozen.projects_path) || !path.isAbsolute(frozen.profile_path)))
         throw new DataError('仓库冻结响应无效', 503);
+      if (fields.execution?.url && frozen &&
+          !(frozen.repository_config?.allowed_urls || []).some((origin: string) => new URL(fields.execution.url).origin === origin))
+        throw taskError('EXECUTION_URL_NOT_ALLOWED', '执行 URL 超出仓库冻结白名单', 403);
       const record = {id: runId, projectId: project.id, mode: fields.mode,
         profile: frozen?.profile_path || project.profile, registry: frozen?.projects_path || project.registry,
         repositorySnapshot: frozen,
         goal: fields.goal.trim(), ...(parentRunId ? {parentRunId} : {}), additionalRuleIds,
         ...(fields.source_run_id ? {source_run_id: fields.source_run_id} : {}),
         status: 'running', phase: 'STARTING', outcome: null, finishedAt: null, startedAt: timestamp(),
-        knowledge: [], logs: [], origin: 'web', dataRoot};
+        knowledge: [], logs: [], origin: 'web', dataRoot, consoleDatabasePath: database.filename};
       return operation === 'run.prepare' ? record : database.updateRun(runId, record, true);
     }
     if (operation === 'run.update') {

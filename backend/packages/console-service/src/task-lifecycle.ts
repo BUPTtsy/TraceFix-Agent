@@ -28,6 +28,8 @@ export function normalizeTask(fields: Data, projects: Data[]): Data {
   if (!project.ready) throw taskError('PROJECT_NOT_READY', '项目尚未就绪或已禁用', 409);
   if (!['test', 'repair'].includes(fields.mode) || typeof fields.goal !== 'string' || !fields.goal.trim() || fields.goal.trim().length > 4000)
     throw taskError('INVALID_TASK', '目标或模式无效', 400);
+  if (/\b(?:sk|rk)-[a-z0-9_-]{16,}\b|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]{8,}/i.test(JSON.stringify(fields)))
+    throw taskError('TASK_CONTAINS_CREDENTIALS', 'Task 不允许包含真实凭据', 400);
   const execution = fields.execution;
   if (!execution || typeof execution !== 'object' || Array.isArray(execution) ||
       Object.keys(execution).some(key => !['executionMode', 'url', 'spec'].includes(key)))
@@ -60,12 +62,13 @@ export function normalizeTask(fields: Data, projects: Data[]): Data {
   if (!Array.isArray(reads) || reads.length > 50 || reads.some(read => {
     if (!read || typeof read !== 'object' || Array.isArray(read) ||
         Object.keys(read).some(key => !['source_kind', 'path', 'number'].includes(key))) return true;
-    if (!['file', 'issue', 'pull_request'].includes(read.source_kind)) return true;
+    if (!['metadata', 'commit', 'file', 'issue', 'pull_request'].includes(read.source_kind)) return true;
+    if (['metadata', 'commit'].includes(read.source_kind)) return read.path !== undefined || read.number !== undefined;
     if (read.source_kind === 'file') return read.number !== undefined || typeof read.path !== 'string' ||
       !read.path || read.path.length > 1024 || /[\\:\x00-\x1f]/.test(read.path) || read.path.startsWith('/') ||
       read.path.split('/').some((part: string) => !part || part === '.' || part === '..' || /^\.env(?:\.|$)/i.test(part));
     return read.path !== undefined || !Number.isSafeInteger(read.number) || read.number < 1;
-  })) throw taskError('INVALID_GITHUB_READ', 'GitHub 读取仅允许 file、issue 和 pull_request 的受控引用', 400);
+  })) throw taskError('INVALID_GITHUB_READ', 'GitHub 读取仅允许受控只读引用', 400);
   if (fields.finding_acceptance !== undefined)
     throw taskError('ACCEPTANCE_NOT_INTEGRATED', 'finding_acceptance 等待 C 提供严格验收适配', 422);
   if (fields.create_and_start !== undefined && typeof fields.create_and_start !== 'boolean')
@@ -155,9 +158,10 @@ export class TaskLifecycle {
     if (this.lease() || this.store.runs().some(run => active.has(run.status) || run.pid))
       throw taskError('EXECUTOR_BUSY', '单执行器正在运行其他 Run', 409, true);
   }
-  start(id: string, fields: Data, key: string | undefined, ownerId: string): Data {
+  start(id: string, fields: Data, key: string | undefined, ownerId: string, namespace = 'explicit'): Data {
     return this.store.transaction(() => {
-      const previous = this.replay('start:' + id, key, fields);
+      const scope = 'start:' + namespace + ':' + id;
+      const previous = this.replay(scope, key, fields);
       if (previous) return previous;
       const task = this.task(id);
       if (Object.keys(fields).length) throw taskError('INVALID_START', 'start 正文必须为空对象', 400);
@@ -174,9 +178,14 @@ export class TaskLifecycle {
       this.writeTask(updated);
       this.store.db.prepare('INSERT INTO console_executor VALUES (1,?,?,?,?,NULL,?)').run(id, runId, process.pid, ownerId, 'reserved');
       const value = {task: updated, run, replayed: false};
-      this.remember('start:' + id, key, fields, value);
+      this.remember(scope, key, fields, value);
       return value;
     });
+  }
+  launchIntent(id: string, runId: string, ownerId: string): void {
+    const result = this.store.db.prepare("UPDATE console_executor SET phase='launching' WHERE slot=1 AND task_id=? AND run_id=? AND owner_id=? AND phase='reserved'")
+      .run(id, runId, ownerId);
+    if (result.changes !== 1) throw taskError('EXECUTOR_OWNERSHIP_LOST', '执行预留已改变');
   }
   spawned(id: string, runId: string, ownerId: string, pid: number): Data {
     return this.store.transaction(() => {
@@ -212,7 +221,7 @@ export class TaskLifecycle {
         error: {code: 'EXECUTOR_INTERRUPTED', message: 'API 在启动或执行期间退出；执行结果不确定', retryable: false}, updatedAt: timestamp()};
       this.writeRun(run);
       this.writeTask({...this.task(lease.task_id), status: 'unknown', updatedAt: timestamp()});
-      if (!lease.child_pid || !isAlive(lease.child_pid)) {
+      if (lease.phase === 'reserved' || lease.phase === 'spawned' && lease.child_pid && !isAlive(lease.child_pid)) {
         this.writeRun({...run, pid: null, processEndedAt: timestamp()});
         this.store.db.prepare('DELETE FROM console_executor WHERE slot=1 AND run_id=?').run(lease.run_id);
         return null;
