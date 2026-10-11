@@ -527,6 +527,11 @@ class RunState(Contract):
     additional_rule_ids: list[str] = Field(default_factory=list)
     rule_coverage: list[dict] = Field(default_factory=list)
     repair_source: FindingRepairSource | None = None
+    finding_acceptance_ref: str | None = None
+    finding_acceptance_hash: str | None = None
+    finding_reproduction_ref: str | None = None
+    finding_verification_ref: str | None = None
+    finding_acceptance_evidence_refs: list[str] = Field(default_factory=list)
     guidance: list[Guidance] = Field(default_factory=list)
     # 已应用的强制约束持续参与动作/补丁检查，不因模型确认而解除。
     guidance_constraints: list[GuidanceConstraints] = Field(default_factory=list)
@@ -559,6 +564,11 @@ def reduce_state(state: RunState, expected_revision: int, **delta) -> RunState:
     if state.test_spec_ref and any(delta.get(field, getattr(state, field)) != getattr(state, field)
                                    for field in ('test_spec_ref', 'test_spec_hash')):
         raise ValueError('已冻结的 TestSpec 不可变更')
+    if state.finding_acceptance_ref and any(delta.get(field, getattr(state, field)) != getattr(state, field)
+            for field in ('finding_acceptance_ref', 'finding_acceptance_hash')):
+        raise ValueError('已冻结的 Finding acceptance 不可变更')
+    if state.finding_reproduction_ref and delta.get('finding_reproduction_ref', state.finding_reproduction_ref) != state.finding_reproduction_ref:
+        raise ValueError('修补前 Finding 独立复现不可替换')
     if state.check_plan_ref and any(delta.get(field, getattr(state, field)) != getattr(state, field)
                                   for field in ('check_plan_ref', 'check_plan_hash')):
         raise ValueError('已冻结的 CheckPlan 不可变更')
@@ -583,6 +593,7 @@ def reduce_state(state: RunState, expected_revision: int, **delta) -> RunState:
                                      and state.initial_check_result_refs) and state.source_aligned):
         raise ValueError("补丁门禁：需要检测或复现失败证据并与源码对齐")
     if delta.get("patch_hash", state.patch_hash) != state.patch_hash:
+        delta['finding_verification_ref'] = None
         delta["validation_refs"] = []
         delta["approval_ref"] = None
         delta["behavior_check_refs"] = []
