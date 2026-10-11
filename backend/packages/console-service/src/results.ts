@@ -55,4 +55,3 @@ export function resultView(run: Data, findings: Data[]): Data {
       sourceRunId: run.source_run_id ?? null, sourceFindingIds: run.source_finding_ids ?? [],
       reportRef: run.reportRef ?? null}};
 }
-
