@@ -8,7 +8,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-from mcp.types import CallToolResult, TextContent, Tool
+from mcp.types import BlobResourceContents, CallToolResult, EmbeddedResource, TextContent, TextResourceContents, Tool
 
 import tracefix.connectors.github_mcp as github
 from tracefix.connectors import (
@@ -559,6 +559,109 @@ async def test_credential_resolver_error_is_sanitized(mcp_mock):
     assert failure.value.code == "credential_unavailable" and SECRET not in str(failure.value)
     assert failure.value.__suppress_context__ is True
     assert not mcp_mock.transports
+
+
+async def test_commit_with_nested_message_retains_verified_source(mcp_mock):
+    connector, session = await opened(mcp_mock)
+    try:
+        context = await connector.read_context("commit")
+        assert "frozen commit" in context.content
+        assert context.source_url == f"https://github.com/owner/app/commit/{COMMIT}"
+        assert context.to_context_document()["source_refs"] == [context.source_url]
+    finally:
+        await connector.close()
+
+
+def embedded_file(uri=None, text="export const value = 1;", *, blob=False):
+    uri = uri or f"repo://owner/app/sha/{COMMIT}/contents/src/value.ts"
+    resource = (BlobResourceContents(uri=uri, mimeType="application/octet-stream", blob="YQ==") if blob
+                else TextResourceContents(uri=uri, mimeType="text/plain; charset=utf-8", text=text))
+    return CallToolResult(content=[TextContent(type="text", text="File downloaded successfully"),
+                                  EmbeddedResource(type="resource", resource=resource)])
+
+
+async def test_official_embedded_file_uses_bound_resource_body_and_source(mcp_mock):
+    connector, session = await opened(mcp_mock)
+    session.hook = lambda name, arguments: embedded_file(text="export const value = 1; " + SECRET) if name == "get_file_contents" else None
+    try:
+        context = await connector.read_context("file", path="src/value.ts")
+        assert context.content == "export const value = 1; [REDACTED]"
+        assert context.source_url == f"https://github.com/owner/app/blob/{COMMIT}/src/value.ts"
+        assert context.source_id == "src/value.ts"
+        assert context.to_context_document()["untrusted"] is True
+        assert "File downloaded successfully" not in context.content
+    finally:
+        await connector.close()
+
+
+@pytest.mark.parametrize("uri", [
+    f"repo://other/app/sha/{COMMIT}/contents/src/value.ts",
+    f"repo://owner/other/sha/{COMMIT}/contents/src/value.ts",
+    f"repo://owner/app/sha/{OTHER_COMMIT}/contents/src/value.ts",
+    "repo://owner/app/branch/main/contents/src/value.ts",
+    f"repo://owner/app/sha/{COMMIT}/contents/src/other.ts",
+    f"repo://owner/app/sha/{COMMIT}/contents/src/%2e%2e/value.ts",
+    f"repo://owner/app/sha/{COMMIT}/contents/src%2Fvalue.ts",
+    f"repo://owner/app/sha/{COMMIT}/contents/src/value.ts?ref=main",
+    f"repo://owner/app/sha/{COMMIT}/contents/src/value.ts#fragment",
+    f"repo://owner:443/app/sha/{COMMIT}/contents/src/value.ts",
+    f"repo://{SECRET}@owner/app/sha/{COMMIT}/contents/src/value.ts",
+    f"repo://owner:{SECRET}/app/sha/{COMMIT}/contents/src/value.ts",
+    f"https://owner/app/sha/{COMMIT}/contents/src/value.ts",
+])
+async def test_embedded_file_rejects_unbound_or_ambiguous_resource_uri(mcp_mock, uri):
+    connector, session = await opened(mcp_mock)
+    result = embedded_file()
+    # 保留畸形 URI 原文，验证 connector 自身的错误与脱敏边界。
+    result.content[-1].resource = result.content[-1].resource.model_copy(update={"uri": uri})
+    session.hook = lambda name, arguments: result if name == "get_file_contents" else None
+    try:
+        with pytest.raises(GitHubMCPError) as failure:
+            await connector.read_context("file", path="src/value.ts")
+        assert failure.value.code == "binding_mismatch"
+        assert SECRET not in str(failure.value) + repr(failure.value.details)
+    finally:
+        await connector.close()
+
+
+async def test_embedded_file_supports_case_insensitive_repository_and_encoded_path(mcp_mock):
+    connector, session = await opened(mcp_mock)
+    uri = f"repo://OWNER/APP/sha/{COMMIT}/contents/src/a%20b%23.ts"
+    session.hook = lambda name, arguments: embedded_file(uri) if name == "get_file_contents" else None
+    try:
+        context = await connector.read_context("file", path="src/a b#.ts")
+        assert context.source_id == "src/a b#.ts"
+        assert context.source_url == f"https://github.com/owner/app/blob/{COMMIT}/src/a%20b%23.ts"
+    finally:
+        await connector.close()
+
+
+@pytest.mark.parametrize("variant", ["blob", "multiple", "oversize"])
+async def test_embedded_file_rejects_binary_ambiguous_and_oversize_payload(mcp_mock, variant):
+    connector, session = await opened(mcp_mock, config(max_response_bytes=1024))
+    result = embedded_file(text="x" * (16 * 1024) if variant == "oversize" else "body", blob=variant == "blob")
+    if variant == "multiple":
+        result.content.append(result.content[-1])
+    session.hook = lambda name, arguments: result if name == "get_file_contents" else None
+    try:
+        with pytest.raises(GitHubMCPError) as failure:
+            await connector.read_context("file", path="src/value.ts")
+        assert failure.value.code == ("response_too_large" if variant == "oversize" else "schema_error")
+    finally:
+        await connector.close()
+
+
+async def test_embedded_file_still_applies_utf8_content_truncation(mcp_mock):
+    connector, session = await opened(mcp_mock, config(max_response_bytes=1024))
+    session.hook = lambda name, arguments: embedded_file(text="测" * 1000) if name == "get_file_contents" else None
+    try:
+        context = await connector.read_context("file", path="src/value.ts")
+        assert context.truncated
+        assert context.original_bytes == 3000
+        assert context.returned_bytes <= 1024
+        assert context.content_digest == digest(context.content)
+    finally:
+        await connector.close()
 
 
 async def test_real_github_mcp_read_only_when_explicitly_configured():

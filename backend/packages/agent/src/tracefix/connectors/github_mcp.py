@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any, Awaitable, Callable, Mapping
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import jsonschema
 
@@ -465,7 +465,7 @@ class GitHubMCPConnector:
             kind = request.source_kind
             arguments = self._arguments(kind, {"path": request.path, "number": request.number, "method": request.method})
             result = await self._enqueue(kind, arguments)
-            payload = self._payload(result)
+            payload = self._payload(result, request)
             self._verify_payload(payload, kind, request)
         payload = self._redact(payload)
         content, source_id, source_url = self._content(payload, request)
@@ -524,7 +524,7 @@ class GitHubMCPConnector:
             self._state = "failed"
             raise GitHubMCPError("timeout", "GitHub MCP 工具调用超时") from None
 
-    def _payload(self, result: Any) -> Any:
+    def _payload(self, result: Any, request: GitHubReadRequest | None = None) -> Any:
         if getattr(result, "isError", False):
             structured = getattr(result, "structuredContent", None)
             if isinstance(structured, Mapping) and structured.get("status") in {401, 403}:
@@ -545,12 +545,45 @@ class GitHubMCPConnector:
         blocks = getattr(result, "content", None) or []
         texts = [getattr(block, "text", "") for block in blocks if getattr(block, "type", "text") == "text"]
         raw = "\n".join(texts)
+        resources = [getattr(block, "resource", None) for block in blocks if getattr(block, "type", None) == "resource"]
+        if resources:
+            if (request is None or request.source_kind != "file" or len(resources) != 1
+                    or any(getattr(block, "type", None) not in {"text", "resource"} for block in blocks)):
+                raise GitHubMCPError("schema_error", "GitHub MCP 文件响应必须包含单个文本资源")
+            payload = self._file_resource_payload(resources[0], request)
+            if len(raw.encode("utf-8")) + len(payload["content"].encode("utf-8")) > self.config.max_response_bytes * 16:
+                raise GitHubMCPError("response_too_large", "GitHub MCP 响应超过传输解析上限")
+            return payload
         if len(raw.encode("utf-8")) > self.config.max_response_bytes * 16:
             raise GitHubMCPError("response_too_large", "GitHub MCP 响应超过传输解析上限")
         try:
             return json.loads(raw)
         except (TypeError, json.JSONDecodeError):
             return {"content": raw}
+
+    def _file_resource_payload(self, resource: Any, request: GitHubReadRequest) -> dict[str, Any]:
+        """适配官方 server 的 repo://owner/repo/sha/SHA/contents/path 文本资源。"""
+        text = getattr(resource, "text", None)
+        uri = getattr(resource, "uri", None)
+        if not isinstance(text, str) or uri is None:
+            raise GitHubMCPError("schema_error", "GitHub MCP 文件资源必须是文本")
+        try:
+            parsed = urlsplit(str(uri))
+            parts = [unquote(part) for part in parsed.path.split("/")]
+            if (parsed.scheme != "repo" or parsed.username or parsed.password or parsed.port is not None
+                    or parsed.query or parsed.fragment or not parsed.hostname
+                    or parsed.hostname.casefold() != self.config.owner.casefold()
+                    or len(parts) < 6 or parts[0] != "" or parts[1].casefold() != self.config.repo.casefold()
+                    or parts[2:4] != ["sha", self.config.commit] or parts[4] != "contents"
+                    or any("/" in part or "\\" in part for part in parts)
+                    or "/".join(parts[5:]) != request.path):
+                raise ValueError
+        except ValueError:
+            raise GitHubMCPError("binding_mismatch", "GitHub MCP 文件资源来源与 Run 快照不一致") from None
+        # 来源链接由已验证的资源标识生成；提示文本不作为文件正文。
+        path = quote(request.path or "", safe="/")
+        return {"path": request.path, "commit_sha": self.config.commit, "content": text,
+                "html_url": f"https://github.com/{self.config.owner}/{self.config.repo}/blob/{self.config.commit}/{path}"}
 
     def _verify_payload(self, payload: Any, kind: str, request: GitHubReadRequest | None = None):
         if not isinstance(payload, Mapping):
@@ -629,6 +662,7 @@ class GitHubMCPConnector:
                         except (ValueError, UnicodeDecodeError):
                             raise GitHubMCPError("schema_error", "GitHub MCP 文件内容编码无效") from None
                     return payload[key], source_id, source_url
+            return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str), source_id, source_url
         source_id = str(request.path or request.number or request.source_kind)
         return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str), source_id, None
 

@@ -1,0 +1,16 @@
+{
+  "command": ["docker"],
+  "args": [
+    "run", "--rm", "-i", "--init", "--pull=never",
+    "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+    "--user=65532:65532", "--label=tracefix.component=github-mcp",
+    "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
+    "ghcr.io/github/github-mcp-server@sha256:ffced0d76e77428532a2ced185516992d77fd146d69eec2f244e6237d1a97796",
+    "stdio", "--read-only", "--lockdown-mode",
+    "--tools=get_commit,get_file_contents,issue_read,pull_request_read"
+  ],
+  "timeout_seconds": 30,
+  "max_response_bytes": 1048576,
+  "env_keys": ["PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "USERPROFILE", "TEMP", "TMP"],
+  "acceptance_credential_env": "TRACEFIX_GITHUB_TOKEN"
+}
