@@ -580,7 +580,6 @@ class GitHubMCPConnector:
                 raise ValueError
         except ValueError:
             raise GitHubMCPError("binding_mismatch", "GitHub MCP 文件资源来源与 Run 快照不一致") from None
-        # 来源链接由已验证的资源标识生成；提示文本不作为文件正文。
         path = quote(request.path or "", safe="/")
         return {"path": request.path, "commit_sha": self.config.commit, "content": text,
                 "html_url": f"https://github.com/{self.config.owner}/{self.config.repo}/blob/{self.config.commit}/{path}"}

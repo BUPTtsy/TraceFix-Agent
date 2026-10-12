@@ -158,7 +158,6 @@ def main(argv=None):
         print(f"GitHub MCP {'真实读取' if phase == 'real_read' else '部署'}未完成（{error.code}）。", file=sys.stderr)
         return 2
     except Exception:
-        # MCP 的任务组可能返回 ExceptionGroup；原始异常可能包含凭据或远程正文。
         report[phase] = {"status": "failed", "code": f"{phase}_failed"}
         print("GitHub MCP 真实读取未完成，请检查凭据、仓库权限与网络。" if phase == "real_read"
               else "GitHub MCP 部署未完成，请检查 Docker、镜像和部署配置。", file=sys.stderr)

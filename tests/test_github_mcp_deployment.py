@@ -106,7 +106,6 @@ def test_missing_credential_and_environment_precedence(tmp_path, monkeypatch):
     with pytest.raises(GitHubMCPError) as failure:
         deployment.credential_resolver(config, secret_env)
     assert failure.value.code == "credential_unavailable"
-    # 禁用 dotenv 插值，避免 token 中的 ${...} 被意外改写。
     literal_secret = "literal-${TRACEFIX_DEPLOYMENT_PLACEHOLDER}"
     (tmp_path / ".env").write_text(f"TRACEFIX_GITHUB_TOKEN={literal_secret}\n", encoding="utf-8")
     monkeypatch.setenv("TRACEFIX_DEPLOYMENT_PLACEHOLDER", "expanded")

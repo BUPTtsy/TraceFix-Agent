@@ -612,7 +612,6 @@ async def test_official_embedded_file_uses_bound_resource_body_and_source(mcp_mo
 async def test_embedded_file_rejects_unbound_or_ambiguous_resource_uri(mcp_mock, uri):
     connector, session = await opened(mcp_mock)
     result = embedded_file()
-    # 保留畸形 URI 原文，验证 connector 自身的错误与脱敏边界。
     result.content[-1].resource = result.content[-1].resource.model_copy(update={"uri": uri})
     session.hook = lambda name, arguments: result if name == "get_file_contents" else None
     try:
