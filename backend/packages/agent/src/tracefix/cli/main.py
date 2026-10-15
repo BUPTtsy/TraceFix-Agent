@@ -74,6 +74,7 @@ class Session:
         self.documents = DocumentLibrary(getattr(args, 'console_db', None))
         self.workspace_commands = WorkspaceCommands(self)
         self.runtime_stack = None
+        self.runtime_services = None
         self.chat_history = {}
         self.continuation_parent = None
         self.continuation_instruction = None
@@ -105,7 +106,7 @@ class Session:
         if self.store is not None:
             return
         from tracefix.storage.checkpoints import postgres_checkpointer
-        dsn = os.getenv('TRACEFIX_DATABASE_URL', '')
+        dsn = getattr(self.args, 'database_url', None) or os.getenv('TRACEFIX_DATABASE_URL', '')
         if not dsn:
             raise ValueError('请配置 TRACEFIX_DATABASE_URL 才能执行 Test / Repair；项目、知识库和 Chat 可独立使用')
         resources = AsyncExitStack()
@@ -344,7 +345,7 @@ class Session:
                 'error': error_message(error), 'finishedAt': timestamp(), 'pid': None}))
             raise
 
-    async def create_agent(self, state=None, reuse_workspace=False):
+    async def create_agent(self, state=None, reuse_workspace=False, *, frozen_snapshot=None, start=True):
         await self.ensure_runtime()
         if not os.getenv('TRACEFIX_API_KEY'):
             raise ValueError('请设置 TRACEFIX_API_KEY 环境变量')
@@ -377,8 +378,14 @@ class Session:
             state.abnormal_termination = bool(state.continuation_count)
             state.continuation_instruction = record.get('continuationInstruction')
         if managed and not reuse_workspace:
-            snapshot = RepositoryRegistry(Path(self.args.projects), data_root=Path(self.args.data)).freeze(
-                self.scope, state.run_id)
+            if frozen_snapshot is not None:
+                if (frozen_snapshot.get('repository_config') != project.repository_config
+                        or project.repository_config.get('frozen_run_id') != state.run_id):
+                    raise PermissionError('服务冻结快照与 Run/项目配置不一致')
+                snapshot = frozen_snapshot
+            else:
+                snapshot = RepositoryRegistry(Path(self.args.projects), data_root=Path(self.args.data)).freeze(
+                    self.scope, state.run_id)
             state.remote_config = snapshot['repository_config']
             self.args.projects = snapshot['projects_path']
             self.args.profile = snapshot['profile_path']
@@ -432,7 +439,9 @@ class Session:
         self.render.status(state)
         if state.continuation_count:
             self.render.text(f'继续原任务 {state.run_id}：第 {state.continuation_count} 次继续；此前非成功结束已标记，轨迹将追加。')
-        self.task = asyncio.create_task(self.drive(state))
+        if start:
+            self.task = asyncio.create_task(self.drive(state))
+        return state
 
     def validate_workspace(self, state, workspace=None, source=None, data_root=None):
         source = source if source is not None else self.artifacts.json(self.scope, state.run_id, state.repo_snapshot_ref)
@@ -452,7 +461,11 @@ class Session:
     def bind(self, state, profile, workspace, source):
         self.validate_workspace(state, workspace, source)
         runner = DockerRunner(profile, workspace, state.run_id)
+        if self.runtime_services is not None:
+            self.runtime_services.own(runner)
         browser = MCPBrowser(runner.browser_command(), Policy(profile.allowed_origins))
+        if self.runtime_services is not None:
+            self.runtime_services.own(browser)
         embedding = None
         if os.getenv('TRACEFIX_EMBEDDING_URL'):
             embedding = EmbeddingAdapter(os.environ['TRACEFIX_EMBEDDING_URL'], os.environ['TRACEFIX_EMBEDDING_REVISION'])
@@ -468,6 +481,8 @@ class Session:
         self.engine.worker_model = configured_worker_model()
         self.engine.memory = memory
         self.engine.documents = self.documents
+        if self.runtime_services is not None:
+            self.engine.runtime_services = self.runtime_services
         self.engine.current_run = state.run_id
         self.run_id = state.run_id
 

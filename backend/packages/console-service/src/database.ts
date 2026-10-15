@@ -147,10 +147,11 @@ export class ConsoleDatabase {
     this.db.prepare('INSERT OR IGNORE INTO console_events VALUES (?,?,?,?)')
       .run(runId, row.seq, key, JSON.stringify(redact({...event, seq: row.seq})));
   }
-  continueRun(id: string, instruction: string): RecordData {
+  continueRun(id: string, instruction: string, before?: () => void): RecordData {
     if (typeof instruction !== 'string' || !instruction.trim() || instruction.trim().length > 4000)
       throw new DataError('请输入 1-4000 字的继续指令');
     return this.transaction(() => {
+      before?.();
       const record = this.run(id);
       if (!canContinue(record.status, record.outcome)) throw new DataError('只有非成功结束的任务可以继续；请刷新任务状态', 409);
       const marker = redact({id: randomUUID(), instruction: instruction.trim(), at: timestamp(), previous_status: record.status,

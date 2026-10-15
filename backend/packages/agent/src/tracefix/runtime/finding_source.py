@@ -39,13 +39,14 @@ def resolve_source_run(source_run_id: str, *, resolve_run_id: RunIdentityResolve
     return source_run
 
 
-def evidence_closure(source_run: RunState, artifacts: Artifacts) -> dict[str, str]:
+def evidence_closure(source_run: RunState, artifacts: Artifacts, *, additional_refs=()) -> dict[str, str]:
     """Read every reachable source evidence artifact with integrity checking."""
     pending = list(dict.fromkeys([
         *source_run.evidence_refs, *source_run.initial_check_result_refs,
         *source_run.check_result_refs, *source_run.validation_refs,
         *source_run.baseline_validation_refs, *source_run.behavior_check_refs,
         source_run.observation_ref,
+        *additional_refs,
     ]))
     hashes = {}
 
@@ -104,7 +105,9 @@ def _source_material(source_run: RunState, source_finding_ids: list[str], *,
     rules = rule_resolver.load_snapshot_rules(snapshot, scope_id=scope_id,
         project_id=project_id, repo_id=repo_id)
     frozen_rules = {rule.id: rule for rule in rules}
-    hashes = evidence_closure(source_run, artifacts)
+    hashes = evidence_closure(source_run, artifacts, additional_refs=[
+        source_run.replay_plan_ref, source_run.test_spec_ref, source_run.check_plan_ref,
+        *source_run.diagnosis_feedback_refs])
     replay_plan = artifacts.json(scope_id, source_run.run_id, source_run.replay_plan_ref) if source_run.replay_plan_ref else []
     if not isinstance(replay_plan, list) or any(not isinstance(item, dict) for item in replay_plan):
         raise ValueError('来源重现计划不可读')

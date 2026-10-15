@@ -7,6 +7,8 @@ import {loadConfig, projectCatalog, repositoryControl, type RepositoryControlOpt
 import {canContinue, ConsoleDatabase, DataError, timestamp} from './database.js';
 import {RuleDatabase} from './rules.js';
 import {classifyGuidance, guidanceUnsafe} from './guidance.js';
+import {TaskLifecycle, normalizeTask, taskError} from './task-lifecycle.js';
+import {resultView, executorResult} from './results.js';
 
 type Data = Record<string, any>;
 
@@ -18,6 +20,8 @@ export function createConsoleService(options: ConsoleOptions = {}) {
   const database = new ConsoleDatabase(path.resolve(options.databasePath || process.env.TRACEFIX_CONSOLE_DB || path.join(dataRoot, 'console.sqlite3')));
   const rules = new RuleDatabase(database);
   const catalog = () => projectCatalog(projectsPath, dataRoot, options.displayRoot);
+  const tasks = new TaskLifecycle(database, fields => normalizeTask(fields, catalog()),
+    (fields, id) => dispatch('run.prepare', {...fields, _runId: id}));
   const repository = (operation: string, fields: Data = {}) => repositoryControl(projectsPath, operation, fields,
     {...options, engineRoot: options.engineRoot || options.displayRoot, dataRoot});
   const artifactRoot = (run: Data) => path.join(run.dataRoot || dataRoot, 'artifacts');
@@ -119,6 +123,18 @@ export function createConsoleService(options: ConsoleOptions = {}) {
   }
 
   function dispatch(operation: string, fields: Data = {}): any {
+    if (operation === 'tasks') return tasks.tasks(fields.projectId);
+    if (operation === 'task') return tasks.task(fields.id);
+    if (operation === 'task.create') return tasks.create(fields.body, fields.key);
+    if (operation === 'task.create.check') return tasks.checkCreate(fields.body, fields.key);
+    if (operation === 'task.update') return tasks.update(fields.id, fields.body);
+    if (operation === 'task.start') return tasks.start(fields.id, fields.body || {}, fields.key, fields.ownerId, fields.namespace, fields.expectedVersion);
+    if (operation === 'task.start.check') return tasks.checkStart(fields.id, fields.body || {}, fields.key);
+    if (operation === 'task.launching') return tasks.launchIntent(fields.id, fields.runId, fields.ownerId);
+    if (operation === 'task.spawned') return tasks.spawned(fields.id, fields.runId, fields.ownerId, fields.pid);
+    if (operation === 'task.finish') return tasks.finish(fields.id, fields.runId, fields.ownerId, fields.changes);
+    if (operation === 'task.recover') return tasks.recover(fields.isAlive);
+    if (operation === 'executor.lease') return tasks.lease();
     if (operation === 'repositories') return repository('repository.list');
     if (operation === 'repository') return repository('repository.get', {id: fields.id});
     if (operation === 'repository.create') return repository('repository.register', fields);
@@ -146,6 +162,19 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     if (operation === 'runs') return database.runs(fields.projectId).map(({logs, ...run}) =>
       ({...run, canContinue: canContinue(run.status, run.outcome)}));
     if (operation === 'run') return runView(fields.id);
+    if (operation === 'run.record') return database.run(fields.id);
+    if (operation === 'run.executor-result') {
+      const record = database.run(fields.id);
+      const view = fields.result?.report_ref ? runView(fields.id) : undefined;
+      const ref = view?.issueReport?.patch_diff_ref;
+      const bytes = ref ? Buffer.from(dispatch('artifact', {id: fields.id, ref}).content, 'base64') : undefined;
+      return executorResult(fields.result, record, view, bytes);
+    }
+    if (operation === 'run.findings') {
+      const record = database.run(fields.id);
+      return record.agentRunId ? rules.findings({runId: record.agentRunId, limit: 1000}) : [];
+    }
+    if (operation === 'run.result') return resultView(runView(fields.id), dispatch('run.findings', {id: fields.id}));
     if (operation === 'run.trace') {
       const record = database.run(fields.id);
       if (!database.runEvents(record.id).length && record.agentRunId) {
@@ -169,10 +198,11 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     }
     if (operation === 'run.continue') {
       const previous = database.run(fields.id);
+      if (previous.taskId) throw taskError('TASK_RESTART_REQUIRED', 'Task 的重新执行必须使用 start 新建 Run', 409);
       const project = catalog().find(item => item.id === previous.projectId);
       if (project?.enabled === false) throw new DataError('仓库已禁用', 409);
       dispatch('run.trace', {id: fields.id});
-      const record = database.continueRun(fields.id, fields.instruction);
+      const record = database.continueRun(fields.id, fields.instruction, () => tasks.assertIdle());
       if (previous.repositorySnapshot) return record;
       return project ? database.updateRun(record.id, {profile: project.profile, registry: project.registry}) : record;
     }
@@ -181,9 +211,17 @@ export function createConsoleService(options: ConsoleOptions = {}) {
       if (!record.artifacts.some((entry: Data) => entry.ref === fields.ref)) throw new DataError('只允许读取此 Run 的报告或补丁');
       return {encoding: 'base64', content: readArtifactBytes(artifactRoot(record), record.projectId, record.agentRunId, fields.ref).toString('base64')};
     }
-    if (operation === 'run.create') {
+    if (operation === 'run.create') return database.transaction(() => {
+      tasks.assertIdle();
+      const record = dispatch('run.prepare', {...fields, _runId: randomUUID(), _legacy: true});
+      database.db.prepare('INSERT INTO console_runs VALUES (?,?)').run(record.id, JSON.stringify(record));
+      return record;
+    });
+    if (operation === 'run.prepare') {
       const project = catalog().find(item => item.id === fields.projectId);
       if (!project?.ready) throw new DataError(project?.issue || '请选择已注册的项目');
+      if (!fields._legacy && project.repositoryConfigVersion !== 1)
+        throw taskError('REPOSITORY_FREEZE_REQUIRED', 'Task 执行需要 B1 仓库注册与冻结', 409);
       if (typeof fields.goal !== 'string' || !fields.goal.trim() || fields.goal.trim().length > 4000 ||
           !['test', 'repair'].includes(fields.mode)) throw new DataError('运行目标或模式无效');
       if (fields.additionalRuleIds !== undefined && (!Array.isArray(fields.additionalRuleIds) ||
@@ -206,24 +244,39 @@ export function createConsoleService(options: ConsoleOptions = {}) {
         if (!['enabled', 'draft'].includes(rule.status) ||
             (rule.scope.project_ids.length && !rule.scope.project_ids.includes(project.id))) throw new DataError('追加规则已停用或不属于当前项目');
       }
-      const runId = randomUUID();
+      if (fields.source_run_id) {
+        const source = database.runs(project.id).find(run => run.id === fields.source_run_id || run.agentRunId === fields.source_run_id);
+        if (!source?.agentRunId) throw taskError('SOURCE_RUN_NOT_FOUND', '当前项目没有此来源 Run', 404);
+        const findings = rules.findings({runId: source.agentRunId, limit: 1000});
+        if ((fields.source_finding_ids || []).some((id: string) => !findings.some(finding => finding.id === id)))
+          throw taskError('SOURCE_FINDING_NOT_FOUND', '来源 Finding 不属于指定 Run', 404);
+        fields = {...fields, source_run_id: source.agentRunId};
+      }
+      const runId = fields._runId;
       const frozen = project.repositoryConfigVersion === 1 ? repository('repository.freeze', {id: project.id, run_id: runId}) : null;
       if (frozen && (frozen.repo_id !== project.id || frozen.projectId !== project.id ||
           !/^[a-f0-9]{40,64}$/.test(frozen.commit) || typeof frozen.config_digest !== 'string' ||
           typeof frozen.projects_path !== 'string' || typeof frozen.profile_path !== 'string' ||
           !path.isAbsolute(frozen.projects_path) || !path.isAbsolute(frozen.profile_path)))
         throw new DataError('仓库冻结响应无效', 503);
-      return database.updateRun(runId, {id: runId, projectId: project.id, mode: fields.mode,
+      if (fields.execution?.url && frozen &&
+          !(frozen.repository_config?.allowed_urls || []).some((origin: string) => new URL(fields.execution.url).origin === origin))
+        throw taskError('EXECUTION_URL_NOT_ALLOWED', '执行 URL 超出仓库冻结白名单', 403);
+      const record = {id: runId, projectId: project.id, mode: fields.mode,
         profile: frozen?.profile_path || project.profile, registry: frozen?.projects_path || project.registry,
         repositorySnapshot: frozen,
         goal: fields.goal.trim(), ...(parentRunId ? {parentRunId} : {}), additionalRuleIds,
-        status: 'running', phase: 'STARTING', outcome: null, finishedAt: null, origin: 'web', dataRoot}, true);
+        ...(fields.source_run_id ? {source_run_id: fields.source_run_id} : {}),
+        status: 'running', phase: 'STARTING', outcome: null, finishedAt: null, startedAt: timestamp(),
+        knowledge: [], logs: [], origin: 'web', dataRoot, consoleDatabasePath: database.filename};
+      return record;
     }
     if (operation === 'run.update') {
       const previous = database.run(fields.id);
       if (previous.repositorySnapshot && ['agentRunId', 'reportRef', 'artifacts', 'repositorySnapshot', 'profile',
         'registry', 'projectId', 'dataRoot', 'id', 'consoleRunId', 'repoSnapshotRef', 'memorySnapshotRef',
-        'sourceManifest', 'evidenceRefs', 'inheritedEvidenceRefs', 'scopeId', 'parentRunId']
+        'sourceManifest', 'evidenceRefs', 'inheritedEvidenceRefs', 'scopeId', 'parentRunId', 'taskId', 'execution',
+        'executionMode', 'source_run_id', 'source_finding_ids', 'github_reads', 'consoleDatabasePath']
           .some(key => Object.hasOwn(fields.changes || {}, key))) throw new DataError('运行身份、证据归属和仓库快照不可修改', 409);
       return database.updateRun(fields.id, fields.changes);
     }

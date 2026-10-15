@@ -1,0 +1,578 @@
+{
+  "$defs": {
+    "AcceptanceAction": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "navigate",
+            "click",
+            "type",
+            "select",
+            "press",
+            "observe",
+            "finish"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "observation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Observation Id"
+        },
+        "element_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Element Ref"
+        },
+        "page_generation": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Page Generation"
+        },
+        "locator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AcceptanceLocator"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "value": {
+          "anyOf": [
+            {
+              "maxLength": 8192,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        },
+        "preconditions": {
+          "items": {
+            "$ref": "#/$defs/AcceptanceAssertion"
+          },
+          "maxItems": 32,
+          "title": "Preconditions",
+          "type": "array"
+        },
+        "postconditions": {
+          "items": {
+            "$ref": "#/$defs/AcceptanceAssertion"
+          },
+          "maxItems": 32,
+          "title": "Postconditions",
+          "type": "array"
+        },
+        "wait": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AcceptanceWait"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "AcceptanceAction",
+      "type": "object"
+    },
+    "AcceptanceAssertion": {
+      "additionalProperties": false,
+      "properties": {
+        "locator": {
+          "$ref": "#/$defs/AcceptanceLocator"
+        },
+        "condition": {
+          "default": "visible",
+          "enum": [
+            "visible",
+            "absent",
+            "checked",
+            "unchecked",
+            "disabled",
+            "enabled"
+          ],
+          "title": "Condition",
+          "type": "string"
+        }
+      },
+      "required": [
+        "locator"
+      ],
+      "title": "AcceptanceAssertion",
+      "type": "object"
+    },
+    "AcceptanceFinding": {
+      "additionalProperties": false,
+      "properties": {
+        "finding_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Finding Id",
+          "type": "string"
+        },
+        "fingerprint": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Fingerprint",
+          "type": "string"
+        },
+        "expected": {
+          "maxLength": 8192,
+          "minLength": 1,
+          "title": "Expected",
+          "type": "string"
+        },
+        "actual": {
+          "maxLength": 8192,
+          "minLength": 1,
+          "title": "Actual",
+          "type": "string"
+        },
+        "rule_id": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rule Id"
+        },
+        "rule_version": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rule Version"
+        },
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "minItems": 1,
+          "title": "Evidence Refs",
+          "type": "array"
+        },
+        "original_scenario_id": {
+          "pattern": "^[A-Za-z0-9_-]{1,80}$",
+          "title": "Original Scenario Id",
+          "type": "string"
+        },
+        "guards": {
+          "items": {
+            "$ref": "#/$defs/AcceptanceGuard"
+          },
+          "maxItems": 32,
+          "minItems": 3,
+          "title": "Guards",
+          "type": "array"
+        }
+      },
+      "required": [
+        "finding_id",
+        "fingerprint",
+        "expected",
+        "actual",
+        "evidence_refs",
+        "original_scenario_id",
+        "guards"
+      ],
+      "title": "AcceptanceFinding",
+      "type": "object"
+    },
+    "AcceptanceGuard": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "normal",
+            "reverse",
+            "refresh"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "scenario_id": {
+          "pattern": "^[A-Za-z0-9_-]{1,80}$",
+          "title": "Scenario Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "scenario_id"
+      ],
+      "title": "AcceptanceGuard",
+      "type": "object"
+    },
+    "AcceptanceLocator": {
+      "additionalProperties": false,
+      "properties": {
+        "role": {
+          "maxLength": 120,
+          "minLength": 1,
+          "title": "Role",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "name"
+      ],
+      "title": "AcceptanceLocator",
+      "type": "object"
+    },
+    "AcceptanceScenario": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^[A-Za-z0-9_-]{1,80}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "description": {
+          "default": "",
+          "maxLength": 2000,
+          "title": "Description",
+          "type": "string"
+        },
+        "steps": {
+          "items": {
+            "$ref": "#/$defs/AcceptanceStep"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Steps",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "steps"
+      ],
+      "title": "AcceptanceScenario",
+      "type": "object"
+    },
+    "AcceptanceSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "goal": {
+          "maxLength": 16384,
+          "minLength": 5,
+          "title": "Goal",
+          "type": "string"
+        },
+        "preconditions": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "title": "Preconditions",
+          "type": "array"
+        },
+        "executable_preconditions": {
+          "items": {
+            "$ref": "#/$defs/AcceptanceAssertion"
+          },
+          "maxItems": 32,
+          "title": "Executable Preconditions",
+          "type": "array"
+        },
+        "authorized_actions": {
+          "description": "Exact action kinds, never sentences. Include navigate and finish; authorize only actions needed by the goal.",
+          "items": {
+            "enum": [
+              "navigate",
+              "click",
+              "type",
+              "select",
+              "press",
+              "observe",
+              "finish"
+            ],
+            "type": "string"
+          },
+          "title": "Authorized Actions",
+          "type": "array"
+        },
+        "assertions": {
+          "items": {
+            "$ref": "#/$defs/AcceptanceAssertion"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Assertions",
+          "type": "array"
+        },
+        "regression_plan": {
+          "items": {
+            "$ref": "#/$defs/AcceptanceAction"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Regression Plan",
+          "type": "array"
+        },
+        "regression_assertions": {
+          "items": {
+            "$ref": "#/$defs/AcceptanceAssertion"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Regression Assertions",
+          "type": "array"
+        },
+        "behavior_scenarios": {
+          "items": {
+            "$ref": "#/$defs/AcceptanceScenario"
+          },
+          "maxItems": 64,
+          "minItems": 4,
+          "title": "Behavior Scenarios",
+          "type": "array"
+        },
+        "guidance_ack": {
+          "items": {
+            "$ref": "#/$defs/GuidanceAck"
+          },
+          "title": "Guidance Ack",
+          "type": "array"
+        }
+      },
+      "required": [
+        "goal",
+        "assertions",
+        "regression_plan",
+        "regression_assertions",
+        "behavior_scenarios"
+      ],
+      "title": "AcceptanceSpec",
+      "type": "object"
+    },
+    "AcceptanceStep": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/AcceptanceAction"
+        },
+        "assertions": {
+          "items": {
+            "$ref": "#/$defs/AcceptanceAssertion"
+          },
+          "maxItems": 32,
+          "title": "Assertions",
+          "type": "array"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "AcceptanceStep",
+      "type": "object"
+    },
+    "AcceptanceWait": {
+      "additionalProperties": false,
+      "properties": {
+        "assertions": {
+          "items": {
+            "$ref": "#/$defs/AcceptanceAssertion"
+          },
+          "maxItems": 32,
+          "title": "Assertions",
+          "type": "array"
+        },
+        "timeout_seconds": {
+          "default": 5,
+          "exclusiveMinimum": 0,
+          "maximum": 30,
+          "title": "Timeout Seconds",
+          "type": "number"
+        },
+        "interval_seconds": {
+          "default": 0.2,
+          "exclusiveMinimum": 0,
+          "maximum": 2,
+          "title": "Interval Seconds",
+          "type": "number"
+        },
+        "max_observations": {
+          "default": 10,
+          "maximum": 30,
+          "minimum": 1,
+          "title": "Max Observations",
+          "type": "integer"
+        }
+      },
+      "title": "AcceptanceWait",
+      "type": "object"
+    },
+    "GuidanceAck": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "how_applied": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "How Applied",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "how_applied"
+      ],
+      "title": "GuidanceAck",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z0-9_-]{1,80}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "repo_id": {
+      "pattern": "^[A-Za-z0-9_-]{1,80}$",
+      "title": "Repo Id",
+      "type": "string"
+    },
+    "commit": {
+      "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$",
+      "title": "Commit",
+      "type": "string"
+    },
+    "source_run_id": {
+      "pattern": "^[A-Za-z0-9_-]{1,80}$",
+      "title": "Source Run Id",
+      "type": "string"
+    },
+    "source_scope_id": {
+      "pattern": "^[A-Za-z0-9_-]{1,80}$",
+      "title": "Source Scope Id",
+      "type": "string"
+    },
+    "source_repo_id": {
+      "maxLength": 256,
+      "minLength": 1,
+      "title": "Source Repo Id",
+      "type": "string"
+    },
+    "source_commit": {
+      "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$",
+      "title": "Source Commit",
+      "type": "string"
+    },
+    "source_manifest": {
+      "pattern": "^[a-f0-9]{64}$",
+      "title": "Source Manifest",
+      "type": "string"
+    },
+    "source_rule_snapshot_hash": {
+      "pattern": "^[a-f0-9]{64}$",
+      "title": "Source Rule Snapshot Hash",
+      "type": "string"
+    },
+    "allow_revision_rebind": {
+      "default": false,
+      "title": "Allow Revision Rebind",
+      "type": "boolean"
+    },
+    "findings": {
+      "items": {
+        "$ref": "#/$defs/AcceptanceFinding"
+      },
+      "maxItems": 16,
+      "minItems": 1,
+      "title": "Findings",
+      "type": "array"
+    },
+    "spec": {
+      "$ref": "#/$defs/AcceptanceSpec"
+    },
+    "spec_hash": {
+      "pattern": "^[a-f0-9]{64}$",
+      "title": "Spec Hash",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "run_id",
+    "repo_id",
+    "commit",
+    "source_run_id",
+    "source_scope_id",
+    "source_repo_id",
+    "source_commit",
+    "source_manifest",
+    "source_rule_snapshot_hash",
+    "findings",
+    "spec",
+    "spec_hash"
+  ],
+  "title": "FindingAcceptance",
+  "type": "object"
+}

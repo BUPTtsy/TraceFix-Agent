@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+import re
 from time import monotonic
 from typing import Any, Mapping
 
@@ -67,6 +68,12 @@ _TECHNICAL_KEYS = {
     "phase", "validation_index", "replay_index", "diagnosis_retry_count",
     "failure_signatures", "action_fingerprints", "loop_state_fingerprints",
     "loop_error_signatures", "loop_no_progress_steps", "error_tail",
+    "observation_id", "observation_ref", "observation_changed", "page_generation",
+    "screenshot", "screenshot_ref", "screenshot_hash", "artifact_ref", "evidence_refs",
+    "observed_at", "created_at", "updated_at", "started_at", "finished_at",
+    "content_version", "strategy", "strategy_id", "error", "error_details",
+    "last_error_signature", "duration_ms", "source_manifest", "environment_digest",
+    "test_spec_hash", "check_plan_hash", "replay_plan_hash", "source_revision",
 }
 
 
@@ -143,18 +150,16 @@ def has_real_progress(before: Any, after: Any, evidence: Mapping[str, Any] | Non
             return True
     if before is None or after is None:
         return False
-    if isinstance(before, Mapping) and isinstance(after, Mapping):
-        def semantic(value):
-            if isinstance(value, Mapping):
-                return {str(key): semantic(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-                        if str(key).lower() not in _TECHNICAL_KEYS}
-            if isinstance(value, (list, tuple)):
-                return [semantic(item) for item in value]
-            if isinstance(value, str):
-                return value.replace("[ref=", "[")
-            return value
-        return semantic(before) != semantic(after)
-    return before != after
+    def semantic(value):
+        if isinstance(value, Mapping):
+            return {str(key): semantic(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+                    if str(key).lower() not in _TECHNICAL_KEYS}
+        if isinstance(value, (list, tuple)):
+            return [semantic(item) for item in value]
+        if isinstance(value, str):
+            return re.sub(r"\s*\[ref=[^\]]+\]", "", value)
+        return value
+    return semantic(before) != semantic(after)
 
 
 def _entries(history: list[Mapping[str, Any]] | None, cause: RecoveryCause) -> list[Mapping[str, Any]]:
@@ -180,6 +185,24 @@ class RecoveryController:
             RecoveryCause.CONTEXT: RecoveryAction.COMPACT_CONTEXT,
             RecoveryCause.REPEATED_NO_PROGRESS: RecoveryAction.CORRECT_STRATEGY,
         }.get(cause, RecoveryAction.STOP)
+
+    @staticmethod
+    def active_episode_id(history: list[Mapping[str, Any]] | None,
+                          cause: RecoveryCause | str) -> str | None:
+        """Return the current no-progress episode without keying on technical churn.
+
+        A refresh, cleared error, retry number, or strategy change is still the
+        same recovery episode until a caller records semantic progress.  Once an
+        episode has progressed or settled, the caller may create a new identity.
+        """
+        cause = RecoveryCause(cause)
+        for entry in reversed(history or []):
+            if (str(entry.get("cause")) == cause.value
+                    and entry.get("status") == "continued"
+                    and not entry.get("progress")
+                    and entry.get("episode_id")):
+                return str(entry["episode_id"])
+        return None
 
     def decide(
         self,

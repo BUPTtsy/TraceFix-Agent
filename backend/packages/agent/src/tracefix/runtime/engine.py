@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import dataclasses
 import html
@@ -36,12 +37,15 @@ from tracefix.tools.handlers import build_runtime_tools, materialize_patch_propo
 from tracefix.tools.browser import execute_browser_tool
 from tracefix.tools.evidence import attach_source_evidence_tools
 from tracefix.runtime.skills import SkillStore
+from tracefix.runtime.finding_acceptance import (FrozenFindingAcceptance, _binding, _judge_report,
+    _validate_current, freeze_finding_acceptance, read_finding_reproduction)
 from tracefix.runtime.validation_feedback import (ValidationFeedback, build_validation_feedback,
     feedback_is_current)
 from tracefix.runtime.verification import verification_binding
 from tracefix.tools.effects import file_resource, make_operation_executor
 from tracefix.runtime.event_adapter import EventAdapter, EventCursor
-from tracefix.runtime.recovery import RecoveryAction, RecoveryController, classify_cause, has_real_progress
+from tracefix.runtime.recovery import (RecoveryAction, RecoveryCause, RecoveryController,
+                                      classify_cause, has_real_progress)
 from tracefix.runtime.diagnosis import (DiagnosisDraft, DiagnosisReport, binding_from_observation,
     symptom_query, validate_report)
 from tracefix.runtime.checks import make_check_plan, oracle_ready, scope_matches, summarize_checks
@@ -219,6 +223,7 @@ class Engine:
     LOOP_ERROR_LIMIT = 5
     LOOP_NO_PROGRESS_WARNING = 20
     LOOP_NO_PROGRESS_LIMIT = 40
+    LOOP_RECOVERY_GRACE_STEPS = 4
     DIAGNOSIS_RETRY_LIMIT = 3
 
     def __init__(self, store, artifacts, scopes, context, profile, workspace, runner,
@@ -242,6 +247,7 @@ class Engine:
         self._trace_sequences = {}
         self.event_adapter = EventAdapter(store)
         self.recovery = RecoveryController()
+        self.runtime_services = None
         self.skills = SkillCatalog(Path(__file__).resolve().parents[5] / 'skills')
         self.skill_store = SkillStore(self.artifacts)
         self.graph = self._graph(checkpointer)
@@ -492,9 +498,216 @@ class Engine:
             if missing:
                 raise ValueError('修复规则覆盖不足：PATCH/VERIFY 页面或路径不适用：' + ', '.join(missing))
 
+    def _finding_acceptance(self, s):
+        services = getattr(self, 'runtime_services', None)
+        configured = getattr(services, 'finding_acceptance', None)
+        frozen = getattr(configured, 'frozen', None)
+        if s.finding_acceptance_ref:
+            persisted = FrozenFindingAcceptance(**self.get(s, s.finding_acceptance_ref))
+            if persisted.acceptance_hash != s.finding_acceptance_hash or frozen and persisted != frozen:
+                raise ValueError('Finding 验收冻结配置与当前 Run 不一致')
+            frozen = persisted
+        if frozen is not None:
+            validated = freeze_finding_acceptance(frozen.acceptance, s, self.source)
+            if validated != frozen:
+                raise ValueError('Finding 验收来源绑定已经变化')
+            if configured is not None:
+                configured.frozen = frozen
+                configured.reproduction_ref = s.finding_reproduction_ref
+                configured.verification_ref = s.finding_verification_ref
+        return frozen
+
+    def _finding_proof(self, s, *, verify=False):
+        frozen = self._finding_acceptance(s)
+        if frozen is None or not s.finding_reproduction_ref:
+            return None
+        baseline = read_finding_reproduction(frozen, s, artifacts=self.artifacts,
+                                            reproduction_ref=s.finding_reproduction_ref)
+        if not verify:
+            return baseline
+        if not s.patch_hash or not s.finding_verification_ref:
+            return None
+        accepted = _validate_current(frozen, s, self.artifacts)
+        proof = self.get(s, s.finding_verification_ref)
+        expected = _binding(frozen, accepted, s, 'verify')
+        if (proof.get('schema_version') != 1 or proof.get('binding') != expected
+                or proof.get('source_hash') != frozen.source_hash or not proof.get('evidence_hashes')):
+            raise ValueError('Finding 修补后验收没有当前补丁的严格绑定')
+        raw = self.artifacts.read(s.scope_id, s.run_id, proof['report_ref'])
+        if digest(raw) != proof.get('report_hash'):
+            raise ValueError('Finding 修补后报告已经变化')
+        for reference, expected_hash in proof['evidence_hashes'].items():
+            path = Path(reference)
+            if path.is_symlink() or digest(path.read_bytes()) != expected_hash:
+                raise ValueError('Finding 修补后证据已经变化')
+        outcome, _ = _judge_report(accepted, json.loads(raw), expected, 'verify')
+        if str(outcome) != proof.get('outcome'):
+            raise ValueError('Finding 验收报告结论与严格断言结果不一致')
+        return proof
+
+    def finding_acceptance_verified(self, s):
+        try:
+            proof = self._finding_proof(s, verify=True)
+            return proof is not None and proof['outcome'] == str(Outcome.FIX_VERIFIED)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return False
+
+    def _public_finding_report(self, s, proof, report, imported):
+        frozen = self._finding_acceptance(s)
+        stage = 'verify' if proof.get('binding', {}).get('stage') == 'verify' else 'baseline'
+        binding = _binding(frozen, frozen.acceptance, s, stage)
+        scenarios = {scenario.id: digest(scenario) for scenario in frozen.spec.behavior_scenarios}
+        cases = []
+        reported_cases = report.get('cases', [])
+        for case in reported_cases if isinstance(reported_cases, list) else []:
+            if (not isinstance(case, dict) or not isinstance(case.get('id'), str)
+                    or case['id'] not in scenarios or case.get('scenario_hash') != scenarios[case['id']]):
+                continue
+            checks = []
+            reported_checks = case.get('checks', [])
+            for check in reported_checks if isinstance(reported_checks, list) else []:
+                if (not isinstance(check, dict)
+                        or check.get('context') not in ('precondition', 'checkpoint', 'action_precondition',
+                                                       'action_postcondition', 'wait', 'action', 'infrastructure')
+                        or type(check.get('step')) is not int or check['step'] < 0
+                        or type(check.get('assertion_index')) is not int or check['assertion_index'] < 0
+                        or check.get('passed') is not None and type(check['passed']) is not bool
+                        or check.get('failure_kind') not in (None, 'assertion', 'action', 'infrastructure')):
+                    continue
+                checks.append({key: check.get(key) for key in
+                    ('context', 'step', 'assertion_index', 'passed', 'failure_kind')})
+            cases.append({'id': case['id'], 'scenario_hash': scenarios[case['id']],
+                'status': case.get('status') if case.get('status') in ('pass', 'fail') else 'inconclusive',
+                'failure_kind': case.get('failure_kind') if case.get('failure_kind') in
+                    ('assertion', 'action', 'infrastructure') else None,
+                'checks': checks, 'evidence_refs': list(dict.fromkeys(imported[ref]
+                    for ref in case.get('evidence_refs', []) if isinstance(ref, str) and ref in imported))})
+        outcome = next((str(value) for value in Outcome if str(value) == proof.get('outcome')),
+                       str(Outcome.INCONCLUSIVE))
+        return {'schema_version': 'tracefix.finding-evidence/1', 'projection': 'controlled_acceptance_report',
+            'binding': binding, 'outcome': outcome, 'cases': cases,
+            'status': report.get('status') if report.get('status') in ('pass', 'fail') else 'inconclusive',
+            'passed': report.get('passed') if type(report.get('passed')) is bool else None,
+            'evidence_refs': list(dict.fromkeys(imported.values()))}
+
+    def _import_finding_proof(self, s, reference):
+        proof = self.get(s, reference)
+        report = self.get(s, proof['report_ref']) if proof.get('report_ref') else {}
+        imported = {}
+        public_hashes = {}
+        source_hashes = {}
+        json_evidence = []
+        for path_text, checksum in proof.get('evidence_hashes', {}).items():
+            path = Path(path_text)
+            content = path.read_bytes()
+            if path.is_symlink() or digest(content) != checksum:
+                raise ValueError('独立验收证据在导出前已变化')
+            if path.suffix.lower() == '.json':
+                json_evidence.append((path_text, checksum))
+                continue
+            if path.suffix.lower() == '.png':
+                imported[path_text] = self.put(s, content, 'png', name='独立验收截图')
+            else:
+                imported[path_text] = self.put(s, {'encoding': 'base64',
+                    'media_type': 'application/zip' if path.suffix.lower() == '.zip' else 'application/octet-stream',
+                    'source_content_hash': checksum, 'content_hash': checksum,
+                    'content': base64.b64encode(content).decode('ascii')},
+                    name='独立验收二进制证据')
+            public_hashes[imported[path_text]] = checksum
+            source_hashes[imported[path_text]] = checksum
+        projected = json.dumps(redact(self._public_finding_report(s, proof, report, imported)),
+                               ensure_ascii=False, indent=2).encode('utf-8')
+        for path_text, checksum in json_evidence:
+            imported[path_text] = self.put(s, {'encoding': 'base64', 'media_type': 'application/json',
+                'source_content_hash': checksum, 'content_hash': digest(projected),
+                'content': base64.b64encode(projected).decode('ascii')}, name='独立验收附件')
+            public_hashes[imported[path_text]] = digest(projected)
+            source_hashes[imported[path_text]] = checksum
+        public = {**self._public_finding_report(s, proof, report, imported), 'schema_version': 1,
+            'evidence_hashes': public_hashes,
+            'source_evidence_hashes': source_hashes,
+            'source_report_hash': proof.get('report_hash'), 'source_hash': proof.get('source_hash')}
+        manifest = self.put(s, public, name='Finding独立验收公开证明')
+        return list(dict.fromkeys(imported.values())) + [manifest]
+
+    def finding_acceptance_checks(self, s, item):
+        frozen = self._finding_acceptance(s)
+        if frozen is None:
+            return None
+        matches = [finding for finding in frozen.acceptance.findings if item.source == 'user_goal'
+                   or finding.rule_id == item.id and finding.rule_version == item.rule_version]
+        if not matches or item.source != 'user_goal' and item.detector in {'oracle', 'static'}:
+            return None
+        verify = s.check_suite_stage == 'verify'
+        try:
+            proof = self._finding_proof(s, verify=verify)
+            if proof is None:
+                return None
+            status = ('pass' if proof['outcome'] == str(Outcome.FIX_VERIFIED) else 'fail') if verify else 'fail'
+            refs = []
+            for ref in s.finding_acceptance_evidence_refs:
+                value = self.get(s, ref) if ref.endswith('.json') else {}
+                if value.get('binding', {}).get('stage') == ('verify' if verify else 'baseline'):
+                    refs.extend(value.get('evidence_refs', []))
+                    refs.append(ref)
+            if not refs or not all(self.bundle_exists(s, ref) for ref in refs):
+                return None
+            return status, json.dumps({'acceptance_hash': frozen.acceptance_hash,
+                'original_scenario_ids': [finding.original_scenario_id for finding in matches],
+                'outcome': proof['outcome']}, ensure_ascii=False), refs
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    async def execute_finding_acceptance(self, s, *, verify=False):
+        frozen = self._finding_acceptance(s)
+        if frozen is None:
+            return s
+        if not s.finding_acceptance_ref:
+            reference = self.put(s, dataclasses.asdict(frozen), name='Finding验收冻结配置')
+            s = self.changed(s, finding_acceptance_ref=reference, finding_acceptance_hash=frozen.acceptance_hash)
+        field = 'finding_verification_ref' if verify else 'finding_reproduction_ref'
+        if getattr(s, field):
+            return s
+        method = getattr(self.runtime_services, 'verify_finding_acceptance' if verify
+                         else 'reproduce_finding_acceptance', None)
+        if not callable(method):
+            return self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.INCONCLUSIVE,
+                                error='当前环境缺少 Finding 独立验收执行器')
+        if not verify and (s.patch_hash or s.patch_ref or s.staged_candidate_refs):
+            raise ValueError('Finding 独立复现必须先于任何候选补丁')
+        stage = 'verify' if verify else 'baseline'
+        intent = {'acceptance_hash': frozen.acceptance_hash, 'stage': stage,
+                  'source_manifest': s.source_manifest, 'environment_digest': s.environment_digest,
+                  'patch_hash': s.patch_hash if verify else None, 'resources': ['browser', 'sandbox']}
+        async def perform():
+            result = await method(s)
+            return {'outcome': str(result.outcome), 'artifact_ref': result.artifact_ref, 'reason': result.reason}
+        receipt = await self.operation(s, 'finding.acceptance.' + stage, intent, perform,
+            idempotency_key=digest([s.run_id, intent]))
+        imported = self._import_finding_proof(s, receipt['artifact_ref'])
+        evidence_refs = [ref for ref in s.evidence_refs if ref != receipt['artifact_ref']]
+        s = self.changed(s, **{field: receipt['artifact_ref']},
+            finding_acceptance_evidence_refs=list(dict.fromkeys(s.finding_acceptance_evidence_refs + imported)),
+            evidence_refs=list(dict.fromkeys(evidence_refs + imported)))
+        self._finding_acceptance(s)
+        self.event(s, 'finding.acceptance.completed', {'stage': stage,
+            'acceptance_hash': frozen.acceptance_hash, 'outcome': receipt['outcome'], 'evidence_refs': imported})
+        if not verify and not self.source_acceptance_ready(s):
+            return self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.INCONCLUSIVE,
+                error=receipt['reason'], error_details={'integration_blocker': 'finding_independent_reproduction_missing'})
+        return s
+
     def source_acceptance_ready(self, s):
         if not s.repair_source:
             return True
+        try:
+            frozen = self._finding_acceptance(s)
+            if frozen is not None:
+                if self._finding_proof(s) is None:
+                    return False
+                return True
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return False
         rules = {rule.id: rule for rule in self.frozen_check_rules(s)}
         return all(item.get('rule_id') in rules
                    and rules[item['rule_id']].version == item.get('rule_version')
@@ -505,10 +718,18 @@ class Engine:
     def source_rule_trials_passed(self, s):
         if not s.repair_source:
             return True
+        if self._finding_acceptance(s) is not None:
+            if not self.source_acceptance_ready(s):
+                return False
+            selected = [item.get('id') for item in s.repair_source.findings
+                        if item.get('source') in {'oracle', 'static'}]
+            if not selected:
+                return True
+        else:
+            selected = [item.get('id') for item in s.repair_source.findings]
         signatures = [self.get(s, ref) for ref in s.evidence_refs if '来源问题复现结果' in ref]
         if len(signatures) < 3:
             return False
-        selected = [item.get('id') for item in s.repair_source.findings]
         for finding_id in selected:
             failures = Counter(item.get('signatures', {}).get(finding_id) for item in signatures[-3:]
                                if item.get('signatures', {}).get(finding_id) not in {None, 'PASS', 'INCONCLUSIVE'})
@@ -614,14 +835,17 @@ class Engine:
             return []
         result = []
         validation_refs = list(s.validation_refs)
+        if s.finding_verification_ref:
+            validation_refs.extend(s.finding_acceptance_evidence_refs)
+        acceptance_verified = verified and self.finding_acceptance_verified(s)
         findings = self.read_source_findings(s)
         for finding in findings:
             update = {'repair_run_id': s.run_id, 'patch_hash': s.patch_hash,
                       'verification_refs': validation_refs}
-            if verified and finding.rule_id and any(
+            if (acceptance_verified or verified and finding.rule_id and any(
                     finding.rule_id == cov.get('rule_id') and cov.get('status') == 'checked_pass'
                     and cov.get('rule_version') == finding.rule_version
-                    and cov.get('phase') == str(Phase.VERIFY) for cov in s.rule_coverage):
+                    and cov.get('phase') == str(Phase.VERIFY) for cov in s.rule_coverage)):
                 update['status'] = 'fixed'
             finding = finding.model_copy(update=update)
             finding = (self.rule_library.save_verified_finding(finding) if update.get('status') == 'fixed'
@@ -758,6 +982,8 @@ class Engine:
                     or s.repair_source and not self.source_rule_trials_passed(s)
                     or not self.rules_fully_checked(s, Phase.VERIFY)):
                 return False
+            if self._finding_acceptance(s) is not None and not self.finding_acceptance_verified(s):
+                return False
             # 纯证据检查仍须重读冻结工作区、完整补丁差异和已采样环境摘要。
             self.workspace.check_frozen(self.source)
             current_patch_hash = digest(
@@ -849,40 +1075,78 @@ class Engine:
     def read_events(self, s, cursor=None):
         return self.event_adapter.read(s.run_id, s.scope_id, cursor)
 
+    def _observation_progress(self, s, before_ref, after_ref):
+        before = self.get(s, before_ref) if before_ref else None
+        after = self.get(s, after_ref) if after_ref else None
+        if not before or not after:
+            return False
+        if any(before.get(key) is not None and after.get(key) is not None
+               for key in ('assertions', 'business_state')):
+            return has_real_progress(
+                {key: before.get(key) for key in ('assertions', 'business_state')},
+                {key: after.get(key) for key in ('assertions', 'business_state')},
+            )
+        return has_real_progress(
+            {'snapshot': stable_snapshot(before.get('snapshot', '')),
+             'assertions': before.get('assertions'), 'business_state': before.get('business_state')},
+            {'snapshot': stable_snapshot(after.get('snapshot', '')),
+             'assertions': after.get('assertions'), 'business_state': after.get('business_state')},
+        )
+
+    def _verification_results(self, s, refs):
+        values = {}
+        for ref in refs:
+            record = self.get(s, ref)
+            if not isinstance(record, dict):
+                continue
+            identity = digest([record.get('kind') or record.get('detector'),
+                               record.get('scenario_id') or record.get('id')])
+            result = {key: record[key] for key in ('passed', 'status', 'assertions') if key in record}
+            if result:
+                values[identity] = result
+        return values
+
     def changed(self, s, **delta):
         persisted = self.store.load(s.run_id, s.scope_id)
+        explicit = bool(delta.pop('_semantic_progress', False))
         if 'loop_no_progress_steps' not in delta:
-            explicit = bool(delta.pop('_semantic_progress', False))
             progressed = explicit
-            meaningful_fields = {
-                'validation_refs', 'behavior_check_refs', 'reproduced', 'source_aligned',
-                'check_plan_ref', 'check_result_refs', 'check_suite_completed',
-            }
+            meaningful_fields = {'check_plan_ref'}
             progressed = progressed or any(
                 field in delta and delta[field] != getattr(s, field)
                 for field in meaningful_fields
             )
             if not progressed and 'observation_ref' in delta and delta['observation_ref'] != s.observation_ref:
-                before = self.get(s, s.observation_ref) if s.observation_ref else None
-                after = self.get(s, delta['observation_ref']) if delta['observation_ref'] else None
-                if before and after:
-                    progressed = has_real_progress(
-                        {'snapshot': stable_snapshot(before.get('snapshot', '')),
-                         'assertions': before.get('assertions'),
-                         'business_state': before.get('business_state')},
-                        {'snapshot': stable_snapshot(after.get('snapshot', '')),
-                         'assertions': after.get('assertions'),
-                         'business_state': after.get('business_state')},
-                    )
+                progressed = self._observation_progress(s, s.observation_ref, delta['observation_ref'])
             if not progressed:
                 for field in ('reproduced', 'source_aligned'):
                     if field in delta and delta[field] is True and delta[field] != getattr(s, field):
                         progressed = True
                         break
-            if not progressed and 'validation_refs' in delta:
-                progressed = (delta['validation_refs'] != s.validation_refs
-                              and bool(delta['validation_refs']))
+            frontier = dict((s.loop_evidence or {}).get('verification_results') or {})
+            for field in ('validation_refs', 'behavior_check_refs', 'check_result_refs'):
+                if field not in delta:
+                    continue
+                before = {**self._verification_results(s, getattr(s, field)), **frontier.get(field, {})}
+                after = self._verification_results(s, delta[field])
+                progressed = progressed or any(
+                    has_real_progress(before.get(identity, {}), result)
+                    for identity, result in after.items()
+                )
+                frontier[field] = {**before, **after}
+            if frontier:
+                delta['loop_evidence'] = {**(s.loop_evidence or {}), **(delta.get('loop_evidence') or {}),
+                                          'verification_results': frontier}
             delta['loop_no_progress_steps'] = 0 if progressed else s.loop_no_progress_steps + 1
+            if progressed:
+                episodes = [dict(entry) for entry in delta.get('recovery_episodes', s.recovery_episodes)]
+                for entry in episodes:
+                    if entry.get('status') == 'continued' and not entry.get('progress'):
+                        entry.update(progress=True, status='progressed', progress_revision=s.revision + 1)
+                delta['recovery_episodes'] = episodes
+                delta.setdefault('loop_state_fingerprints', [])
+                delta.setdefault('loop_error_signatures', [])
+                delta.setdefault('action_fingerprints', [])
         new = reduce_state(s, persisted.revision, **delta)
         self.store.save(new)
         self.event(new, 'state.changed', {'phase': new.phase, 'status': new.run_status})
@@ -931,7 +1195,13 @@ class Engine:
         if error_count >= self.LOOP_ERROR_LIMIT:
             signals.append({'kind': 'error_repeated', 'signature': s.last_error_signature,
                             'count': error_count})
-        if s.loop_no_progress_steps >= self.LOOP_NO_PROGRESS_LIMIT:
+        grace = any(
+            entry.get('status') == 'continued' and not entry.get('progress')
+            and s.loop_no_progress_steps - entry.get('evidence', {}).get('no_progress_steps', 0)
+                < self.LOOP_RECOVERY_GRACE_STEPS
+            for entry in s.recovery_episodes
+        )
+        if s.loop_no_progress_steps >= self.LOOP_NO_PROGRESS_LIMIT and not grace:
             signals.append({'kind': 'no_progress', 'steps': s.loop_no_progress_steps})
         warnings = []
         if state_count == self.LOOP_STATE_WARNING:
@@ -972,7 +1242,8 @@ class Engine:
                 return False, {'status': 'unavailable', 'interface': 'browser.observe'}
             try:
                 ref = await self.capture(s, await observe())
-                return True, {'status': 'observed', 'observation_ref': ref, 'observation_changed': True}
+                return True, {'status': 'observed', 'observation_ref': ref,
+                              'business_changed': self._observation_progress(s, s.observation_ref, ref)}
             except Exception as error:
                 return False, {'status': 'unavailable', 'interface': 'browser.observe',
                                'error': sanitize(error_message(error))[:300]}
@@ -993,10 +1264,13 @@ class Engine:
                     'state_tail': (s.loop_state_fingerprints + [fingerprint])[-12:],
                     'action_tail': s.action_fingerprints[-12:],
                     'error_tail': s.loop_error_signatures[-12:],
-                    'step': s.step, 'cause': cause.value}
-        episode_key = digest([cause.value, fingerprint,
-                              s.last_error_signature,
-                              s.pending_action.get('kind') if isinstance(s.pending_action, dict) else None])
+                    'step': s.step, 'cause': cause.value,
+                    'no_progress_steps': s.loop_no_progress_steps}
+        if (s.loop_evidence or {}).get('verification_results'):
+            evidence['verification_results'] = s.loop_evidence['verification_results']
+        episode_key = self.recovery.active_episode_id(s.recovery_episodes, cause)
+        if episode_key is None:
+            episode_key = digest([s.run_id, cause.value, s.revision])
         evidence['semantic_repeat_key'] = episode_key
         decision = self.recovery.decide(cause, s.recovery_episodes, evidence=evidence,
                                         episode_id=episode_key)
@@ -1022,7 +1296,7 @@ class Engine:
                 target_phase = Phase.DIAGNOSE
             delta = {
                 'loop_state_fingerprints': [], 'loop_error_signatures': [],
-                'loop_no_progress_steps': 0, 'loop_warnings': s.loop_warnings + warnings,
+                'action_fingerprints': [], 'loop_warnings': s.loop_warnings + warnings,
                 'loop_evidence': evidence, 'loop_cause': cause.value,
                 'recovery_episodes': episodes, 'last_error_signature': None,
                 'error': None, 'error_details': {'recovery': evidence['recovery'], 'cause': cause.value},
@@ -1030,12 +1304,22 @@ class Engine:
             }
             if action_evidence.get('observation_ref'):
                 delta['observation_ref'] = action_evidence['observation_ref']
-            if action_evidence.get('child_settled') or action_evidence.get('observation_changed'):
+            if action_evidence.get('child_settled') or action_evidence.get('business_changed'):
                 delta['_semantic_progress'] = True
             if target_phase != s.phase:
                 delta['phase'] = target_phase
             s = self.changed(s, **delta)
             self.event(s, 'recovery.started', evidence)
+            return s
+        if cause in {RecoveryCause.UNKNOWN, RecoveryCause.CANCELLED}:
+            cancelled = cause == RecoveryCause.CANCELLED
+            s = self.changed(s, loop_evidence=evidence, loop_cause=cause.value,
+                recovery_episodes=episodes, phase=Phase.FINALIZE, pending_action=None,
+                outcome=Outcome.INCONCLUSIVE if cancelled else Outcome.INFRA_FAILURE,
+                error='用户已取消' if cancelled else s.error or 'UNKNOWN_OPERATION',
+                error_details={**(s.error_details or {}), 'recovery': evidence['recovery'],
+                               'requires_manual_review': not cancelled})
+            self.event(s, 'recovery.stopped', evidence)
             return s
         s = self.changed(s, loop_state_fingerprints=s.loop_state_fingerprints + [fingerprint],
                          loop_warnings=s.loop_warnings + warnings,
@@ -1111,6 +1395,12 @@ class Engine:
                'workspace_root': str(self.workspace.root)}
         if s.repair_source:
             ctx['repair_source'] = s.repair_source.model_dump(mode='json')
+        if self.runtime_services is not None:
+            references = await self.runtime_services.reference_documents(s)
+            if not isinstance(references, list) or any(not isinstance(item, dict) for item in references):
+                raise ValueError('Run reference_documents 必须是文档列表')
+            references = copy.deepcopy(list(ctx.get('reference_documents') or []) + references)
+            ctx['reference_documents'] = list({digest(item): item for item in references}.values())
         # Worker calls select locally; never replace the shared supervisor model.
         selected_model = (self.worker_model if ctx.get('worker_depth') == 1
                           and not ctx.get('worker_same_model')
@@ -1954,6 +2244,10 @@ class Engine:
             ref = self.put(s, {**result, 'kind': 'baseline_unit', 'source_manifest': s.source_manifest}, name='基线单元测试')
             s = self.changed(s, step=2, baseline_validation_refs=[ref])
             return self.output(s, 'prelude')
+        if s.repair_source and self._finding_acceptance(s) is not None and not s.finding_reproduction_ref:
+            s = await self.execute_finding_acceptance(s)
+            if s.phase == Phase.FINALIZE:
+                return self.output(s, 'finalize')
         if not s.observation_ref:
             action = BrowserAction(kind='navigate', value=s.url)
             if s.test_spec_ref:
@@ -2246,7 +2540,10 @@ class Engine:
         try:
             if item.extraction_error:
                 raise ValueError('用户目标提炼失败：' + item.extraction_error)
-            if item.source == 'user_goal':
+            acceptance_checks = self.finding_acceptance_checks(s, item)
+            if acceptance_checks is not None:
+                status, actual, refs = acceptance_checks
+            elif item.source == 'user_goal':
                 status, actual, refs = await self.evaluate_goal(s, item, observation, refs)
             else:
                 from tracefix.rules.models import Rule
@@ -2385,7 +2682,8 @@ class Engine:
             if item.source == 'rule':
                 from tracefix.rules.models import Rule
                 coverage_status = ('matched' if result.status == 'fail' else 'checked_pass'
-                    if result.status == 'pass' and item.detector in {'oracle', 'static'}
+                    if result.status == 'pass' and (item.detector in {'oracle', 'static'}
+                    or self.finding_acceptance_checks(s, item) is not None)
                     and result.fallback is None else 'not_completed')
                 self.record_rule_coverage(s, Rule.model_validate(item.detection), coverage_status,
                     phase='VERIFY' if s.check_suite_stage == 'verify' else 'EXPLORE',
@@ -2451,6 +2749,16 @@ class Engine:
         return await self.operation(s, 'scenario.reset', {'trial': s.trial, 'validation': s.validation_index}, reset_env)
 
     async def reproduce(self, s, _):
+        if s.repair_source and self._finding_acceptance(s) is not None:
+            s = await self.execute_finding_acceptance(s)
+            if s.phase == Phase.FINALIZE:
+                return self.output(s, 'finalize')
+            if not any(item.get('source') in {'oracle', 'static'} for item in s.repair_source.findings):
+                if not self.source_rule_trials_passed(s):
+                    return self.output(self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.INCONCLUSIVE,
+                        error='独立 Finding 复现证据未通过来源绑定'), 'finalize')
+                s = await self.freeze_reproduction_plan(s)
+                return self.output(self.changed(s, phase=Phase.DIAGNOSE, reproduced=True), 'prelude')
         if not s.reproduction_plan_frozen:
             s = await self.freeze_reproduction_plan(s)
         plan = [BrowserAction(**a) for a in self.get(s, s.replay_plan_ref)]
@@ -2520,6 +2828,19 @@ class Engine:
             raise ValueError('修补后不能重新选择复现计划')
         if s.reproduction_plan_frozen:
             return s
+        frozen = self._finding_acceptance(s)
+        if frozen is not None:
+            original_id = frozen.acceptance.findings[0].original_scenario_id
+            scenario = next(item for item in frozen.spec.behavior_scenarios if item.id == original_id)
+            plan_ref = self.put(s, [step.action.model_dump(mode='json') for step in scenario.steps],
+                                name='Finding冻结复现计划')
+            binding_ref = self.put(s, {'source_manifest': s.source_manifest,
+                'environment_digest': s.environment_digest, 'test_spec_hash': s.test_spec_hash,
+                'scope_id': s.scope_id, 'url': s.url,
+                'preconditions': [item.model_dump(mode='json') for item in self.spec(s).executable_preconditions]},
+                name='Finding复现绑定')
+            return self.changed(s, replay_plan_ref=plan_ref, reproduction_binding_ref=binding_ref,
+                                reproduction_plan_frozen=True)
         plan = self.get(s, s.replay_plan_ref) if s.replay_plan_ref else []
         if not plan:
             binding = self.put(s, {'source_manifest': s.source_manifest,
@@ -2925,6 +3246,10 @@ class Engine:
         self.workspace.check_frozen(self.source)
         if digest(self.workspace.diff(s.patch_base_commit or 'HEAD').encode()) != s.patch_hash:
             raise PermissionError('补丁在验证开始后发生了变化')
+        if s.validation_index >= 4 and self._finding_acceptance(s) is not None:
+            s = await self.execute_finding_acceptance(s, verify=True)
+            if s.phase == Phase.FINALIZE:
+                return self.output(s, 'finalize')
         spec = self.spec(s)
         kinds = ['static', 'unit', 'build', 'health', 'original', 'regression'] + ['behavior'] * len(spec.behavior_scenarios)
         kind = kinds[s.validation_index]
@@ -3030,6 +3355,11 @@ class Engine:
         return self.output(s, 'check_suite')
 
     async def complete_verification(self, s):
+        if self._finding_acceptance(s) is not None and not s.finding_verification_ref:
+            s = await self.execute_finding_acceptance(s, verify=True)
+        if self._finding_acceptance(s) is not None and not self.finding_acceptance_verified(s):
+            return self.output(self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.INCONCLUSIVE,
+                error='冻结 Finding 原问题及正常、逆向、刷新验收未全部通过'), 'finalize')
         if not self.rules_fully_checked(s, Phase.VERIFY):
             return self.output(self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.INCONCLUSIVE,
                 error='冻结规则覆盖未完成或缺少可执行验收，保留未验证候选补丁'), 'finalize')
@@ -3219,6 +3549,11 @@ class Engine:
                   'rule_refs': s.rule_refs, 'rule_coverage': s.rule_coverage,
                   'repair_source': s.repair_source.model_dump(mode='json') if s.repair_source else None,
                   'source_findings': [finding.model_dump(mode='json') for finding in source_findings],
+                  'finding_acceptance': {'acceptance_hash': s.finding_acceptance_hash,
+                      'configuration_ref': s.finding_acceptance_ref,
+                      'baseline_confirmed': self.source_acceptance_ready(s) if s.finding_acceptance_ref else None,
+                      'verification_passed': self.finding_acceptance_verified(s) if s.finding_acceptance_ref else None,
+                      'evidence_refs': list(s.finding_acceptance_evidence_refs)},
                   'agent_instructions_ref': s.agent_instructions_ref,
                   'agent_instructions_hash': s.agent_instructions_hash,
                   'agent_instructions_path': s.agent_instructions_path,
@@ -3253,6 +3588,7 @@ class Engine:
             'rule_snapshot_hash': s.rule_snapshot_hash, 'rule_snapshot_ref': s.rule_snapshot_ref,
             'finding_ids': [item['id'] for item in report.get('findings', [])],
             'repair_source': report['repair_source'], 'patch_hash': s.patch_hash,
+            'finding_acceptance': report['finding_acceptance'],
             'verification_refs': list(s.validation_refs), 'check_result_refs': list(s.check_result_refs),
             'evidence_refs': list(s.evidence_refs), 'verified': verified}
         report['behavior_scenarios_error'] = None
@@ -3310,6 +3646,22 @@ class Engine:
         return self.output(s, 'end')
 
     async def run(self, state=None, resume=None):
+        close_services = True
+        try:
+            result = await self._run_graph(state, resume)
+            current = self.store.load(self.current_run, self.context.active_scope)
+            close_services = current.run_status not in {
+                RunStatus.PAUSED, RunStatus.WAITING_INPUT, RunStatus.WAITING_APPROVAL,
+            }
+            return result
+        except GraphInterrupt:
+            close_services = False
+            raise
+        finally:
+            if close_services and self.runtime_services is not None:
+                await self.runtime_services.aclose()
+
+    async def _run_graph(self, state=None, resume=None):
         run_id = state.run_id if state else self.current_run
         self.current_run = run_id
         config = {'configurable': {'thread_id': run_id}, 'recursion_limit': 1500}
