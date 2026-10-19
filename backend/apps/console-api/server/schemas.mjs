@@ -80,7 +80,37 @@ export const result = {type: 'object', additionalProperties: false,
   required: ['runId', 'taskId', 'outcome', 'settled', 'ready', 'ruleCoverage', 'findings', 'patch', 'verification', 'error', 'provenance'], properties: {
     runId: text, taskId: {type: ['string', 'null']}, outcome: {type: ['string', 'null']}, settled: {type: 'boolean'}, ready: {type: 'boolean'},
     ruleCoverage: object, findings: {type: 'array', items: object}, patch: nullableObject, verification: nullableObject,
+    summary: {type: ['string', 'null']}, branch: {type: ['string', 'null']}, commit: {type: ['string', 'null']}, publication: nullableObject,
     error: nullableObject, provenance: object}};
+const commandArgv = {type: 'array', minItems: 1, maxItems: 200, items: {type: 'string', minLength: 1, maxLength: 8000}};
+const repositoryProfile = {type: 'object', additionalProperties: false, required: ['commands'], properties: {
+  project: {type: 'string', maxLength: 64}, source_commit: {type: 'string', maxLength: 64},
+  url: {type: 'string', format: 'uri', maxLength: 2048},
+  allowed_origins: {type: 'array', minItems: 1, maxItems: 100, items: {type: 'string', maxLength: 2048}},
+  commands: {type: 'object', required: ['start', 'reset', 'static', 'unit', 'build'], additionalProperties: commandArgv},
+  image: text, browser_image: text, health_path: text, version_path: text,
+  port: {type: 'integer', minimum: 1, maximum: 65535}, timeout_seconds: {type: 'integer', minimum: 1, maximum: 600},
+  screenshot_redaction: text}};
+const repositoryFields = {
+  repo_id: {type: 'string', pattern: '^[A-Za-z0-9_-]{1,64}$'},
+  projectId: {type: 'string', pattern: '^[A-Za-z0-9_-]{1,64}$'},
+  id: {type: 'string', pattern: '^[A-Za-z0-9_-]{1,64}$'},
+  root: {type: 'string', minLength: 1, maxLength: 4096},
+  owner: {type: 'string', pattern: '^[A-Za-z0-9_.-]{1,100}$'},
+  repo: {type: 'string', pattern: '^[A-Za-z0-9_.-]{1,100}$'},
+  default_ref: {type: 'string', minLength: 1, maxLength: 255},
+  checkout_mode: {type: 'string', enum: ['existing', 'managed']}, publish_branch: {type: 'boolean'},
+  profile: repositoryProfile, profile_ref: {type: ['string', 'null'], minLength: 1, maxLength: 4096},
+  allowed_files: {type: 'array', minItems: 1, maxItems: 200, uniqueItems: true, items: {type: 'string', minLength: 1, maxLength: 1024}},
+  allowed_urls: {type: 'array', minItems: 1, maxItems: 100, uniqueItems: true, items: {type: 'string', minLength: 1, maxLength: 2048}},
+  credential_ref: {type: ['string', 'null'], pattern: '^[A-Za-z0-9_.:/-]{1,200}$'}, enabled: {type: 'boolean'}};
+export const repositoryInput = {type: 'object', additionalProperties: false,
+  required: ['owner', 'repo', 'default_ref', 'allowed_files', 'allowed_urls'], properties: repositoryFields,
+  allOf: [
+    {anyOf: [{required: ['repo_id']}, {required: ['projectId']}, {required: ['id']}]},
+    {anyOf: [{required: ['profile']}, {required: ['profile_ref']}]},
+    {if: {required: ['checkout_mode'], properties: {checkout_mode: {const: 'managed'}}}, then: {}, else: {required: ['root']}}]};
+export const repositoryPatch = {type: 'object', additionalProperties: false, minProperties: 1, properties: repositoryFields};
 export const empty = {type: 'object', additionalProperties: false, properties: {}};
 export const params = {type: 'object', additionalProperties: false, required: ['id'], properties: {id: text}};
 export const idempotency = {type: 'object', properties: {'idempotency-key': {type: 'string', minLength: 1, maxLength: 200, pattern: '^[!-~]+$'}}};

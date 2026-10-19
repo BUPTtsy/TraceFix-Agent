@@ -23,7 +23,7 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
     path.join(projectRoot, '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python') : process.platform === 'win32' ? 'py' : 'python3');
   const redact = value => {
     let text = String(value).replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/\bsk-[A-Za-z0-9_-]{20,}\b/g, '[REDACTED]');
-    for (const name of ['TRACEFIX_API_KEY', 'TRACEFIX_DATABASE_URL', 'TRACEFIX_GITHUB_TOKEN', 'TRACEFIX_CONTROL_TOKEN'])
+    for (const name of ['TRACEFIX_API_KEY', 'TRACEFIX_DATABASE_URL', 'TRACEFIX_SERVICE_DATABASE_URL', 'TRACEFIX_GITHUB_TOKEN', 'TRACEFIX_CONTROL_TOKEN'])
       if (process.env[name]) text = text.replaceAll(process.env[name], '[REDACTED]');
     return text;
   };
@@ -43,6 +43,7 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
           env: {...process.env, TRACEFIX_CONSOLE_RUN_ID: run.id, TRACEFIX_PROCESS_CONTROL_ID: run.processControlId,
             TRACEFIX_DATA: run.dataRoot, TRACEFIX_CONSOLE_DB: run.consoleDatabasePath,
             TRACEFIX_SERVICE_DATA_ROOT: run.dataRoot, TRACEFIX_SERVICE_CONSOLE_DB: run.consoleDatabasePath,
+            TRACEFIX_SERVICE_DATABASE_URL: process.env.TRACEFIX_SERVICE_DATABASE_URL || process.env.TRACEFIX_DATABASE_URL || '',
             PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1',
             PYTHONPATH: [path.join(projectRoot, 'backend/packages/agent/src'), process.env.PYTHONPATH].filter(Boolean).join(path.delimiter)}});
     } catch {

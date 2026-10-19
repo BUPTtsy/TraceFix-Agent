@@ -154,13 +154,16 @@ export function projectCatalog(projectsPath: string, dataRoot: string, displayRo
     const enabled = repository?.enabled !== false && project.enabled !== false;
     let issue: string | null = null;
     if (!enabled) issue = '仓库已禁用';
-    else if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) issue = '目标目录不存在，请先初始化或 clone 项目';
-    else if (!fs.existsSync(path.join(root, '.git'))) issue = '目标目录尚未初始化 Git';
+    else if (repository?.checkout_mode !== 'managed' && (!fs.existsSync(root) || !fs.statSync(root).isDirectory())) issue = '目标目录不存在，请先初始化或 clone 项目';
+    else if (repository?.checkout_mode !== 'managed' && !fs.existsSync(path.join(root, '.git'))) issue = '目标目录尚未初始化 Git';
     else if (!entry) issue = '缺少有效的项目 Profile' + (errors.has(project.id) ? ': ' + errors.get(project.id) : '');
     return {
       id: project.id, repoId: project.repo_id, root: path.relative(displayRoot, root) || '.',
       profile: entry?.filename ? path.relative(displayRoot, path.resolve(path.dirname(registry), entry.filename)) : null,
       registry, url: entry?.profile.url || null, enabled, repositoryConfigVersion: repository?.version || null,
+      checkoutMode: repository?.checkout_mode || 'existing',
+      cloneUrl: repository ? `https://github.com/${repository.owner}/${repository.repo}.git` : null,
+      defaultRef: repository?.default_ref || null, publishBranch: repository?.publish_branch === true,
       allowedFiles: project.allowed_files || [], commands: entry?.profile.commands || {}, remoteConfig: remote[project.id] || null,
       ready: issue === null, issue,
     };

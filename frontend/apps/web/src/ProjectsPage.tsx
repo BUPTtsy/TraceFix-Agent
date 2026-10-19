@@ -3,7 +3,7 @@ import {loadRepository, Project, RepositoryDraft, RepositoryProfile, saveReposit
 
 interface Props {projects: Project[]; projectId: string; onSelect: (id: string) => boolean; onSaved: (id: string) => Promise<void>; onDirty: (dirty: boolean) => void; onNavigate: (page: 'runs' | 'rules') => void; report: (error: unknown) => void}
 interface Draft {id: string; url: string; ref: string; root: string; mode: RepositoryDraft['checkout_mode']; commands: string; allowedFiles: string; allowedUrls: string; appUrl: string; credential: string; enabled: boolean; publish: boolean; profile: RepositoryProfile | null}
-const defaultCommands = {prepare: ['npm', 'ci'], start: ['npm', 'start'], reset: ['npm', 'run', 'reset'], static: ['npm', 'run', 'typecheck'], unit: ['npm', 'test'], build: ['npm', 'run', 'build']};
+const defaultCommands = {prepare: ['node', '--version'], start: ['node', 'scripts/serve.mjs'], reset: ['node', 'scripts/reset.mjs'], static: ['node', 'node_modules/typescript/bin/tsc', '--noEmit'], unit: ['node', '--test', 'tests/tasks.test.mjs'], build: ['node', 'scripts/build.mjs']};
 function blank(): Draft {return {id: 'test-bug-repo', url: 'https://github.com/BUPTtsy/Test-Bug-repo', ref: 'main', root: '', mode: 'managed', commands: JSON.stringify(defaultCommands, null, 2), allowedFiles: 'src/**\nserver/**', allowedUrls: 'http://app:3000', appUrl: 'http://app:3000', credential: '', enabled: true, publish: false, profile: null};}
 function lines(text: string): string[] {return text.split(/\r?\n/).map(value => value.trim()).filter(Boolean);}
 function commandsFrom(text: string): Record<string, string[]> {

@@ -49,6 +49,15 @@ export async function createApi({bridge, controller, token, legacyHandler, logge
   const response = (status, success) => ({[status]: success, ...schemas.errors});
   const listQuery = {type: 'object', additionalProperties: false, properties: {projectId: {type: 'string', maxLength: 128}}};
   route('GET', '/api/v1/openapi.json', {hide: true}, async () => app.swagger());
+  const repositoryResponse = status => response(status, schemas.genericObject);
+  route('GET', '/api/v1/repositories', {response: response(200, {type: 'array', items: schemas.genericObject})},
+    () => bridge('repositories'));
+  route('POST', '/api/v1/repositories', {body: schemas.repositoryInput, response: repositoryResponse(201)},
+    async (request, reply) => reply.code(201).send(await bridge('repository.create', request.body)));
+  route('GET', '/api/v1/repositories/:id', {params: schemas.params, response: repositoryResponse(200)},
+    request => bridge('repository', request.params));
+  route('PATCH', '/api/v1/repositories/:id', {params: schemas.params, body: schemas.repositoryPatch, response: repositoryResponse(200)},
+    request => bridge('repository.update', {id: request.params.id, patch: request.body}));
   route('POST', '/api/v1/tasks', {body: schemas.taskInput, headers: schemas.idempotency, response: response(201, schemas.mutation)}, async (request, reply) => {
     const created = await bridge('task.create', {body: request.body, key: request.headers['idempotency-key']});
     reply.header('location', '/api/v1/tasks/' + created.task.id);

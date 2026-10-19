@@ -1,9 +1,17 @@
 import {taskError} from './task-lifecycle.js';
+import {isDeepStrictEqual} from 'node:util';
 
 type Data = Record<string, any>;
 const terminal = new Set(['completed', 'failed', 'cancelled', 'abnormal', 'unknown', 'superseded']);
 const outcomes = new Set(['FIX_VERIFIED', 'NO_BUG_FOUND', 'BUG_CONFIRMED', 'INCONCLUSIVE', 'LOOP_DETECTED',
   'REPAIR_EXHAUSTED', 'POLICY_BLOCKED', 'INFRA_FAILURE', 'CANCELLED', 'UNKNOWN']);
+
+function repairMetadata(report?: Data): Data {
+  return {summary: report?.result_summary ?? null,
+    branch: report?.publication?.branch ?? report?.branch ?? null,
+    commit: report?.publication?.commit ?? report?.repair_commit ?? null,
+    publication: report?.publication ?? null};
+}
 
 export function executorResult(value: Data, run: Data, view?: Data, patchBytes?: Buffer): Data {
   if (!value || value.schema_version !== 1 || value.task_id !== run.taskId || value.run_id !== run.id || value.repo_id !== run.projectId ||
@@ -21,12 +29,18 @@ export function executorResult(value: Data, run: Data, view?: Data, patchBytes?:
   if (value.outcome === 'FIX_VERIFIED' && (!ref || !patchBytes?.length || report?.patch_verification !== 'verified' ||
       report?.patch_available !== true || value.patch_available !== true || value.patch_verification !== 'verified'))
     throw taskError('EXECUTOR_RESULT_INVALID', '修复成功必须绑定已验证补丁', 503);
+  const metadata = repairMetadata(report);
+  if (Object.entries(metadata).some(([key, expected]) => !isDeepStrictEqual(value[key] ?? null, expected)) ||
+      (value.report && !isDeepStrictEqual(repairMetadata(value.report), metadata)))
+    throw taskError('EXECUTOR_RESULT_INVALID', '执行器修复摘要、分支或提交与权威报告不一致', 503);
   const error = value.error ? {code: typeof value.error.code === 'string' ? value.error.code : 'EXECUTION_FAILED',
     message: '执行器报告执行失败', retryable: false} : null;
   return {status: String(value.run_status).toLowerCase(), outcome: value.outcome, error,
     executionResult: {outcome: value.outcome, settled: value.outcome !== 'UNKNOWN',
+      ...metadata,
       ruleCoverage: {snapshot: view?.ruleSnapshot ?? null, summary: report?.check_summary ?? null, results: report?.check_results ?? []},
-      patch: ref ? {ref, diff: value.diff, available: report.patch_available === true, verification: report.patch_verification ?? 'none'} : null,
+      patch: ref ? {ref, diff: value.diff, available: report.patch_available === true, verification: report.patch_verification ?? 'none',
+        branch: metadata.branch, commit: metadata.commit} : null,
       verification: report ? {overall_status: report.overall_status ?? null, check_summary: report.check_summary ?? null,
         patch_verification: report.patch_verification ?? 'none', validation_refs: report.validation_refs ?? []} : null}};
 }
@@ -41,11 +55,16 @@ export function resultView(run: Data, findings: Data[]): Data {
     (recorded ? recorded.settled === true : ['failed', 'cancelled'].includes(run.status) || Boolean(report?.outcome));
   const structuredError = run.error && typeof run.error === 'object' ? run.error : run.error ?
     {code: ready ? 'EXECUTION_FAILED' : 'EXECUTION_PENDING', message: String(run.error), retryable: false} : null;
+  const metadata = repairMetadata(report);
+  for (const key of ['summary', 'branch', 'commit', 'publication'])
+    if (recorded && Object.hasOwn(recorded, key)) metadata[key] = recorded[key];
   return {runId: run.id, taskId: run.taskId ?? null, outcome: normalized, settled, ready,
+    ...metadata,
     ruleCoverage: recorded?.ruleCoverage ?? recorded?.rule_coverage ?? {
       snapshot: run.ruleSnapshot, summary: report?.check_summary ?? null, results: report?.check_results ?? []},
     findings, patch: recorded?.patch ?? (report?.patch_diff_ref ? {ref: report.patch_diff_ref,
-      available: report.patch_available === true, verification: report.patch_verification ?? 'none'} : null),
+      available: report.patch_available === true, verification: report.patch_verification ?? 'none',
+      branch: metadata.branch, commit: metadata.commit} : null),
     verification: recorded?.verification ?? (report ? {overall_status: report.overall_status ?? null,
       check_summary: report.check_summary ?? null, validation_refs: report.validation_refs ?? []} : null),
     error: structuredError ?? (!ready ? {code: 'RESULT_NOT_READY', message: '结果尚未就绪', retryable: true} :
