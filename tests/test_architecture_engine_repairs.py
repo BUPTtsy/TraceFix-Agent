@@ -16,6 +16,77 @@ BINDING = ['scope_id', 'run_id', 'verifier_version', 'source_manifest', 'patch_h
            'environment_digest', 'test_spec_hash', 'plan_hash']
 
 
+@pytest.mark.parametrize('failure_kind', ['not_dispatched', 'unknown'])
+async def test_browser_dispatch_boundary_records_known_rejection_and_preserves_unknown(tmp_path, failure_kind):
+    from tracefix.execution.browser import MCPActionNotDispatched, MCPActionUnknown, MCPConnectionError
+    from tracefix.tools.browser import execute_browser_tool
+    engine, state = make_engine(tmp_path)
+    original = engine.browser.action
+    calls = []
+
+    async def action(selected):
+        calls.append(selected.kind)
+        if selected.kind == 'navigate':
+            if failure_kind == 'not_dispatched':
+                raise MCPActionNotDispatched('页面 generation 已失效，动作尚未派发')
+            raise MCPActionUnknown('action-one', 'navigate', MCPConnectionError('响应丢失'))
+        return await original(selected)
+
+    engine.browser.action = action
+    original_step, original_plan = state.step, state.replay_plan_ref
+    if failure_kind == 'unknown':
+        with pytest.raises(MCPActionUnknown):
+            await execute_browser_tool(engine, state, {}, 'BrowserNavigate', {'value': state.url}, 'call-one', 1)
+        assert any(record['status'] == 'UNKNOWN' for record in engine.store.operations.values())
+        assert calls == ['navigate']
+    else:
+        result, context = await execute_browser_tool(engine, state, {}, 'BrowserNavigate',
+                                                    {'value': state.url}, 'call-one', 1)
+        assert result['executed'] is False and result['action_status'] == 'rejected'
+        assert result['observation_ref'] == state.observation_ref
+        assert context['observation']['id'] == result['observation']['id']
+        assert state.step == original_step and state.replay_plan_ref == original_plan
+        assert 'business_outcome' not in result and 'passed' not in result
+        assert calls == ['navigate', 'observe']
+        assert engine.store.operations and all(record['status'] == 'DONE' for record in engine.store.operations.values())
+
+
+@pytest.mark.parametrize('fault', ['observation', 'generation', 'reference', 'locator', 'fresh_locator'])
+async def test_browser_pre_dispatch_guards_use_explicit_not_dispatched_error(fault):
+    from tracefix.execution.browser import MCPActionNotDispatched, MCPBrowser
+    from tracefix.execution.policy import Policy
+    browser = MCPBrowser([], Policy(['http://app:3000']))
+    snapshot = '- checkbox "Complete task" [ref=e2]'
+    browser.observation = {'id': 'current', 'page_generation': 2, 'snapshot': snapshot}
+    browser._snapshot_guard = snapshot
+    selected = BrowserAction(kind='click', observation_id='current', element_ref='e2',
+                             locator=Locator(role='checkbox', name='Complete task'), page_generation=2)
+    if fault == 'observation':
+        selected.observation_id = 'stale'
+    elif fault == 'generation':
+        selected.page_generation = 1
+    elif fault == 'reference':
+        selected.element_ref = 'e3'
+    elif fault == 'locator':
+        selected.locator = Locator(role='checkbox', name='Missing task')
+    else:
+        async def snapshot_only():
+            browser._snapshot_guard = '- heading "Different page" [ref=e1]'
+            return {'id': 'fresh', 'page_generation': 3}
+        browser._collect_snapshot = snapshot_only
+    dispatched = []
+
+    async def call(*arguments):
+        dispatched.append(arguments)
+        pytest.fail('定位拒绝不能派发动作')
+
+    browser.call = call
+    with pytest.raises(MCPActionNotDispatched) as rejected:
+        await browser.action(selected)
+    assert rejected.value.executed is False and rejected.value.status == 'FAILED'
+    assert dispatched == []
+
+
 def add_behavior_spec(engine, state):
     check = Assertion(locator=Locator(role='checkbox', name='Complete task'), condition='checked')
     scenario = BehaviorScenario(id='B12-round-trip', steps=[

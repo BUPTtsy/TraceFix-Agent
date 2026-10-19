@@ -705,6 +705,35 @@ async def test_native_browser_business_counterexample_reaches_model_without_reex
     assert calls == ['click-counterexample']
 
 
+async def test_native_browser_known_rejection_is_cached_and_model_can_submit_new_observation(fake_pydantic_ai):
+    from tracefix.tools.browser import native_browser_tools
+    calls = []
+
+    def port(name, arguments, call_id):
+        calls.append(call_id)
+        if call_id == 'stale-click':
+            return {'executed': False, 'action_status': 'rejected',
+                    'rejection': {'type': 'MCPActionNotDispatched', 'executed': False},
+                    'observation_ref': 'fresh-ref', 'observation': {'id': 'fresh-observation'}}
+        return {'executed': True, 'observation_ref': 'after-click'}
+
+    async def model(agent, prompt, history, handler):
+        tool = next(tool for tool in agent.tools if tool.name == 'BrowserClick')
+        arguments = {'observation_id': 'stale-observation', 'element_ref': 'e1',
+                     'locator': {'role': 'checkbox', 'name': 'Complete task'}}
+        first = await tool.function(tool_context('stale-click'), **arguments)
+        assert first['executed'] is False and 'business_outcome' not in first
+        assert await tool.function(tool_context('stale-click'), **arguments) == first
+        arguments['observation_id'] = first['observation']['id']
+        second = await tool.function(tool_context('new-click'), **arguments)
+        assert second['executed'] is True
+        return completion()
+
+    model._native_tools = native_browser_tools
+    await PydanticAIAdapter(model).generate(BrowserAction, {'phase': 'EXPLORE'}, tool_executor=port)
+    assert calls == ['stale-click', 'new-click']
+
+
 @pytest.mark.parametrize('fault', ['unknown', 'locator', 'unexecuted', 'missing_observation', 'not_failed', 'not_native'])
 async def test_native_browser_counterexample_exception_is_strict(fake_pydantic_ai, fault):
     from tracefix.tools.browser import native_browser_tools

@@ -123,6 +123,15 @@ class MCPConnectionError(RuntimeError):
         super().__init__(message)
 
 
+class MCPActionNotDispatched(PermissionError):
+    status = 'FAILED'
+    executed = False
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.details = {'status': self.status, 'executed': False, 'retryable': False}
+
+
 class MCPActionUnknown(MCPConnectionError):
     """浏览器副作用可能已经发生，但动作结果无法确定。"""
 
@@ -480,17 +489,17 @@ class MCPBrowser:
             raise PermissionError('不支持的浏览器动作')
         if action.kind in {'click', 'type', 'select', 'press'}:
             if not self.observation or action.observation_id != self.observation['id']:
-                raise PermissionError('MCP 页面观测已过期；请重新观测后再执行动作')
+                raise MCPActionNotDispatched('MCP 页面观测已过期；请重新观测后再执行动作')
             generation = getattr(action, 'page_generation', None)
             if generation is not None and generation != self.observation.get('page_generation'):
-                raise PermissionError('MCP 页面 generation 已过期；请重新观测后再执行动作')
+                raise MCPActionNotDispatched('MCP 页面 generation 已过期；请重新观测后再执行动作')
             if action.kind in {'click', 'type', 'select'}:
                 try:
                     current_ref = resolve_locator(self._snapshot_guard or self.observation['snapshot'], action.locator)
                 except ValueError as error:
-                    raise PermissionError('MCP 元素定位器已不在当前页面') from error
+                    raise MCPActionNotDispatched('MCP 元素定位器已不在当前页面') from error
                 if action.element_ref != current_ref:
-                    raise PermissionError('MCP 元素引用已失效')
+                    raise MCPActionNotDispatched('MCP 元素引用已失效')
         action_id = new_id('mcp-action')
         self.last_action = {
             'action_id': action_id,
@@ -556,7 +565,7 @@ class MCPBrowser:
             try:
                 fresh_ref = resolve_action_locator(self._snapshot_guard, action.locator)
             except ValueError as error:
-                raise PermissionError('MCP 新快照无法安全唯一重定位；请重新观测') from error
+                raise MCPActionNotDispatched('MCP 新快照无法安全唯一重定位；请重新观测') from error
             self.last_action.update(grounding_observation_id=observation['id'],
                                     grounding_page_generation=observation['page_generation'],
                                     dispatched_element_ref=fresh_ref)

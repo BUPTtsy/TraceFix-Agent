@@ -18,7 +18,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 from langgraph.errors import GraphInterrupt, GraphRecursionError
 
-from tracefix.execution.browser import (MCPActionUnknown, MCPConnectionError, assertions,
+from tracefix.execution.browser import (MCPActionNotDispatched, MCPActionUnknown, MCPConnectionError, assertions,
     resolve_locator, validate_spec_observation)
 from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
 from tracefix.model.chat_completions import reasoning_records
@@ -1781,10 +1781,15 @@ class Engine:
         s.budget = s.budget.charge('browser_actions')
         self.store.save(s)
         async def perform():
-            raw = await self.browser.action(action)
+            try:
+                raw = await self.browser.action(action)
+            except MCPActionNotDispatched as error:
+                return {'executed': False, 'action_status': 'rejected', 'rejection': str(error)}
             return {'observation_ref': await self.capture(s, raw, action)}
         intent = action.model_dump()
         receipt = await self.operation(s, 'browser', intent, perform, tool_call_id=tool_call_id)
+        if receipt.get('action_status') == 'rejected' and receipt.get('executed') is False:
+            raise MCPActionNotDispatched(receipt['rejection'])
         current_ref = receipt['observation_ref']
         current = self.get(s, current_ref)
 

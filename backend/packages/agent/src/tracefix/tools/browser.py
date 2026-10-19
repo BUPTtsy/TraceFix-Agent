@@ -58,6 +58,7 @@ def browser_action(name, arguments):
 
 
 async def execute_browser_tool(engine, state, context, name, arguments, call_id, logical_call):
+    from tracefix.execution.browser import MCPActionNotDispatched
     from tracefix.runtime.engine import ActionBusinessFailure, stable_snapshot
 
     if context.get('worker_readonly_investigation'):
@@ -80,6 +81,18 @@ async def execute_browser_tool(engine, state, context, name, arguments, call_id,
     business_failure = None
     try:
         reference = await engine.act(state, action, tool_call_id=call_id)
+    except MCPActionNotDispatched as error:
+        raw = await engine.browser.action(BrowserAction(kind='observe'))
+        reference = await engine.capture(state, raw)
+        updated = engine.changed(state, observation_ref=reference)
+        for field in type(state).model_fields:
+            setattr(state, field, getattr(updated, field))
+        observation = engine.get(state, reference)
+        context = {**context, 'observation': observation}
+        return {'executed': False, 'action_status': 'rejected',
+                'rejection': {'type': type(error).__name__, 'message': sanitize(str(error)),
+                              'executed': False, 'retryable': False},
+                'observation_ref': reference, 'observation': observation}, context
     except ActionBusinessFailure as error:
         business_failure = error
         reference = error.observation_ref
