@@ -1,15 +1,19 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$NoPublish,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$BootstrapArguments
 )
 
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $Utf8NoBom
+[Console]::OutputEncoding = $Utf8NoBom
+$OutputEncoding = $Utf8NoBom
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $pythonExecutable = Join-Path $projectRoot '.venv/Scripts/python.exe'
 if (-not (Test-Path -LiteralPath $pythonExecutable -PathType Leaf)) {
-    throw ([regex]::Unescape('\u8bf7\u5148\u6267\u884c scripts/bootstrap/start.ps1 --web \u5b8c\u6210\u9996\u6b21\u73af\u5883\u5b89\u88c5\u548c\u955c\u50cf\u6784\u5efa\u3002'))
+    throw '请先执行 scripts/bootstrap/start.ps1 --web 完成首次环境安装和镜像构建。'
 }
 
 $env:TRACEFIX_PROJECTS = Join-Path $projectRoot '.tracefix/interface-projects.yaml'

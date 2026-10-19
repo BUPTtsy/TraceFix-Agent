@@ -1,4 +1,8 @@
-# Windows PowerShell 5.1 / PowerShell 7. Arguments are forwarded unchanged.
+﻿# Windows PowerShell 5.1 / PowerShell 7. Arguments are forwarded unchanged.
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $Utf8NoBom
+[Console]::OutputEncoding = $Utf8NoBom
+$OutputEncoding = $Utf8NoBom
 $ErrorActionPreference = 'Stop'
 $TraceFixArguments = @($args)
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -20,7 +24,7 @@ if (-not $PythonCommand -and (Get-Command python.exe -ErrorAction SilentlyContin
     } catch { }
 }
 if (-not $PythonCommand) {
-    Write-Host ([regex]::Unescape('\u9700\u8981 Python 3.12\uff0864 \u4f4d\uff09\u3002\u8bf7\u4ece python.org \u5b89\u88c5\u540e\u91cd\u65b0\u6253\u5f00\u7ec8\u7aef\u3002'))
+    Write-Host '需要 Python 3.12（64 位）。请从 python.org 安装后重新打开终端。'
     exit 2
 }
 $env:PYTHONUTF8 = '1'

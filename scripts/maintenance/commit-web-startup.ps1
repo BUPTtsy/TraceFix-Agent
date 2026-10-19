@@ -1,9 +1,13 @@
-param(
+﻿param(
     [ValidateNotNullOrEmpty()]
     [string]$Message = 'feat: add unified web startup and workspace configuration',
     [switch]$Preview
 )
 
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $Utf8NoBom
+[Console]::OutputEncoding = $Utf8NoBom
+$OutputEncoding = $Utf8NoBom
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $CommitFiles = @(

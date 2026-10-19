@@ -23,13 +23,73 @@ def load_tool(name):
     return module
 
 
+def tracked_powershell_scripts(root):
+    result = subprocess.run(
+        ['git', 'ls-files', '-z', '--', '*.ps1', '*.psm1', '*.psd1'],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    scripts = []
+    for raw_path in result.stdout.split(b'\0'):
+        if not raw_path:
+            continue
+        relative = raw_path.decode('utf-8').replace('\\', '/')
+        parts = relative.split('/')
+        if 'artifacts' in parts or '.tmp' in parts:
+            continue
+        if relative == 'bugboard/target' or relative.startswith('bugboard/target/'):
+            continue
+        scripts.append(root / Path(*relative.split('/')))
+    return scripts
+
+
+def test_tracked_powershell_scripts_use_utf8_bom(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    scripts = tracked_powershell_scripts(root)
+    assert scripts, 'No tracked PowerShell scripts found.'
+    missing_bom = [str(path.relative_to(root)) for path in scripts
+                   if not path.read_bytes().startswith(b'\xef\xbb\xbf')]
+    assert not missing_bom, f'PowerShell scripts must use UTF-8 BOM: {missing_bom}'
+
+
+@pytest.mark.parametrize('shell_name', ['powershell.exe', 'pwsh.exe'])
+def test_tracked_powershell_scripts_parse_in_windows_shell(shell_name):
+    shell = shutil.which(shell_name)
+    if shell is None:
+        pytest.skip(f'{shell_name} is unavailable')
+    root = Path(__file__).resolve().parents[1]
+    scripts = tracked_powershell_scripts(root)
+    assert scripts, 'No tracked PowerShell scripts found.'
+    command = (
+        "$ErrorActionPreference='Stop'; "
+        "$parseTokens=$null; $parseErrors=$null; "
+        "[System.Management.Automation.Language.Parser]::ParseFile("
+        "$env:TRACEFIX_TEST_SCRIPT,[ref]$parseTokens,[ref]$parseErrors) | Out-Null; "
+        "if($parseErrors.Count){$parseErrors | Out-String | Write-Output; exit 3}"
+    )
+    for script in scripts:
+        environment = {**os.environ, 'TRACEFIX_TEST_SCRIPT': str(script)}
+        result = subprocess.run(
+            [shell, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=30,
+        )
+        assert result.returncode == 0, f'{script}: {result.stdout}{result.stderr}'
+        assert 'ParserError' not in result.stdout + result.stderr
+
+
 @pytest.mark.parametrize('shell_name', ['powershell.exe', 'pwsh.exe'])
 def test_interface_launcher_parses_and_reports_missing_environment_in_windows_shell(tmp_path, shell_name):
     shell = shutil.which(shell_name)
     if shell is None:
         pytest.skip(f'{shell_name} is unavailable')
     original = Path(__file__).resolve().parents[1] / 'scripts/bootstrap/start-interface.ps1'
-    original.read_bytes().decode('ascii')
+    original.read_bytes().decode('utf-8-sig')
     destination = tmp_path / 'scripts/bootstrap/start-interface.ps1'
     destination.parent.mkdir(parents=True)
     shutil.copyfile(original, destination)

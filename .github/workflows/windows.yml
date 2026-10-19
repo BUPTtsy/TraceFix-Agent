@@ -29,6 +29,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./.venv/Scripts/python.exe -c "import tracefix.agents.deepagents_adapter; from pydantic_ai.models.openai import OpenAIChatModel"
           exit $LASTEXITCODE
+      - name: Verify PowerShell script encoding and syntax
+        run: ./.venv/Scripts/python.exe -m pytest tests/test_web_startup.py -k powershell -q
       - name: Unit and platform tests
         run: |
           npm ci --ignore-scripts
