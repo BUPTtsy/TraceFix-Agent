@@ -1,6 +1,6 @@
 # 仓库接入与平台交付边界
 
-> 定位更新：2026-10-07。TraceFix 通过接口接收受控仓库并返回候选 diff；远端发布由上层 GUI 检测—修复平台的仓库连接器处理。
+> 更新日期：2026-10-10，`main@b622dfd`。B1 仓库 API 与冻结已实现，B2 stdio 只读 connector 已通过 Mock；真实读取与 B4 生命周期接线待完成。TraceFix 返回候选 diff，远端发布由上层平台处理。
 
 ## 1. 当前仓库能力
 
@@ -8,7 +8,7 @@
 
 `execution/workspace.py` 提供源码导出、路径保护、before_hash / patch hash 检查和审批后的本地候选提交。现有代码没有 push / PR 交付入口；本地分支不能当成远端交付证据。
 
-## 2. 平台提供的仓库输入 📐
+## 2. 平台提供的仓库输入
 
 | 输入 | 处理要求 |
 |---|---|
@@ -18,18 +18,20 @@
 | 凭据引用 | 由部署方预置，明文不进入任务正文、命令行、模型或报告 |
 | 规则与规范 | 冻结 Rule / TestSpec / 复现计划，并记录实际上下文与证据来源 |
 
-仓库注册 / 更新 / 禁用、就绪状态与配置冻结按 B1 补齐。活动 Run 使用已冻结配置，不因后续注册修改而静默变更；作用域撤销仍按安全边界即时复核。
+`POST /api/v1/repositories`、列表 / 单仓库 `GET` 和单仓库 `PATCH` 已实现注册、更新与禁用；外部 `repo_id/projectId` 映射规范化 `Project.id`。Python 权威入口加锁原子写入同一项目注册表，校验真实 root、origin、ref 与 Profile，每个新 Run 使用具体 commit 与冻结配置。注册修改不改变活动 Run；作用域撤销仍按安全边界即时复核。完整字段、部署授权 root 与 service bridge 见[项目配置与操作边界](../../项目配置与操作边界.md)。
 
-首版支持受控 React / TypeScript 项目与显式 Profile，私有源码可以由平台预置普通 checkout。通过 A → B → A 验收源码、规则、浏览器状态、测试数据、diff 与报告不串用。
+首版支持受控 React / TypeScript 项目与显式 Profile，私有源码由平台预置普通 checkout。A → B → A 定向测试使用受控执行器与替身资源；真实 GUI / 测试数据全链路仍需部署验收。仅承诺可信单实例逻辑隔离。
 
-## 3. GitHub MCP 只读接入 📐
+## 3. GitHub MCP 只读接入（实现 / Mock 已验证）
 
-B2 计划提供独立 GitHub MCP 适配，使用真实授权仓库读取必要上下文。已有浏览器 MCP transport 不等于 GitHub MCP 已接入。
+B2 已实现 `connectors/github_mcp.py` 独立 stdio connector，保持浏览器 MCP 独立。`GitHubMCPConfig.from_snapshot()` 使用 B1 冻结配置，部署方提供 command / args、超时、响应上限与 credential resolver；初始化发现 schema 后才允许窄读取能力。契约、工具别名及真实验收配置见[GitHub 接入说明](../../GitHub端到端测试边界.md)。
 
 - 只接受当前支持的 `github.com` 仓库范围，凭据仅发往授权服务端点。
 - MCP 工具 schema、输入与返回值由适配层校验，默认只读；读到的 Issue / PR 文本按不可信资料处理。
-- 错误区分凭据、授权、仓库不存在、限流和网络故障，不自动扩大访问范围。
+- 错误使用稳定 `GitHubMCPError.code/details`，区分凭据不可用、无权限、绑定 / schema 错误、超时与断线，不暴露服务端原始异常；不承诺逐一识别所有服务端限流或不存在语义。
 - 验收真实授权读取、跨仓库拒绝和 token 脱敏，不要求 Agent 创建 PR 或回复评论。
+
+`read_context()` / `health()` 为 async，`list_read_tools()` 为 sync；`GitHubContext.to_context_document()` 带来源、摘要、时间与截断信息，Issue / PR 描述不证明缺陷复现。B4 尚需为每 Run 创建 / 关闭 connector，通过统一入口读取并注入 `ContextAssembler.reference_documents` 预算区。当前没有实际生命周期调用成功记录；真实只读测试因部署前置条件缺失为 **SKIPPED**。
 
 ## 4. 返回补丁与平台交付
 
