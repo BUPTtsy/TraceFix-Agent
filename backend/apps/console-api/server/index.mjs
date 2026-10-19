@@ -242,6 +242,7 @@ const legacyHandler = async (req,res) => {
     if (ruleMatch && req.method === 'DELETE') return send(res, 200, await bridge('rule.delete', {id: decodeURIComponent(ruleMatch[1])}));
     const documentMatch = url.pathname.match(/^\/api\/knowledge\/([a-zA-Z0-9_-]+)$/);
     if (documentMatch && req.method === 'GET') return send(res, 200, await bridge('document', {id: documentMatch[1]}));
+    if (documentMatch && req.method === 'DELETE') return send(res, 200, await bridge('document.delete', {id: documentMatch[1]}));
     if (documentMatch && req.method === 'PUT') {
       return send(res, 200, await bridge('document.save', {...await body(req), id: documentMatch[1]}));
     }
@@ -299,10 +300,11 @@ const legacyHandler = async (req,res) => {
       if(req.method==='DELETE') {tasks=tasks.filter(t=>t.id!==task.id);await persist();return send(res,200,{ok:true});}
     }
     if (url.pathname.startsWith('/api/')) return send(res,404,{error:'找不到接口'});
+    if (url.pathname === '/favicon.ico') {res.writeHead(302, {Location: '/favicon.svg'}); return res.end();}
     const file = path.resolve(root, '.' + decodeURIComponent(url.pathname === '/' ? '/index.html' : url.pathname));
     if(!file.startsWith(root+path.sep)) return send(res,403,{error:'禁止访问'});
     const content=await fs.readFile(file);
-    res.writeHead(200,{'Content-Type':({'.html':'text/html','.js':'text/javascript','.css':'text/css'})[path.extname(file)]||'application/octet-stream','Cache-Control':'no-store'});res.end(content);
+    res.writeHead(200,{'Content-Type':({'.html':'text/html','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml'})[path.extname(file)]||'application/octet-stream','Cache-Control':'no-store'});res.end(content);
   } catch(e) {
     if (res.headersSent) return;
     const status = Number.isInteger(e.status) ? e.status : e.code === 'ENOENT' ? 404 : 500;

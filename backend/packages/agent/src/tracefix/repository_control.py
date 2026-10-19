@@ -18,6 +18,8 @@ def dispatch(operation, fields, *, projects_path=None):
         return registry.get(fields['id'])
     if operation == 'repository.update':
         return registry.update(fields['id'], fields['patch'])
+    if operation == 'repository.delete':
+        return registry.delete(fields['id'])
     if operation == 'repository.freeze':
         return registry.freeze(fields['id'], fields['run_id'])
     if operation == 'project.create':

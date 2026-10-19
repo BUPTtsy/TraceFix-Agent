@@ -117,6 +117,7 @@ export class RuleDatabase {
       CREATE TABLE IF NOT EXISTS findings (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, run_id TEXT, rule_id TEXT, rule_version INTEGER, source TEXT NOT NULL, severity TEXT NOT NULL, status TEXT NOT NULL, fingerprint TEXT NOT NULL UNIQUE, data TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS findings_rule_idx ON findings(rule_id, created_at);
       CREATE TABLE IF NOT EXISTS rule_sets (id TEXT PRIMARY KEY, org_id TEXT, name TEXT NOT NULL, parent_id TEXT, version INTEGER NOT NULL, items TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS repository_rule_settings (project_id TEXT PRIMARY KEY, rule_ids TEXT NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL);
     `);
     this.seedBuiltins();
   }
@@ -150,6 +151,33 @@ export class RuleDatabase {
   }
   versions(id: string): Data[] {
     return this.store.db.prepare('SELECT rule_id,version,body_hash,change_note,author,created_at FROM rule_versions WHERE rule_id=? ORDER BY version DESC').all(id) as Data[];
+  }
+  repositoryRules(projectId: string): Data {
+    const row = this.store.db.prepare('SELECT * FROM repository_rule_settings WHERE project_id=?').get(projectId) as Data | undefined;
+    const ruleIds: string[] = row ? JSON.parse(row.rule_ids) : this.rules({projectId, status: 'enabled'}).map(rule => rule.id);
+    const available = this.rules({includeArchived: true});
+    return {projectId, ruleIds, version: row?.version || 0,
+      effectiveRuleIds: ruleIds.filter(id => available.some(rule => rule.id === id && rule.status === 'enabled'))};
+  }
+  saveRepositoryRules(projectId: string, ruleIds: unknown, expectedVersion: unknown): Data {
+    if (!Array.isArray(ruleIds) || ruleIds.length > 100 || ruleIds.some(id => typeof id !== 'string') || new Set(ruleIds).size !== ruleIds.length)
+      throw new DataError('仓库规则须为最多 100 个不重复规则 ID');
+    return this.store.transaction(() => {
+      const current = this.repositoryRules(projectId);
+      if (!Number.isInteger(expectedVersion) || expectedVersion !== current.version) throw new DataError('仓库规则配置已更新，请重新读取后保存', 409);
+      for (const id of ruleIds) {
+        const rule = this.rule(id);
+        if (rule.status !== 'enabled' && !current.ruleIds.includes(id)) throw new DataError('只能勾选已发布的规则');
+        if (rule.scope.project_ids?.length && !rule.scope.project_ids.includes(projectId)) throw new DataError('此旧版规则尚未发布为共享规则，请在统一规则页重新保存');
+      }
+      this.store.db.prepare('INSERT OR REPLACE INTO repository_rule_settings VALUES (?,?,?,?)')
+        .run(projectId, JSON.stringify(ruleIds), current.version + 1, timestamp());
+      return this.repositoryRules(projectId);
+    });
+  }
+  initializeRepositoryRules(projectId: string, inherit = true): void {
+    const current = this.repositoryRules(projectId);
+    if (!current.version) this.saveRepositoryRules(projectId, inherit ? current.ruleIds : [], 0);
   }
   preview(id: string, maxTokens: number): Data {
     const rule = this.rule(id);
@@ -237,6 +265,9 @@ export class RuleDatabase {
     return this.store.transaction(() => {
       this.rule(id);
       const db = this.store.db;
+      const repositorySettings = db.prepare('SELECT rule_ids FROM repository_rule_settings').all() as {rule_ids: string}[];
+      if (repositorySettings.some(setting => JSON.parse(setting.rule_ids).includes(id)))
+        throw new DataError('规则已被仓库配置引用，请先取消勾选或归档规则', 409);
       const snapshots = db.prepare('SELECT refs FROM rule_run_snapshots').all() as {refs: string}[];
       if (db.prepare('SELECT 1 FROM findings WHERE rule_id=? LIMIT 1').get(id) ||
           db.prepare('SELECT 1 FROM rule_assignments WHERE rule_id=? LIMIT 1').get(id) ||

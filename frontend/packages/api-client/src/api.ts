@@ -1,7 +1,7 @@
 import {errorWithContext} from './errors';
 
 export type Service = 'test' | 'repair' | 'chat';
-export interface Project {id: string; repoId: string; root: string; profile: string | null; url: string | null; ready: boolean; issue: string | null; allowedFiles: string[]; commands: Record<string, string[]>; runCount: number; documentCount: number; checkoutMode?: 'existing' | 'managed'; cloneUrl?: string | null; defaultRef?: string | null; publishBranch?: boolean}
+export interface Project {id: string; repoId: string; root: string; profile: string | null; url: string | null; ready: boolean; issue: string | null; allowedFiles: string[]; commands: Record<string, string[]>; runCount: number; documentCount: number; checkoutMode?: 'existing' | 'managed'; cloneUrl?: string | null; defaultRef?: string | null; publishBranch?: boolean; repositoryConfigVersion?: number | null}
 export interface RepositoryProfile {project: string; source_commit?: string; url: string; allowed_origins: string[]; commands: Record<string, string[]>; [key: string]: unknown}
 export interface RepositoryDraft {repo_id: string; root?: string; owner: string; repo: string; default_ref: string; checkout_mode: 'existing' | 'managed'; publish_branch: boolean; profile: RepositoryProfile; allowed_files: string[]; allowed_urls: string[]; credential_ref: string | null; enabled: boolean}
 export interface Repository extends RepositoryDraft {version: number; commit: string | null; config_digest: string; profile_ref?: string | null}
@@ -144,15 +144,22 @@ async function responseJson(response: Response) {
   try {return await response.json();}
   catch (error) {throw errorWithContext(`响应 JSON 解析失败（HTTP ${response.status}）`, error);}
 }
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number, readonly code: string, readonly requestId?: string) {super(message);}
+}
 async function request<Value>(url: string, options: RequestInit = {}): Promise<Value> {
   const response = await fetchResponse(url, {...options, headers: {'Content-Type': 'application/json', ...options.headers}});
   const data = await responseJson(response);
-  if (!response.ok) throw new Error(`请求失败（HTTP ${response.status}）${data?.message || data?.error ? '：' + (data.message || data.error) : ''}`);
+  if (!response.ok) throw new ApiError(`请求失败（HTTP ${response.status}）${data?.message || data?.error ? '：' + (data.message || data.error) : ''}`, response.status, data?.code || 'REQUEST_FAILED', data?.requestId);
   return data;
 }
 export const loadProjects = () => request<Project[]>('/api/projects');
 export const loadRepository = (id: string) => request<Repository>(`/api/v1/repositories/${encodeURIComponent(id)}`);
 export const saveRepository = (repository: RepositoryDraft, existingId?: string) => request<Repository>(`/api/v1/repositories${existingId ? '/' + encodeURIComponent(existingId) : ''}`, {method: existingId ? 'PATCH' : 'POST', body: JSON.stringify(repository)});
+export const deleteRepository = (id: string) => request<{ok: boolean}>(`/api/v1/repositories/${encodeURIComponent(id)}`, {method: 'DELETE'});
+export interface RepositoryRules {projectId: string; ruleIds: string[]; effectiveRuleIds: string[]; version: number}
+export const loadRepositoryRules = (id: string) => request<RepositoryRules>(`/api/v1/repositories/${encodeURIComponent(id)}/rules`);
+export const saveRepositoryRules = (id: string, ruleIds: string[], expectedVersion: number) => request<RepositoryRules>(`/api/v1/repositories/${encodeURIComponent(id)}/rules`, {method: 'PUT', body: JSON.stringify({ruleIds, expectedVersion})});
 export const loadServices = () => request<{id: Service; label: string}[]>('/api/services');
 export const loadRuns = () => request<Run[]>('/api/runs');
 export const loadRun = (id: string) => request<Run>(`/api/runs/${encodeURIComponent(id)}`);
@@ -189,11 +196,16 @@ export const deriveRun = (id: string, additionalRuleIds: string[], goal = '') =>
 export const loadDocuments = (projectId: string, query = '') => request<KnowledgeDocument[]>(`/api/knowledge?${new URLSearchParams({projectId, q: query})}`);
 export const loadDocument = (id: string) => request<KnowledgeDocument>(`/api/knowledge/${encodeURIComponent(id)}`);
 export const saveDocument = (document: DocumentDraft) => request<KnowledgeDocument>(`/api/knowledge${document.id ? '/' + encodeURIComponent(document.id) : ''}`, {method: document.id ? 'PUT' : 'POST', body: JSON.stringify(document)});
+export const deleteDocument = (id: string) => request<{ok: boolean}>(`/api/knowledge/${encodeURIComponent(id)}`, {method: 'DELETE'});
 export const searchDocuments = (projectId: string, query: string) => request<SearchHit[]>('/api/knowledge/search', {method: 'POST', body: JSON.stringify({projectId, query})});
 export const loadRules = (projectId: string, filters: {status?: string; q?: string; includeArchived?: boolean} = {}) => request<DetectionRule[]>(`/api/rules?${new URLSearchParams({projectId, ...(filters.status ? {status: filters.status} : {}), ...(filters.q ? {q: filters.q} : {}), ...(filters.includeArchived ? {includeArchived: 'true'} : {})})}`);
 export const loadRule = (id: string) => request<DetectionRule>(`/api/rules/${encodeURIComponent(id)}`);
-export const saveRule = (rule: Partial<DetectionRule> & {id?: string; expectedVersion?: number; changeNote?: string}) => request<DetectionRule>(`/api/rules${rule.version && rule.id ? '/' + encodeURIComponent(rule.id) : ''}`, {method: rule.version ? 'PUT' : 'POST', body: JSON.stringify(rule)});
-export const changeRuleStatus = (id: string, action: 'publish' | 'disable' | 'archive', expectedVersion?: number) => request<DetectionRule>(`/api/rules/${encodeURIComponent(id)}:${action}`, {method: 'POST', body: JSON.stringify({expectedVersion})});
+export const saveRule = (rule: Partial<DetectionRule> & {id?: string; expectedVersion?: number; changeNote?: string}) => {
+  const editing = Boolean(rule.version && rule.id);
+  const payload = {...rule, version: editing ? rule.version : undefined, expectedVersion: editing ? rule.expectedVersion : undefined};
+  return request<DetectionRule>(`/api/rules${editing ? '/' + encodeURIComponent(rule.id!) : ''}`, {method: editing ? 'PUT' : 'POST', body: JSON.stringify(payload)});
+};
+export const changeRuleStatus = (id: string, action: 'publish' | 'disable' | 'archive', expectedVersion?: number) => request<DetectionRule>(`/api/rules/${encodeURIComponent(id)}/${action}`, {method: 'POST', body: JSON.stringify({expectedVersion})});
 export const deleteRule = (id: string) => request<{ok: boolean}>(`/api/rules/${encodeURIComponent(id)}`, {method: 'DELETE'});
 export const loadRuleVersions = (id: string) => request<RuleVersion[]>(`/api/rules/${encodeURIComponent(id)}/versions`);
 export const loadRuleInsights = () => request<RuleInsight[]>('/api/rules/insights');

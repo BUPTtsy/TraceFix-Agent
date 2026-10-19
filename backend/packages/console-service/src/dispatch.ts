@@ -20,6 +20,7 @@ export function createConsoleService(options: ConsoleOptions = {}) {
   const database = new ConsoleDatabase(path.resolve(options.databasePath || process.env.TRACEFIX_CONSOLE_DB || path.join(dataRoot, 'console.sqlite3')));
   const rules = new RuleDatabase(database);
   const catalog = () => projectCatalog(projectsPath, dataRoot, options.displayRoot);
+  for (const project of catalog()) rules.initializeRepositoryRules(project.id);
   const tasks = new TaskLifecycle(database, fields => normalizeTask(fields, catalog()),
     (fields, id) => dispatch('run.prepare', {...fields, _runId: id}));
   const repository = (operation: string, fields: Data = {}) => repositoryControl(projectsPath, operation, fields,
@@ -137,8 +138,23 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     if (operation === 'executor.lease') return tasks.lease();
     if (operation === 'repositories') return repository('repository.list');
     if (operation === 'repository') return repository('repository.get', {id: fields.id});
-    if (operation === 'repository.create') return repository('repository.register', fields);
+    if (operation === 'repository.create') {
+      const created = repository('repository.register', fields);
+      rules.initializeRepositoryRules(created.repo_id, false);
+      return created;
+    }
     if (operation === 'repository.update') return repository('repository.update', {id: fields.id, patch: fields.patch});
+    if (operation === 'repository.delete') {
+      if (database.runs(fields.id).length || database.documents().some(document => document.projectId === fields.id) ||
+          tasks.tasks(fields.id).length) throw new DataError('仓库已有关联任务、运行或知识文档，请停用仓库以保留历史记录', 409);
+      const removed = repository('repository.delete', {id: fields.id});
+      database.db.prepare('DELETE FROM repository_rule_settings WHERE project_id=?').run(fields.id);
+      return removed;
+    }
+    if (operation === 'repository.rules' || operation === 'repository.rules.save') {
+      if (!catalog().some(project => project.id === fields.id)) throw new DataError('仓库不存在', 404);
+      return operation === 'repository.rules' ? rules.repositoryRules(fields.id) : rules.saveRepositoryRules(fields.id, fields.ruleIds, fields.expectedVersion);
+    }
     if (operation === 'repository.freeze') return repository('repository.freeze', {id: fields.id, run_id: fields.run_id});
     if (operation === 'runs.import') return importRuns();
     if (operation === 'chat.project') {
@@ -148,8 +164,18 @@ export function createConsoleService(options: ConsoleOptions = {}) {
       if (!project || !entry || typeof entry.root !== 'string') throw new DataError('请选择已注册的项目');
       if (!project.ready) throw new DataError(project.issue || '项目当前不可读');
       const root = path.resolve(path.dirname(projectsPath), entry.root);
+      const configuration = entry.repository_config ? repository('repository.get', {id: project.id}) : null;
+      const profile = configuration?.profile || (project.profile ? loadConfig(path.resolve(options.displayRoot || process.cwd(), project.profile)) : null);
+      const selectedRuleIds = new Set(rules.repositoryRules(project.id).effectiveRuleIds);
       return {projectId: project.id, root, context: {id: project.id, repoId: project.repoId,
         root: project.root, allowedFiles: project.allowedFiles, ready: project.ready, issue: project.issue,
+        url: project.url, executionProfile: profile,
+        repository: configuration ? {defaultRef: configuration.default_ref, commit: configuration.commit,
+          configDigest: configuration.config_digest, checkoutMode: configuration.checkout_mode,
+          publishBranch: configuration.publish_branch, allowedUrls: configuration.allowed_urls} : null,
+        detectionRules: rules.rules({status: 'enabled'}).filter(rule => selectedRuleIds.has(rule.id)).map(rule => ({
+          id: rule.id, version: rule.version, name: rule.name, severity: rule.severity,
+          detection: rule.detection, fix_guidance: rule.fix_guidance})),
         access: 'read-only',
         tools: ['project.list_files', 'project.read_file', 'project.search']}};
     }
@@ -300,6 +326,7 @@ export function createConsoleService(options: ConsoleOptions = {}) {
         .map(({content, ...record}) => ({...record, preview: content.slice(0, 180)}));
     }
     if (operation === 'document') return database.document(fields.id);
+    if (operation === 'document.delete') return database.deleteDocument(fields.id);
     if (operation === 'document.save' || operation === 'search') {
       const projectId = fields.projectId || null;
       if (projectId && !catalog().some(project => project.id === projectId)) throw new DataError('知识范围必须是已注册项目或全局');
@@ -315,7 +342,7 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     if (operation === 'rule') return rules.rule(fields.id);
     if (operation === 'rule.save') return rules.save(fields, fields.id, fields.expectedVersion ?? fields.expected_version);
     if (operation === 'rule.create' || operation === 'rule.update')
-      return rules.save(fields, fields.id, fields.expectedVersion ?? fields.expected_version, operation === 'rule.create' ? 'create' : 'update');
+      return rules.save({...fields, scope: {level: 'org'}}, fields.id, fields.expectedVersion ?? fields.expected_version, operation === 'rule.create' ? 'create' : 'update');
     if (operation === 'rule.status') return rules.status(fields.id, fields.status, fields.expectedVersion);
     if (operation === 'rule.delete') return rules.delete(fields.id);
     if (operation === 'rule.versions') return rules.versions(fields.id);

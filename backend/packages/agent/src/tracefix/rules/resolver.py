@@ -131,6 +131,8 @@ class RuleResolver:
                 additional: Iterable[str | Rule] = (), rule_ids: Iterable[str] = (),
                 relevance: dict[str, float] | None = None) -> list[Rule]:
         all_rules = {rule.id: rule for rule in self._all()}
+        settings = getattr(self.source, 'repository_rule_ids', None)
+        configured_ids = settings(project_id) if callable(settings) and project_id else None
         paths = list(paths)
         selected: dict[str, Rule] = {}
         inherited_ids: set[str] = set()
@@ -153,6 +155,8 @@ class RuleResolver:
                 # parent cannot change meaning after it has started.
                 continue
             if rule.status != "enabled":
+                continue
+            if configured_ids is not None and rule.id not in configured_ids:
                 continue
             if phase != "*" and not rule_applies(rule, phase=phase, url=url, paths=paths):
                 continue

@@ -58,6 +58,13 @@ export async function createApi({bridge, controller, token, legacyHandler, logge
     request => bridge('repository', request.params));
   route('PATCH', '/api/v1/repositories/:id', {params: schemas.params, body: schemas.repositoryPatch, response: repositoryResponse(200)},
     request => bridge('repository.update', {id: request.params.id, patch: request.body}));
+  route('DELETE', '/api/v1/repositories/:id', {params: schemas.params, response: repositoryResponse(200)},
+    request => bridge('repository.delete', request.params));
+  route('GET', '/api/v1/repositories/:id/rules', {params: schemas.params, response: repositoryResponse(200)},
+    request => bridge('repository.rules', request.params));
+  route('PUT', '/api/v1/repositories/:id/rules', {params: schemas.params, body: {type: 'object', additionalProperties: false,
+    required: ['ruleIds', 'expectedVersion'], properties: {ruleIds: {type: 'array', uniqueItems: true, maxItems: 100, items: {type: 'string', minLength: 1, maxLength: 120}}, expectedVersion: {type: 'integer', minimum: 0}}}, response: repositoryResponse(200)},
+    request => bridge('repository.rules.save', {...request.params, ...request.body}));
   route('POST', '/api/v1/tasks', {body: schemas.taskInput, headers: schemas.idempotency, response: response(201, schemas.mutation)}, async (request, reply) => {
     const created = await bridge('task.create', {body: request.body, key: request.headers['idempotency-key']});
     reply.header('location', '/api/v1/tasks/' + created.task.id);

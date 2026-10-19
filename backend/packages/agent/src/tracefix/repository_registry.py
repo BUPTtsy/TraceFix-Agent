@@ -377,6 +377,18 @@ class RepositoryRegistry:
         self.prepare_codegraph(identifier)
         return deepcopy(config)
 
+    def delete(self, identifier):
+        identifier = normalize_id(identifier)
+        with registry_lock(self.path):
+            raw = self._read()
+            self._assert_mutable(raw)
+            item = next((item for item in raw['projects'] if item['id'] == identifier), None)
+            if not item or not item.get('repository_config'):
+                raise RepositoryError('REPOSITORY_NOT_FOUND', '未注册的仓库', 404)
+            raw['projects'] = [item for item in raw['projects'] if item['id'] != identifier]
+            atomic_yaml(self.path, raw)
+        return {'ok': True}
+
     def freeze(self, identifier, run_id):
         if not isinstance(run_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', run_id):
             raise RepositoryError('INVALID_RUN_ID', 'freeze 必须绑定安全且非空的 run_id')

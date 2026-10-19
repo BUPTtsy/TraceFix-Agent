@@ -1695,3 +1695,25 @@
   text-align: center;
   line-height: var(--lh-snug);
 }
+.repository-rule-list {
+  display: grid;
+  gap: var(--space-3, 12px);
+}
+
+.repository-rule-list .knowledge-toggle {
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  align-items: flex-start;
+}
+
+.repository-rule-list span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.repository-rule-list small {
+  display: block;
+  margin-top: 5px;
+  color: var(--text-muted);
+}

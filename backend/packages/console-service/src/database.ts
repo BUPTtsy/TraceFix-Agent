@@ -82,6 +82,16 @@ export class ConsoleDatabase {
       return record;
     });
   }
+  deleteDocument(id: string): RecordData {
+    return this.transaction(() => {
+      this.document(id);
+      if (this.runs().some(run => (run.knowledge || []).some((use: RecordData) =>
+        (use.documents || []).some((document: RecordData) => document.id === id))))
+        throw new DataError('已被运行引用的文档不能删除，请停用以保留来源记录', 409);
+      this.db.prepare('DELETE FROM documents WHERE id=?').run(id);
+      return {ok: true};
+    });
+  }
   search(query: string, projectId: string, limit = 8): RecordData[] {
     const queryTerms = terms(query.slice(0, 2000));
     if (!queryTerms.size) return [];

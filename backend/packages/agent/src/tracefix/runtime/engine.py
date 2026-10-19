@@ -1392,7 +1392,8 @@ class Engine:
 
     async def model_call(self, s, schema, ctx, image=None, validate_output=None):
         ctx = {**ctx, 'phase': str(s.phase), 'execution_mode': s.execution_mode,
-               'workspace_root': str(self.workspace.root)}
+               'workspace_root': str(self.workspace.root),
+               'execution_profile': self.profile.model_dump(mode='json')}
         if s.repair_source:
             ctx['repair_source'] = s.repair_source.model_dump(mode='json')
         if self.runtime_services is not None:
