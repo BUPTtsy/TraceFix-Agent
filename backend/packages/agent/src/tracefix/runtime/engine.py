@@ -3493,6 +3493,27 @@ class Engine:
                     error='来源 Finding 或证据已变化，拒绝回写已验证修复',
                     error_details={'integration_blocker': 'finding_source_invalid', 'reason': str(error)})
                 patch_verification = 'unverified' if patch_available else 'none'
+        repair_commit = None
+        if verified and s.execution_mode == 'batch' and not s.local_branch:
+            action = {'action': 'local_commit', 'branch': 'tracefix/'+s.run_id}
+            try:
+                async def commit():
+                    branch = self.workspace.branch(action['branch'])
+                    if digest(self.workspace.diff(s.patch_base_commit).encode()) != s.patch_hash:
+                        raise PermissionError('提交后的候选补丁与验证证据不一致')
+                    return {'branch': branch, 'commit': self.workspace.head()}
+                receipt = await self.operation(s, 'local.commit', action, commit)
+                s = self.changed(s, local_branch=receipt['branch'])
+                repair_commit = receipt['commit']
+            except Exception as error:
+                verified = False
+                patch_verification = 'unverified' if patch_available else 'none'
+                s = self.changed(s, outcome=Outcome.INFRA_FAILURE,
+                    error='已验证候选无法创建本地提交',
+                    error_details={'terminal_reason': 'local_commit_failed',
+                                   'reason': sanitize(error_message(error))[:300]})
+        elif verified and s.local_branch:
+            repair_commit = self.workspace.head()
         summaries = {
             Outcome.FIX_VERIFIED: '修复补丁通过全部确定性验证，可供后续流程消费。',
             Outcome.NO_BUG_FOUND: '本次测试规范未发现缺陷，未生成修复补丁。',
@@ -3537,6 +3558,7 @@ class Engine:
                   'outcome': s.outcome, 'reproduced': s.reproduced,
                   'patch_hash': s.patch_hash, 'branch': s.local_branch, 'merged': False,
                   'patch_base_commit': s.patch_base_commit,
+                  'repair_commit': repair_commit,
                   'patch_diff_ref': diff_ref, 'patch_available': patch_available,
                   'patch_verification': patch_verification, 'patch_export_error': diff_error,
                   'result_summary': result_summary,

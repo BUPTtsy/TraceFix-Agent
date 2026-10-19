@@ -480,6 +480,54 @@ async def test_runner_prepares_nested_mountpoints_before_readonly_bind(tmp_path,
     assert calls == [image_call, network_call, volume_call, start_call, health_call, version_call, runtime_call]
 
 
+@pytest.mark.parametrize('prepare_failure', [False, True])
+async def test_runner_preparation_precedes_start_and_failure_cleans_resources(tmp_path, monkeypatch, prepare_failure):
+    engine, state = make_engine(tmp_path / 'engine')
+    profile = Profile(project='b', source_commit='HEAD', image='app:1', browser_image='browser:1',
+        commands={'start': ['node', 'server/index.mjs'], 'prepare': ['node', '--version'],
+                  **{name: ['node', name] for name in ('reset', 'static', 'unit', 'build')}})
+    runner = DockerRunner(profile, engine.workspace, state.run_id)
+    runner.resolved_image_ids = {'app': 'sha256:' + 'a' * 64, 'browser': 'sha256:' + 'b' * 64}
+    calls = []
+
+    async def docker(*arguments, **options):
+        calls.append(arguments)
+        if arguments[0] == 'run' and runner.name + '-prepare' in arguments:
+            assert options == {}
+            assert arguments[-2:] == ('node', '--version')
+            assert '--read-only' in arguments and '--cap-drop=ALL' in arguments
+            assert arguments[arguments.index('--network') + 1] == runner.network
+            assert bind_mount(engine.workspace.root) in arguments
+            assert 'type=volume,src='+runner.dependency_volume+',dst=/app/node_modules' in arguments
+            assert '--security-opt=no-new-privileges' in arguments
+            assert 'HOME=/tmp' in arguments
+            assert profile.image not in arguments
+            if prepare_failure:
+                raise RuntimeError('前置准备失败')
+        return {'passed': True, 'exit_code': 0, 'output': ''}
+
+    monkeypatch.setattr(runner, 'docker', docker)
+    if prepare_failure:
+        with pytest.raises(RuntimeError, match='前置准备失败'):
+            await runner.start(state.source_manifest)
+        assert not any(arguments[:2] == ('run', '-d') for arguments in calls)
+        assert ('rm', '-f', runner.name+'-prepare') in calls
+        assert ('volume', 'rm', runner.dependency_volume) in calls
+        assert ('network', 'rm', runner.network) in calls
+        assert runner._started is False
+    else:
+        assert (await runner.start(state.source_manifest))['passed']
+        prepare_index = next(index for index, arguments in enumerate(calls)
+                             if arguments[0] == 'run' and runner.name+'-prepare' in arguments)
+        start_index = next(index for index, arguments in enumerate(calls)
+                           if arguments[:2] == ('run', '-d'))
+        assert prepare_index < start_index
+        assert calls[0][:3] == ('network', 'create', '--internal')
+        assert 'type=volume,src='+runner.dependency_volume+',dst=/app/node_modules,readonly' in calls[start_index]
+        await runner.close()
+    engine.workspace.check_frozen(engine.source)
+
+
 @pytest.mark.skipif(os.getenv('TRACEFIX_TEST_LOCAL_DOCKER') != '1', reason='opt-in Docker test')
 async def test_real_runner_seeds_readonly_dependencies_and_removes_volume(tmp_path):
     engine, state = make_engine(tmp_path / 'engine')

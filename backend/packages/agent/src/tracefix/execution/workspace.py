@@ -882,5 +882,5 @@ class Workspace:
         if git(self.root, 'status', '--porcelain').strip():
             safe_index_files(self.root, sorted(self.repository_snapshot['files']
                              if self.repository_snapshot else git(self.root, 'ls-files', '-z').decode().split('\0')[:-1]))
-            commit_workspace(self.root, "TraceFix verified candidate")
+            commit_workspace(self.root, "提交通过验证的修复候选")
         return name

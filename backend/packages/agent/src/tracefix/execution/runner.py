@@ -121,6 +121,22 @@ class DockerRunner:
         self._started = True
         await self.docker('network', 'create', '--internal', '--label', 'tracefix.run='+self.run_id, self.network)
         await self.docker('volume', 'create', '--label', 'tracefix.run='+self.run_id, self.dependency_volume)
+        if self.profile.commands.get('prepare'):
+            try:
+                await self.docker('run', '--rm', '--name', self.name+'-prepare',
+                    '--network', self.network, '--label', 'tracefix.run='+self.run_id,
+                    '--user', container_user(), '--cap-drop=ALL', '--security-opt=no-new-privileges',
+                    '--pids-limit=128', '--memory=1g', '--cpus=2', '--read-only',
+                    '--tmpfs', '/tmp:rw,nosuid,size=128m,mode=1777',
+                    '--mount', bind_mount(self.workspace.root),
+                    '--mount', 'type=volume,src='+self.dependency_volume+',dst=/app/node_modules',
+                    '-e', 'HOME=/tmp', '-e', 'npm_config_cache=/tmp/npm-cache',
+                    '-e', 'TRACEFIX_SOURCE='+source_manifest,
+                    self.resolved_image_ids['app'], *self.profile.commands['prepare'])
+                self.workspace.check_frozen(snapshot)
+            except BaseException:
+                await self.close()
+                raise
         await self.docker('run', '-d', '--name', self.name, '--network', self.network, '--network-alias', 'app',
             '--label', 'tracefix.run='+self.run_id, '--user', container_user(),
             '--cap-drop=ALL', '--security-opt=no-new-privileges', '--pids-limit=128', '--memory=1g', '--cpus=2',
@@ -166,6 +182,8 @@ class DockerRunner:
     async def close(self):
         """幂等地清理应用、浏览器容器和专用网络。"""
         try:
+            if self.profile.commands.get('prepare'):
+                await self.docker('rm', '-f', self.name+'-prepare', check=False)
             await self.docker('rm', '-f', '-v', self.name, check=False)
             await self.docker('rm', '-f', self.name+'-browser', check=False)
             await self.docker('volume', 'rm', self.dependency_volume, check=False)

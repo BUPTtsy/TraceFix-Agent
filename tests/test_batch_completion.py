@@ -71,7 +71,7 @@ async def test_batch_fix_finishes_without_interactive_approval(tmp_path):
     assert finished.run_status == RunStatus.COMPLETED, finished.error
     assert finished.outcome == Outcome.FIX_VERIFIED
     assert finished.approval_ref is None
-    assert finished.local_branch is None
+    assert finished.local_branch == 'tracefix/' + state.run_id
     assert engine.store.approvals == {}
     assert len(finished.validation_refs) == 6
     assert finished.report_ref
@@ -80,6 +80,8 @@ async def test_batch_fix_finishes_without_interactive_approval(tmp_path):
     assert report["patch_verification"] == "verified"
     assert report["patch_available"] is True
     assert report["patch_diff_ref"]
+    assert report["repair_commit"] == engine.workspace.head()
+    assert engine.workspace.diff() == ''
     assert report["result_summary"]
     assert engine.runner.closed and engine.browser.closed
 
@@ -339,6 +341,14 @@ async def test_batch_final_report_rechecks_patch_and_validation_evidence(tmp_pat
     state.execution_mode = 'batch'
     original_finalize = engine.finalize
     original_get = engine.get
+    original_branch = engine.workspace.branch
+    commits = []
+
+    def record_branch(name):
+        commits.append(name)
+        return original_branch(name)
+
+    engine.workspace.branch = record_branch
 
     async def corrupt_before_final_report(current, next_node):
         if damage == 'changed_diff':
@@ -365,6 +375,29 @@ async def test_batch_final_report_rechecks_patch_and_validation_evidence(tmp_pat
     assert report['patch_verification'] != 'verified'
     assert report['error_details']['terminal_reason'] == 'final_verification_invalid'
     assert report['patch_diff_ref']
+    assert report['repair_commit'] is None
+    assert commits == []
+    assert engine.runner.closed and engine.browser.closed
+
+
+async def test_batch_commit_failure_is_terminal_and_reported(tmp_path):
+    engine, state = make_engine(tmp_path)
+    state.execution_mode = 'batch'
+    baseline = engine.workspace.head()
+
+    def fail_commit(name):
+        raise OSError('无法创建本地修复提交')
+
+    engine.workspace.branch = fail_commit
+    await engine.run(state)
+    finished = engine.store.load(state.run_id, state.scope_id)
+    report = engine.get(finished, finished.report_ref)
+    assert finished.run_status == RunStatus.FAILED
+    assert finished.outcome == Outcome.INFRA_FAILURE
+    assert report['patch_verification'] == 'unverified'
+    assert report['error_details']['terminal_reason'] == 'local_commit_failed'
+    assert report['repair_commit'] is None
+    assert engine.workspace.head() == baseline
     assert engine.runner.closed and engine.browser.closed
 
 
