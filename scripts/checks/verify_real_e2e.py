@@ -16,7 +16,7 @@ import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -193,6 +193,12 @@ def run_flow(args, output_path: Path) -> int:
     registry = run_root / "projects.json"
     compose_env = run_root / "compose.env"
     dsn, compose_env_contents = postgres_connection_config()
+    database_url = getattr(args, 'database_url', None) or os.getenv('TRACEFIX_E2E_DATABASE_URL')
+    if database_url:
+        dsn = database_url
+        parsed = urlsplit(dsn)
+        if parsed.scheme not in {'postgres', 'postgresql'} or not parsed.hostname or not parsed.path.strip('/'):
+            raise ValueError('--database-url 必须是包含独立数据库名称的 PostgreSQL DSN')
     python = str(PYTHON)
     docker = shutil.which("docker") or "docker"
     env = os.environ.copy()
@@ -283,6 +289,7 @@ def main(argv=None) -> int:
     parser.add_argument("--case", default="B01", choices=[f"B{i:02d}" for i in range(1, 13)])
     parser.add_argument("--required", action="store_true", help="缺少真实环境时以失败退出（CI 使用）")
     parser.add_argument("--preflight-only", action="store_true", help="仅检查前置条件，不执行真实修复")
+    parser.add_argument("--database-url", help="验收专用 PostgreSQL DSN；建议通过 TRACEFIX_E2E_DATABASE_URL 传入以避免密码出现在进程参数中")
     parser.add_argument("--spec", type=Path, default=ROOT / "profiles/persistence.spec.json",
                         help="在初始化和修复源码前保存快照的验收规范")
     parser.add_argument("--output", type=Path, default=ROOT / "artifacts/real-e2e/report.json")

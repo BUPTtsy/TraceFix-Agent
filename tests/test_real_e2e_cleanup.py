@@ -128,6 +128,45 @@ def test_real_e2e_uses_postgres_password_for_compose_and_dsn(monkeypatch):
     assert compose_env == 'POSTGRES_PASSWORD=pa:ss@word#1\n'
 
 
+@pytest.mark.parametrize('source', ['argument', 'environment'])
+def test_real_e2e_database_override_is_bound_to_agent_and_state(tmp_path, monkeypatch, source):
+    root = Path(__file__).resolve().parents[1]
+    module = runpy.run_path(str(root / 'scripts/checks/verify_real_e2e.py'))
+    run_flow = module['run_flow']
+    specification = tmp_path / 'spec.json'
+    specification.write_bytes((root / 'profiles/persistence.spec.json').read_bytes())
+    dsn = 'postgresql://tracefix:test@127.0.0.1:55432/tracefix_e2e_isolated'
+    monkeypatch.delenv('TRACEFIX_E2E_DATABASE_URL', raising=False)
+    if source == 'environment':
+        monkeypatch.setenv('TRACEFIX_E2E_DATABASE_URL', dsn)
+    calls = []
+
+    def command(arguments, **options):
+        arguments = [str(argument) for argument in arguments]
+        calls.append((arguments, options))
+        if 'bugboard/scripts/init_demo.py' in arguments:
+            assert options['env']['TRACEFIX_DATABASE_URL'] == dsn
+            Path(arguments[-1]).mkdir(parents=True)
+        if '--run' in arguments:
+            assert options['env']['TRACEFIX_DATABASE_URL'] == dsn
+            artifact = Path(options['env']['TRACEFIX_DATA']) / 'artifacts/bugboard/run_isolated'
+            artifact.mkdir(parents=True)
+            return SimpleNamespace(returncode=0, stdout='')
+        return SimpleNamespace(returncode=0, stdout='existing-postgres' if 'ps' in arguments else '')
+
+    def load_state(data_root, actual_dsn, run_id):
+        assert actual_dsn == dsn and run_id == 'run_isolated'
+        raise RuntimeError('isolated state boundary')
+
+    monkeypatch.setitem(run_flow.__globals__, 'ROOT', tmp_path)
+    monkeypatch.setitem(run_flow.__globals__, 'command', command)
+    monkeypatch.setitem(run_flow.__globals__, 'load_state', load_state)
+    with pytest.raises(RuntimeError, match='isolated state boundary'):
+        run_flow(SimpleNamespace(case='B01', spec=specification,
+                                database_url=dsn if source == 'argument' else None), tmp_path / 'report.json')
+    assert not any('down' in arguments for arguments, options in calls)
+
+
 @pytest.mark.parametrize('already_running', [False, True])
 def test_real_e2e_preserves_preexisting_postgres_on_failure(tmp_path, monkeypatch, already_running):
     root = Path(__file__).resolve().parents[1]
