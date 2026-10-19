@@ -1,4 +1,4 @@
-import {useCallback, useEffect, useState} from 'react';
+import {useCallback, useEffect, useRef, useState} from 'react';
 import {AgentStatus, DocumentDraft, loadAgentStatus, loadProjects, loadRuns, Project, Run} from '@tracefix/api-client';
 import {AgentDock} from '@tracefix/agent-ui';
 import {KnowledgePage} from '@tracefix/knowledge-ui';
@@ -6,27 +6,42 @@ import {RulesPage} from '@tracefix/rules-ui';
 import {RunList, RunsPage, statusLabel} from '@tracefix/runs-ui';
 import {outcomeLabel, serviceLabel} from '@tracefix/presentation';
 import {ProjectsPage} from './ProjectsPage';
+import {RepositoryPage} from './RepositoryPage';
+import {RepositoryRulesPage} from './RepositoryRulesPage';
 import './style.css';
 
-type Page = 'overview' | 'runs' | 'projects' | 'knowledge' | 'rules';
-const pages: {id: Page; label: string; icon: string; subtitle: string}[] = [
+type Page = 'overview' | 'runs' | 'projects' | 'repository' | 'repository-rules' | 'knowledge' | 'rules';
+interface Route {page: Page; target: string}
+const pages: {id: Page; label: string; icon: string; subtitle: string; parent?: Page; hidden?: boolean}[] = [
   {id: 'overview', label: '总览', icon: '◈', subtitle: '从一个目标开始，让每次验证与修复都有迹可循。'},
   {id: 'runs', label: '运行记录', icon: '⌁', subtitle: '查看真实的执行阶段、结果、日志与候选补丁。'},
   {id: 'projects', label: '项目空间', icon: '▱', subtitle: '管理目标项目的运行入口，连接项目、运行与经验。'},
+  {id: 'repository', label: '仓库注册', icon: '⊕', subtitle: '注册 GitHub 仓库，配置工作区准备方式、允许范围与验证命令。'},
+  {id: 'repository-rules', label: '配置规则', icon: '◇', subtitle: '为单个仓库勾选需要注入新运行的检测规则。', parent: 'projects', hidden: true},
   {id: 'knowledge', label: '知识库', icon: '▤', subtitle: '把修复方法和测试经验写成文档，让 Agent 在需要时找到它们。'},
   {id: 'rules', label: '统一规则管理', icon: '◇', subtitle: '集中维护检测规则，在各仓库配置中勾选需要生效的规则。'},
 ];
-function currentPage(): Page {return pages.find(page => '#' + page.id === window.location.hash)?.id || 'overview';}
+// 路由形如 #projects、#repository（注册）、#repository/<id>（编辑）、#repository-rules/<id>。
+function currentRoute(): Route {
+  const [name, ...rest] = window.location.hash.slice(1).split('/');
+  const page = pages.find(item => item.id === name)?.id || 'overview';
+  let target = '';
+  try {target = decodeURIComponent(rest.join('/'));} catch {}
+  return {page, target: page === 'repository' || page === 'repository-rules' ? target : ''};
+}
 
 export default function App() {
-  const [page, setPage] = useState<Page>(currentPage), [projects, setProjects] = useState<Project[]>([]);
+  const [route, setRoute] = useState<Route>(currentRoute), [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState(''), [runs, setRuns] = useState<Run[]>([]), [agent, setAgent] = useState<AgentStatus>({running: false});
   const [connected, setConnected] = useState(false), [error, setError] = useState(''), [syncedAt, setSyncedAt] = useState('');
-  const [selectedRun, setSelectedRun] = useState(''), [documentId, setDocumentId] = useState(''), [documentDraft, setDocumentDraft] = useState<DocumentDraft | null>(null), [dirty, setDirty] = useState(false);
-  const [documentRequest, setDocumentRequest] = useState(0);
+  const [selectedRun, setSelectedRun] = useState(''), [documentId, setDocumentId] = useState(''), [documentDraft, setDocumentDraft] = useState<DocumentDraft | null>(null);
+  const [documentRequest, setDocumentRequest] = useState(0), [projectsLoaded, setProjectsLoaded] = useState(false), [flash, setFlash] = useState('');
+  const page = route.page, dirtyRef = useRef(false), routeHash = useRef(window.location.hash);
+  // 脏状态只用于离开确认，用 ref 保存，保存后立即跳转时 hashchange 能读到最新值。
+  const markDirty = useCallback((value: boolean) => {dirtyRef.current = value;}, []);
   const report = useCallback((error: unknown) => setError(error instanceof Error ? error.message : String(error)), []);
   const refreshProjects = useCallback(async () => {
-    const records = await loadProjects(); setProjects(records);
+    const records = await loadProjects(); setProjects(records); setProjectsLoaded(true);
     setProjectId(previous => records.some(project => project.id === previous) ? previous : records[0]?.id || '');
   }, []);
   useEffect(() => {refreshProjects().catch(report); const timer = window.setInterval(() => refreshProjects().catch(report), 15000); return () => window.clearInterval(timer);}, [refreshProjects, report]);
@@ -43,16 +58,18 @@ export default function App() {
   }, [report]);
   useEffect(() => {
     const change = () => {
-      if (dirty && !window.confirm('更改尚未保存，确认离开并放弃更改？')) {window.history.replaceState(null, '', '#' + page); return;}
-      setDirty(false); setPage(currentPage());
+      if (dirtyRef.current && !window.confirm('更改尚未保存，确认离开并放弃更改？')) {window.history.replaceState(null, '', routeHash.current || '#overview'); return;}
+      routeHash.current = window.location.hash; markDirty(false); setRoute(currentRoute());
     };
     window.addEventListener('hashchange', change); return () => window.removeEventListener('hashchange', change);
-  }, [dirty, page]);
-  function navigate(next: Page) {window.location.hash = next;}
+  }, [markDirty]);
+  // 规则配置页以路由中的仓库为准，同步当前项目。
+  useEffect(() => {if (route.page === 'repository-rules' && route.target && projects.some(item => item.id === route.target)) setProjectId(route.target);}, [route, projects]);
+  function navigate(next: string, message = '') {setFlash(message); window.location.hash = next;}
   function selectProject(id: string) {
     if (id === projectId) return true;
-    if (dirty && !window.confirm('切换项目会放弃未保存的更改，确认继续？')) return false;
-    setDirty(false); setProjectId(id); setDocumentId(''); setDocumentDraft(null); setSelectedRun('');
+    if (dirtyRef.current && !window.confirm('切换项目会放弃未保存的更改，确认继续？')) return false;
+    markDirty(false); setProjectId(id); setDocumentId(''); setDocumentDraft(null); setSelectedRun('');
     return true;
   }
   function openRun(run: Run) {if (selectProject(run.projectId)) {setSelectedRun(run.id); navigate('runs');}}
@@ -63,19 +80,21 @@ export default function App() {
     navigate('knowledge');
   }
   const project = projects.find(item => item.id === projectId), scopedRuns = runs.filter(run => run.projectId === projectId);
-  const heading = pages.find(item => item.id === page)!;
+  const heading = pages.find(item => item.id === page)!, parent = pages.find(item => item.id === heading.parent);
+  const title = page === 'repository' && route.target ? '编辑仓库' : heading.label;
   return <div className="app-shell">
     <aside className="sidebar">
       <a href="#overview" className="brand"><span className="brand-mark" aria-hidden="true">✦</span>trace<span>fix</span></a>
       <div className="workspace-label"><span className="workspace-avatar" aria-hidden="true">T</span><div><strong>TraceFix workspace</strong><small>Agent 控制台</small></div></div>
-      <p className="nav-label">工作台</p><nav aria-label="工作台导航">{pages.map(item => <a href={'#' + item.id} key={item.id} className={page === item.id ? 'active' : ''} aria-current={page === item.id ? 'page' : undefined}><span aria-hidden="true">{item.icon}</span>{item.label}</a>)}</nav>
+      <p className="nav-label">工作台</p><nav aria-label="工作台导航">{pages.filter(item => !item.hidden).map(item => <a href={'#' + item.id} key={item.id} className={page === item.id || heading.parent === item.id ? 'active' : ''} aria-current={page === item.id ? 'page' : undefined}><span aria-hidden="true">{item.icon}</span>{item.label}</a>)}</nav>
       <p className="nav-label">已注册项目 <span>{projects.length}</span></p><div className="sidebar-projects">{projects.map(item => <button className={projectId === item.id ? 'active' : ''} key={item.id} onClick={() => {if (selectProject(item.id)) navigate('projects');}} aria-pressed={projectId === item.id} title={item.ready ? item.id + '：配置就绪' : item.id + '：待配置'}><span className={'project-dot ' + (item.ready ? 'ready' : '')} aria-hidden="true"/>{item.id}</button>)}{!projects.length && <small>暂无已注册项目</small>}</div>
       <div className="sidebar-bottom"><span>LOCAL WORKSPACE</span><p>控制台与目标仓库独立运行</p><small>TraceFix · v0.1.1</small></div>
     </aside>
     <main className="main-content">
-      <header className="topbar"><div>工作台 <span aria-hidden="true">/</span> <strong>{heading.label}</strong></div><span className={'connection ' + (connected ? 'online' : '')} aria-live="polite"><i aria-hidden="true"/>{connected ? 'API 已连接' : 'API 连接中断或连接中'}</span></header>
-      <div className="page-heading"><div><p className="kicker">YOUR AGENT WORKSPACE</p><h1>{heading.label}<span aria-hidden="true"> /</span></h1><p>{heading.subtitle}</p></div>{page !== 'rules' && <label className="project-picker">当前项目<select aria-label="当前项目" value={projectId} onChange={event => selectProject(event.target.value)}><option value="" disabled>选择项目</option>{projects.map(item => <option key={item.id} value={item.id}>{item.id}</option>)}</select></label>}</div>
+      <header className="topbar"><div>工作台 <span aria-hidden="true">/</span> {parent && <><a href={'#' + parent.id}>{parent.label}</a> <span aria-hidden="true">/</span> </>}<strong>{title}{route.target ? ' · ' + route.target : ''}</strong></div><span className={'connection ' + (connected ? 'online' : '')} aria-live="polite"><i aria-hidden="true"/>{connected ? 'API 已连接' : 'API 连接中断或连接中'}</span></header>
+      <div className="page-heading"><div><p className="kicker">YOUR AGENT WORKSPACE</p><h1>{title}<span aria-hidden="true"> /</span></h1><p>{heading.subtitle}</p></div>{!['rules', 'repository', 'repository-rules'].includes(page) && <label className="project-picker">当前项目<select aria-label="当前项目" value={projectId} onChange={event => selectProject(event.target.value)}><option value="" disabled>选择项目</option>{projects.map(item => <option key={item.id} value={item.id}>{item.id}</option>)}</select></label>}</div>
       {error && <div className="error-banner" role="alert"><span>{error}</span><button aria-label="关闭错误提示" onClick={() => setError('')}>×</button></div>}
+      {flash && <div className="notice" role="status">{flash}</div>}
       {!connected && <div className="notice">正在尝试连接后端。已有数据可能已过期，连接恢复后会自动刷新。</div>}
       {page === 'overview' && <>
         <section className="metric-grid"><article className="card metric"><span>项目运行总数</span><strong>{scopedRuns.length}</strong><small>来自持久化运行记录</small></article><article className="card metric"><span>已验证修复</span><strong>{scopedRuns.filter(run => run.outcome === 'FIX_VERIFIED').length}</strong><small>仅统计 FIX_VERIFIED 结果</small></article><article className="card metric"><span>知识文档</span><strong>{project?.documentCount ?? 0}</strong><small>本项目与全局文档，含停用草稿</small></article></section>
@@ -84,9 +103,11 @@ export default function App() {
         <nav className="journey" aria-label="推荐流程"><button onClick={() => navigate('projects')}><b>01</b><strong>选择目标项目</strong><span>确认仓库与运行配置</span></button><div aria-hidden="true">→</div><button onClick={() => navigate('runs')}><b>02</b><strong>检查运行结果</strong><span>从日志追溯到补丁</span></button><div aria-hidden="true">→</div><button onClick={() => navigate('knowledge')}><b>03</b><strong>沉淀为知识</strong><span>积累可检索的经验</span></button></nav>
       </>}
       {page === 'runs' && <RunsPage runs={scopedRuns} selectedId={selectedRun} onSelect={setSelectedRun} onDocument={openDocument} onCapture={captureExperience} report={report}/>}
-      {page === 'projects' && <ProjectsPage projects={projects} projectId={projectId} onSelect={selectProject} onSaved={async id => {await refreshProjects(); if (id) setProjectId(id); setDocumentId(''); setDocumentDraft(null); setSelectedRun('');}} onDirty={setDirty} onNavigate={navigate} report={report}/>}
-      {page === 'knowledge' && <KnowledgePage key={projectId} projectId={projectId} projects={projects} documentId={documentId} documentRequest={documentRequest} initialDraft={documentDraft} onDirty={setDirty} onSaved={() => {setDocumentDraft(null); refreshProjects().catch(report);}} onRun={id => {setSelectedRun(id); navigate('runs');}} report={report}/>}
-      {page === 'rules' && <RulesPage onDirty={setDirty} report={report}/>}
+      {page === 'projects' && <ProjectsPage projects={projects} projectId={projectId} onSelect={selectProject} onRemoved={async () => {setFlash(''); await refreshProjects(); setDocumentId(''); setDocumentDraft(null); setSelectedRun('');}} onNavigate={navigate} report={report}/>}
+      {page === 'repository' && <RepositoryPage key={route.target || 'new'} projects={projects} editId={route.target} onSaved={async id => {await refreshProjects(); setProjectId(id); setDocumentId(''); setDocumentDraft(null); setSelectedRun('');}} onDirty={markDirty} onNavigate={navigate} report={report}/>}
+      {page === 'repository-rules' && <RepositoryRulesPage key={route.target} projectId={route.target} project={projects.find(item => item.id === route.target)} projectsLoaded={projectsLoaded} onDirty={markDirty} onNavigate={navigate} report={report}/>}
+      {page === 'knowledge' && <KnowledgePage key={projectId} projectId={projectId} projects={projects} documentId={documentId} documentRequest={documentRequest} initialDraft={documentDraft} onDirty={markDirty} onSaved={() => {setDocumentDraft(null); refreshProjects().catch(report);}} onRun={id => {setSelectedRun(id); navigate('runs');}} report={report}/>}
+      {page === 'rules' && <RulesPage onDirty={markDirty} report={report}/>}
       <footer className="page-footer"><span>TRACEFIX · Evidence before confidence</span><span>{syncedAt ? `上次同步 ${syncedAt}` : '等待首次同步'}{agent.running && ` · ${statusLabel(agent.status || 'running')}`}</span></footer>
     </main>
     <AgentDock project={project} agent={agent} onStarted={status => {setAgent(status); if (status.id) setSelectedRun(status.id);}} onRun={() => {if (agent.projectId && !selectProject(agent.projectId)) return; if (agent.id) setSelectedRun(agent.id); navigate('runs');}} onDocument={openDocument} report={report}/>

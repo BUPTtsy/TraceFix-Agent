@@ -42,6 +42,8 @@ try {
   await page.waitForLoadState('networkidle');
   const projectId = 'repository-ui-' + Date.now();
   await page.getByRole('button', {name: '＋ 注册仓库'}).click();
+  await page.waitForURL(/#repository$/);
+  await page.getByRole('heading', {name: '注册远程仓库'}).waitFor();
   await page.getByLabel('项目 ID', {exact: true}).fill(projectId);
   await page.getByLabel('允许修改的文件').fill('src/**\nserver/**');
   const savedResponse = page.waitForResponse(response => response.url().endsWith('/api/v1/repositories') && response.request().method() === 'POST', {timeout: 180000});
@@ -58,6 +60,8 @@ try {
   await page.waitForLoadState('networkidle');
   await page.getByLabel('当前项目', {exact: true}).selectOption(projectId);
   await page.getByRole('button', {name: '编辑仓库配置', exact: true}).click();
+  await page.waitForURL(new RegExp('#repository/' + projectId + '$'));
+  await page.getByLabel('默认分支或 ref').and(page.locator(':enabled')).waitFor();
   assert.equal(await page.getByLabel('代码获取方式').inputValue(), 'managed');
   assert.equal(await page.getByLabel('默认分支或 ref').inputValue(), 'main');
   await page.getByLabel('默认分支或 ref').fill('missing-ref-for-ui-validation');
@@ -71,17 +75,23 @@ try {
   await page.getByLabel('默认分支或 ref').fill('main');
   await page.getByRole('button', {name: '保存仓库配置', exact: true}).click();
   await page.getByRole('status').filter({hasText: '仓库配置已保存'}).waitFor();
-  await page.getByRole('button', {name: '管理检测规则', exact: true}).click();
-  await page.getByRole('heading', {name: /检测规则/, level: 1}).waitFor();
+  await page.getByRole('button', {name: '配置规则', exact: true}).click();
+  await page.waitForURL(new RegExp('#repository-rules/' + projectId + '$'));
+  await page.getByRole('heading', {name: /配置规则/, level: 1}).waitFor();
+  await page.getByRole('button', {name: '保存规则配置', exact: true}).waitFor();
+  await page.getByRole('button', {name: '统一规则管理', exact: true}).click();
+  await page.getByRole('heading', {name: /统一规则管理/, level: 1}).waitFor();
   await page.getByRole('navigation').getByRole('link', {name: /项目空间/}).click();
   await page.getByRole('button', {name: '编辑仓库配置', exact: true}).click();
+  await page.getByLabel('默认分支或 ref').and(page.locator(':enabled')).waitFor();
   await page.getByLabel('默认分支或 ref').focus();
   await page.keyboard.press('Tab');
   assert.equal(await page.getByLabel('GitHub 仓库地址').evaluate(element => element === document.activeElement), true);
   await page.setViewportSize({width: 390, height: 844});
   await page.screenshot({path: path.join(evidenceRoot, 'repository-mobile.png'), fullPage: true});
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
-  await page.getByRole('button', {name: '关闭', exact: true}).click();
+  await page.getByRole('button', {name: '返回项目空间', exact: true}).click();
+  await page.getByRole('heading', {name: projectId + ' 的运行配置'}).waitFor();
   let taskPayload;
   await page.route('**/api/v1/tasks', async route => {
     if (route.request().method() !== 'POST') return route.continue();
@@ -110,7 +120,7 @@ try {
   await page.locator('.patch-diff').filter({hasText: 'fixture repair'}).waitFor();
   await page.screenshot({path: path.join(evidenceRoot, 'repository-desktop.png'), fullPage: true});
   assert.deepEqual(errors, []);
-  fs.writeFileSync(path.join(evidenceRoot, 'result.json'), JSON.stringify({passed: true, projectId, repository: {root: saved.root, commit: saved.commit}, checks: ['真实远程 clone 与注册', '保存与全新加载持久化', '真实无效 ref 错误', '规则入口', '键盘 Tab', '390px 无横向溢出', '模拟任务启动 payload，未调用模型', '模拟完成 Run 的摘要、commit、发布状态与 diff 展示'], taskPayload}, null, 2));
+  fs.writeFileSync(path.join(evidenceRoot, 'result.json'), JSON.stringify({passed: true, projectId, repository: {root: saved.root, commit: saved.commit}, checks: ['真实远程 clone 与注册', '保存与全新加载持久化', '真实无效 ref 错误', '独立仓库注册/编辑页', '独立仓库规则配置页', '规则入口', '键盘 Tab', '390px 无横向溢出', '模拟任务启动 payload，未调用模型', '模拟完成 Run 的摘要、commit、发布状态与 diff 展示'], taskPayload}, null, 2));
   console.log('通过：真实仓库注册/clone、刷新持久化、错误回显、规则导航、键盘与窄屏；Task POST 使用 mock，未启动模型。');
   console.log(evidenceRoot);
 } finally {
