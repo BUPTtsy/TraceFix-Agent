@@ -16,8 +16,12 @@ $env:TRACEFIX_PROJECTS = Join-Path $projectRoot '.tracefix/interface-projects.ya
 $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
 $repositoryRoot = Join-Path $projectRoot '.tracefix/repositories'
-$env:TRACEFIX_REPOSITORY_ROOTS = ConvertTo-Json -InputObject @($repositoryRoot) -Compress
-$env:TRACEFIX_SERVICE_GITHUB_CREDENTIAL_MAP = '{"deployment/test-bug":"TRACEFIX_GITHUB_TOKEN"}'
+if ($null -eq $env:TRACEFIX_REPOSITORY_ROOTS) {
+    $env:TRACEFIX_REPOSITORY_ROOTS = ConvertTo-Json -InputObject @($repositoryRoot) -Compress
+}
+if ($null -eq $env:TRACEFIX_SERVICE_GITHUB_CREDENTIAL_MAP) {
+    $env:TRACEFIX_SERVICE_GITHUB_CREDENTIAL_MAP = '{"deployment/test-bug":"TRACEFIX_GITHUB_TOKEN"}'
+}
 $registrationArguments = @(
     (Join-Path $projectRoot 'scripts/github/configure_test_repository.py'),
     '--registry', $env:TRACEFIX_PROJECTS, '--ensure-existing'
