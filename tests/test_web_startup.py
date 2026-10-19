@@ -1,6 +1,10 @@
 import importlib.util
+import base64
+import os
 import signal
 import socket
+import shutil
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +21,42 @@ def load_tool(name):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize('shell_name', ['powershell.exe', 'pwsh.exe'])
+def test_interface_launcher_parses_and_reports_missing_environment_in_windows_shell(tmp_path, shell_name):
+    shell = shutil.which(shell_name)
+    if shell is None:
+        pytest.skip(f'{shell_name} is unavailable')
+    original = Path(__file__).resolve().parents[1] / 'scripts/bootstrap/start-interface.ps1'
+    original.read_bytes().decode('ascii')
+    destination = tmp_path / 'scripts/bootstrap/start-interface.ps1'
+    destination.parent.mkdir(parents=True)
+    shutil.copyfile(original, destination)
+    command = (
+        "$ErrorActionPreference='Stop'; "
+        "$launcher=$env:TRACEFIX_TEST_LAUNCHER; "
+        "$parseTokens=$null; $parseErrors=$null; "
+        "[System.Management.Automation.Language.Parser]::ParseFile("
+        "$launcher,[ref]$parseTokens,[ref]$parseErrors) | Out-Null; "
+        "if($parseErrors.Count){Write-Output 'TRACEFIX_PARSER_ERROR'; exit 3}; "
+        "try { & $launcher; exit 4 } catch { "
+        "if($_.Exception.Message -match 'scripts/bootstrap/start.ps1 --web'){"
+        "Write-Output ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($_.Exception.Message))); "
+        "Write-Output 'TRACEFIX_MISSING_ENVIRONMENT'; exit 0}; "
+        "Write-Output $_.Exception.GetType().FullName; exit 5 }"
+    )
+    environment = {**os.environ, 'TRACEFIX_TEST_LAUNCHER': str(destination)}
+    result = subprocess.run([shell, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
+                            env=environment, capture_output=True, text=True,
+                            encoding='utf-8', errors='replace', timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'TRACEFIX_MISSING_ENVIRONMENT' in result.stdout
+    encoded_message = result.stdout.splitlines()[0]
+    message = base64.b64decode(encoded_message).decode('utf-8')
+    assert message == '请先执行 scripts/bootstrap/start.ps1 --web 完成首次环境安装和镜像构建。'
+    assert 'TRACEFIX_PARSER_ERROR' not in result.stdout
+    assert 'ParserError' not in result.stdout + result.stderr
 
 
 def bootstrap_fixture(tmp_path, monkeypatch):
