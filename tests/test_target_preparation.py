@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -100,8 +101,8 @@ def registration_tool():
     return module
 
 
-@pytest.mark.parametrize('exists', [False, True])
-def test_configuration_uses_managed_registry_and_preserves_other_projects(tmp_path, monkeypatch, exists):
+@pytest.mark.parametrize('exists,ensure_existing', [(False, False), (True, False), (False, True)])
+def test_configuration_uses_managed_registry_and_preserves_other_projects(tmp_path, monkeypatch, exists, ensure_existing):
     tool = registration_tool()
     calls = []
 
@@ -126,8 +127,11 @@ def test_configuration_uses_managed_registry_and_preserves_other_projects(tmp_pa
     monkeypatch.setattr(tool, 'RepositoryRegistry', Registry)
     monkeypatch.setattr(tool, 'load_dotenv', lambda *args, **options: None)
     root = tmp_path / 'repositories/test-bug-repo'
-    assert tool.main(['--registry', str(tmp_path / 'projects.yaml'), '--data', str(tmp_path),
-                      '--root', str(root)]) == 0
+    arguments = ['--registry', str(tmp_path / 'projects.yaml'), '--data', str(tmp_path),
+                 '--root', str(root)]
+    if ensure_existing:
+        arguments.append('--ensure-existing')
+    assert tool.main(arguments) == 0
     assert calls[0][2]['authorized_roots'] == [root.parent]
     operation, fields = calls[1]
     assert operation == ('update' if exists else 'register')
@@ -148,3 +152,49 @@ def test_configuration_rejects_publish_without_deployment_credential(monkeypatch
         tool.main(['--publish-branch'])
     assert error.value.code == 2
     assert 'credential_ref' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('publish', [False, True])
+def test_ensure_existing_preserves_registered_ref_root_and_commands(tmp_path, monkeypatch, publish):
+    tool = registration_tool()
+    from tracefix.config import load_projects
+    from tracefix.repository_registry import RepositoryRegistry
+
+    source = tmp_path / 'custom-target'
+    source.mkdir()
+    helper.git(tmp_path, 'init', '-q', '-b', 'custom-branch', str(source))
+    (source / 'application.txt').write_text('custom source\n', encoding='utf-8')
+    helper.git(source, 'add', '.')
+    helper.git(source, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@localhost',
+               'commit', '-qm', '创建自定义仓库配置基线')
+    helper.git(source, 'remote', 'add', 'origin', 'https://github.com/BUPTtsy/Test-Bug-repo.git')
+    monkeypatch.setattr(RepositoryRegistry, 'prepare_codegraph', lambda *args: None)
+    monkeypatch.setattr(tool, 'load_dotenv', lambda *args, **options: None)
+    monkeypatch.setenv('TRACEFIX_REPOSITORY_ROOTS', json.dumps([str(tmp_path)]))
+    if publish:
+        monkeypatch.setenv('TRACEFIX_SERVICE_GITHUB_CREDENTIAL_MAP', '{"custom/reference":"CUSTOM_TEST_GITHUB_TOKEN"}')
+        monkeypatch.setenv('CUSTOM_TEST_GITHUB_TOKEN', 'fixture-only-token')
+    else:
+        monkeypatch.delenv('TRACEFIX_SERVICE_GITHUB_CREDENTIAL_MAP', raising=False)
+    registry_path = tmp_path / 'projects.yaml'
+    registry = RepositoryRegistry(registry_path, authorized_roots=[tmp_path], data_root=tmp_path / 'data')
+    fields = tool.registration_fields(source, publish_branch=not publish, credential_ref='custom/reference')
+    fields.update(checkout_mode='existing', default_ref='custom-branch')
+    fields['profile']['commands']['unit'] = ['node', '--test', 'custom tests/assertion.test.mjs']
+    fields['profile']['commands']['prepare'] = ['node', '-e', 'console.log("custom preparation")']
+    baseline = registry.register(fields)
+    original_head = helper.git(source, 'rev-parse', 'HEAD')
+    arguments = ['--registry', str(registry_path), '--data', str(tmp_path / 'data'), '--ensure-existing']
+    if publish:
+        arguments.append('--publish-branch')
+    assert tool.main(arguments) == 0
+    configured = load_projects(registry_path)['test-bug-repo'].repository_config
+    assert configured['publish_branch'] is publish
+    assert configured['default_ref'] == 'custom-branch'
+    assert configured['root'] == str(source.resolve())
+    assert configured['credential_ref'] == 'custom/reference'
+    assert configured['profile']['commands'] == baseline['profile']['commands']
+    assert helper.git(source, 'rev-parse', 'HEAD') == original_head
+    first_contents = registry_path.read_bytes()
+    assert tool.main(arguments) == 0
+    assert registry_path.read_bytes() == first_contents

@@ -20,7 +20,7 @@ $env:TRACEFIX_REPOSITORY_ROOTS = ConvertTo-Json -InputObject @($repositoryRoot) 
 $env:TRACEFIX_SERVICE_GITHUB_CREDENTIAL_MAP = '{"deployment/test-bug":"TRACEFIX_GITHUB_TOKEN"}'
 $registrationArguments = @(
     (Join-Path $projectRoot 'scripts/github/configure_test_repository.py'),
-    '--registry', $env:TRACEFIX_PROJECTS
+    '--registry', $env:TRACEFIX_PROJECTS, '--ensure-existing'
 )
 if (-not $NoPublish) {
     $registrationArguments += '--publish-branch'

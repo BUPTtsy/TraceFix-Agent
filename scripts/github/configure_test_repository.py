@@ -44,6 +44,7 @@ def main(argv=None):
     parser.add_argument('--root', type=Path, default=ROOT / '.tracefix/repositories/test-bug-repo')
     parser.add_argument('--publish-branch', action='store_true')
     parser.add_argument('--credential-ref', default='deployment/test-bug')
+    parser.add_argument('--ensure-existing', action='store_true', help='保留已注册仓库配置，仅同步本次发布开关')
     parser.add_argument('--print-config', action='store_true', help='仅预览配置，不拉取或注册')
     args = parser.parse_args(argv)
     load_dotenv(ROOT / '.env', override=False, encoding='utf-8-sig')
@@ -52,22 +53,29 @@ def main(argv=None):
     if args.print_config:
         print(json.dumps(fields, ensure_ascii=False, indent=2))
         return 0
+    registry = RepositoryRegistry(args.registry.resolve(),
+                                  authorized_roots=None if os.getenv('TRACEFIX_REPOSITORY_ROOTS') else [root.parent],
+                                  data_root=args.data.resolve())
+    try:
+        existing = registry.get(fields['repo_id'])
+    except RepositoryError as error:
+        if error.code != 'REPOSITORY_NOT_FOUND':
+            raise
+        existing = None
+    credential_ref = existing.get('credential_ref') if args.ensure_existing and existing else args.credential_ref
     if args.publish_branch:
         try:
             mapping = json.loads(os.getenv('TRACEFIX_SERVICE_GITHUB_CREDENTIAL_MAP', '{}'))
         except json.JSONDecodeError:
             parser.error('TRACEFIX_SERVICE_GITHUB_CREDENTIAL_MAP 必须是有效 JSON 对象')
-        variable = mapping.get(args.credential_ref) if isinstance(mapping, dict) else None
+        variable = mapping.get(credential_ref) if isinstance(mapping, dict) else None
         if not isinstance(variable, str) or not os.getenv(variable, '').strip():
             parser.error('启用分支发布前，请在部署环境映射 credential_ref 到已配置的 GitHub token 环境变量')
-    registry = RepositoryRegistry(args.registry.resolve(), authorized_roots=[root.parent],
-                                  data_root=args.data.resolve())
-    try:
-        registry.get(fields['repo_id'])
-    except RepositoryError as error:
-        if error.code != 'REPOSITORY_NOT_FOUND':
-            raise
+    if existing is None:
         configured = registry.register(fields)
+    elif args.ensure_existing:
+        configured = (existing if existing.get('publish_branch', False) == args.publish_branch else
+                      registry.update(fields['repo_id'], {'publish_branch': args.publish_branch}))
     else:
         configured = registry.update(fields['repo_id'], fields)
     print(json.dumps({'project_id': configured['repo_id'], 'root': configured['root'],
