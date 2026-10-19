@@ -10,6 +10,32 @@ from tracefix.model.gateway import Gateway, ModelError
 from tracefix.runtime.contracts import BrowserAction
 from tracefix.model.chat import stream_chat
 from tracefix.model import protocol
+from tracefix.tools.core import ToolSpec
+
+
+@pytest.mark.parametrize('base_url,model_name,thinking,expected_choice', [
+    ('https://api.deepseek.com', 'deepseek-chat', 'enabled', 'auto'),
+    ('https://api.deepseek.com', 'deepseek-v4-flash', 'enabled', 'auto'),
+    ('https://api.deepseek.com', 'deepseek-chat', 'disabled', 'required'),
+    ('https://compatible.test', 'compatible-chat', 'enabled', 'required'),
+])
+async def test_thinking_provider_respects_tool_forcing_capability(
+        monkeypatch, base_url, model_name, thinking, expected_choice):
+    submission = ToolSpec('browser.submit', '提交浏览器结论', BrowserAction,
+        submission=True, submission_schema=BrowserAction, side_effect='write', idempotency_key=lambda value: 'fixture')
+    output_call = {'index': 0, 'id': 'final-1', 'type': 'function',
+        'function': {'name': 'final_result', 'arguments': '{"kind":"finish"}'}}
+    requests = use_transport(monkeypatch, [stream_response([
+        event({'reasoning_content': '检查工具选择兼容性'}), event({'tool_calls': [output_call]}),
+        event(finish='tool_calls'), event(usage={'total_tokens': 3}), b'data: [DONE]\n\n',
+    ])])
+    result = await Gateway(key='ci', base_url=base_url, text_model=model_name,
+        thinking=thinking, stream=True).generate(BrowserAction, {}, tools=[submission])
+    assert result.value.kind == 'finish'
+    assert requests[0]['tool_choice'] == expected_choice
+    assert requests[0]['thinking'] == {'type': thinking}
+    assert {'final_result', submission.wire_name} <= {
+        tool['function']['name'] for tool in requests[0]['tools']}
 
 
 def compressed(payload, encoding):

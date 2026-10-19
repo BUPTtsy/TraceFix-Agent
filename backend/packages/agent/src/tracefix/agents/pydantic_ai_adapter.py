@@ -9,6 +9,7 @@ import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING, TypeVar
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -204,6 +205,8 @@ class PydanticAIAdapter:
             try:
                 from pydantic_ai.models.openai import OpenAIChatModel
                 from pydantic_ai.providers.openai import OpenAIProvider
+                from pydantic_ai.providers.deepseek import DeepSeekProvider
+                from pydantic_ai.profiles.openai import OpenAIModelProfile
                 from openai import AsyncOpenAI
                 from tracefix.model.protocol import create_http_client, RequestBoundary
                 boundary = RequestBoundary(self.model, schema, context, tool_registry,
@@ -212,14 +215,18 @@ class PydanticAIAdapter:
                         'on_event': on_event, 'initial_history': copy.deepcopy(trace.messages),
                         'framework_output_tool_names': framework_output_tool_names})
                 client = create_http_client(boundary)
-                provider = OpenAIProvider(openai_client=AsyncOpenAI(base_url=self.model.base_url,
+                is_deepseek = urlsplit(self.model.base_url).hostname == 'api.deepseek.com'
+                provider_type = DeepSeekProvider if is_deepseek else OpenAIProvider
+                provider = provider_type(openai_client=AsyncOpenAI(base_url=self.model.base_url,
                     api_key=self.model.key, http_client=client, max_retries=0))
                 settings = {'max_tokens': self.model.max_output_tokens}
                 if self.model.thinking is not None:
                     settings['extra_body'] = {'thinking': {'type': self.model.thinking}}
-                return OpenAIChatModel(
-                    self.model.vision_model if image and self.model.vision_model else self.model.text_model,
-                    provider=provider, settings=settings)
+                model_name = self.model.vision_model if image and self.model.vision_model else self.model.text_model
+                profile = provider.model_profile(model_name) if is_deepseek else None
+                if is_deepseek and self.model.thinking == 'enabled':
+                    profile = OpenAIModelProfile(openai_supports_tool_choice_required=False).update(profile)
+                return OpenAIChatModel(model_name, provider=provider, settings=settings, profile=profile)
             except PydanticAIAdapterError:
                 raise
             except Exception as error:
