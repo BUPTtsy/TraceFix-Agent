@@ -47,6 +47,7 @@ tests/*
 !tests/test_code_analysis_tool.py
 !tests/test_target_preparation.py
 !tests/test_knowledge_training.py
+!tests/test_console_knowledge.py
 !tests/test_repository_publication.py
 !backend/apps/console-api/tests/
 !backend/apps/console-api/tests/**
