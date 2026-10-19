@@ -25,6 +25,7 @@ from tracefix.service.contracts import ServiceRequest
 from tracefix.service.finding import (RunBoundFindings, finding_repair_state,
                                      strict_acceptance_adapter, validate_acceptance)
 from tracefix.service.resources import RunServices
+from tracefix.service.publication import prepare_publication
 from tracefix.service.results import (ServiceError, TERMINAL_STATUSES, failure_result,
                                      preserve_report_diff, serialize_result)
 from tracefix.storage.artifacts import redact
@@ -272,6 +273,23 @@ async def execute_request(request, settings, *, session_factory=Session,
                 except Exception:
                     pass
             result['cleanup_errors'] = services.cleanup_errors
+        if (session is not None and result.get('outcome') == 'FIX_VERIFIED'
+                and result.get('run_status') == 'COMPLETED' and result.get('patch_verification') == 'verified'):
+            publication = await asyncio.to_thread(prepare_publication, result,
+                request.repository_snapshot.repository_config, settings, run_id=request.run_id)
+            try:
+                latest = session.state()
+                report = session.artifacts.json(latest.scope_id, latest.run_id, latest.report_ref)
+                report['publication'] = publication
+                latest.report_ref = session.artifacts.put(latest.scope_id, latest.run_id, report, label='服务发布报告')
+                session.store.save(latest)
+                result = serialize_result(latest, session.artifacts, task_id=request.task_id, repo_id=request.repo_id)
+            except Exception:
+                result['publication'] = {**publication, 'status': 'failed', 'error': {'code': 'publication_report_failed'}}
+                if isinstance(result.get('report'), dict):
+                    result['report'] = {**result['report'], 'publication': result['publication']}
+                result['branch'] = publication.get('branch') or result.get('branch')
+                result['commit'] = publication.get('commit') or result.get('commit')
         try:
             await resources.aclose()
         except Exception:
@@ -280,7 +298,8 @@ async def execute_request(request, settings, *, session_factory=Session,
             try:
                 documents.update_run(request.run_id, {'status': result['run_status'].lower(),
                     'outcome': result['outcome'], 'phase': 'FINALIZE', 'reportRef': result['report_ref'],
-                    'error': result['error'], 'finishedAt': timestamp(), 'pid': None})
+                    'error': result['error'], 'finishedAt': timestamp(), 'pid': None,
+                    'publication': result.get('publication')})
             except Exception:
                 result.update(run_status='FAILED', outcome='INFRA_FAILURE', error={'code': 'run_index_failed'})
     return safe_result(result, settings)

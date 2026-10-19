@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import os
 import re
 import subprocess
@@ -41,9 +42,18 @@ def _git_prefix() -> list[str]:
 
 
 def run_git(root: Path | None, *args: str, input_data: bytes | None = None,
-            timeout: int = 30, check: bool = True, identity: tuple[str, str] | None = None) -> bytes:
+            timeout: int = 30, check: bool = True, identity: tuple[str, str] | None = None,
+            github_token: str | None = None, local_clone: bool = False) -> bytes:
     command = _git_prefix()
     environment = safe_git_environment()
+    if local_clone:
+        if root is not None or len(args) != 5 or args[:3] != ('clone', '--no-hardlinks', '--'):
+            raise PermissionError('本地 clone 只允许独立复制受信源仓库')
+        repository_root(Path(args[3]))
+        destination = plain_root(Path(args[4]))
+        if destination.exists():
+            raise PermissionError('发布 checkout 必须使用新目录')
+        command.extend(['-c', 'protocol.file.allow=always'])
     initializing = bool(args) and args[0] == 'init'
     if root is not None:
         root = plain_root(root)
@@ -85,10 +95,29 @@ def run_git(root: Path | None, *args: str, input_data: bytes | None = None,
     if identity:
         environment.update(GIT_AUTHOR_NAME=identity[0], GIT_AUTHOR_EMAIL=identity[1],
                            GIT_COMMITTER_NAME=identity[0], GIT_COMMITTER_EMAIL=identity[1])
+    authorization = None
+    if github_token is not None:
+        if root is None or not args or args[0] not in {'push', 'ls-remote'}:
+            raise PermissionError('GitHub 凭据只能用于受控远端发布')
+        target = next((argument for argument in args[1:] if argument.startswith('https://')), None)
+        parsed = urlsplit(target or '')
+        if (parsed.scheme != 'https' or parsed.netloc != 'github.com' or parsed.username
+                or parsed.query or parsed.fragment or '\n' in target
+                or not re.fullmatch(r'/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git', parsed.path)):
+            raise PermissionError('GitHub 发布只允许 HTTPS origin')
+        if run_git(root, 'config', '--local', '--get-regexp', '^url\..*\.(insteadof|pushinsteadof)$', check=False).strip():
+            raise PermissionError('GitHub 发布禁止仓库 URL 重写')
+        authorization = 'AUTHORIZATION: basic ' + base64.b64encode(
+            ('x-access-token:' + github_token).encode()).decode()
+        environment.update(GIT_CONFIG_COUNT='2', GIT_CONFIG_KEY_0=f'http.{target}.extraheader',
+                           GIT_CONFIG_VALUE_0=authorization, GIT_CONFIG_KEY_1='http.followRedirects',
+                           GIT_CONFIG_VALUE_1='false')
     result = subprocess.run(command, input=input_data, capture_output=True,
                             timeout=timeout, env=environment, cwd=root or tempfile.gettempdir())
     if check and result.returncode:
         detail = result.stderr.decode(errors='replace').strip()
+        if authorization:
+            detail = detail.replace(authorization, '[REDACTED]').replace(github_token, '[REDACTED]')
         raise RuntimeError(f'安全 Git 操作失败（退出码 {result.returncode}）：{detail[:500]}')
     return result.stdout
 

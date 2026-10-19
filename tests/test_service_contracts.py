@@ -92,10 +92,17 @@ def test_result_reads_integrity_checked_authoritative_report(tmp_path):
     reference = artifacts.put('alpha', state.run_id, diff, 'diff')
     report = {'run_id': state.run_id, 'scope_id': 'alpha', 'run_status': 'COMPLETED',
         'outcome': 'FIX_VERIFIED', 'patch_diff_ref': reference, 'patch_available': True,
-        'patch_verification': 'verified'}
+        'patch_verification': 'verified', 'result_summary': '修复通过验证',
+        'branch': 'tracefix/run_alpha', 'repair_commit': 'b' * 40,
+        'publication': {'status': 'local', 'branch': 'codex/tracefix-run_alpha',
+                        'commit': 'c' * 40, 'error': None}}
     state.report_ref = artifacts.put('alpha', state.run_id, report)
     result = serialize_result(state, artifacts, task_id='task_alpha', repo_id='alpha')
     assert result['diff'] == diff and result['patch_verification'] == 'verified'
+    assert result['summary'] == report['result_summary']
+    assert result['branch'] == report['publication']['branch']
+    assert result['commit'] == report['publication']['commit']
+    assert result['publication'] == report['publication']
     state.patch_hash = 'forged'
     with pytest.raises(ServiceError, match='补丁报告'):
         serialize_result(state, artifacts, task_id='task_alpha', repo_id='alpha')

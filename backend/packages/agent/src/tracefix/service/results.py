@@ -19,7 +19,8 @@ def failure_result(*, task_id=None, run_id=None, repo_id=None, code='infrastruct
             'run_status': 'CANCELLED' if cancelled else 'FAILED',
             'outcome': 'INCONCLUSIVE' if cancelled else 'INFRA_FAILURE', 'report_ref': None,
             'report': None, 'patch_diff_ref': None, 'diff': None, 'patch_available': False,
-            'patch_verification': 'none', 'error': {'code': code}, 'terminal': True}
+            'patch_verification': 'none', 'error': {'code': code}, 'terminal': True,
+            'summary': None, 'branch': None, 'commit': None, 'publication': None}
 
 
 def preserve_report_diff(state, artifacts, workspace):
@@ -70,4 +71,9 @@ def serialize_result(state, artifacts, *, task_id, repo_id):
         'diff': diff, 'patch_available': available, 'patch_verification': verification,
         'error': state.error_details or ({'code': 'runtime_error'} if state.error else None)})
     result['diff'] = diff
+    publication = report.get('publication')
+    result.update(summary=report.get('result_summary'),
+                  branch=(publication or {}).get('branch') or report.get('branch'),
+                  commit=(publication or {}).get('commit') or report.get('repair_commit'),
+                  publication=publication)
     return result
