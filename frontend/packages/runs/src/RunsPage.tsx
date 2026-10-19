@@ -1,5 +1,5 @@
 import {useEffect, useMemo, useState} from 'react';
-import {aggregateWorkers, artifactUrl, CheckItem, CheckResult, CheckSummary, continueRun, deriveRun, DetectionRule, loadRun, loadRules, loadRunTrace, Run, TraceEvent, WorkerSnapshot, Guidance, loadGuidance, submitGuidance, confirmGuidance} from '@tracefix/api-client';
+import {aggregateWorkers, artifactUrl, CheckItem, CheckResult, CheckSummary, continueRun, deriveRun, DetectionRule, loadRun, loadRunResult, loadRules, loadRunTrace, Run, RunResult, TraceEvent, WorkerSnapshot, Guidance, loadGuidance, submitGuidance, confirmGuidance} from '@tracefix/api-client';
 import {eventLabel, outcomeLabel, phaseLabel, serviceLabel, workerRoleLabel, workerStatusLabel} from '@tracefix/presentation';
 
 const statuses: Record<string, string> = {idle: '空闲', running: '运行中', completed: '已结束', abnormal: '异常结束', failed: '失败', cancelled: '已停止', superseded: '目标已替换', paused: '已暂停', waiting_input: '等待输入', waiting_approval: '等待审批', stopping: '停止中'};
@@ -90,14 +90,15 @@ export function RetrievalWarning({events}: {events: TraceEvent[]}) {
 export function RunsPage({runs, selectedId, onSelect, onDocument, onCapture, report}: Props) {
   const [query, setQuery] = useState(''), [status, setStatus] = useState(''), [detail, setDetail] = useState<Run | null>(null);
   const [loading, setLoading] = useState(false), [continuing, setContinuing] = useState(false), [deriving, setDeriving] = useState(false);
+  const [result, setResult] = useState<RunResult | null>(null);
   const [instruction, setInstruction] = useState(''), [trace, setTrace] = useState<TraceEvent[]>([]);
   const [ruleOptions, setRuleOptions] = useState<DetectionRule[]>([]), [additionalRuleIds, setAdditionalRuleIds] = useState<string[]>([]), [deriveGoal, setDeriveGoal] = useState('');
   const [guidance, setGuidance] = useState<Guidance[]>([]), [guidanceText, setGuidanceText] = useState(''), [guidanceLevel, setGuidanceLevel] = useState<Guidance['level']>('hint'), [guidanceBusy, setGuidanceBusy] = useState(false);
   useEffect(() => {
-    if (!selectedId) {setDetail(null); setTrace([]); return;}
+    if (!selectedId) {setDetail(null); setTrace([]); setResult(null); return;}
     let active = true, timer: number;
     let loadedRules = false;
-    setDetail(null); setLoading(true); setInstruction(''); setTrace([]); setRuleOptions([]); setAdditionalRuleIds([]); setDeriveGoal('');
+    setDetail(null); setResult(null); setLoading(true); setInstruction(''); setTrace([]); setRuleOptions([]); setAdditionalRuleIds([]); setDeriveGoal('');
     setGuidance([]); setGuidanceText('');
     let lastSequence = 0;
     async function poll() {
@@ -106,6 +107,7 @@ export function RunsPage({runs, selectedId, onSelect, onDocument, onCapture, rep
         const [record, events] = await Promise.all([loadRun(selectedId), loadRunTrace(selectedId, lastSequence)]);
         if (active) {
           setDetail(record); setTrace(previous => [...previous, ...events]);
+          loadRunResult(record.id).then(value => {if (active) setResult(value);}).catch(error => {if (active) report(error);});
           // 引导通过实际 Agent Run 关联查询；只有收到新账本状态才显示“已注入/已采纳”等执行结果。
           if (record.agentRunId) loadGuidance(record.id).then(items => {if (active) setGuidance(items);}).catch(error => {if (active) report(error);});
           if (!loadedRules) {
@@ -163,6 +165,7 @@ export function RunsPage({runs, selectedId, onSelect, onDocument, onCapture, rep
     </section>}
     {detail && <section className="card run-detail"><div className="section-heading"><div><span className="eyebrow">RUN DETAIL</span><h2>{detail.goal}</h2><p>{detail.agentRunId || detail.id}</p></div><button className="secondary" onClick={() => onCapture(detail)}>沉淀为知识</button></div>{detail.timeSource && <div className="notice">此记录导入自历史报告，未记录的服务模式与启动时间不作推断。</div>}<dl><dt>执行状态</dt><dd>{statusLabel(detail.status)} · {phaseLabel(detail.phase)}</dd><dt>验证结论</dt><dd>{detail.outcome ? outcomeLabel(detail.outcome) : '尚未生成验证结论'}</dd><dt>{detail.timeSource ? '报告文件时间' : '开始 / 结束'}</dt><dd>{detail.timeSource ? timeLabel(detail.finishedAt) : `${timeLabel(detail.startedAt)} / ${timeLabel(detail.finishedAt)}`}</dd><dt>退出码</dt><dd>{detail.exitCode ?? (detail.timeSource ? '历史未记录' : '进程尚未退出')}</dd><dt>工作分支</dt><dd>{detail.branch || '尚未生成候选分支'}</dd></dl>{detail.error && <div className="notice failure">{detail.error}</div>}
       <div className="detail-block"><h3>使用的知识来源</h3>{detail.knowledge.length ? detail.knowledge.map((entry, index) => <div className="knowledge-use" key={index}><span className="badge">{phaseLabel(entry.phase)}</span><p>检索：{entry.queries.join(' · ') || 'Agent 未请求检索'}</p><div className="source-links">{entry.documents.length ? entry.documents.map(document => <button type="button" key={document.id} onClick={() => onDocument(document.id)}><span aria-hidden="true">▤</span> {document.title} · v{document.version}</button>) : <span className="muted">未选择相关文档</span>}</div></div>) : <p className="muted">尚无知识检索记录。Agent 会在测试规划、探索或诊断阶段按需检索。</p>}</div>
+      <div className="detail-block"><h3>修复结果</h3>{result?.summary ? <p className="repair-summary">{result.summary}</p> : <p className="muted">尚未生成修复摘要。</p>}<dl><dt>修复分支</dt><dd><code>{result?.branch || result?.patch?.branch || detail.branch || '尚未生成'}</code></dd><dt>修复 commit</dt><dd><code>{result?.commit || result?.patch?.commit || '尚未生成'}</code></dd><dt>发布状态</dt><dd>{result?.publication ? ({published: '已发布', succeeded: '已发布', failed: '发布失败', disabled: '未启用发布', skipped: '已跳过', pending: '等待发布'}[result.publication.status] || result.publication.status) : '暂无发布记录'}</dd></dl>{result?.publication?.error && <p className="notice failure">{typeof result.publication.error === 'string' ? result.publication.error : result.publication.error.message || '发布失败'}</p>}{result?.patch?.diff && <details><summary>查看补丁 diff · {result.patch.verification === 'verified' ? '已验证' : result.patch.verification}</summary><pre className="log-view patch-diff">{result.patch.diff}</pre></details>}</div>
       <div className="detail-block"><h3>报告与补丁</h3><div className="artifact-links">{detail.artifacts?.length ? detail.artifacts.map(artifact => <a href={artifactUrl(detail.id, artifact.ref)} key={artifact.ref} download={!artifact.ref.endsWith('.html')}><span><span aria-hidden="true">↓</span> {artifact.label}</span><small>{Math.ceil(artifact.bytes / 1024)} KiB</small></a>) : <p className="muted">此 Run 尚未产生可下载的报告或补丁。</p>}</div></div>
       <div className="detail-block"><h3>进程日志 <span className="muted">最近 120 个输出片段</span></h3><pre className="log-view">{detail.logs?.join('') || '等待 Agent 输出…'}</pre></div>
     </section>}

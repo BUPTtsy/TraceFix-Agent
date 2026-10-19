@@ -5,6 +5,7 @@ import {KnowledgePage} from '@tracefix/knowledge-ui';
 import {RulesPage} from '@tracefix/rules-ui';
 import {RunList, RunsPage, statusLabel} from '@tracefix/runs-ui';
 import {outcomeLabel, serviceLabel} from '@tracefix/presentation';
+import {ProjectsPage} from './ProjectsPage';
 import './style.css';
 
 type Page = 'overview' | 'runs' | 'projects' | 'knowledge' | 'rules';
@@ -42,7 +43,7 @@ export default function App() {
   }, [report]);
   useEffect(() => {
     const change = () => {
-      if (dirty && !window.confirm('文档尚未保存，确认离开并放弃更改？')) {window.history.replaceState(null, '', '#' + page); return;}
+      if (dirty && !window.confirm('更改尚未保存，确认离开并放弃更改？')) {window.history.replaceState(null, '', '#' + page); return;}
       setDirty(false); setPage(currentPage());
     };
     window.addEventListener('hashchange', change); return () => window.removeEventListener('hashchange', change);
@@ -50,7 +51,7 @@ export default function App() {
   function navigate(next: Page) {window.location.hash = next;}
   function selectProject(id: string) {
     if (id === projectId) return true;
-    if (dirty && !window.confirm('切换项目会放弃未保存的文档，确认继续？')) return false;
+    if (dirty && !window.confirm('切换项目会放弃未保存的更改，确认继续？')) return false;
     setDirty(false); setProjectId(id); setDocumentId(''); setDocumentDraft(null); setSelectedRun('');
     return true;
   }
@@ -78,12 +79,12 @@ export default function App() {
       {!connected && <div className="notice">正在尝试连接后端。已有数据可能已过期，连接恢复后会自动刷新。</div>}
       {page === 'overview' && <>
         <section className="metric-grid"><article className="card metric"><span>项目运行总数</span><strong>{scopedRuns.length}</strong><small>来自持久化运行记录</small></article><article className="card metric"><span>已验证修复</span><strong>{scopedRuns.filter(run => run.outcome === 'FIX_VERIFIED').length}</strong><small>仅统计 FIX_VERIFIED 结果</small></article><article className="card metric"><span>知识文档</span><strong>{project?.documentCount ?? 0}</strong><small>本项目与全局文档，含停用草稿</small></article></section>
-        <section className="card featured"><div><span className="eyebrow">CONNECTED WORKSPACE</span><h2>{project?.id || '先连接一个目标项目'}</h2><p>{project ? project.root : '在 profiles/projects.yaml 中注册仓库，并添加对应 Profile。'}</p><span className={'badge ' + (project?.ready ? 'success' : 'warning')}>{project?.ready ? '项目配置就绪' : project?.issue || '尚未配置'}</span></div><button className="primary" onClick={() => navigate('projects')}>查看项目空间 ↗</button></section>
+        <section className="card featured"><div><span className="eyebrow">CONNECTED WORKSPACE</span><h2>{project?.id || '先连接一个目标项目'}</h2><p>{project ? project.root : '在项目空间注册 GitHub 仓库，配置准备和验证命令。'}</p><span className={'badge ' + (project?.ready ? 'success' : 'warning')}>{project?.ready ? '项目配置就绪' : project?.issue || '尚未配置'}</span></div><button className="primary" onClick={() => navigate('projects')}>查看项目空间 ↗</button></section>
         <section className="card"><div className="section-heading"><div><h2>最近运行</h2><p>执行状态与修复结论分别记录</p></div><button className="text-button" onClick={() => navigate('runs')}>全部记录 →</button></div><RunList runs={scopedRuns.slice(0, 5)} onSelect={openRun}/></section>
         <nav className="journey" aria-label="推荐流程"><button onClick={() => navigate('projects')}><b>01</b><strong>选择目标项目</strong><span>确认仓库与运行配置</span></button><div aria-hidden="true">→</div><button onClick={() => navigate('runs')}><b>02</b><strong>检查运行结果</strong><span>从日志追溯到补丁</span></button><div aria-hidden="true">→</div><button onClick={() => navigate('knowledge')}><b>03</b><strong>沉淀为知识</strong><span>积累可检索的经验</span></button></nav>
       </>}
       {page === 'runs' && <RunsPage runs={scopedRuns} selectedId={selectedRun} onSelect={setSelectedRun} onDocument={openDocument} onCapture={captureExperience} report={report}/>}
-      {page === 'projects' && <><div className="project-grid">{projects.map(item => <button key={item.id} className={'card project-card ' + (projectId === item.id ? 'selected' : '')} onClick={() => selectProject(item.id)} aria-pressed={projectId === item.id}><div><span className="project-avatar" aria-hidden="true">{item.id.slice(0, 1).toUpperCase()}</span><span className={'badge ' + (item.ready ? 'success' : 'warning')}>{item.ready ? '配置就绪' : '待配置'}</span></div><h2>{item.id}</h2><p>{item.repoId}</p><code>{item.root}</code><footer><span>{item.runCount} 次运行</span><span>{item.documentCount} 篇文档</span></footer></button>)}</div>{project && <section className="card project-detail"><div className="section-heading"><div><h2>{project.id} 的运行配置</h2><p>读取已注册仓库及其实际 Profile</p></div><span className="badge">{project.repoId}</span></div>{project.issue && <div className="notice">{project.issue}</div>}<dl><dt>目标目录</dt><dd><code>{project.root}</code></dd><dt>Profile</dt><dd><code>{project.profile || '缺失'}</code></dd><dt>测试地址</dt><dd>{project.url || '未配置'}</dd><dt>允许修改</dt><dd>{project.allowedFiles.join(' · ')}</dd></dl><div className="command-list">{Object.entries(project.commands).map(([name, command]) => <div key={name}><span>{name}</span><code>{command.join(' ')}</code></div>)}</div><div className="button-row"><button className="primary" onClick={() => navigate('runs')}>查看项目运行</button><button className="secondary" onClick={() => navigate('knowledge')}>查看项目知识</button></div></section>}<div className="notice">添加项目：在 profiles/projects.yaml 注册独立仓库，在同目录添加 project 字段匹配的 Profile。控制台自动同步配置；右侧 Test／Repair 使用当前项目启动 Agent。</div></>}
+      {page === 'projects' && <ProjectsPage projects={projects} projectId={projectId} onSelect={selectProject} onSaved={async id => {await refreshProjects(); setProjectId(id); setDocumentId(''); setDocumentDraft(null); setSelectedRun('');}} onDirty={setDirty} onNavigate={navigate} report={report}/>}
       {page === 'knowledge' && <KnowledgePage key={projectId} projectId={projectId} projects={projects} documentId={documentId} documentRequest={documentRequest} initialDraft={documentDraft} onDirty={setDirty} onSaved={() => {setDocumentDraft(null); refreshProjects().catch(report);}} onRun={id => {setSelectedRun(id); navigate('runs');}} report={report}/>}
       {page === 'rules' && <RulesPage key={projectId} projectId={projectId} report={report}/>}
       <footer className="page-footer"><span>TRACEFIX · Evidence before confidence</span><span>{syncedAt ? `上次同步 ${syncedAt}` : '等待首次同步'}{agent.running && ` · ${statusLabel(agent.status || 'running')}`}</span></footer>

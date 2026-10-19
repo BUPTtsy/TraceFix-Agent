@@ -1,5 +1,5 @@
 import {FormEvent, useEffect, useRef, useState} from 'react';
-import {AgentStatus, ChatMessage, loadServices, Project, Service, startAgent, stopAgent, streamChat} from '@tracefix/api-client';
+import {AgentStatus, ChatMessage, DetectionRule, loadRules, loadServices, Project, Service, startAgent, stopAgent, streamChat} from '@tracefix/api-client';
 import {statusLabel} from '@tracefix/runs-ui';
 import {phaseLabel, serviceLabel} from '@tracefix/presentation';
 
@@ -8,6 +8,7 @@ export function AgentDock({project, agent, onStarted, onRun, onDocument, report}
   const [services, setServices] = useState<{id: Service; label: string}[]>([]), [service, setService] = useState<Service>('repair');
   const [goal, setGoal] = useState(''), [busy, setBusy] = useState(false), [useKnowledge, setUseKnowledge] = useState(true);
   const [stopping, setStopping] = useState(false);
+  const [rules, setRules] = useState<DetectionRule[]>([]), [additionalRuleIds, setAdditionalRuleIds] = useState<string[]>([]);
   const stopPending = useRef(false);
   const submitPending = useRef(false);
   const [messages, setMessages] = useState<Record<string, ChatMessage[]>>({}), [streamingProject, setStreamingProject] = useState('');
@@ -21,10 +22,16 @@ export function AgentDock({project, agent, onStarted, onRun, onDocument, report}
     finally {stopPending.current = false; setStopping(false);}
   }
   useEffect(() => {loadServices().then(setServices).catch(report);}, [report]);
+  useEffect(() => {
+    let active = true; setRules([]); setAdditionalRuleIds([]);
+    if (project?.id) loadRules(project.id).then(items => {if (active) setRules(items.filter(rule => rule.status === 'enabled' || rule.status === 'draft'));}).catch(error => {if (active) report(error);});
+    return () => {active = false;};
+  }, [project?.id, report]);
   useEffect(() => {viewport.current?.scrollTo({top: viewport.current.scrollHeight});}, [conversation.length, conversation.at(-1)?.content, conversation.at(-1)?.reasoning]);
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (submitPending.current || !services.length || !goal.trim() || (service !== 'chat' && (agent.running || !project?.ready))) return;
+    if (service !== 'chat' && goal.trim().length < 5) {report(new Error('运行目标至少需要 5 个字符')); return;}
     submitPending.current = true;
     const text = goal.trim(), key = projectKey, history = messages[key] || [], selectedService = service;
     const assistantIndex = history.length + 1;
@@ -39,7 +46,7 @@ export function AgentDock({project, agent, onStarted, onRun, onDocument, report}
         delta => update(items => items.map((item, index) => index === assistantIndex ? {...item, reasoning: (item.reasoning || '') + delta} : item)));
       else {
         if (!project) throw new Error('请先选择目标项目');
-        const status = await startAgent(text, selectedService, project.id); onStarted(status);
+        const status = await startAgent(text, selectedService, project.id, additionalRuleIds); onStarted(status);
         update(items => items.map((item, index) => index === assistantIndex ? {...item, content: `${project.id} 的${serviceLabel(selectedService)}已启动。运行记录中可查看阶段、日志和检索来源。`} : item));
       }
     } catch (error) {
@@ -56,6 +63,7 @@ export function AgentDock({project, agent, onStarted, onRun, onDocument, report}
     {agent.running && agent.stopUnavailableReason && agent.status !== 'stopping' && <small className="dock-footnote">{agent.stopUnavailableReason}</small>}
     {agent.stopError && <small className="dock-footnote" role="alert">{agent.stopError}</small>}
     <form className="run-composer" onSubmit={submit}><label htmlFor="run-goal">{service === 'chat' ? '发送消息' : '新的运行目标'}</label><textarea id="run-goal" value={goal} onChange={event => setGoal(event.target.value)} onKeyDown={event => {if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {event.preventDefault(); event.currentTarget.form?.requestSubmit();}}} maxLength={service === 'chat' ? 8000 : 4000} placeholder={service === 'chat' ? '向 TraceFix 提问…' : '输入目标后按 Enter 直接启动；Shift+Enter 换行'}/><div className="composer-footer"><span>{goal.length} / {service === 'chat' ? 8000 : 4000} · Enter 发送 · Shift+Enter 换行</span><button className="primary" disabled={busy || !services.length || !goal.trim() || (service !== 'chat' && (agent.running || !project?.ready))}>{busy ? '处理中…' : service === 'chat' ? '发送 ↑' : '启动 Run ↑'}</button></div></form>
-    {service === 'chat' ? <label className="knowledge-toggle"><input type="checkbox" checked={useKnowledge} onChange={event => setUseKnowledge(event.target.checked)}/>使用当前项目与全局知识</label> : <small className="dock-footnote">检索仅加入相关片段；修复结论由验证结果决定。</small>}
+    {service !== 'chat' && <details className="dock-rule-picker"><summary>本次追加检测规则（{additionalRuleIds.length}）</summary><fieldset disabled={busy}><legend>已启用的项目规则会自动应用；可追加规则或草稿</legend>{rules.map(rule => <label className="knowledge-toggle" key={rule.id}><input type="checkbox" checked={additionalRuleIds.includes(rule.id)} onChange={event => setAdditionalRuleIds(previous => event.target.checked ? [...previous, rule.id] : previous.filter(id => id !== rule.id))}/><span>{rule.name} · v{rule.version}{rule.status === 'draft' ? ' · 草稿' : ''}</span></label>)}{!rules.length && <p>暂无规则，可在检测规则页面创建。</p>}</fieldset></details>}
+    {service === 'chat' ? <label className="knowledge-toggle"><input type="checkbox" checked={useKnowledge} onChange={event => setUseKnowledge(event.target.checked)}/>使用当前项目与全局知识</label> : <small className="dock-footnote">Agent 自动拉取并准备已配置的仓库；修复结论由验证结果决定。</small>}
   </aside>;
 }
