@@ -871,7 +871,7 @@ class Workspace:
 
     def branch(self, name):
         """创建并提交验证分支，确保分支名称只能属于本次运行命名空间。"""
-        if not name.startswith('tracefix/run_'):
+        if not isinstance(name, str) or not re.fullmatch(r'tracefix/[A-Za-z0-9_-]{1,80}', name):
             raise PermissionError("本地分支名称无效")
         existing = git(self.root, "branch", "--list", name).decode().strip()
         if existing:

@@ -293,7 +293,10 @@ async def execute_request(request, settings, *, session_factory=Session,
         try:
             await resources.aclose()
         except Exception:
-            result = failure_result(**identity, code='runtime_close_failed')
+            if result.get('publication') is not None:
+                result.setdefault('cleanup_errors', []).append({'code': 'runtime_close_failed'})
+            else:
+                result = failure_result(**identity, code='runtime_close_failed')
         if documents is not None:
             try:
                 documents.update_run(request.run_id, {'status': result['run_status'].lower(),

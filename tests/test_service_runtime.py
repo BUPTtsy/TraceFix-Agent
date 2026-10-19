@@ -124,6 +124,8 @@ async def test_service_uses_session_factory_and_managed_run_identity(service_fix
     fixture = service_fixture
     result = await execute_request(fixture.request(), fixture.settings, session_factory=fixture.factory)
     assert result['terminal'] and result['run_id'] == 'run_alpha'
+    assert result['publication'] is None
+    assert result['summary'] == result['report']['result_summary']
     assert result['run_status'] == 'COMPLETED', result
     state = fixture.store.load('run_alpha', 'alpha')
     assert state.execution_mode == 'batch' and state.job_id == 'task_alpha'
@@ -299,6 +301,99 @@ async def test_finding_repair_reexports_source_and_does_not_inherit_success(serv
     assert library.finding(finding.id).status == 'fixed'
     assert state.repair_source.findings[0]['fix_guidance'] == '将真实保存结果持久化'
     assert fixture.runners[-1].closed
+
+
+@pytest.mark.parametrize('failure', ['none', 'publication', 'cleanup', 'store_close'])
+async def test_verified_publication_persists_before_store_close_and_preserves_evidence(service_fixture, monkeypatch, failure):
+    from tracefix.execution.repository import run_git
+    from tracefix.runtime.contracts import RunStatus
+    fixture = service_fixture
+    events = []
+    import shutil
+
+    def managed_clone(settings, destination):
+        if destination == fixture.root:
+            run_git(destination, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+            return
+        shutil.copytree(fixture.root, destination)
+        run_git(destination, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+
+    monkeypatch.setattr('tracefix.repository_registry.prepare_checkout', managed_clone)
+    fixture.registry.update('alpha', {'checkout_mode': 'managed'})
+    original_runtime = fixture.factory.ensure_runtime
+
+    async def runtime(self):
+        await original_runtime(self)
+
+        def close_store():
+            latest = fixture.store.load('repair_publication', 'alpha')
+            report = self.artifacts.json('alpha', latest.run_id, latest.report_ref)
+            events.append(('store_close', report.get('publication')))
+            if failure == 'store_close':
+                raise RuntimeError('close failed')
+
+        self.runtime_stack.callback(close_store)
+
+    async def verified_drive(self, state):
+        workspace = self.engine.workspace
+        baseline = workspace.head()
+        workspace.path('src/value.ts', write=True).write_text('export const persisted = true;\n', encoding='utf-8')
+        raw = workspace.diff(baseline).encode()
+        branch = workspace.branch('tracefix/' + state.run_id)
+        state.run_status, state.outcome = RunStatus.COMPLETED, Outcome.FIX_VERIFIED
+        state.local_branch, state.patch_base_commit, state.patch_hash = branch, baseline, digest(raw)
+        reference = self.artifacts.put(state.scope_id, state.run_id, raw.decode('utf-8'), 'diff')
+        report = {'run_id': state.run_id, 'scope_id': state.scope_id, 'run_status': 'COMPLETED',
+            'outcome': 'FIX_VERIFIED', 'patch_diff_ref': reference, 'patch_hash': state.patch_hash,
+            'patch_available': True, 'patch_verification': 'verified', 'result_summary': '修复通过真实差异验证',
+            'branch': branch, 'repair_commit': workspace.head()}
+        state.report_ref = self.artifacts.put(state.scope_id, state.run_id, report)
+        self.store.save(state)
+
+    class Services(RunServices):
+        async def aclose(self):
+            await super().aclose()
+            events.append(('services_close', None))
+            if failure == 'cleanup':
+                self.cleanup_errors.append({'code': 'resource_close_failed'})
+
+    from tracefix.service.publication import prepare_publication as publish
+
+    def publication(*arguments, **options):
+        events.append(('publication', None))
+        assert events[0][0] == 'services_close'
+        if failure == 'publication':
+            return {'status': 'failed', 'branch': None, 'commit': None, 'error': {'code': 'publication_failed'}}
+        return publish(*arguments, **options)
+
+    monkeypatch.setattr(fixture.factory, 'ensure_runtime', runtime)
+    monkeypatch.setattr(fixture.factory, 'drive', verified_drive)
+    monkeypatch.setattr('tracefix.service.run.prepare_publication', publication)
+    request = fixture.request('repair_publication', mode='repair')
+    frozen = request.repository_snapshot.repository_config
+    assert frozen['checkout_mode'] == 'managed'
+    assert frozen['root'] != str(fixture.root)
+    assert frozen['root'] == str(fixture.settings.data_root / 'frozen-repositories' / request.run_id / 'checkout')
+    result = await execute_request(request, fixture.settings, session_factory=fixture.factory, services_factory=Services)
+    if failure == 'cleanup':
+        assert not any(event[0] == 'publication' for event in events)
+        assert result['outcome'] == 'INFRA_FAILURE'
+        return
+    assert result['outcome'] == 'FIX_VERIFIED'
+    assert result['summary'] == '修复通过真实差异验证'
+    assert result['patch_verification'] == 'verified' and result['diff']
+    assert events[-1][0] == 'store_close' and events[-1][1] == result['publication']
+    assert result['report']['repair_commit']
+    if failure == 'publication':
+        assert result['publication']['status'] == 'failed'
+        assert result['commit'] == result['report']['repair_commit']
+    else:
+        assert result['publication']['status'] == 'local'
+        checkout = fixture.settings.data_root / 'publications' / request.run_id / 'checkout'
+        assert run_git(checkout, 'rev-parse', 'HEAD^').decode().strip() == request.repository_snapshot.commit
+        assert result['commit'] == result['publication']['commit']
+    if failure == 'store_close':
+        assert result['cleanup_errors'] == [{'code': 'runtime_close_failed'}]
 
 
 async def test_unverified_json_acceptance_and_implicit_revision_change_rejected(service_fixture):
