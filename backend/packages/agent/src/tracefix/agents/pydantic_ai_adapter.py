@@ -137,11 +137,13 @@ class PydanticAIAdapter:
             for spec in self.model.additional_tools:
                 if spec not in tools:
                     tools += (spec,)
+        native_browser_names = set()
         if schema in {BrowserAction, Decision}:
             for definition in getattr(self.model, '_native_tools', lambda _schema: [])(schema):
                 function = definition['function']
                 if any(spec.wire_name == function['name'] for spec in tools):
                     continue
+                native_browser_names.add('browser.' + function['name'][len('Browser'):].lower())
                 tools += (ToolSpec(
                     'browser.' + function['name'][len('Browser'):].lower(),
                     function['description'], function['parameters'],
@@ -346,8 +348,26 @@ class PydanticAIAdapter:
                     except ValueError:
                         pass
                 failed = isinstance(receipt, dict) and (receipt.get('isError') or receipt.get('is_error'))
+                business_counterexample = False
+                if (failed and spec.name in native_browser_names
+                        and spec.name in {'browser.navigate', 'browser.click', 'browser.type',
+                                          'browser.select', 'browser.press', 'browser.snapshot'}):
+                    error = receipt.get('error')
+                    outcome = receipt.get('business_outcome')
+                    business_counterexample = (
+                        receipt.get('executed') is True
+                        and isinstance(error, dict) and isinstance(outcome, dict)
+                        and error.get('type') == 'ActionBusinessFailure'
+                        and error.get('category') == 'business_assertion'
+                        and error.get('executed') is True
+                        and error.get('status', 'FAILED') == 'FAILED'
+                        and error.get('check') in {'postconditions', 'wait'}
+                        and outcome.get('check') == error.get('check')
+                        and outcome.get('status') == 'failed' and outcome.get('passed') is False
+                        and isinstance(receipt.get('observation_ref'), str)
+                        and bool(receipt['observation_ref'].strip()))
                 failure = None
-                if failed:
+                if failed and not business_counterexample:
                     error_details = receipt.get('error') or {}
                     rejected_submission = (spec.submission and receipt.get('executed') is False
                                            and error_details.get('status', 'FAILED') == 'FAILED')
@@ -363,7 +383,7 @@ class PydanticAIAdapter:
                         failure.details.pop('tool_calls', None)
                         failure.details['retry_context'] = [{key: value for key, value in item.items()
                             if key != 'messages'} for item in trace.retry_context]
-                if not failed:
+                if not failed or business_counterexample:
                     completed_results[call_id] = {'identity': identity, 'result': copy.deepcopy(result)}
                 if boundary is not None:
                     boundary.completed[call_id] = (identity, result)
@@ -392,7 +412,7 @@ class PydanticAIAdapter:
                         raise trace.failure('event_callback', '工具结果回调失败', error,
                             event_kind='tool.completed', tool_call_id=call_id,
                             tool_name=spec.name, result=copy.deepcopy(result)) from error
-                if failed:
+                if failed and not business_counterexample:
                     await emit_failure(record, failure)
                     raise failure
                 await emit('tool.completed', record)

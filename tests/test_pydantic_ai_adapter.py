@@ -674,6 +674,73 @@ async def test_error_tool_result_preserves_receipt_and_operation_id(fake_pydanti
     assert fake_pydantic_ai.instances[0].run_count == 1
 
 
+@pytest.mark.parametrize('check', ['postconditions', 'wait'])
+async def test_native_browser_business_counterexample_reaches_model_without_reexecution(fake_pydantic_ai, check):
+    from tracefix.tools.browser import native_browser_tools
+    calls = []
+    receipt = {'isError': True, 'executed': True, 'observation_ref': 'observed-counterexample',
+        'error': {'type': 'ActionBusinessFailure', 'category': 'business_assertion',
+                  'executed': True, 'check': check},
+        'business_outcome': {'status': 'failed', 'passed': False, 'check': check,
+                             'assertions': [{'passed': False, 'matches': 1}]}}
+
+    def port(name, arguments, call_id):
+        calls.append(call_id)
+        return copy.deepcopy(receipt)
+
+    async def model(agent, prompt, history, handler):
+        tool = next(tool for tool in agent.tools if tool.name == 'BrowserClick')
+        arguments = {'observation_id': 'before', 'element_ref': 'e1',
+                     'locator': {'role': 'checkbox', 'name': 'Complete task'}}
+        for attempt in range(2):
+            returned = await tool.function(tool_context('click-counterexample'), **arguments)
+            assert returned == receipt
+            assert returned['isError'] is True
+            assert returned['business_outcome']['passed'] is False
+        return completion(BrowserAction(kind='finish'))
+
+    model._native_tools = native_browser_tools
+    result = await PydanticAIAdapter(model).generate(BrowserAction, {'phase': 'EXPLORE'}, tool_executor=port)
+    assert result.value.kind == 'finish'
+    assert calls == ['click-counterexample']
+
+
+@pytest.mark.parametrize('fault', ['unknown', 'locator', 'unexecuted', 'missing_observation', 'not_failed', 'not_native'])
+async def test_native_browser_counterexample_exception_is_strict(fake_pydantic_ai, fault):
+    from tracefix.tools.browser import native_browser_tools
+    receipt = {'isError': True, 'executed': True, 'observation_ref': 'observation',
+        'error': {'type': 'ActionBusinessFailure', 'category': 'business_assertion',
+                  'executed': True, 'check': 'postconditions'},
+        'business_outcome': {'status': 'failed', 'passed': False, 'check': 'postconditions'}}
+    if fault == 'unknown':
+        receipt['error']['status'] = 'UNKNOWN_OPERATION'
+    elif fault == 'locator':
+        receipt['error']['type'] = 'LocatorRejected'
+    elif fault == 'unexecuted':
+        receipt['executed'] = False
+    elif fault == 'missing_observation':
+        receipt.pop('observation_ref')
+    elif fault == 'not_failed':
+        receipt['business_outcome']['passed'] = True
+
+    async def model(agent, prompt, history, handler):
+        if fault == 'not_native':
+            await execute_tool(agent)
+        else:
+            tool = next(tool for tool in agent.tools if tool.name == 'BrowserClick')
+            await tool.function(tool_context('click-rejected'), observation_id='before', element_ref='e1',
+                                locator={'role': 'checkbox', 'name': 'Complete task'})
+        pytest.fail('非受控业务反例不能继续模型诊断')
+
+    model._native_tools = native_browser_tools if fault != 'not_native' else lambda schema: []
+    with pytest.raises(PydanticAIAdapterError) as raised:
+        await PydanticAIAdapter(model).generate(BrowserAction, {'phase': 'EXPLORE'},
+            tools=(readonly_tool(),) if fault == 'not_native' else (),
+            tool_executor=lambda *arguments: copy.deepcopy(receipt))
+    assert raised.value.category == 'tool_execution'
+    assert raised.value.status == ('UNKNOWN_OPERATION' if fault == 'unknown' else 'FAILED')
+
+
 @pytest.mark.parametrize('approval', ['policy', 'always'])
 async def test_approval_tool_is_rejected_before_model_or_port(fake_pydantic_ai, approval):
     calls = []
