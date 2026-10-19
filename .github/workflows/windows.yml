@@ -35,6 +35,8 @@ jobs:
         run: |
           npm ci --ignore-scripts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./.venv/Scripts/python.exe scripts/codegraph/deploy_codegraph.py --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./.venv/Scripts/python.exe -m pytest -q --junitxml=artifacts/pytest-results.xml
       - name: Upload Python JUnit results
         if: ${{ always() && hashFiles('artifacts/pytest-results.xml') != '' }}

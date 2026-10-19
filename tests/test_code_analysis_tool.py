@@ -12,6 +12,63 @@ from tracefix.tools.evidence import attach_source_evidence_tools
 from tracefix.tools.handlers import build_runtime_tools
 
 
+@pytest.mark.parametrize('windows', [False, True])
+@pytest.mark.parametrize('hoisted', [False, True])
+def test_runtime_prefers_project_dependency_over_global_cli(tmp_path, monkeypatch, windows, hoisted):
+    from types import SimpleNamespace
+    from tracefix.rules import codegraph
+
+    agent = tmp_path / 'backend/packages/agent'
+    monkeypatch.setattr(codegraph, 'AGENT_ROOT', agent)
+    environment = {}
+    monkeypatch.setattr(codegraph, 'os', SimpleNamespace(
+        name='nt' if windows else 'posix', environ=environment, getenv=environment.get))
+    monkeypatch.setattr(codegraph.shutil, 'which', lambda name: str(tmp_path / 'global/codegraph'))
+    monkeypatch.setattr(codegraph.platform, 'machine', lambda: 'AMD64')
+    modules = (tmp_path if hoisted else agent) / 'node_modules'
+    if windows:
+        bundle = modules / '@colbymchenry/codegraph-win32-x64'
+        entry = bundle / 'lib/dist/bin/codegraph.js'
+        entry.parent.mkdir(parents=True)
+        entry.touch()
+        runtime = bundle / 'node.exe'
+        runtime.touch()
+        assert codegraph.command_prefix() == [str(runtime), '--liftoff-only',
+                                              '--disable-warning=ExperimentalWarning', str(entry)]
+    else:
+        launcher = modules / '.bin/codegraph'
+        launcher.parent.mkdir(parents=True)
+        launcher.touch()
+        assert codegraph.command_prefix() == [str(launcher)]
+
+
+def test_runtime_explicit_deployment_command_takes_priority(tmp_path, monkeypatch):
+    from tracefix.rules import codegraph
+
+    executable = str(tmp_path / 'deployment/codegraph.exe')
+    monkeypatch.setenv('TRACEFIX_CODEGRAPH_COMMAND', executable)
+    assert codegraph.command_prefix() == [executable]
+
+
+@pytest.mark.parametrize('version,expected', [(CODEGRAPH_VERSION, 0), ('0.0.0', 2)])
+def test_runtime_check_works_without_projects_or_indexes(tmp_path, monkeypatch, capsys, version, expected):
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location('tracefix_codegraph_deploy_test',
+                                                root / 'scripts/codegraph/deploy_codegraph.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, 'ROOT', tmp_path)
+    monkeypatch.setattr(module, 'run_cli', lambda arguments, root: version)
+    monkeypatch.setattr(module, 'load_projects', lambda *args: pytest.fail('不能读取项目注册表'))
+    assert module.main(['--check', '--data', str(tmp_path / 'data')]) == expected
+    report = json.loads(capsys.readouterr().out)
+    assert report['status'] == ('passed' if expected == 0 else 'failed')
+    assert report['repositories'] == {}
+    assert not (tmp_path / 'data').exists()
+
+
 @pytest.mark.parametrize('mode,phase', [('test', Phase.EXPLORE), ('repair', Phase.VERIFY)])
 async def test_code_analysis_reads_overlay_and_records_current_check_evidence(tmp_path, mode, phase):
     engine, state = make_engine(tmp_path / mode)

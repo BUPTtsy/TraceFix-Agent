@@ -25,6 +25,7 @@ CODEGRAPH_SUPPORTED_SUFFIXES = {
 }
 MAX_FILES = 20000
 MAX_BYTES = 128 * 1024 * 1024
+AGENT_ROOT = Path(__file__).resolve().parents[3]
 
 
 def is_graph_file(path: str) -> bool:
@@ -40,25 +41,35 @@ class CodeGraphError(RuntimeError):
 
 def command_prefix() -> list[str]:
     configured = os.getenv("TRACEFIX_CODEGRAPH_COMMAND")
+    launchers = [Path(configured)] if configured else [
+        root / "node_modules" / ".bin" / ("codegraph.cmd" if os.name == "nt" else "codegraph")
+        for root in (AGENT_ROOT, AGENT_ROOT.parents[2])
+    ]
     executable = configured or shutil.which("codegraph")
+    if executable and not configured:
+        launchers.append(Path(executable))
     if os.name == "nt":
-        launchers = [Path(executable)] if executable else []
         if os.environ.get("APPDATA") and not configured:
             launchers.append(Path(os.environ["APPDATA"]) / "npm" / "codegraph.cmd")
         arch = "arm64" if platform.machine().lower() in {"arm64", "aarch64"} else "x64"
         for launcher in launchers:
-            packages = launcher.parent / "node_modules" / "@colbymchenry"
-            for bundle in (packages / f"codegraph-win32-{arch}",
-                           packages / "codegraph" / "node_modules" / "@colbymchenry" / f"codegraph-win32-{arch}"):
-                entry = bundle / "lib" / "dist" / "bin" / "codegraph.js"
-                runtime = bundle / "node.exe"
-                if runtime.is_file() and entry.is_file():
-                    return [str(runtime), "--liftoff-only", "--disable-warning=ExperimentalWarning", str(entry)]
+            for packages in (launcher.parent.parent / "@colbymchenry",
+                             launcher.parent / "node_modules" / "@colbymchenry"):
+                for bundle in (packages / f"codegraph-win32-{arch}",
+                               packages / "codegraph" / "node_modules" / "@colbymchenry" / f"codegraph-win32-{arch}"):
+                    entry = bundle / "lib" / "dist" / "bin" / "codegraph.js"
+                    runtime = bundle / "node.exe"
+                    if runtime.is_file() and entry.is_file():
+                        return [str(runtime), "--liftoff-only", "--disable-warning=ExperimentalWarning", str(entry)]
         if executable and Path(executable).suffix.lower() == ".exe":
             return [executable]
-        raise CodeGraphError("未找到 CodeGraph Windows runtime，请安装 @colbymchenry/codegraph@1.6.2")
+        raise CodeGraphError("未找到 CodeGraph Windows runtime，请执行 npm ci --workspace @tracefix/agent --include=optional")
+    if not configured:
+        for launcher in launchers:
+            if launcher.is_file():
+                return [str(launcher)]
     if not executable:
-        raise CodeGraphError("找不到 CodeGraph CLI，请安装 @colbymchenry/codegraph@1.6.2")
+        raise CodeGraphError("找不到 CodeGraph 运行组件，请执行 npm ci --workspace @tracefix/agent --include=optional")
     return [executable]
 
 

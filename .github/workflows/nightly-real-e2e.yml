@@ -36,6 +36,10 @@ jobs:
         run: |
           python -m pip check
           python -c "import tracefix.agents.deepagents_adapter; from pydantic_ai.models.openai import OpenAIChatModel"
+      - name: Install and check Agent native runtime dependencies
+        run: |
+          npm ci --workspace @tracefix/agent --include=optional --omit=dev
+          python scripts/codegraph/deploy_codegraph.py --check
       - name: Prepare pinned test repository and verify all mutation baselines
         run: python bugboard/scripts/prepare_target.py --verify-cases
       - name: Run real BugBoard B01 E2E

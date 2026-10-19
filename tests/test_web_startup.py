@@ -152,6 +152,10 @@ def test_full_web_prepares_agent_and_starts_services(tmp_path, monkeypatch):
     initialize = next(index for index, command in enumerate(calls)
                       if 'bugboard/scripts/init_demo.py' in command)
     assert prepare < initialize
+    check = next(index for index, command in enumerate(calls)
+                 if 'scripts/codegraph/deploy_codegraph.py' in command)
+    assert calls[check][-1] == '--check'
+    assert check < prepare
     assert calls[-1] == [str(module.venv_python(tmp_path)), 'scripts/bootstrap/services.py']
     assert not any('frontend/apps/cli/dist/cli.mjs' in command for command in calls)
 
@@ -176,8 +180,37 @@ def test_console_only_does_not_require_docker_or_key(tmp_path, monkeypatch):
     assert all(command[0] != 'docker' for command in calls)
     assert not any('bugboard/scripts/init_demo.py' in command for command in calls)
     assert not any('bugboard/scripts/prepare_target.py' in command for command in calls)
+    assert not any('scripts/codegraph/deploy_codegraph.py' in command for command in calls)
     assert calls[-1][-2:] == ['scripts/bootstrap/services.py', '--dev']
     assert (tmp_path / '.env').read_text(encoding='utf-8') == 'TRACEFIX_API_KEY=\n'
+
+
+def test_full_web_installs_runtime_before_preparing_target(tmp_path, monkeypatch):
+    module, calls, _ = bootstrap_fixture(tmp_path, monkeypatch)
+    assert module.main(['--web', '--skip-build', '--plain']) == 0
+    install = calls.index(['npm', 'ci', '--include=optional'])
+    check = next(index for index, command in enumerate(calls)
+                 if 'scripts/codegraph/deploy_codegraph.py' in command)
+    prepare = next(index for index, command in enumerate(calls)
+                   if 'bugboard/scripts/prepare_target.py' in command)
+    assert install < check < prepare
+    assert sum(command[:2] == ['npm', 'ci'] for command in calls) == 1
+
+
+def test_missing_runtime_stops_web_before_database_or_services(tmp_path, monkeypatch):
+    module, calls, _ = bootstrap_fixture(tmp_path, monkeypatch)
+    original = module.run
+
+    def run(argv, **kwargs):
+        if 'scripts/codegraph/deploy_codegraph.py' in argv:
+            raise RuntimeError('CodeGraph 版本不匹配')
+        return original(argv, **kwargs)
+
+    monkeypatch.setattr(module, 'run', run)
+    with pytest.raises(RuntimeError, match='CodeGraph 版本不匹配'):
+        module.main(['--web', '--skip-install', '--skip-build', '--plain'])
+    assert not any(command[0] == 'docker' for command in calls)
+    assert not any('scripts/bootstrap/services.py' in command for command in calls)
 
 
 @pytest.mark.parametrize('arguments', [

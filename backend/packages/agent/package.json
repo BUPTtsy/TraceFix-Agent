@@ -1,0 +1,9 @@
+{
+  "name": "@tracefix/agent",
+  "version": "0.1.1",
+  "private": true,
+  "description": "TraceFix Agent 服务的原生运行依赖",
+  "dependencies": {
+    "@colbymchenry/codegraph": "1.6.2"
+  }
+}

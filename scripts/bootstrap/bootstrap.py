@@ -227,6 +227,7 @@ def main(argv=None):
     elif not offline:
         total += 4 + (2 if not options.skip_build else 1)
         total += 1 + int(not options.skip_install)
+        total += 1
     progress = StartupProgress(total, plain='--plain' in agent_args)
 
     def check_prerequisites():
@@ -275,13 +276,14 @@ def main(argv=None):
         progress.finish('正在进入界面预览。' if options.preview else '正在运行离线 Smoke。')
         run([python, 'scripts/bootstrap/launch.py', '--preview' if options.preview else '--smoke', *agent_args])
         return 0
+    if not options.skip_install:
+        progress.run('安装 workspace 与 Agent 运行依赖', [npm, 'ci', '--include=optional'])
     if options.console_only:
-        if not options.skip_install:
-            progress.run('安装控制台 workspace 依赖', [npm, 'ci'])
         progress.run('构建控制台软件包', [npm, 'run', 'build'])
         progress.finish('正在启动 Web 控制台；Test / Repair 需要完整 Agent 环境。')
         run([python, 'scripts/bootstrap/services.py', *(['--dev'] if options.dev else [])])
         return 0
+    progress.run('检查 CodeGraph 运行依赖', [python, 'scripts/codegraph/deploy_codegraph.py', '--check'])
     progress.run('检查模型配置', [python, '-c', "from dotenv import load_dotenv; import os; load_dotenv('.env', encoding='utf-8-sig'); assert os.getenv('TRACEFIX_API_KEY'), '请先在 .env 中填写 TRACEFIX_API_KEY'"])
     progress.run('启动 PostgreSQL', ['docker', 'compose', '--env-file', '.env', 'up', '-d', '--wait', 'postgres'])
     progress.run('拉取并验证独立测试仓库', [python, 'bugboard/scripts/prepare_target.py', '--verify-cases'])
@@ -292,8 +294,6 @@ def main(argv=None):
     else:
         progress.run('检查沙箱镜像', ['docker', 'image', 'inspect', '--format', '{{.Id}}', 'tracefix-bugboard:1.0', 'tracefix-browser:1.0'])
     progress.run('初始化演示项目', [python, 'bugboard/scripts/init_demo.py', '--case', 'B01'])
-    if not options.skip_install:
-        progress.run('安装 TypeScript 控制台依赖', [npm, 'ci'])
     progress.run('构建控制台软件包', [npm, 'run', 'build', *([] if web else ['--workspace', '@tracefix/cli'])])
     if web:
         progress.finish('正在启动 Web 控制台；请在页面选择项目并启动 Agent Run。')
