@@ -20,6 +20,8 @@ from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'bugboard/scripts'))
+from prepare_target import target_cache
 PYTHON = Path(sys.executable)
 REQUIRED_VALIDATIONS = {"static", "unit", "build", "health", "original", "regression"}
 DEFAULT_POSTGRES_PASSWORD = "tracefix"
@@ -221,7 +223,7 @@ def run_flow(args, output_path: Path) -> int:
         compose_started = not bool(existing_postgres.stdout.strip())
         images = {
             "tracefix-bugboard:1.0": [docker, "build", "-f", "bugboard/docker/Dockerfile",
-                                      "-t", "tracefix-bugboard:1.0", "bugboard/target"],
+                                      "-t", "tracefix-bugboard:1.0", target_cache(ROOT)],
             "tracefix-browser:1.0": [docker, "build", "-f", "Dockerfile.browser",
                                       "-t", "tracefix-browser:1.0", "."],
         }

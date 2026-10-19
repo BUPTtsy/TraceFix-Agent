@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {spawn} from 'node:child_process';
+import {spawn,execFileSync} from 'node:child_process';
 import {once} from 'node:events';
 import fs from 'node:fs/promises';
 import net from 'node:net';
@@ -138,7 +138,9 @@ async function main(){
  const runRoot=await fs.mkdtemp(path.join(parent,'b01-behavior-'));
  const report={status:'failed',run_root:path.relative(root,runRoot),results:[]};
  try{
-  for(const variant of ['clean','completion_only'])report.results.push(await verifyVariant(path.join(root,'bugboard/target'),runRoot,variant));
+  const python=process.env.TRACEFIX_PYTHON || path.join(root,'.venv',process.platform==='win32'?'Scripts/python.exe':'bin/python');
+  const source=execFileSync(python,[path.join(root,'bugboard/scripts/prepare_target.py'),'--verify-cases'],{cwd:root,encoding:'utf8',windowsHide:true,timeout:240000}).trim();
+  for(const variant of ['clean','completion_only'])report.results.push(await verifyVariant(source,runRoot,variant));
   report.status='passed';
  }catch(failure){
   report.error=failure.message;

@@ -19,6 +19,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'backend/packages/agent/src'))
 
 from tracefix.messages import ChineseArgumentParser
+sys.path.insert(0, str(ROOT / 'bugboard/scripts'))
+from prepare_target import target_cache
 
 
 def safe_diagnostic(text):
@@ -223,7 +225,7 @@ def main(argv=None):
     if options.console_only:
         total += 1 + int(not options.skip_install)
     elif not offline:
-        total += 3 + (2 if not options.skip_build else 1)
+        total += 4 + (2 if not options.skip_build else 1)
         total += 1 + int(not options.skip_install)
     progress = StartupProgress(total, plain='--plain' in agent_args)
 
@@ -282,8 +284,10 @@ def main(argv=None):
         return 0
     progress.run('检查模型配置', [python, '-c', "from dotenv import load_dotenv; import os; load_dotenv('.env', encoding='utf-8-sig'); assert os.getenv('TRACEFIX_API_KEY'), '请先在 .env 中填写 TRACEFIX_API_KEY'"])
     progress.run('启动 PostgreSQL', ['docker', 'compose', '--env-file', '.env', 'up', '-d', '--wait', 'postgres'])
+    progress.run('拉取并验证独立测试仓库', [python, 'bugboard/scripts/prepare_target.py', '--verify-cases'])
+    source = target_cache(ROOT)
     if not options.skip_build:
-        progress.run('构建 BugBoard 镜像', ['docker', 'build', '-f', 'bugboard/docker/Dockerfile', '-t', 'tracefix-bugboard:1.0', 'bugboard/target'])
+        progress.run('构建 BugBoard 镜像', ['docker', 'build', '-f', 'bugboard/docker/Dockerfile', '-t', 'tracefix-bugboard:1.0', source])
         progress.run('构建浏览器镜像', ['docker', 'build', '-f', 'Dockerfile.browser', '-t', 'tracefix-browser:1.0', '.'])
     else:
         progress.run('检查沙箱镜像', ['docker', 'image', 'inspect', '--format', '{{.Id}}', 'tracefix-bugboard:1.0', 'tracefix-browser:1.0'])

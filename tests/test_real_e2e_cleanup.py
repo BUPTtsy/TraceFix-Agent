@@ -15,6 +15,7 @@ def demo_initializer(tmp_path):
     script = tmp_path / 'bugboard/scripts/init_demo.py'
     script.parent.mkdir(parents=True)
     shutil.copyfile(root / 'bugboard/scripts/init_demo.py', script)
+    shutil.copyfile(root / 'bugboard/scripts/prepare_target.py', script.with_name('prepare_target.py'))
     cases = tmp_path / 'evals/cases.py'
     cases.parent.mkdir()
     shutil.copyfile(root / 'evals/cases.py', cases)
@@ -22,35 +23,52 @@ def demo_initializer(tmp_path):
 
 
 @pytest.mark.parametrize('empty_directory', [False, True])
-def test_demo_initialization_rejects_uninitialized_submodule_before_copy(tmp_path, empty_directory):
+def test_demo_initialization_rejects_unavailable_remote_before_copy(tmp_path, empty_directory):
     script = demo_initializer(tmp_path)
     if empty_directory:
         (tmp_path / 'bugboard/target').mkdir()
     destination = tmp_path / 'demo'
 
-    result = subprocess.run([sys.executable, str(script), '--case', 'B01',
+    result = subprocess.run([sys.executable, '-X', 'utf8', str(script), '--case', 'B01',
+        '--repo-url', str(tmp_path / 'missing.git'),
         '--destination', str(destination)], capture_output=True, text=True,
         encoding='utf-8', errors='replace', timeout=30)
 
     assert result.returncode != 0
-    assert 'git submodule update --init --recursive' in result.stderr
+    assert '测试仓库 Git 操作失败' in result.stderr
     assert not destination.exists()
+    assert not list((tmp_path / '.tracefix/repositories').glob('.bugboard-clone-*'))
 
 
 @pytest.mark.parametrize('case', ['clean', 'B01'])
 def test_demo_initialization_copies_template_and_freezes_case_in_baseline(tmp_path, case):
     script = demo_initializer(tmp_path)
-    source = tmp_path / 'bugboard/target'
+    source = tmp_path / 'upstream'
     (source / 'src').mkdir(parents=True)
     (source / 'package.json').write_text('{"name":"bugboard"}\n', encoding='utf-8')
+    (source / 'package-lock.json').write_text('{}\n', encoding='utf-8')
     original = "{method: 'PATCH', body: JSON.stringify(fields)}"
     (source / 'src/api.ts').write_text(original, encoding='utf-8')
     (source / 'node_modules').mkdir()
     (source / 'node_modules/excluded.txt').write_text('dependency', encoding='utf-8')
     (source / 'Dockerfile').write_text('FROM node', encoding='utf-8')
+    cases = tmp_path / 'evals/cases.py'
+    cases.write_text('CASES = ' + repr([{'id': 'B01', 'file': 'src/api.ts',
+                                       'before': original, 'after': original.replace("'PATCH'", "'POST'")}]),
+                     encoding='utf-8')
+    subprocess.run(['git', 'init', '-q', str(source)], check=True)
+    subprocess.run(['git', '-C', str(source), 'add', '.'], check=True)
+    subprocess.run(['git', '-C', str(source), '-c', 'user.name=Fixture', '-c',
+                    'user.email=fixture@localhost', 'commit', '-qm', '测试远程基线'], check=True)
+    revision = subprocess.run(['git', '-C', str(source), 'rev-parse', 'HEAD'],
+                              capture_output=True, text=True, check=True).stdout.strip()
+    remote = tmp_path / 'remote.git'
+    subprocess.run(['git', 'clone', '--bare', str(source), str(remote)], check=True,
+                    capture_output=True)
     destination = tmp_path / 'demo'
 
     result = subprocess.run([sys.executable, str(script), '--case', case,
+        '--repo-url', str(remote), '--revision', revision,
         '--destination', str(destination)], capture_output=True, text=True,
         encoding='utf-8', errors='replace', timeout=30)
 

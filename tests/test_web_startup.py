@@ -47,6 +47,11 @@ def test_full_web_prepares_agent_and_starts_services(tmp_path, monkeypatch):
     assert ['docker', 'compose', '--env-file', '.env', 'up', '-d', '--wait', 'postgres'] in calls
     assert any(command[1:3] == ['image', 'inspect'] for command in calls)
     assert ['npm', 'run', 'build'] in calls
+    prepare = next(index for index, command in enumerate(calls)
+                   if 'bugboard/scripts/prepare_target.py' in command)
+    initialize = next(index for index, command in enumerate(calls)
+                      if 'bugboard/scripts/init_demo.py' in command)
+    assert prepare < initialize
     assert calls[-1] == [str(module.venv_python(tmp_path)), 'scripts/bootstrap/services.py']
     assert not any('frontend/apps/cli/dist/cli.mjs' in command for command in calls)
 
@@ -70,6 +75,7 @@ def test_console_only_does_not_require_docker_or_key(tmp_path, monkeypatch):
     assert prerequisites == [{'require_docker': False}]
     assert all(command[0] != 'docker' for command in calls)
     assert not any('bugboard/scripts/init_demo.py' in command for command in calls)
+    assert not any('bugboard/scripts/prepare_target.py' in command for command in calls)
     assert calls[-1][-2:] == ['scripts/bootstrap/services.py', '--dev']
     assert (tmp_path / '.env').read_text(encoding='utf-8') == 'TRACEFIX_API_KEY=\n'
 

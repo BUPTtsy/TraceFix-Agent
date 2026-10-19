@@ -20,8 +20,6 @@ jobs:
       PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v5
-        with:
-          submodules: recursive
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -38,6 +36,8 @@ jobs:
         run: |
           python -m pip check
           python -c "import tracefix.agents.deepagents_adapter; from pydantic_ai.models.openai import OpenAIChatModel"
+      - name: Prepare pinned test repository and verify all mutation baselines
+        run: python bugboard/scripts/prepare_target.py --verify-cases
       - name: Run real BugBoard B01 E2E
         run: python scripts/checks/verify_real_e2e.py --required --case B01 --output artifacts/real-e2e/report.json
       - name: Upload E2E report
