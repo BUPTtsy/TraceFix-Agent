@@ -297,7 +297,13 @@ class RepositoryRegistry:
                            repository_config=config).model_dump(mode='json')
             raw['projects'].append(item)
             atomic_yaml(self.path, raw)
+        self.prepare_codegraph(identifier)
         return deepcopy(config)
+
+    def prepare_codegraph(self, identifier):
+        from tracefix.config import load_projects
+        from tracefix.rules.codegraph import prepare_project_index
+        return prepare_project_index(load_projects(self.path), identifier, self.data_root)
 
     def list(self):
         from tracefix.config import load_projects
@@ -337,6 +343,7 @@ class RepositoryRegistry:
             item.update(repo_id=config['owner'] + '/' + config['repo'], root=config['root'],
                         allowed_files=config['allowed_files'], repository_config=config)
             atomic_yaml(self.path, raw)
+        self.prepare_codegraph(identifier)
         return deepcopy(config)
 
     def freeze(self, identifier, run_id):
@@ -402,6 +409,7 @@ class RepositoryRegistry:
             destination.mkdir(parents=True, exist_ok=True)
             raw['projects'].append(project.model_dump(mode='json'))
             atomic_yaml(self.path, raw)
+        self.prepare_codegraph(identifier)
         return project
 
     def configure_legacy(self, identifier, fields, profile_path=None):

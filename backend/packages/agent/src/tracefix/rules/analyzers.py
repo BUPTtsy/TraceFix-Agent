@@ -211,10 +211,31 @@ def _selected(record, config):
 
 
 def analyze_source(files: Mapping[str, str] | Iterable[tuple[str, str]],
-                   config: dict[str, Any] | None = None, *, detector: str = "ast") -> dict[str, Any]:
+                   config: dict[str, Any] | None = None, *, detector: str = "ast",
+                   index=None, graph_files=None, binding=None) -> dict[str, Any]:
     """Analyze authorized text only; pass means this configured check succeeded."""
     config = dict(config or {})
     adapter = config.get("analyzer", detector)
+    if adapter == "codegraph":
+        from .codegraph import GRAPH_CHECKS
+        source_files = list(files.items() if isinstance(files, Mapping) else files)
+        check = config.get("check") or config.get("kind") or "symbols"
+        if check == "regex":
+            return analyze_source(source_files, {**config, "analyzer": "ast"}, detector="ast")
+        if index is None:
+            return {"status": "error", "detector": str(check), "findings": [], "items": [],
+                    "errors": [{"message": "CodeGraph 需要已配置仓库的持久索引"}],
+                    "analyzed_files": [], "parser": "codegraph", "fallback_required": True}
+        result = index.analyze(graph_files if graph_files is not None else source_files,
+            selected=[path for path, _ in source_files], check=str(check),
+            query=str(config.get("query") or ""), binding=binding)
+        if check in GRAPH_CHECKS or result["errors"]:
+            return result
+        legacy = analyze_source(source_files, {**config, "analyzer": "ast", "check": check}, detector="ast")
+        result["graph_items"] = result["items"]
+        result.update({key: legacy[key] for key in ("status", "items", "findings", "errors", "fallback_required")})
+        result["parser"] = "codegraph + " + legacy["parser"]
+        return result
     check = config.get("check") or config.get("kind") or (adapter if adapter != "ast" else "elements")
     if check in {"ast", "tree-sitter"}:
         check = "elements"

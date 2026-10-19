@@ -84,9 +84,10 @@ export function repositoryControl(filename: string, operation: string, fields: R
     PYTHONPATH: [path.join(engineRoot, 'backend/packages/agent/src'), process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
     ...(options.dataRoot ? {TRACEFIX_DATA: path.resolve(options.dataRoot)} : {}),
     ...(options.repositoryRoots ? {TRACEFIX_REPOSITORY_ROOTS: JSON.stringify(options.repositoryRoots.map(root => path.resolve(root)))} : {})};
+  const defaultTimeout = ['repository.register', 'repository.update', 'project.create'].includes(operation) ? 1200000 : 15000;
   const result = spawnSync(python, [...(python === 'py' ? ['-3.12'] : []), '-m', 'tracefix.repository_control'],
     {cwd: engineRoot, env, input: JSON.stringify({operation, projects_path: path.resolve(filename), fields}),
-      encoding: 'utf8', windowsHide: true, timeout: options.repositoryTimeoutMs || 15000, maxBuffer: 1048576});
+      encoding: 'utf8', windowsHide: true, timeout: options.repositoryTimeoutMs || defaultTimeout, maxBuffer: 1048576});
   if (result.error) throw failure(result.error.code === 'ETIMEDOUT' ? 'repository_control_timeout' : 'repository_control_unavailable',
     result.error.code === 'ETIMEDOUT' ? '仓库控制服务超时' : '仓库控制服务不可用');
   let response;

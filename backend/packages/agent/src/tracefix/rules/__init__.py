@@ -23,11 +23,12 @@ from .resolver import RuleResolver, derive_rule_snapshot, render_rule_context
 from .store import RuleLibrary
 from .builtins import builtin_rules
 from .analyzers import analyze_source, SUPPORTED_LANGUAGES, SUPPORTED_DETECTORS
+from .codegraph import RepositoryCodeGraph
 
 __all__ = [
     "DetectionType", "Finding", "FindingSource", "FindingStatus", "Rule",
     "RuleCategory", "RuleDetection", "RuleLibrary", "RuleRef", "RuleResolver", "RuleCoverage", "RuleEvaluation", "CoverageStatus",
     "RuleScope", "RuleSeverity", "RuleSnapshot", "RuleStatus", "derive_rule_snapshot",
     "builtin_rules", "evaluate_oracle", "evaluate_oracle_result", "evaluate_static", "evaluate_static_result", "render_rule_context",
-    "analyze_source", "SUPPORTED_LANGUAGES", "SUPPORTED_DETECTORS",
+    "analyze_source", "RepositoryCodeGraph", "SUPPORTED_LANGUAGES", "SUPPORTED_DETECTORS",
 ]

@@ -663,8 +663,9 @@ class Workspace:
 
     def files(self):
         """枚举根目录下可读的普通文件，排除链接和受保护目录。"""
+        from tracefix.rules.codegraph import CODEGRAPH_SUPPORTED_SUFFIXES
         for p in sorted(self.root.rglob('*')):
-            if p.is_file() and p.suffix in {'.ts', '.tsx', '.js', '.jsx', '.mjs', '.css', '.json', '.py', '.html'}:
+            if p.is_file() and p.suffix in CODEGRAPH_SUPPORTED_SUFFIXES | {'.css', '.json', '.html', '.htm'}:
                 rel = p.relative_to(self.root).as_posix()
                 try:
                     self.path(rel)

@@ -2595,10 +2595,19 @@ class Engine:
                                  for pattern in rule.scope.path_globs)]
                     files = [(path, self.workspace.read(path)) for path in paths]
                     config = rule.detection.static or {}
-                    if config.get('engine') in {'ast', 'semgrep'} or config.get('detector') in {'ast', 'semgrep'}:
+                    if config.get('engine') in {'ast', 'semgrep', 'codegraph'} or config.get('detector') in {'ast', 'semgrep', 'codegraph'}:
                         from tracefix.rules.analyzers import analyze_source
-                        result = await asyncio.to_thread(analyze_source, files, config,
-                            detector=config.get('engine') or config.get('detector'))
+                        from tracefix.rules.codegraph import RepositoryCodeGraph
+                        project = self.scopes.projects[self.context.active_scope]
+                        index = RepositoryCodeGraph(project, self.artifacts.root.parent)
+                        graph_files = [(path, self.workspace.read(path)) for path in self.workspace.files()]
+                        adapter = config.get('engine') or config.get('detector')
+                        result = await asyncio.to_thread(analyze_source, files,
+                            {**config, 'analyzer': 'codegraph' if adapter == 'ast' else adapter,
+                             'check': config.get('check') or config.get('kind') or 'elements'},
+                            detector=adapter, index=index,
+                            graph_files=graph_files, binding={'scope_id': s.scope_id, 'run_id': s.run_id,
+                                'source_manifest': s.source_manifest, 'patch_hash': s.patch_hash, 'view': 'run'})
                         if result['status'] == 'error' or result.get('fallback_required'):
                             raise RuntimeError(json.dumps(result.get('errors', result), ensure_ascii=False))
                         status, actual = result['status'], json.dumps(result, ensure_ascii=False)

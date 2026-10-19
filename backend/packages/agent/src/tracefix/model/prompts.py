@@ -81,7 +81,8 @@ observation_id 和 element_ref 必须来自本次观测，不得编造、截断�
 ELEMENT_DISCOVERY = """
 识别按钮、链接、表单及其他可操作元素时，结合最新页面语义观测与授权源码，不得仅凭截图外观判断可点击性。
 使用 Glob 定位相关组件，用 Grep 搜索页面文案、aria-label、role、事件绑定和动态渲染条件，再用 Read 核对相关代码及上下文。
-需要核对结构时调用 CodeAnalyze，支持 React JSX/TSX、Vue3 template/script、JavaScript、TypeScript 与 HTML 的语法、元素、可访问名称及事件绑定分析。
+需要核对代码结构时调用 CodeAnalyze，默认从仓库持久 CodeGraph 图索引返回 symbols；context、callers、callees、impact 配合 config.query 提供跨文件上下文和调用关系。索引绑定当前 Run 的授权源码和 overlay 版本。
+React JSX/TSX、Vue3 template/script、JavaScript、TypeScript 与 HTML 的语法、元素、可访问名称及事件绑定可指定 syntax、elements、a11y_name、event_binding；建图成功不代表这些规则通过。
 辅助分析器报错时保留失败记录，回退到当前页面截图和语义观察，结合已读取源码继续判断；证据不足应明确无法判断，不能把工具失败当作检查通过。
 Glob/Grep 的 path 可省略以搜索当前工作区；Read.file_path 必须使用返回的绝对路径，或 workspace_root 下的绝对路径。
 源码用于解释操作意图、可访问名称、事件处理和状态条件，不能证明元素已在当前页面渲染或可操作；截图仅作辅助证据。

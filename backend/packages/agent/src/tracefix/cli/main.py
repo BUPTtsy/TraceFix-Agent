@@ -56,6 +56,9 @@ class Session:
     def __init__(self, args, store, saver):
         self.args, self.store, self.saver = args, store, saver
         self.scopes = ScopeResolver(load_projects(Path(args.projects)), Path(args.projects))
+        from tracefix.rules.codegraph import prepare_project_index
+        self.codegraph_indexes = {identifier: prepare_project_index(self.scopes.projects, identifier, Path(args.data))
+                                 for identifier in self.scopes.projects}
         self.scope = args.project
         self.ctx = self.scopes.context(self.scope)
         self.render = Renderer(args.plain)
