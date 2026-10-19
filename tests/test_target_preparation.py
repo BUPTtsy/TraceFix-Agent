@@ -90,3 +90,61 @@ def test_precise_mutation_check_rejects_missing_or_duplicate_anchor(tmp_path):
             helper.verify_cases(source, tmp_path)
     target.write_text('unique anchor', encoding='utf-8')
     helper.verify_cases(source, tmp_path)
+
+
+def registration_tool():
+    specification = importlib.util.spec_from_file_location(
+        'test_repository_registration', ROOT / 'scripts/github/configure_test_repository.py')
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize('exists', [False, True])
+def test_configuration_uses_managed_registry_and_preserves_other_projects(tmp_path, monkeypatch, exists):
+    tool = registration_tool()
+    calls = []
+
+    class Registry:
+        def __init__(self, path, **options):
+            calls.append(('construct', path, options))
+
+        def get(self, identifier):
+            if not exists:
+                raise tool.RepositoryError('REPOSITORY_NOT_FOUND', '未注册的仓库', 404)
+            return {'repo_id': identifier}
+
+        def register(self, fields):
+            calls.append(('register', fields))
+            return {**fields, 'commit': 'a' * 40}
+
+        def update(self, identifier, fields):
+            calls.append(('update', fields))
+            assert identifier == 'test-bug-repo'
+            return {**fields, 'commit': 'a' * 40}
+
+    monkeypatch.setattr(tool, 'RepositoryRegistry', Registry)
+    monkeypatch.setattr(tool, 'load_dotenv', lambda *args, **options: None)
+    root = tmp_path / 'repositories/test-bug-repo'
+    assert tool.main(['--registry', str(tmp_path / 'projects.yaml'), '--data', str(tmp_path),
+                      '--root', str(root)]) == 0
+    assert calls[0][2]['authorized_roots'] == [root.parent]
+    operation, fields = calls[1]
+    assert operation == ('update' if exists else 'register')
+    assert fields['checkout_mode'] == 'managed'
+    assert fields['default_ref'] == 'main'
+    assert fields['owner'] == 'BUPTtsy' and fields['repo'] == 'Test-Bug-repo'
+    assert fields['publish_branch'] is False
+    assert fields['profile']['commands']['prepare'] == ['node', '--version']
+    assert fields['profile']['commands']['unit'] == ['node', '--test', 'tests/tasks.test.mjs']
+    assert fields['repo_id'] != 'bugboard'
+
+
+def test_configuration_rejects_publish_without_deployment_credential(monkeypatch, capsys):
+    tool = registration_tool()
+    monkeypatch.setattr(tool, 'load_dotenv', lambda *args, **options: None)
+    monkeypatch.delenv('TRACEFIX_SERVICE_GITHUB_CREDENTIAL_MAP', raising=False)
+    with pytest.raises(SystemExit) as error:
+        tool.main(['--publish-branch'])
+    assert error.value.code == 2
+    assert 'credential_ref' in capsys.readouterr().err
