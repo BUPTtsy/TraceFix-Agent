@@ -1,15 +1,16 @@
 import {errorWithContext} from './errors';
 
 export type Service = 'test' | 'repair' | 'chat';
-export interface Project {id: string; repoId: string; root: string; profile: string | null; url: string | null; ready: boolean; issue: string | null; allowedFiles: string[]; commands: Record<string, string[]>; runCount: number; documentCount: number}
+export interface Project {id: string; repoId: string; root: string; profile: string | null; url: string | null; ready: boolean; issue: string | null; allowedFiles: string[]; commands: Record<string, string[]>; runCount: number; documentCount: number; checkoutMode?: 'existing' | 'managed'; cloneUrl?: string | null; defaultRef?: string | null; publishBranch?: boolean}
 export interface RepositoryProfile {project: string; source_commit?: string; url: string; allowed_origins: string[]; commands: Record<string, string[]>; [key: string]: unknown}
 export interface RepositoryDraft {repo_id: string; root?: string; owner: string; repo: string; default_ref: string; checkout_mode: 'existing' | 'managed'; publish_branch: boolean; profile: RepositoryProfile; allowed_files: string[]; allowed_urls: string[]; credential_ref: string | null; enabled: boolean}
 export interface Repository extends RepositoryDraft {version: number; commit: string | null; config_digest: string; profile_ref?: string | null}
-export interface RunResult {runId: string; ready: boolean; outcome: string | null; summary: string | null; branch: string | null; commit: string | null; publication: {status: string; branch: string | null; commit: string | null; error?: string | {message?: string}} | null; patch: {ref: string; diff?: string; available: boolean; verification: string; branch?: string | null; commit?: string | null} | null}
+export interface RunResult {runId: string; ready: boolean; outcome: string | null; summary: string | null; branch: string | null; commit: string | null; publication: {status: string; branch: string | null; commit: string | null; error?: string | {code?: string; message?: string} | null} | null; patch: {ref: string; diff?: string; available: boolean; verification: string; branch?: string | null; commit?: string | null} | null}
 export interface Source {id: string; title: string; version: number}
 export interface KnowledgeUse {phase: string; queries: string[]; documents: Source[]; artifact_ref: string}
 export interface Run {id: string; projectId: string; agentRunId?: string; goal: string; mode: Service | 'unknown'; status: string; phase: string; outcome?: string; startedAt: string; finishedAt?: string; timeSource?: string; exitCode?: number; error?: string; branch?: string; continuationCount?: number; abnormalTermination?: boolean; continuationMarkers?: {instruction: string; previous_status: string; previous_error?: string; at: string}[]; knowledge: KnowledgeUse[]; logs?: string[]; artifacts?: {ref: string; label: string; bytes: number}[]}
 export interface AgentStatus extends Partial<Run> {running: boolean; canStop?: boolean; stopUnavailableReason?: string; stopError?: string | null}
+export interface Run {taskId?: string | null}
 // 引导状态来自持久化账本；retarget 排队后仍需 confirmed_at 才能在运行时替换目标。
 export interface Guidance {id: string; run_id: string; level: 'hint' | 'constraint' | 'retarget'; text: string; status: 'queued' | 'applied' | 'acknowledged' | 'rejected' | 'superseded'; created_at: number; applied_step?: number; how_applied?: string; rejection_reason?: string; confirmed_at?: number; child_run_id?: string}
 export interface TraceEvent {seq: number; agentSeq?: number; type: string; phase: string; at: number; payload: Record<string, unknown>}
@@ -161,13 +162,28 @@ export const loadRunTrace = (id: string, after = 0) => request<TraceEvent[]>(`/a
 export const loadGuidance = (id: string) => request<Guidance[]>(`/api/runs/${encodeURIComponent(id)}/guidance`);
 export const submitGuidance = (id: string, text: string, level: Guidance['level']) => request<Guidance>(`/api/runs/${encodeURIComponent(id)}/guidance`, {method: 'POST', body: JSON.stringify({text, level})});
 export const confirmGuidance = (id: string, guidanceId: string) => request<Guidance>(`/api/runs/${encodeURIComponent(id)}/guidance/${encodeURIComponent(guidanceId)}/confirm`, {method: 'POST', body: '{}'});
-export const loadAgentStatus = () => request<AgentStatus>('/api/agent/status');
+export async function loadAgentStatus(): Promise<AgentStatus> {
+  const [legacy, tasks] = await Promise.all([request<AgentStatus>('/api/agent/status'),
+    request<{id: string; status: string; currentRunId: string | null; updatedAt: string}[]>('/api/v1/tasks')]);
+  const active = new Set(['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping']);
+  const ordered = tasks.filter(task => task.currentRunId).sort((first, second) => second.updatedAt.localeCompare(first.updatedAt));
+  const task = ordered.find(item => active.has(item.status)) || (!legacy.running ? ordered[0] : undefined);
+  if (!task?.currentRunId) return legacy;
+  const run = await loadRun(task.currentRunId);
+  if (!active.has(task.status) && legacy.startedAt && run.startedAt && legacy.startedAt > run.startedAt) return legacy;
+  return {...run, taskId: task.id, running: active.has(run.status), canStop: active.has(run.status)};
+}
 export async function startAgent(goal: string, mode: Exclude<Service, 'chat'>, projectId: string, additionalRuleIds: string[] = []): Promise<AgentStatus> {
   const created = await request<{run: Run | null}>('/api/v1/tasks', {method: 'POST', body: JSON.stringify({goal, mode, projectId, execution: {executionMode: 'batch'}, additionalRuleIds, create_and_start: true})});
   if (!created.run) throw new Error('任务已创建，但未返回运行信息');
-  return {...created.run, running: ['running', 'queued', 'created', 'retrying'].includes(created.run.status.toLowerCase())};
+  return {...created.run, running: ['starting', 'running', 'queued', 'created', 'retrying'].includes(created.run.status.toLowerCase()), canStop: true};
 }
-export const stopAgent = () => request<AgentStatus>('/api/agent/stop', {method: 'POST'});
+export async function stopAgent(taskId?: string | null): Promise<AgentStatus> {
+  if (!taskId) return request<AgentStatus>('/api/agent/stop', {method: 'POST'});
+  const stopped = await request<{run: Run | null}>(`/api/v1/tasks/${encodeURIComponent(taskId)}/stop`, {method: 'POST', body: '{}'});
+  if (!stopped.run) return {running: false, taskId};
+  return {...stopped.run, running: ['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping'].includes(stopped.run.status), canStop: stopped.run.status !== 'stopping'};
+}
 export const continueRun = (id: string, instruction: string) => request<AgentStatus>(`/api/runs/${encodeURIComponent(id)}/continue`, {method: 'POST', body: JSON.stringify({instruction})});
 export const deriveRun = (id: string, additionalRuleIds: string[], goal = '') => request<AgentStatus>(`/api/runs/${encodeURIComponent(id)}/derive`, {method: 'POST', body: JSON.stringify({additionalRuleIds, goal})});
 export const loadDocuments = (projectId: string, query = '') => request<KnowledgeDocument[]>(`/api/knowledge?${new URLSearchParams({projectId, q: query})}`);

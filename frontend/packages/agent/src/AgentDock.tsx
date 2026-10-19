@@ -17,7 +17,7 @@ export function AgentDock({project, agent, onStarted, onRun, onDocument, report}
   async function stop() {
     if (stopPending.current || !agent.canStop) return;
     stopPending.current = true; setStopping(true);
-    try {onStarted(await stopAgent());}
+    try {onStarted(await stopAgent(agent.taskId));}
     catch (error) {report(error);}
     finally {stopPending.current = false; setStopping(false);}
   }
