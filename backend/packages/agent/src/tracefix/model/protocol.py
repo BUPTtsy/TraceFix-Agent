@@ -7,6 +7,7 @@ import os
 from uuid import uuid4
 
 import httpx
+from httpx._decoders import SUPPORTED_DECODERS
 
 from tracefix.model.contracts import ModelError, ModelOutputError
 from tracefix.model.history import ModelProtocol
@@ -287,6 +288,7 @@ class AuditedStream(httpx.AsyncByteStream):
         self.iterator = source.__aiter__()
         self.deltas = []
         self.completion = CompletionStream(on_delta=self.deltas.append)
+        self.content_decoder = None
         self.finished = False
         self.closed = False
         self.failure = None
@@ -294,10 +296,7 @@ class AuditedStream(httpx.AsyncByteStream):
     async def __aiter__(self):
         try:
             async for chunk in self.iterator:
-                self.completion.feed(chunk)
-                for delta in self.deltas:
-                    await self.boundary.callback('on_delta', self.boundary.exchange, delta)
-                self.deltas.clear()
+                await self.feed(self.decoder().decode(chunk))
                 yield chunk
             await self.finalize()
         except asyncio.CancelledError as error:
@@ -314,8 +313,24 @@ class AuditedStream(httpx.AsyncByteStream):
             raise await self.boundary.fail('stream_incomplete', '模型流未完整结束，响应未完成',
                                           error, status='UNKNOWN_OPERATION') from error
 
+    def decoder(self):
+        if self.content_decoder is None:
+            encodings = self.response.headers.get_list('content-encoding', split_commas=True)
+            if any(encoding.strip().lower() not in SUPPORTED_DECODERS for encoding in encodings):
+                raise httpx.DecodingError('模型响应使用不支持的 Content-Encoding')
+            decoding_response = httpx.Response(200, headers=self.response.headers, stream=httpx.ByteStream(b''))
+            self.content_decoder = decoding_response._get_content_decoder()
+        return self.content_decoder
+
+    async def feed(self, chunk):
+        self.completion.feed(chunk)
+        for delta in self.deltas:
+            await self.boundary.callback('on_delta', self.boundary.exchange, delta)
+        self.deltas.clear()
+
     async def finalize(self):
         if not self.finished:
+            await self.feed(self.decoder().flush())
             self.finished = True
             body = self.completion.finish()
             await self.boundary.finish_response(self.response, body)
@@ -326,10 +341,7 @@ class AuditedStream(httpx.AsyncByteStream):
             try:
                 if not self.finished and self.failure is None:
                     async for chunk in self.iterator:
-                        self.completion.feed(chunk)
-                        for delta in self.deltas:
-                            await self.boundary.callback('on_delta', self.boundary.exchange, delta)
-                        self.deltas.clear()
+                        await self.feed(self.decoder().decode(chunk))
                     await self.finalize()
             except asyncio.CancelledError as error:
                 self.failure = error

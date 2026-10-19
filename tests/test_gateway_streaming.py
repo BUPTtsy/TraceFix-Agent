@@ -1,5 +1,7 @@
 import copy
+import gzip
 import json
+import zlib
 
 import httpx
 import pytest
@@ -8,6 +10,126 @@ from tracefix.model.gateway import Gateway, ModelError
 from tracefix.runtime.contracts import BrowserAction
 from tracefix.model.chat import stream_chat
 from tracefix.model import protocol
+
+
+def compressed(payload, encoding):
+    if encoding == 'gzip':
+        return gzip.compress(payload)
+    if encoding == 'deflate':
+        return zlib.compress(payload)
+    if encoding == 'zstd':
+        import zstandard
+        return zstandard.ZstdCompressor().compress(payload)
+    return payload
+
+
+@pytest.mark.parametrize('encoding', ['identity', 'gzip', 'deflate', 'zstd'])
+async def test_compressed_sse_audits_decoded_chunks_and_preserves_provider_response(monkeypatch, encoding):
+    payload = b''.join([event({'reasoning_content': '分析压缩响应'}), event({'content': '完整中文正文'}),
+        event(finish='stop'), event(usage={'total_tokens': 9}), b'data: [DONE]\n\n'])
+    wire = compressed(payload, encoding)
+    source = EventBytes([wire[index:index + 3] for index in range(0, len(wire), 3)])
+    response = httpx.Response(200, headers={'content-type': 'text/event-stream', 'content-encoding': encoding}, stream=source)
+    requests = use_transport(monkeypatch, [response])
+    audits, deltas, usages = [], [], []
+    result = await Gateway(key='ci', stream=True).generate(str, {'message': '测试压缩'},
+        on_response=lambda exchange, value: audits.append(value),
+        on_delta=lambda exchange, delta: deltas.append(delta), on_usage=usages.append)
+    assert result.value == '完整中文正文'
+    assert len(requests) == len(audits) == 1
+    assert audits[0]['body']['choices'][0]['message']['reasoning_content'] == '分析压缩响应'
+    assert audits[0]['billing_status'] == 'known'
+    assert audits[0]['stream_incomplete'] is False
+    assert usages == [{'total_tokens': 9}]
+    assert ''.join(delta['delta'] for delta in deltas if delta['channel'] == 'content') == '完整中文正文'
+    assert source.closed
+
+
+@pytest.mark.parametrize('encoding', ['gzip', 'deflate', 'zstd'])
+async def test_compressed_json_uses_httpx_decoding_before_audit(monkeypatch, encoding):
+    payload = {'id': 'compressed-json', 'object': 'chat.completion', 'created': 1, 'model': 'revision', 'choices': [
+        {'index': 0, 'message': {'role': 'assistant', 'content': 'JSON 中文'}, 'finish_reason': 'stop'}],
+        'usage': {'prompt_tokens': 2, 'completion_tokens': 2, 'total_tokens': 4}}
+    wire = compressed(json.dumps(payload, ensure_ascii=False).encode(), encoding)
+    source = EventBytes([wire[index:index + 2] for index in range(0, len(wire), 2)])
+    response = httpx.Response(200, headers={'content-type': 'application/json', 'content-encoding': encoding}, stream=source)
+    use_transport(monkeypatch, [response])
+    audits = []
+    result = await Gateway(key='ci', stream=False).generate(str, {'message': '测试 JSON'},
+        on_response=lambda exchange, value: audits.append(value))
+    assert result.value == 'JSON 中文'
+    assert audits[0]['body'] == payload
+    assert audits[0]['billing_status'] == 'known'
+    assert source.closed
+
+
+@pytest.mark.parametrize('with_usage', [False, True])
+async def test_truncated_zstd_stream_preserves_audit_and_billing_unknown_semantics(monkeypatch, with_usage):
+    frames = [event({'content': '压缩部分正文'}), event(finish='stop')]
+    if with_usage:
+        frames.append(event(usage={'total_tokens': 13}))
+    wire = compressed(b''.join(frames), 'zstd') + compressed(b'data: [DONE]\n\n', 'zstd')[:-1]
+    source = EventBytes([wire[index:index + 7] for index in range(0, len(wire), 7)])
+    response = httpx.Response(200, headers={'content-type': 'text/event-stream', 'content-encoding': 'zstd'}, stream=source)
+    requests = use_transport(monkeypatch, [response])
+    audits, errors = [], []
+    with pytest.raises(ModelError) as raised:
+        await Gateway(key='ci', stream=True).generate(str, {'message': '测试截断'},
+            on_response=lambda exchange, value: audits.append(value),
+            on_error=lambda exchange, value: errors.append(value))
+    assert raised.value.status == 'UNKNOWN_OPERATION'
+    assert len(requests) == len(audits) == len(errors) == 1
+    assert audits[0]['stream_incomplete'] is True
+    assert errors[0]['will_retry'] is False
+    assert errors[0]['billing_status'] == ('known' if with_usage else 'unknown')
+    assert audits[0]['body']['choices'][0]['message']['content'] == '压缩部分正文'
+    assert source.closed
+
+
+async def test_audited_close_drains_compressed_tail_without_changing_raw_chunks():
+    from types import SimpleNamespace
+
+    audits, deltas = [], []
+
+    async def callback(name, exchange, value):
+        deltas.append(value)
+
+    async def finish_response(response, body):
+        audits.append(body)
+
+    payload = b''.join([event({'content': '关闭时仍审计完整响应'}), event(finish='stop'),
+        event(usage={'total_tokens': 8}), b'data: [DONE]\n\n'])
+    wire = compressed(payload, 'zstd')
+    source = EventBytes([wire[index:index + 3] for index in range(0, len(wire), 3)])
+    response = httpx.Response(200, headers={'content-encoding': 'zstd'})
+    boundary = SimpleNamespace(exchange='attempt', callback=callback, finish_response=finish_response)
+    audited = protocol.AuditedStream(source, response, boundary)
+    iterator = audited.__aiter__()
+    assert await anext(iterator) == wire[:3]
+    await audited.aclose()
+    assert audits[0]['choices'][0]['message']['content'] == '关闭时仍审计完整响应'
+    assert audits[0]['usage'] == {'total_tokens': 8}
+    assert source.closed
+    assert audited.finished
+
+
+async def test_unsupported_encoding_is_audited_as_unknown_without_utf8_fallback(monkeypatch):
+    payload = b''.join([event({'content': '不可接受未声明的解码'}), event(finish='stop'),
+        b'data: [DONE]\n\n'])
+    source = EventBytes([payload])
+    response = httpx.Response(200, headers={'content-type': 'text/event-stream', 'content-encoding': 'unsupported'}, stream=source)
+    requests = use_transport(monkeypatch, [response])
+    audits, errors = [], []
+    with pytest.raises(ModelError) as raised:
+        await Gateway(key='ci', stream=True).generate(str, {'message': '未知压缩'},
+            on_response=lambda exchange, value: audits.append(value),
+            on_error=lambda exchange, value: errors.append(value))
+    assert raised.value.status == 'UNKNOWN_OPERATION'
+    assert len(requests) == len(audits) == len(errors) == 1
+    assert audits[0]['stream_incomplete'] is True
+    assert errors[0]['billing_status'] == 'unknown'
+    assert errors[0]['will_retry'] is False
+    assert source.closed
 
 
 class EventBytes(httpx.AsyncByteStream):
