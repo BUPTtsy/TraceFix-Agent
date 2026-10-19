@@ -87,6 +87,9 @@ class RuleLibrary:
               phase TEXT NOT NULL, data TEXT NOT NULL, updated_at TEXT NOT NULL,
               PRIMARY KEY(run_id, rule_id, version, phase)
             );
+            CREATE TABLE IF NOT EXISTS repository_rule_settings (
+              project_id TEXT PRIMARY KEY, rule_ids TEXT NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL
+            );
             """)
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(rule_run_snapshots)")}
             if "snapshot_data" not in columns:
@@ -142,6 +145,11 @@ class RuleLibrary:
                 continue
             result.append(rule)
         return result
+
+    def repository_rule_ids(self, project_id: str) -> list[str] | None:
+        with self.connect() as connection:
+            row = connection.execute('SELECT rule_ids FROM repository_rule_settings WHERE project_id=?', (project_id,)).fetchone()
+        return json.loads(row['rule_ids']) if row else None
 
     def rule(self, rule_id: str) -> Rule:
         with self.connect() as connection:
@@ -220,6 +228,13 @@ class RuleLibrary:
             referenced = connection.execute(
                 "SELECT 1 FROM rule_run_snapshots WHERE refs LIKE ? LIMIT 1", (f'%"id": "{rule_id}"%',)
             ).fetchone() or connection.execute("SELECT 1 FROM findings WHERE rule_id=? LIMIT 1", (rule_id,)).fetchone()
+            configured = connection.execute(
+                "SELECT 1 FROM repository_rule_settings WHERE EXISTS "
+                "(SELECT 1 FROM json_each(repository_rule_settings.rule_ids) WHERE json_each.value=?) LIMIT 1",
+                (rule_id,),
+            ).fetchone()
+            if configured:
+                raise RuleConflictError("规则仍被仓库勾选，请先取消勾选或归档")
             if referenced:
                 raise RuleConflictError("已被历史 Run 或 Finding 引用的规则只能归档")
             if connection.execute("SELECT 1 FROM rules WHERE id=?", (rule_id,)).fetchone() is None:
