@@ -100,6 +100,8 @@ def prepare_checkout(settings: dict, destination: Path) -> dict:
         validate_branch(branch)
     destination = plain_root(destination)
     if destination.exists():
+        if not destination.is_dir():
+            raise ValueError('远程仓库目标路径必须是目录')
         if (destination / '.git').is_dir():
             identity = repository_binding(destination, repository, f'refs/remotes/origin/{base}',
                                           expected_branch=branch or base)
@@ -122,6 +124,11 @@ def prepare_checkout(settings: dict, destination: Path) -> dict:
                                       expected_branch=branch or base)
         if identity['head'] != identity['base']:
             raise PermissionError('远程 checkout HEAD 与 base 不一致')
+        if settings.get('source_commit') and run_git(destination, 'rev-parse', '--verify',
+                settings['source_commit'] + '^{commit}').decode().strip() != identity['base']:
+            raise PermissionError('远程 checkout 与 source commit 不一致')
+    except PermissionError:
+        raise
     except (OSError, RuntimeError) as error:
         raise RuntimeError(f'远程仓库拉取失败: {str(error)[-500:]}') from error
     return {'destination': str(destination), 'repository': repository, 'base': base,

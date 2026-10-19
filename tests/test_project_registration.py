@@ -6,6 +6,7 @@ import sys
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+import shutil
 
 import pytest
 import yaml
@@ -281,3 +282,140 @@ def test_frozen_profile_tamper_is_rejected_before_runtime(tmp_path):
         with pytest.raises(RepositoryError) as rejected:
             source.freeze('app', 'run_profile')
         assert rejected.value.code == 'FROZEN_PROFILE_MISMATCH'
+
+
+def test_managed_registration_and_run_checkouts_are_isolated_and_idempotent(tmp_path, monkeypatch):
+    source = _checkout(tmp_path, 'remote-source', 'acme/remote')
+    roots = tmp_path / 'checkouts'
+    data = tmp_path / 'data'
+    registry = RepositoryRegistry(tmp_path / 'profiles' / 'projects.yaml',
+                                  authorized_roots=[roots], data_root=data)
+    calls = []
+
+    def clone(settings, destination):
+        calls.append((settings, destination))
+        shutil.copytree(source, destination)
+        run_git(destination, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+
+    monkeypatch.setattr('tracefix.repository_registry.prepare_checkout', clone)
+    fields = _fields(source, 'remote-app', 'acme/remote')
+    fields.pop('root')
+    fields['checkout_mode'] = 'managed'
+    registered = registry.register(fields)
+    assert registered['root'] == str(roots / 'remote-app')
+    assert registered['checkout_mode'] == 'managed'
+    assert registered['publish_branch'] is False
+    first = registry.freeze('remote-app', 'managed_run_one')
+    assert first['repository_config']['root'] == str(data / 'frozen-repositories' / 'managed_run_one' / 'checkout')
+    assert first['commit'] == registered['commit']
+    (source / 'src' / 'main.py').write_text('value = 2\n', encoding='utf-8')
+    run_git(source, 'add', 'src/main.py')
+    safe_commit(source, '更新远端测试版本', 'Test', 'test@localhost')
+    assert registry.freeze('remote-app', 'managed_run_one') == first
+    second = registry.freeze('remote-app', 'managed_run_two')
+    assert second['commit'] != first['commit']
+    assert second['repository_config']['profile']['source_commit'] == second['commit']
+    assert second['config_digest'] != first['config_digest']
+    assert registry.get('remote-app') == registered
+    assert run_git(Path(registered['root']), 'rev-parse', 'HEAD').decode().strip() == registered['commit']
+    assert len(calls) == 3
+    assert RepositoryRegistry(Path(first['projects_path'])).freeze('remote-app', 'managed_run_one') == first
+
+
+@pytest.mark.parametrize('invalid,code', [
+    ('profile', 'INVALID_PROFILE'), ('publish', 'INVALID_PUBLISH_BRANCH'),
+    ('mode', 'INVALID_CHECKOUT_MODE'), ('files', 'INVALID_ALLOWED_FILES'),
+])
+def test_managed_invalid_configuration_never_clones(tmp_path, monkeypatch, invalid, code):
+    registry = RepositoryRegistry(tmp_path / 'projects.yaml', authorized_roots=[tmp_path])
+    fields = _fields(tmp_path / 'checkout', 'remote-app', 'acme/remote')
+    fields['checkout_mode'] = 'managed'
+    if invalid == 'profile':
+        fields['profile'] = {'commands': {}}
+    elif invalid == 'publish':
+        fields['publish_branch'] = 'true'
+    elif invalid == 'mode':
+        fields['checkout_mode'] = 'remote'
+    else:
+        fields['allowed_files'] = ['../outside']
+
+    def unexpected_clone(*arguments):
+        pytest.fail('无效注册不得拉取仓库')
+
+    monkeypatch.setattr('tracefix.repository_registry.prepare_checkout', unexpected_clone)
+    with pytest.raises(RepositoryError) as rejected:
+        registry.register(fields)
+    assert rejected.value.code == code
+    assert registry.list() == []
+
+
+def test_managed_checkout_failure_does_not_register_or_freeze(tmp_path, monkeypatch):
+    registry = RepositoryRegistry(tmp_path / 'projects.yaml', authorized_roots=[tmp_path])
+    fields = _fields(tmp_path / 'checkout', 'remote-app', 'acme/remote')
+    fields['checkout_mode'] = 'managed'
+
+    def failing_clone(*arguments):
+        raise RuntimeError('network error')
+
+    monkeypatch.setattr('tracefix.repository_registry.prepare_checkout', failing_clone)
+    with pytest.raises(RepositoryError) as rejected:
+        registry.register(fields)
+    assert rejected.value.code == 'CHECKOUT_FAILED'
+    assert registry.list() == []
+    assert not registry.path.exists()
+
+
+def test_legacy_config_without_new_checkout_fields_remains_valid(tmp_path):
+    root = _checkout(tmp_path, 'source', 'acme/app')
+    registry = RepositoryRegistry(tmp_path / 'projects.yaml', authorized_roots=[tmp_path], data_root=tmp_path / 'data')
+    registry.register(_fields(root, 'app', 'acme/app'))
+    raw = yaml.safe_load(registry.path.read_text(encoding='utf-8'))
+    config = raw['projects'][0]['repository_config']
+    config.pop('checkout_mode')
+    config.pop('publish_branch')
+    from tracefix.repository_registry import config_digest
+    config['config_digest'] = config_digest(config)
+    registry.path.write_text(yaml.safe_dump(raw), encoding='utf-8')
+    assert registry.get('app') == config
+    assert registry.freeze('app', 'legacy_run')['commit'] == config['commit']
+
+
+def test_checkout_rejects_plain_file_and_nonempty_directory_before_network(tmp_path):
+    from tracefix.remote import prepare_checkout
+    destination = tmp_path / 'file'
+    destination.write_text('preserve', encoding='utf-8')
+    with pytest.raises(ValueError, match='必须是目录'):
+        prepare_checkout({'repository': 'owner/app', 'base': 'main'}, destination)
+    directory = tmp_path / 'directory'
+    directory.mkdir()
+    (directory / 'keep').write_text('preserve', encoding='utf-8')
+    with pytest.raises(ValueError, match='非空'):
+        prepare_checkout({'repository': 'owner/app', 'base': 'main'}, directory)
+    assert destination.read_text(encoding='utf-8') == 'preserve'
+    assert (directory / 'keep').read_text(encoding='utf-8') == 'preserve'
+
+
+def test_new_checkout_checks_requested_source_commit(tmp_path, monkeypatch):
+    from tracefix.remote import prepare_checkout
+    destination = tmp_path / 'checkout'
+    clone_arguments = []
+
+    def fake_git(root, *arguments, **options):
+        if root is None:
+            clone_arguments.append(arguments)
+            destination.mkdir()
+            run_git(destination, 'init', '-q', '--initial-branch=main')
+            (destination / 'source.py').write_text('value = 1\n', encoding='utf-8')
+            run_git(destination, 'add', 'source.py')
+            safe_commit(destination, '初始化远程拉取测试', 'Test', 'test@localhost')
+            run_git(destination, 'remote', 'add', 'origin', 'https://github.com/owner/app.git')
+            run_git(destination, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+            return b''
+        if arguments == ('rev-parse', '--verify', 'wrong^{commit}'):
+            return b'0' * 40
+        return run_git(root, *arguments, **options)
+
+    monkeypatch.setattr('tracefix.remote.run_git', fake_git)
+    with pytest.raises(PermissionError, match='source commit'):
+        prepare_checkout({'repository': 'owner/app', 'base': 'main', 'source_commit': 'wrong'}, destination)
+    assert clone_arguments[0][-2] == 'https://github.com/owner/app.git'

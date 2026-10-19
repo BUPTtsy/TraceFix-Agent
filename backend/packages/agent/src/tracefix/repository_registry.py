@@ -17,7 +17,7 @@ import yaml
 from tracefix.config import Profile, Project
 from tracefix.execution.repository import canonical_remote, plain_root, repository_binding, run_git
 from tracefix.runtime.contracts import digest
-from tracefix.remote import validate_branch, validate_repository
+from tracefix.remote import prepare_checkout, validate_branch, validate_repository
 
 
 class RepositoryError(ValueError):
@@ -112,6 +112,9 @@ def validate_stored_config(project: Project):
                 'enabled', 'config_digest'}
     if not isinstance(config, dict) or not required <= config.keys() or config.get('version') != 1:
         raise RepositoryError('INVALID_REPOSITORY_CONFIG', '仓库配置记录不完整')
+    if (config.get('checkout_mode', 'existing') not in ('existing', 'managed')
+            or not isinstance(config.get('publish_branch', False), bool)):
+        raise RepositoryError('INVALID_REPOSITORY_CONFIG', '仓库拉取或分支发布配置无效')
     if (config['repo_id'] != project.id or config['projectId'] != project.id
             or config['root'] != str(project.root)
             or canonical_remote(project.repo_id) != canonical_remote(config['owner'] + '/' + config['repo'])
@@ -196,15 +199,29 @@ class RepositoryRegistry:
                 raise RepositoryError('INVALID_ALLOWED_URLS', 'allowed_urls 必须是精确 http(s) 来源')
         return list(dict.fromkeys(origin.rstrip('/') for origin in value))
 
-    def _validate_record(self, fields: dict, identifier: str):
+    def _registration_root(self, fields, identifier):
+        mode = fields.get('checkout_mode', 'existing')
+        if mode not in ('existing', 'managed'):
+            raise RepositoryError('INVALID_CHECKOUT_MODE', 'checkout_mode 必须是 existing 或 managed')
+        value = fields.get('root')
+        if not value and mode == 'managed':
+            value = str(self.authorized_roots[0] / identifier)
+        return self._root(value)
+
+    def _validate_record(self, fields: dict, identifier: str, *, checkout_root=None):
         allowed = {'repo_id', 'projectId', 'id', 'root', 'owner', 'repo', 'default_ref', 'profile',
-                   'profile_ref', 'allowed_files', 'allowed_urls', 'credential_ref', 'enabled'}
+                   'profile_ref', 'allowed_files', 'allowed_urls', 'credential_ref', 'enabled',
+                   'checkout_mode', 'publish_branch'}
         if set(fields) - allowed:
             raise RepositoryError('INVALID_FIELDS', '仓库注册包含未知字段')
         for alias in ('repo_id', 'projectId', 'id'):
             if alias in fields and normalize_id(fields[alias]) != identifier:
                 raise RepositoryError('REPO_ID_IMMUTABLE', 'repo_id 与 projectId 必须一致且不可修改', 409)
-        root = self._root(fields.get('root'))
+        root = self._registration_root(fields, identifier)
+        checkout_mode = fields.get('checkout_mode', 'existing')
+        publish_branch = fields.get('publish_branch', False)
+        if not isinstance(publish_branch, bool):
+            raise RepositoryError('INVALID_PUBLISH_BRANCH', 'publish_branch 必须是布尔值')
         owner, repository = fields.get('owner'), fields.get('repo')
         if not isinstance(owner, str) or not isinstance(repository, str):
             raise RepositoryError('INVALID_REPOSITORY', '必须提供 GitHub owner 和 repo')
@@ -216,13 +233,6 @@ class RepositoryRegistry:
         if not isinstance(ref, str):
             raise RepositoryError('INVALID_REF', '必须提供 default_ref')
         validate_branch(ref)
-        try:
-            identity = repository_binding(root, github, ref, require_clean=False)
-        except PermissionError:
-            raise RepositoryError('REPOSITORY_BINDING_MISMATCH', '仓库 origin、root 或 Git 身份与注册绑定不一致', 403) from None
-        except (RuntimeError, OSError):
-            raise RepositoryError('INVALID_REF', 'default_ref 无法在预置 checkout 解析为 commit') from None
-        commit = identity['base']
         allowed_files = self._files(fields.get('allowed_files'))
         allowed_urls = self._urls(fields.get('allowed_urls'))
         profile_ref = fields.get('profile_ref')
@@ -245,7 +255,7 @@ class RepositoryRegistry:
         payload = dict(payload)
         if normalize_id(payload.get('project', identifier)) != identifier:
             raise RepositoryError('PROFILE_MISMATCH', 'Profile 不属于注册项目')
-        payload.update(project=identifier, source_commit=commit)
+        payload.update(project=identifier, source_commit=ref)
         try:
             profile = Profile(**payload)
         except ValueError:
@@ -260,11 +270,30 @@ class RepositoryRegistry:
         enabled = fields.get('enabled', True)
         if not isinstance(enabled, bool):
             raise RepositoryError('INVALID_ENABLED', 'enabled 必须是布尔值')
+        if checkout_root is not None:
+            root = plain_root(checkout_root)
+            if checkout_mode != 'managed' or not root.is_relative_to(self.data_root / 'frozen-repositories'):
+                raise RepositoryError('ROOT_NOT_AUTHORIZED', 'Run checkout 不在冻结数据目录内', 403)
+        try:
+            if checkout_mode == 'managed':
+                prepare_checkout({'repository': github, 'base': ref}, root)
+            identity = repository_binding(root, github, ref, require_clean=False)
+        except PermissionError:
+            raise RepositoryError('REPOSITORY_BINDING_MISMATCH', '仓库 origin、root 或 Git 身份与注册绑定不一致', 403) from None
+        except ValueError:
+            raise RepositoryError('CHECKOUT_CONFLICT', '目标目录非空或仓库 checkout 无效', 409) from None
+        except (RuntimeError, OSError):
+            if checkout_mode == 'managed':
+                raise RepositoryError('CHECKOUT_FAILED', '远程仓库拉取失败，请检查仓库、分支和部署网络', 503) from None
+            raise RepositoryError('INVALID_REF', 'default_ref 无法在预置 checkout 解析为 commit') from None
+        commit = identity['base']
+        profile = profile.model_copy(update={'source_commit': commit})
         config = {'version': 1, 'repo_id': identifier, 'projectId': identifier, 'root': str(root),
                   'owner': owner, 'repo': repository, 'default_ref': ref, 'commit': commit,
                   'profile_ref': profile_ref, 'profile': profile.model_dump(mode='json'),
                   'allowed_files': allowed_files, 'allowed_urls': allowed_urls,
-                  'credential_ref': credential_ref, 'enabled': enabled}
+                  'credential_ref': credential_ref, 'enabled': enabled,
+                  'checkout_mode': checkout_mode, 'publish_branch': publish_branch}
         config['config_digest'] = config_digest(config)
         return config
 
@@ -290,6 +319,7 @@ class RepositoryRegistry:
         with registry_lock(self.path):
             raw = self._read()
             self._assert_mutable(raw)
+            self._check_unique(raw['projects'], identifier, self._registration_root(fields, identifier))
             config = self._validate_record(fields, identifier)
             self._check_unique(raw['projects'], identifier, Path(config['root']))
             item = Project(id=identifier, repo_id=config['owner'] + '/' + config['repo'],
@@ -338,6 +368,7 @@ class RepositoryRegistry:
                 fields.pop('profile', None)
             else:
                 fields['profile_ref'] = None
+            self._check_unique(raw['projects'], identifier, self._registration_root(fields, identifier), replacing=identifier)
             config = self._validate_record(fields, identifier)
             self._check_unique(raw['projects'], identifier, Path(config['root']), replacing=identifier)
             item.update(repo_id=config['owner'] + '/' + config['repo'], root=config['root'],
@@ -369,7 +400,8 @@ class RepositoryRegistry:
             fields = {key: deepcopy(value) for key, value in config.items()
                       if key not in {'version', 'commit', 'config_digest', 'frozen_run_id'}}
             fields['profile_ref'] = None
-            frozen_config = self._validate_record(fields, config['repo_id'])
+            checkout_root = target / 'checkout' if config.get('checkout_mode') == 'managed' else None
+            frozen_config = self._validate_record(fields, config['repo_id'], checkout_root=checkout_root)
             frozen_config['frozen_run_id'] = run_id
             frozen_config['snapshot_digest'] = digest(frozen_config)
             item = Project(id=config['repo_id'], repo_id=config['owner'] + '/' + config['repo'],
