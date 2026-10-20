@@ -320,7 +320,10 @@ class Workspace:
                     raise PermissionError('候选提交存在文件删除')
                 for relative, content in tree_files.items():
                     if content != snapshot['files'].get(relative):
-                        self.path(relative, write=True)
+                        try:
+                            self.path(relative, write=True)
+                        except PermissionError as error:
+                            raise PermissionError(f'候选提交包含未授权路径：{relative}（{error}）') from error
         diff = self.diff(base=baseline)
         if (patch_hash and digest(diff.encode()) != patch_hash) or (not patch_hash and diff):
             raise PermissionError('原任务补丁已变化，请核对工作区后继续')

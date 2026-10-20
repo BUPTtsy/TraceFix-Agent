@@ -21,6 +21,7 @@ from tracefix.execution.workspace import Workspace
 from tracefix.knowledge.memory import MemoryLibrary, MemoryNote
 from tracefix.knowledge.scope import ScopeResolver
 from tracefix.runtime.contracts import Phase, RunState, digest
+from tracefix.runtime.engine import Engine
 from tracefix.tools.effects import (EffectBoundaryError, file_resource, make_operation_executor,
                                      operation_identity, resources_intersect, run_effect)
 from tracefix.tools.handlers import build_runtime_tools
@@ -363,6 +364,8 @@ def local_engine(tmp_path, files=None):
     scopes = ScopeResolver({'r05': project})
     workspace, snapshot = Workspace.export(scopes, scopes.context('r05'), 'HEAD', tmp_path / 'workspace')
     engine = SimpleNamespace(workspace=workspace, store=MemoryStore(), memory=None)
+    engine.changed = Engine.changed.__get__(engine)
+    engine.event = engine.store.event
     state = state_for()
     state.source_manifest = digest(snapshot)
     engine.store.save(state)
@@ -376,6 +379,10 @@ async def test_spawn_local_production_handler_updates_parent_only(tmp_path):
     assert not result.is_error and result.executed
     assert engine.workspace.staged_content('source.py') == b'new\n'
     assert source.read_text(encoding='utf-8') == 'baseline\n'
+    persisted = engine.store.load(state.run_id, state.scope_id)
+    assert len(state.action_fingerprints) == 1
+    assert persisted.action_fingerprints == state.action_fingerprints
+    assert persisted.revision == state.revision == 1
     assert all(record['status'] == 'DONE' for record in engine.store.operations.values())
     assert not [worker for worker in multiprocessing.active_children() if worker.name == 'tracefix-r05-effect']
 
@@ -764,6 +771,8 @@ async def test_production_completed_call_id_rebinding_does_not_replay_new_epoch(
     assert second.call_id == 'new-call' and not second.is_error
     assert engine.workspace.staged_content('source.py') == b'must-survive-replay\n'
     assert len(engine.store.operations) == 1
+    assert second.result == first.result
+    assert len(changed.action_fingerprints) == len(state.action_fingerprints) == 1
 
 
 def test_owned_crashed_started_requires_exit_identity_then_manual_reconcile(ledger):

@@ -12,8 +12,10 @@ from tracefix.execution.runner import DockerRunner
 from tracefix.execution.workspace import Workspace
 from tracefix.knowledge.scope import ScopeResolver
 from tracefix.remote import prepare_checkout
-from tracefix.runtime.contracts import digest
+from tracefix.runtime.contracts import RunState, digest
 from tracefix.runtime.smoke import make_engine
+from tracefix.storage.artifacts import Artifacts
+from tracefix.storage.store import MemoryStore
 
 
 def repository(root, origin=True):
@@ -237,10 +239,11 @@ def test_legal_continuation_retains_bound_baseline(tmp_path, nested):
 def test_bind_rejects_tampered_workspace_before_runner(tmp_path, monkeypatch):
     root, scopes, ctx, workspace, snapshot = exported(tmp_path)
     (workspace.root / 'unexpected').write_text('untracked')
-    session = SimpleNamespace(scopes=scopes, ctx=ctx)
+    session = SimpleNamespace(scopes=scopes, ctx=ctx, store=MemoryStore(),
+                              artifacts=Artifacts(tmp_path / 'artifacts'))
     session.validate_workspace = lambda *args: Session.validate_workspace(session, *args)
-    state = SimpleNamespace(scope_id='app', source_manifest=digest(snapshot), patch_base_commit=None,
-                            patch_hash=None, local_branch=None, run_id='run_fixture')
+    state = RunState(scope_id='app', source_manifest=digest(snapshot), run_id='run_fixture',
+                     goal='拒绝被篡改的工作区', url='http://localhost')
     monkeypatch.setattr('tracefix.cli.main.DockerRunner', lambda *_: pytest.fail('runner must not be constructed'))
     with pytest.raises(PermissionError):
         Session.bind(session, state, None, workspace, snapshot)
@@ -267,15 +270,16 @@ def test_mountpoints_are_prepared_and_frozen_before_snapshot(tmp_path, change):
         assert not (workspace.root / 'dist').exists()
 
 
-def test_candidate_history_cannot_hide_frozen_edits(tmp_path):
+@pytest.mark.parametrize('relative', ['unauthorized.txt', 'src/value.test.ts'])
+def test_candidate_history_cannot_hide_frozen_edits(tmp_path, relative):
     root, scopes, ctx, workspace, snapshot = exported(tmp_path)
     baseline = workspace.head()
     run_git(workspace.root, 'switch', '-c', 'tracefix/run_history')
-    (workspace.root / 'unauthorized.txt').write_text('hidden earlier addition')
-    safe_index_files(workspace.root, ['unauthorized.txt'])
+    (workspace.root / relative).write_text('hidden earlier addition')
+    safe_index_files(workspace.root, [relative])
     safe_commit(workspace.root, 'unauthorized', 'CI', 'ci@localhost')
-    run_git(workspace.root, 'update-index', '--force-remove', 'unauthorized.txt')
-    (workspace.root / 'unauthorized.txt').unlink()
+    run_git(workspace.root, 'update-index', '--force-remove', relative)
+    (workspace.root / relative).unlink()
     safe_commit(workspace.root, 'hide addition', 'CI', 'ci@localhost')
     with pytest.raises(PermissionError, match='候选提交'):
         workspace.validate_repository(scopes, ctx, snapshot, base_commit=baseline,

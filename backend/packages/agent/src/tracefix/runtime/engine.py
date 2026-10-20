@@ -2248,14 +2248,14 @@ class Engine:
             runtime.close()
 
     async def prepare(self, s, _):
+        self.scopes.assert_current(self.context)
+        if s.scope_id != self.context.active_scope:
+            raise PermissionError('运行状态与当前 scope 不一致')
         from tracefix.runtime.test_edit_approval import ensure_test_edit_approval
         s = ensure_test_edit_approval(self, s)
         self.warn_retrieval_degraded(s)
         command_mode = bool(s.test_spec_ref and self.spec(s).mode != 'gui')
         if s.step == 0:
-            self.scopes.assert_current(self.context)
-            if s.scope_id != self.context.active_scope:
-                raise PermissionError('运行状态与当前 scope 不一致')
             snapshot = self.workspace.require_repository_snapshot(self.source)
             self.validate_repair_source_binding(s, snapshot)
             if s.mode == 'repair':

@@ -612,6 +612,24 @@ async def test_prepare_rejects_snapshot_mismatch_before_runner(tmp_path, fault):
     assert calls == []
 
 
+@pytest.mark.parametrize('step', [0, 1, 2])
+async def test_prepare_checks_scope_before_reading_approval_or_spec(tmp_path, monkeypatch, step):
+    engine, state = make_engine(tmp_path)
+    state.scope_id, state.step = 'other', step
+    state.test_edit_requested_files = ['src/value.test.ts']
+    state.approved_test_files = ['src/value.test.ts']
+    state.test_edit_approval_ref = 'missing_approval.json'
+    state.test_edit_approval_id = 'missing-approval'
+    engine.store.save(state)
+
+    def reject_artifact_read(*args, **kwargs):
+        pytest.fail('scope 校验前不应读取审批或测试规范')
+
+    monkeypatch.setattr(engine.artifacts, 'json', reject_artifact_read)
+    with pytest.raises(PermissionError, match='scope'):
+        await engine.prepare(state, None)
+
+
 async def test_behavior_intermediate_failure_stops_before_next_action(verified_engine):
     engine, state = verified_engine
     state.phase, state.run_status = Phase.VERIFY, RunStatus.RUNNING
