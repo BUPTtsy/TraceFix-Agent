@@ -8,6 +8,7 @@ version = "0.1.1"
 description = "Evidence-gated GUI testing and repair agent"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+  "claude-agent-sdk==0.2.168",
   "pydantic==2.12.5", "pydantic-ai-slim[openai]==1.107.7",
   "langgraph==1.1.0", "langgraph-checkpoint-postgres==3.0.4",
   "deepagents==0.4.12", "langchain==1.2.11", "langchain-openai==1.1.7",

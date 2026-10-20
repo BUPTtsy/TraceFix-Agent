@@ -1,0 +1,14 @@
+ARG SDK_BASE_IMAGE=python:3.12.12-slim-bookworm
+FROM ${SDK_BASE_IMAGE}
+ARG SDK_VERSION=0.2.168
+ARG CLI_VERSION=2.1.301
+LABEL tracefix.sdk.version="${SDK_VERSION}" tracefix.cli.version="${CLI_VERSION}"
+USER root
+RUN if ! command -v git || ! command -v bash; then sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources && apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=30 update && apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=30 install -y --no-install-recommends bash git ca-certificates && rm -rf /var/lib/apt/lists/*; fi
+RUN pip install --no-cache-dir "claude-agent-sdk==${SDK_VERSION}" "pydantic==2.12.5"
+COPY backend/packages/agent/src/tracefix /opt/tracefix/tracefix
+ENV PYTHONPATH=/opt/tracefix HOME=/sdk-config CLAUDE_CONFIG_DIR=/sdk-config TRACEFIX_SDK_WORKER=1
+RUN (getent passwd 1000 || useradd --create-home --uid 1000 worker) && mkdir -p /workspace /state /control /sdk-config && chown 1000:1000 /workspace /state /sdk-config
+USER 1000:1000
+WORKDIR /workspace
+ENTRYPOINT ["python", "-m", "tracefix.agents.claude_sdk_worker"]
