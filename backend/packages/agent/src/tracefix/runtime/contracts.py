@@ -443,6 +443,10 @@ class RunState(Contract):
     remote_config: dict | None = None
     url: str
     mode: Literal["test", "repair"] = "test"
+    # 缺字段的旧 checkpoint 实际运行的是流水线；新 Run 默认由解析器给出。
+    repair_mode: Literal['hybrid', 'pipeline'] = 'pipeline'
+    repair_mode_requested: str | None = None
+    repair_mode_reason: str | None = None
     execution_mode: Literal["interactive", "batch"] = "interactive"
     phase: Phase = Phase.PREPARE
     run_status: RunStatus = RunStatus.RUNNING
@@ -549,7 +553,7 @@ TRANSITIONS = {
     Phase.REVIEW: {Phase.FINALIZE},
     Phase.FINALIZE: set(),
 }
-IMMUTABLE = {"run_id", "scope_id", "schema_version", "mode", "goal", "url"}
+IMMUTABLE = {"run_id", "scope_id", "schema_version", "mode", "goal", "url", "repair_mode"}
 
 
 def reduce_state(state: RunState, expected_revision: int, **delta) -> RunState:

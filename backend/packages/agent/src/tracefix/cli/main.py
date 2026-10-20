@@ -28,6 +28,7 @@ from tracefix.model.gateway import Gateway
 from tracefix.model.chat import stream_chat, stream_tool_chat
 from tracefix.messages import ChineseArgumentParser, error_message
 from tracefix.runtime.contracts import Outcome, Phase, RunState, RunStatus, TestSpec, digest, new_id
+from tracefix.runtime.repair_mode import REPAIR_MODES, repair_mode_fields, resolve_repair_mode_fields
 from tracefix.runtime.engine import Engine
 from tracefix.runtime.continuation import continuation_state
 from tracefix.rules import RuleLibrary, RuleResolver
@@ -187,6 +188,8 @@ class Session:
         state = self.state()
         changes = {'agentRunId': state.run_id, 'goal': state.goal, 'status': str(state.run_status).lower(),
                    'executionMode': state.execution_mode,
+                   'repairMode': state.repair_mode, 'repairModeRequested': state.repair_mode_requested,
+                   'repairModeReason': state.repair_mode_reason,
                    'phase': str(state.phase), 'outcome': state.outcome, 'reportRef': state.report_ref,
                    'branch': state.local_branch, 'error': error or state.error}
         changes.update({'continuationCount': state.continuation_count,
@@ -374,7 +377,10 @@ class Session:
                              execution_mode=self.execution_mode,
                              parent_run_id=self.continuation_parent or self.parent_run_id,
                              continuation_instruction=self.continuation_instruction,
-                             remote_config=remote, additional_rule_ids=self.additional_rule_ids)
+                             remote_config=remote, additional_rule_ids=self.additional_rule_ids,
+                             **resolve_repair_mode_fields(requested=getattr(self.args, 'repair_mode', None),
+                                 project_config=project.repository_config, run_mode=self.mode,
+                                 model=Gateway(), repair_source=None))
             record = self.documents.run(self.console_run_id)
             state.continuation_markers = record.get('continuationMarkers', [])
             state.continuation_count = len(state.continuation_markers)
@@ -438,6 +444,8 @@ class Session:
             state.test_spec_ref = self.artifacts.put(self.scope, state.run_id, spec.model_dump(), label='测试规范')
         self.bind(state, profile, workspace, source)
         self.store.save(state)
+        if not reuse_workspace:
+            self.engine.event(state, 'repair_mode.resolved', repair_mode_fields(state))
         self.publish_console()
         self.render.status(state)
         if state.continuation_count:
@@ -453,7 +461,8 @@ class Session:
             if config.get('frozen_run_id') != state.run_id or source.get('repository_config') != config:
                 raise PermissionError('仓库配置快照与 Run 身份不一致')
         workspace = workspace or Workspace(Path(data_root or self.args.data)/'workspaces'/state.run_id,
-                                           self.scopes.projects[self.scope].allowed_files)
+                                           self.scopes.projects[self.scope].allowed_files,
+                                           protected_paths=(config or {}).get('protected_paths', []))
         if state.scope_id != self.ctx.active_scope or state.source_manifest != digest(source):
             raise PermissionError('运行状态与源码快照身份不一致')
         workspace.validate_repository(self.scopes, self.ctx, source,
@@ -925,6 +934,7 @@ async def application(args):
             if state.execution_mode == 'batch':
                 report = session.artifacts.json(state.scope_id, state.run_id, state.report_ref) if state.report_ref else {}
                 result = {'run_id': state.run_id, 'run_status': str(state.run_status),
+                          **repair_mode_fields(state),
                           'outcome': str(state.outcome) if state.outcome else None,
                           'report_ref': state.report_ref,
                           'patch_diff_ref': report.get('patch_diff_ref'),
@@ -1100,6 +1110,8 @@ def main():
     parser.add_argument('--url')
     parser.add_argument('--goal')
     parser.add_argument('--mode',choices=['test','repair','chat'],default='test')
+    parser.add_argument('--repair-mode', choices=REPAIR_MODES, default=None,
+                        help='修复模式；默认按项目配置、环境变量和内置默认值解析')
     parser.add_argument('--execution-mode', choices=['interactive', 'batch'], default=None,
                         help='运行策略；--run 默认 batch，interactive 保留人工暂停/审批')
     parser.add_argument('--spec')

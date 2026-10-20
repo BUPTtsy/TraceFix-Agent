@@ -17,6 +17,7 @@ class ServiceError(RuntimeError):
 def failure_result(*, task_id=None, run_id=None, repo_id=None, code='infrastructure_error', cancelled=False):
     return {'schema_version': 1, 'task_id': task_id, 'run_id': run_id, 'repo_id': repo_id,
             'run_status': 'CANCELLED' if cancelled else 'FAILED',
+            'repair_mode': None, 'repair_mode_requested': None, 'repair_mode_reason': None,
             'outcome': 'INCONCLUSIVE' if cancelled else 'INFRA_FAILURE', 'report_ref': None,
             'report': None, 'patch_diff_ref': None, 'diff': None, 'patch_available': False,
             'patch_verification': 'none', 'error': {'code': code}, 'terminal': True,
@@ -66,6 +67,8 @@ def serialize_result(state, artifacts, *, task_id, repo_id):
                 or not available or digest(diff.encode()) != state.patch_hash)):
         raise ServiceError('report_invalid', '权威补丁报告与状态/差异不一致')
     result = redact({'schema_version': 1, 'task_id': task_id, 'run_id': state.run_id, 'repo_id': repo_id,
+        'repair_mode': state.repair_mode, 'repair_mode_requested': state.repair_mode_requested,
+        'repair_mode_reason': state.repair_mode_reason,
         'run_status': str(state.run_status), 'outcome': str(state.outcome), 'terminal': True,
         'report_ref': state.report_ref, 'report': report, 'patch_diff_ref': diff_ref,
         'diff': diff, 'patch_available': available, 'patch_verification': verification,

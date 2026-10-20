@@ -33,6 +33,7 @@ from tracefix.runtime.contracts import (BudgetExceeded, BrowserAction, CheckJudg
     reduce_state, verification_gate)
 from tracefix.runtime.guidance import (GuidanceLedger, GuidanceRejected, active_guidance,
                                       retarget_state)
+from tracefix.runtime.repair_mode import repair_mode_fields
 from tracefix.tools.handlers import build_runtime_tools, materialize_patch_proposal
 from tracefix.tools.browser import execute_browser_tool
 from tracefix.tools.evidence import attach_source_evidence_tools
@@ -3153,9 +3154,13 @@ class Engine:
             try:
                 path = self.workspace.path(edit.path, write=True)
             except (PermissionError, ValueError, FileNotFoundError) as error:
+                details = {**getattr(error, 'details', {}),
+                           'path': edit.path, 'reason': sanitize(error_message(error))}
+                if getattr(error, 'error_code', None):
+                    details['error_code'] = error.error_code
                 raise ModelOutputError('补丁路径未通过授权校验：' + edit.path,
                     category='output_validation',
-                    details={'path': edit.path, 'reason': sanitize(error_message(error))}) from error
+                    details=details) from error
             current = path.read_bytes()
             if digest(current) != edit.before_hash:
                 raise ModelOutputError(
@@ -3550,6 +3555,7 @@ class Engine:
                   RunStatus.FAILED if s.outcome in {Outcome.INFRA_FAILURE, Outcome.POLICY_BLOCKED, Outcome.REPAIR_EXHAUSTED}
                   or isinstance(s.error, str) and s.error.startswith('ModelOutputError:') else RunStatus.COMPLETED)
         report = {'schema_version': s.schema_version, 'run_id': s.run_id, 'scope_id': s.scope_id,
+                  **repair_mode_fields(s),
                   'run_status': status, 'mode': s.mode, 'execution_mode': s.execution_mode,
                   'goal': s.goal, 'parent_run_id': s.parent_run_id,
                   'continuation_instruction': s.continuation_instruction,
@@ -3619,6 +3625,7 @@ class Engine:
         except (OSError, ValueError, KeyError) as error:
             report['rules_error'] = sanitize(str(error))[:1500]
         report['provenance'] = {'scope_id': s.scope_id, 'project_id': s.project_id or s.scope_id,
+            **repair_mode_fields(s),
             'repo_id': self.rule_scope(s)['repo_id'], 'run_id': s.run_id,
             'repo_snapshot_ref': s.repo_snapshot_ref, 'source_manifest': s.source_manifest,
             'base_commit': self.source.get('commit'), 'patch_base_commit': s.patch_base_commit,

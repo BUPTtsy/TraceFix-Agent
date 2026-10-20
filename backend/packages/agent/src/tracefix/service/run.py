@@ -17,8 +17,10 @@ from tracefix.cli.main import Session
 from tracefix.connectors import GitHubMCPError
 from tracefix.execution.policy import Policy
 from tracefix.knowledge.documents import DocumentLibrary, timestamp
+from tracefix.model.gateway import Gateway
 from tracefix.rules import RuleLibrary, RuleResolver
 from tracefix.runtime.contracts import Outcome, Phase, RunState, RunStatus
+from tracefix.runtime.repair_mode import repair_mode_fields, resolve_repair_mode_fields
 from tracefix.runtime.finding_source import rebind_finding_repair_revision
 from tracefix.service.config import ServiceSettings, validate_snapshot
 from tracefix.service.contracts import ServiceRequest
@@ -133,6 +135,7 @@ async def terminal_failure(session, state, code, *, cancelled=False):
         except Exception:
             pass
     report = {'run_id': latest.run_id, 'scope_id': latest.scope_id, 'run_status': str(latest.run_status),
+        **repair_mode_fields(latest),
         'outcome': str(latest.outcome), 'patch_available': False, 'patch_verification': 'none',
         'error_details': latest.error_details, 'reproduction_status': 'not_verified'}
     latest.report_ref = session.artifacts.put(latest.scope_id, latest.run_id, report, label='服务失败报告')
@@ -160,6 +163,7 @@ async def execute_request(request, settings, *, session_factory=Session,
         args = SimpleNamespace(project=request.repo_id, projects=snapshot['projects_path'],
             profile=snapshot['profile_path'], plain=True, goal=request.goal, mode=request.mode,
             execution_mode='batch', data=str(settings.data_root), console_db=str(settings.console_db),
+            repair_mode=request.execution.repair_mode,
             database_url=settings.database_url, run=True, url=url, spec=None,
             parent_run=None, rule=request.additional_rule_ids, skills='skills')
         stage = 'configuration_missing'
@@ -184,7 +188,9 @@ async def execute_request(request, settings, *, session_factory=Session,
         state = RunState(run_id=request.run_id, scope_id=request.repo_id, project_id=request.repo_id,
             repo_id=config['owner'] + '/' + config['repo'], job_id=request.task_id,
             goal=request.goal, url=url, mode=request.mode, execution_mode='batch',
-            additional_rule_ids=request.additional_rule_ids, remote_config=config)
+            additional_rule_ids=request.additional_rule_ids, remote_config=config,
+            **(resolve_repair_mode_fields(requested=request.execution.repair_mode, project_config=config,
+                run_mode=request.mode, model=Gateway(), repair_source=None) if not request.source_run_id else {}))
         accepted = None
         if request.source_run_id:
             stage = 'finding_source_invalid'
@@ -300,6 +306,9 @@ async def execute_request(request, settings, *, session_factory=Session,
         if documents is not None:
             try:
                 documents.update_run(request.run_id, {'status': result['run_status'].lower(),
+                    'repairMode': result.get('repair_mode'),
+                    'repairModeRequested': result.get('repair_mode_requested'),
+                    'repairModeReason': result.get('repair_mode_reason'),
                     'outcome': result['outcome'], 'phase': 'FINALIZE', 'reportRef': result['report_ref'],
                     'error': result['error'], 'finishedAt': timestamp(), 'pid': None,
                     'publication': result.get('publication')})
