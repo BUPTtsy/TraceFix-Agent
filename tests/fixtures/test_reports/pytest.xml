@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest" errors="0" failures="1" skipped="1" tests="3" time="0.1">
+  <testcase classname="tests.test_tasks" name="test_list" time="0.01"/>
+  <testcase classname="tests.test_tasks" name="test_blank_title" time="0.02" file="tests/test_tasks.py" line="12">
+    <failure message="assert 201 == 400">AssertionError: expected 400, got 201
+at /workspace/tests/test_tasks.py:18:5</failure>
+  </testcase>
+  <testcase classname="tests.test_tasks" name="test_optional"><skipped message="backend unavailable"/></testcase>
+</testsuite></testsuites>
