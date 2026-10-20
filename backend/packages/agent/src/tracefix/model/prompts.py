@@ -5,7 +5,16 @@ import json
 from tracefix.knowledge.context import POLICY
 
 
-PROMPT_VERSION = 'stage-prefix-v3'
+PROMPT_VERSION = 'stage-prefix-v4'
+
+REPAIR_LOOP = '''当前处于混合修复内循环。根据冻结目标、TestSpec、失败基线和最新验证反馈，
+自主组织 Read/Grep/Glob、局部 Edit、RunTests 以及按需委派；每次根据真实工具结果调整下一步。
+先建立现象与代码的证据联系，优先小范围可验证修改；检查当前 overlay 和 diff 后再提交。
+段边界保留当前修改和工具会话，继续先前调查即可，无需重新进行固定诊断流程。
+遇到重复失败、撤销或进展警告时，核对原件并改变有证据支持的策略，不重复无效提交。
+FinishRepair 只提交 summary、可选 diagnosis 与 self_test_refs；补丁由运行时从当前 overlay 生成。
+RunTests 自测成功和 FinishRepair 接受均不代表修复成功，最终结论由外层 PATCH/VERIFY 决定。
+不得修改测试、断言、权限、受保护路径或通过 Bash 绕过 Edit；遵守当前用户引导和约束。'''
 
 STAGE_POLICIES = {
     'PREPARE': '当前阶段负责将用户目标编译为可执行、可核验的测试规范。先区分用户报告、首次页面观测与尚未证实的假设，不预设缺陷必然存在。根据真实页面元素和完整可访问名称定义操作、预期结果及刷新后的状态断言；动态元素必须有明确步骤支持。只申请完成目标所需的最小动作权限，并设计与原问题不同的独立回归场景。信息不足时明确说明限制，不编造页面、登录状态或成功条件。输出前检查断言是否真正衡量用户要求，以及授权动作是否覆盖必要流程；规范冻结后由运行时负责执行与判定。',
@@ -15,6 +24,8 @@ STAGE_POLICIES = {
 
 
 def stage_policy(schema, context):
+    if schema.__name__ == 'FinishRepair':
+        return REPAIR_LOOP
     phase = context.get('phase')
     if phase is None:
         phase = {'TestSpec': 'PREPARE', 'Decision': 'EXPLORE',
@@ -128,6 +139,6 @@ edits 的 path 必须是允许编辑的项目相对路径；before_hash 必须�
 
 def output_instructions(schema, *, include_common=True):
     specific = {'TestSpec': SPEC, 'Decision': ACTION, 'BrowserAction': ACTION,
-                'PatchProposal': PATCH}.get(schema.__name__, '')
+                'PatchProposal': PATCH, 'FinishRepair': REPAIR_LOOP}.get(schema.__name__, '')
     discovery = ELEMENT_DISCOVERY if schema.__name__ in {'TestSpec', 'Decision', 'BrowserAction', 'CheckJudgement'} else ''
     return (COMMON if include_common else '') + NATIVE_OUTPUT + discovery + specific

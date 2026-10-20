@@ -350,6 +350,38 @@ class FileEdit(Contract):
     content: str = Field(max_length=150_000)
 
 
+class CandidatePath(Contract):
+    path: str
+    symbol: str | None = None
+    line_start: int | None = Field(default=None, ge=1)
+    line_end: int | None = Field(default=None, ge=1)
+    content_version: str
+    status: Literal['current', 'stale', 'unresolved'] = 'current'
+
+
+class Hypothesis(Contract):
+    id: str = Field(min_length=1, max_length=120)
+    summary: str = Field(min_length=1, max_length=1000)
+    support_refs: list[str] = Field(default_factory=list, max_length=20)
+    counterevidence_refs: list[str] = Field(default_factory=list, max_length=20)
+    candidate_paths: list[CandidatePath] = Field(default_factory=list, max_length=8)
+    prediction: str = Field(default='', max_length=800)
+    minimal_probe: str = Field(default='', max_length=800)
+    status: Literal['supported', 'plausible', 'refuted', 'unresolved'] = 'unresolved'
+
+
+class DiagnosisDraft(Contract):
+    hypotheses: list[Hypothesis] = Field(default_factory=list, max_length=5)
+    unresolved: list[str] = Field(default_factory=list, max_length=10)
+    guidance_ack: list[GuidanceAck] = Field(default_factory=list)
+
+
+class FinishRepair(Contract):
+    summary: str = Field(min_length=1, max_length=4000)
+    diagnosis: DiagnosisDraft | None = None
+    self_test_refs: list[str] = Field(default_factory=list, max_length=20)
+
+
 class StagedCandidateRef(Contract):
     ref: str = Field(min_length=1)
     path: str = Field(min_length=1)
@@ -447,6 +479,8 @@ class RunState(Contract):
     repair_mode: Literal['hybrid', 'pipeline'] = 'pipeline'
     repair_mode_requested: str | None = None
     repair_mode_reason: str | None = None
+    repair_segment: int = Field(default=0, ge=0)
+    overlay_snapshot_ref: str | None = None
     execution_mode: Literal["interactive", "batch"] = "interactive"
     phase: Phase = Phase.PREPARE
     run_status: RunStatus = RunStatus.RUNNING

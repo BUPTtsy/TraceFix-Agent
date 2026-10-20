@@ -34,6 +34,7 @@ from tracefix.runtime.contracts import (BudgetExceeded, BrowserAction, CheckJudg
 from tracefix.runtime.guidance import (GuidanceLedger, GuidanceRejected, active_guidance,
                                       retarget_state)
 from tracefix.runtime.repair_mode import repair_mode_fields
+from tracefix.runtime.repair_progress import assess_repair, observe_repair
 from tracefix.tools.handlers import build_runtime_tools, materialize_patch_proposal
 from tracefix.tools.browser import execute_browser_tool
 from tracefix.tools.evidence import attach_source_evidence_tools
@@ -1219,6 +1220,13 @@ class Engine:
                              'count': error_count})
         if s.loop_no_progress_steps == self.LOOP_NO_PROGRESS_WARNING:
             warnings.append({'kind': 'no_progress', 'steps': s.loop_no_progress_steps})
+        if s.repair_mode == 'hybrid' and s.phase == Phase.DIAGNOSE:
+            # 同一 DIAGNOSE 内允许多个有进展的工具段，使用实际修复语义判停。
+            warnings = [item for item in warnings if item['kind'] != 'state_repeated']
+            signals = [item for item in signals if item['kind'] != 'state_repeated']
+            repair = assess_repair(s)
+            warnings.extend(repair['warnings'])
+            signals.extend(repair['signals'])
         return fingerprint, warnings, signals
 
     async def _recovery_action(self, s, decision):
@@ -1269,6 +1277,9 @@ class Engine:
                     'no_progress_steps': s.loop_no_progress_steps}
         if (s.loop_evidence or {}).get('verification_results'):
             evidence['verification_results'] = s.loop_evidence['verification_results']
+        for key in ('repair', 'repair_session'):
+            if key in (s.loop_evidence or {}):
+                evidence[key] = s.loop_evidence[key]
         episode_key = self.recovery.active_episode_id(s.recovery_episodes, cause)
         if episode_key is None:
             episode_key = digest([s.run_id, cause.value, s.revision])
@@ -1292,6 +1303,9 @@ class Engine:
             status='continued' if decision.can_continue else 'settled')
         if decision.can_continue:
             target_phase = s.phase
+            if s.repair_mode == 'hybrid' and decision.action.value == 'correct_strategy':
+                observe_repair(self, s, 'correction')
+                evidence['repair'] = s.loop_evidence.get('repair', {})
             if (decision.action.value == 'correct_strategy'
                     and s.phase in {Phase.PATCH, Phase.VERIFY}):
                 target_phase = Phase.DIAGNOSE
@@ -1391,7 +1405,7 @@ class Engine:
                 'category': error.category, 'details': redact(error.details)})
             raise
 
-    async def model_call(self, s, schema, ctx, image=None, validate_output=None):
+    async def model_call(self, s, schema, ctx, image=None, validate_output=None, message_history=None):
         ctx = {**ctx, 'phase': str(s.phase), 'execution_mode': s.execution_mode,
                'workspace_root': str(self.workspace.root),
                'execution_profile': self.profile.model_dump(mode='json')}
@@ -1415,7 +1429,8 @@ class Engine:
         original_validation = validate_output
 
         def validate_candidate(candidate):
-            self.acknowledge_guidance(s, candidate, ctx)
+            if schema.__name__ != 'FinishRepair':
+                self.acknowledge_guidance(s, candidate, ctx)
             if original_validation:
                 original_validation(candidate)
             if hasattr(candidate, 'rule_refs'):
@@ -1596,6 +1611,8 @@ class Engine:
 
         validation = {'validate_output': validate_output} if (original_validation or ctx['guidance_ack_required'] or
             (self.rule_resolver and getattr(selected_model, 'supports_tool_executor', False))) else {}
+        if message_history:
+            validation['message_history'] = message_history
         recovery = s.error_details or {}
         recovering_model_request = (recovery.get('status') == 'WAITING_NETWORK'
             and recovery.get('request_status') == 'not_sent'
@@ -1618,8 +1635,10 @@ class Engine:
                         continue
                     history = request.get('unprojected_messages') or request.get('json', {}).get('messages', [])
                     if history:
+                        validation.pop('message_history', None)
                         validation['messages'] = history
                         validation['preserve_resumed_request'] = True
+                        validation['initial_tool_round'] = request.get('tool_round', 0)
                         if getattr(selected_model, 'supports_tool_history_projection', False):
                             restored_refs = {}
                             for message in history:
@@ -1685,6 +1704,9 @@ class Engine:
         result = await selected_model.generate(schema, ctx, image=image,
             agent_instructions=self.agent_instructions(s), on_attempt=attempt,
             on_response=response, on_error=error, on_usage=usage, **generation_kwargs)
+        if schema.__name__ == 'FinishRepair' and not isinstance(tool_pipeline.submission_value, PatchProposal):
+            raise ModelOutputError('FinishRepair 必须通过运行时提交工具，不能直接返回补丁或成功声明',
+                                   category='output_validation')
         if tool_pipeline.submission_value is not None:
             result = type(result)(tool_pipeline.submission_value, result.usage,
                                   result.model_revision, result.finish_reason)
@@ -1851,12 +1873,17 @@ class Engine:
     def _graph(self, saver):
         graph = StateGraph(GraphState)
         names = ['prelude', 'prepare', 'decide', 'execute', 'explore_gate', 'reproduce',
-                 'check_suite', 'diagnose', 'patch', 'verify', 'review', 'paused', 'finalize']
+                 'check_suite', 'diagnose', 'repair_loop', 'patch', 'verify', 'review', 'paused', 'finalize']
         for name in names:
             async def wrapped(data, node=name):
                 s = RunState(**data['data'])
                 # Usage committed before a crash takes precedence over old graph state.
                 saved = self.store.load(s.run_id, s.scope_id)
+                if node == 'repair_loop' and saved.revision >= s.revision:
+                    # 段内中断后的持久化会话优先于上一个图 checkpoint。
+                    s = saved
+                    if s.phase != Phase.DIAGNOSE:
+                        return self.output(s, 'prelude')
                 s.guidance = saved.guidance
                 s.guidance_constraints = saved.guidance_constraints
                 for metric in ('model_calls', 'browser_actions', 'patches', 'subtasks', 'tokens', 'cost_usd'):
@@ -2067,7 +2094,8 @@ class Engine:
         if s.phase != Phase.FINALIZE and s.check_suite_stage and not s.check_suite_completed:
             return 'check_suite'
         return {Phase.PREPARE: 'prepare', Phase.EXPLORE: 'decide', Phase.REPRODUCE: 'reproduce',
-                Phase.DIAGNOSE: 'diagnose', Phase.PATCH: 'patch', Phase.VERIFY: 'verify',
+                Phase.DIAGNOSE: 'repair_loop' if s.repair_mode == 'hybrid' else 'diagnose',
+                Phase.PATCH: 'patch', Phase.VERIFY: 'verify',
                 Phase.REVIEW: 'review', Phase.FINALIZE: 'finalize'}[s.phase]
 
     async def prelude(self, s, _):
@@ -2896,6 +2924,10 @@ class Engine:
         return self.changed(s, exploration_plan_ref=s.replay_plan_ref, replay_plan_ref=ref,
                             reproduction_binding_ref=binding, reproduction_plan_frozen=True)
 
+    async def repair_loop(self, s, _):
+        from tracefix.runtime.repair_loop import run_segment
+        return await run_segment(self, s)
+
     async def diagnose(self, s, _):
         if s.mode == 'repair':
             self.require_repair_rule_coverage(s)
@@ -3347,6 +3379,12 @@ class Engine:
             replay_plan_hash=binding['plan_hash'])
         ref = self.put(s, validation.model_dump(), name=validation_name+'验证记录')
         s = self.changed(s, validation_refs=s.validation_refs+[ref], replay_index=0)
+        if s.repair_mode == 'hybrid':
+            checkpoints = [self.get(s, item) for item in result.get('checkpoint_refs', [])]
+            observe_repair(self, s, 'verify', result={**result, 'result_ref': artifact,
+                'validation_ref': ref, 'candidate_fingerprint': self.candidate_fingerprint()},
+                **({'passed_counts': {'behavior': sum(item.get('passed') is True for item in checkpoints)}}
+                   if checkpoints else {}))
         if not validation.passed:
             feedback = build_validation_feedback(s, validation,
                 artifact_exists=lambda item: self.artifacts.exists(s.scope_id, s.run_id, item),
@@ -3461,6 +3499,7 @@ class Engine:
         return self.output(s, 'prelude')
 
     async def finalize(self, s, _):
+        from tracefix.runtime.repair_loop import report_summary
         if s.outcome == Outcome.NO_BUG_FOUND and not self.rules_fully_checked(s, Phase.EXPLORE):
             s = self.changed(s, outcome=Outcome.INCONCLUSIVE,
                 error='必检规则覆盖不足，不能输出 NO_BUG_FOUND')
@@ -3575,6 +3614,7 @@ class Engine:
                   'patch_verification': patch_verification, 'patch_export_error': diff_error,
                   'result_summary': result_summary,
                   'diagnosis_retry_count': s.diagnosis_retry_count,
+                  'repair_loop': report_summary(self, s) if s.repair_mode == 'hybrid' else None,
                   'diagnosis_feedback_refs': s.diagnosis_feedback_refs,
                   'budget': s.budget.model_dump(), 'evidence_refs': [reference for reference in s.evidence_refs
                       if not re.search(r'模型|推理|上下文|指令|记忆|源码|状态|事件', reference)],

@@ -43,8 +43,26 @@ def register_test_runner(engine, state, context, bind):
         feedback = {'target': arguments.target, 'exit_code': result['exit_code'],
                     'passed': result['passed'], **parsed, 'overlay_revision': result['overlay_revision'],
                     'diff_fingerprint': result['diff_fingerprint'], 'output_ref': output_ref}
+        if 'normalized_diff_fingerprint' in result:
+            feedback['normalized_diff_fingerprint'] = result['normalized_diff_fingerprint']
         if parsed['summary']['unparsed']:
             feedback['output_tail'] = output[-4000:]
+        feedback.update(run_id=state.run_id, scope_id=state.scope_id,
+                        kind='repair_self_test', source_manifest=state.source_manifest)
+        feedback['result_ref'] = engine.put(state, feedback, name='修复自测结果')
+        from tracefix.runtime.repair_progress import observe_repair
+        assessment = observe_repair(engine, state, 'run_tests', result=feedback,
+                                    target=arguments.target)
+        if assessment.get('warnings') or assessment.get('signals'):
+            feedback['loop_warning'] = assessment.get('warnings', []) + assessment.get('signals', [])
+        if state.repair_mode != 'hybrid':
+            repair = dict((state.loop_evidence or {}).get('repair') or {})
+            repair['self_test_refs'] = list(dict.fromkeys(
+                repair.get('self_test_refs', []) + [feedback['result_ref']]))
+            updated = engine.changed(state, loop_evidence={**(state.loop_evidence or {}), 'repair': repair},
+                                     loop_no_progress_steps=state.loop_no_progress_steps)
+            for field in type(state).model_fields:
+                setattr(state, field, getattr(updated, field))
         record_tool_action(engine, state, 'RunTests', arguments, feedback)
         return feedback
 

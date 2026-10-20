@@ -5,6 +5,7 @@ import ast
 import base64
 import json
 from collections import Counter
+from contextlib import nullcontext
 import os
 import re
 from fnmatch import fnmatchcase
@@ -660,6 +661,93 @@ class Workspace:
         for relative in self._staged_versions:
             self._staged_versions[relative] += 1
         self._overlay_revision += 1
+
+    def unstage_many(self, paths):
+        """全部路径先授权，再原子撤销 overlay；调用方持有工作区写锁。"""
+        paths = list(dict.fromkeys(paths))
+        for relative in paths:
+            self.path(relative, write=True)
+        removed = [relative for relative in paths if relative in self._staged_files]
+        if not removed:
+            return []
+        for relative in removed:
+            self._staged_files.pop(relative, None)
+            self._staged_disk_hashes.pop(relative, None)
+            self._staged_versions[relative] = self.file_overlay_revision(relative) + 1
+        self._staged_candidates = {ref: item for ref, item in self._staged_candidates.items()
+                                   if item.get('path') not in removed}
+        self._overlay_revision += 1
+        return removed
+
+    def export_overlay(self):
+        """导出绑定源码快照与磁盘基线的完整可恢复 overlay。"""
+        mutex = getattr(self, '_local_tool_mutex', None)
+        with mutex.workspace_write() if mutex else nullcontext():
+            snapshot = self.require_repository_snapshot()
+            return {'version': 1, 'repository_snapshot': digest(snapshot), 'head': self.head(),
+                    'overlay_revision': self._overlay_revision,
+                    'files': {path: {'content_b64': base64.b64encode(body).decode('ascii'),
+                                     'disk_hash': self._staged_disk_hashes[path]}
+                              for path, body in self._staged_files.items()},
+                    'file_versions': dict(self._staged_versions),
+                    'candidates': json.loads(json.dumps(self._staged_candidates))}
+
+    def restore_overlay(self, value):
+        """先验证整个快照，失败时保持原 overlay，拒绝路径或磁盘漂移。"""
+        mutex = getattr(self, '_local_tool_mutex', None)
+        with mutex.workspace_write() if mutex else nullcontext():
+            snapshot = self.require_repository_snapshot()
+            if (not isinstance(value, dict) or value.get('version') != 1
+                    or value.get('repository_snapshot') != digest(snapshot)
+                    or value.get('head') != self.head()):
+                raise PermissionError('overlay 快照与当前源码或 Git 基线不匹配')
+            revision = value.get('overlay_revision')
+            versions, files, candidates = (value.get('file_versions'), value.get('files'),
+                                           value.get('candidates'))
+            if (type(revision) is not int or revision < 0 or not isinstance(versions, dict)
+                    or not isinstance(files, dict) or not isinstance(candidates, dict)):
+                raise ValueError('overlay 快照格式不完整')
+            restored, disk_hashes = {}, {}
+            for relative, file_revision in versions.items():
+                self.path(relative, write=True)
+                if type(file_revision) is not int or not 0 <= file_revision <= revision:
+                    raise ValueError('overlay 文件版本无效')
+            for relative, record in files.items():
+                path = self.path(relative, write=True)
+                if (relative not in versions or not path.is_file() or not isinstance(record, dict)
+                        or not isinstance(record.get('content_b64'), str)):
+                    raise ValueError('overlay 文件记录无效')
+                body = base64.b64decode(record['content_b64'], validate=True)
+                body.decode('utf-8')
+                if not body.strip():
+                    raise ValueError('不能恢复空 overlay 文件')
+                if digest(path.read_bytes()) != record.get('disk_hash'):
+                    raise CandidateRejected('DISK_DRIFT', path=relative,
+                                            overlay_revision=revision)
+                restored[relative], disk_hashes[relative] = body, record['disk_hash']
+            for ref, candidate in candidates.items():
+                if not isinstance(ref, str) or not isinstance(candidate, dict):
+                    raise ValueError('overlay 候选记录无效')
+                relative = candidate.get('path')
+                self.path(relative, write=True)
+                # 旧版本候选仍可用于审计；只允许引用当前快照中的路径和基线。
+                if (relative not in restored or candidate.get('ref') != ref
+                        or candidate.get('disk_before_hash') != disk_hashes[relative]
+                        or type(candidate.get('expected_overlay_revision')) is not int
+                        or not 0 < candidate['expected_overlay_revision'] <= versions[relative]):
+                    raise ValueError('overlay 候选绑定无效')
+            old = (self._staged_files, self._staged_disk_hashes,
+                   self._staged_versions, self._staged_candidates, self._overlay_revision)
+            try:
+                self._staged_files, self._staged_disk_hashes = restored, disk_hashes
+                self._staged_versions, self._staged_candidates = dict(versions), dict(candidates)
+                self._overlay_revision = revision
+                self.check_frozen(snapshot)
+                self._validate_staged_constraints()
+            except Exception:
+                (self._staged_files, self._staged_disk_hashes, self._staged_versions,
+                 self._staged_candidates, self._overlay_revision) = old
+                raise
 
     def _validate_staged_constraints(self):
         if not self.guidance_constraints:

@@ -1,6 +1,8 @@
 """工具动作及相对修复基线的累积候选摘要。"""
 from __future__ import annotations
 
+import shlex
+
 from tracefix.execution.workspace import git
 from tracefix.runtime.contracts import digest
 
@@ -33,10 +35,24 @@ def record_tool_action(engine, state, name, arguments, result):
         if key in values:
             values[key] = str(values[key]).replace('\\', '/').removeprefix(
                 engine.workspace.root.as_posix().rstrip('/') + '/')
-    current_diff = (result['diff_fingerprint'] if name == 'RunTests'
-                    else diff_fingerprint(engine.workspace, state))
-    fingerprint = digest([name, values, current_diff,
-                          result.get('exit_code'), result.get('failure_signatures', [])])
+    if name in {'Edit', 'Write', 'NotebookEdit'}:
+        value = values.get('file_path') or values['notebook_path']
+        path = str(value).removeprefix('/workspace/')
+        content = engine.workspace.staged_content(path)
+        if content is None:
+            content = engine.workspace.path(path).read_bytes()
+        fingerprint = digest([name, path, digest(content)])
+    elif name == 'Bash':
+        command = values.get('command', '')
+        try:
+            command = shlex.split(command)
+        except ValueError:
+            pass
+        fingerprint = digest([name, command])
+    elif name == 'RunTests':
+        fingerprint = digest([name, values.get('target', 'unit'), result['diff_fingerprint']])
+    else:
+        fingerprint = digest([name, values, diff_fingerprint(engine.workspace, state)])
     updated = engine.changed(state,
         action_fingerprints=(state.action_fingerprints + [fingerprint])[-12:],
         loop_no_progress_steps=state.loop_no_progress_steps)

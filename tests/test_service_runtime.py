@@ -105,6 +105,10 @@ def service_fixture(tmp_path, monkeypatch):
     monkeypatch.setattr('tracefix.cli.main.DockerRunner', runner)
     monkeypatch.setattr('tracefix.cli.main.MCPBrowser', browser)
     monkeypatch.setattr('tracefix.cli.main.Gateway', lambda: FakeModel(runners[-1].workspace))
+    # 新 Run 冻结先于 runner 创建，能力探测与绑定后的 FakeModel 保持一致。
+    model_capabilities = SimpleNamespace(supports_tool_executor=False)
+    monkeypatch.setattr('tracefix.service.run.Gateway', lambda: model_capabilities)
+    monkeypatch.setattr('tracefix.service.finding.Gateway', lambda: model_capabilities)
 
     def request(run_id='run_alpha', **fields):
         snapshot = registry.freeze('alpha', run_id)
@@ -297,6 +301,8 @@ async def test_finding_repair_reexports_source_and_does_not_inherit_success(serv
     assert fixture.runners[-1].workspace.root != fixture.runners[0].workspace.root
     assert state.repair_source.target_base_commit == request.repository_snapshot.commit
     assert not state.repair_source.revision_rebound
+    assert state.repair_mode == 'pipeline' and state.repair_mode_requested == 'hybrid'
+    assert state.repair_mode_reason == 'model_without_tools'
     assert state.reproduced and state.trial == 3 and state.outcome == Outcome.FIX_VERIFIED, result
     assert library.finding(finding.id).status == 'fixed'
     assert state.repair_source.findings[0]['fix_guidance'] == '将真实保存结果持久化'

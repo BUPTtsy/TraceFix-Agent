@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from tracefix.runtime.contracts import GuidanceAck, digest
+from tracefix.runtime.contracts import CandidatePath, DiagnosisDraft, GuidanceAck, Hypothesis, digest
 
 
 class EvidenceBinding(BaseModel):
@@ -28,38 +28,6 @@ class EvidenceBinding(BaseModel):
     source_map: dict = Field(default_factory=lambda: {"status": "unavailable"})
     initiator: dict = Field(default_factory=lambda: {"status": "unavailable"})
     observed_at: float = Field(default_factory=time.time)
-
-
-class CandidatePath(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    path: str
-    symbol: str | None = None
-    line_start: int | None = Field(default=None, ge=1)
-    line_end: int | None = Field(default=None, ge=1)
-    content_version: str
-    status: Literal["current", "stale", "unresolved"] = "current"
-
-
-class Hypothesis(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str = Field(min_length=1, max_length=120)
-    summary: str = Field(min_length=1, max_length=1000)
-    support_refs: list[str] = Field(default_factory=list, max_length=20)
-    counterevidence_refs: list[str] = Field(default_factory=list, max_length=20)
-    candidate_paths: list[CandidatePath] = Field(default_factory=list, max_length=8)
-    prediction: str = Field(default="", max_length=800)
-    minimal_probe: str = Field(default="", max_length=800)
-    status: Literal["supported", "plausible", "refuted", "unresolved"] = "unresolved"
-
-
-class DiagnosisDraft(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    hypotheses: list[Hypothesis] = Field(default_factory=list, max_length=5)
-    unresolved: list[str] = Field(default_factory=list, max_length=10)
-    guidance_ack: list[GuidanceAck] = Field(default_factory=list)
 
 
 class DiagnosisReport(DiagnosisDraft):

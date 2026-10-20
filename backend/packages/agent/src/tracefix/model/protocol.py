@@ -52,6 +52,9 @@ class RequestBoundary:
         self.request_count = 0
         self.tool_round = sum(1 for message in options.get('initial_history', ())
             if isinstance(message, dict) and message.get('role') == 'assistant' and message.get('tool_calls'))
+        if getattr(schema, '__name__', None) == 'FinishRepair':
+            # 会话历史跨段保留，工具轮次只计本段；网络恢复继续原段计数。
+            self.tool_round = options.get('initial_tool_round', 0) if options.get('preserve_resumed_request') else 0
         self.exchange = None
         self.requests, self.responses, self.tool_records = [], [], []
         self.completed = {}
@@ -233,14 +236,17 @@ class RequestBoundary:
                     raise await self.fail('tool_protocol', '结构化输出不能与运行时工具混合')
                 if len(output_calls) > 1:
                     raise await self.fail('tool_protocol', '结构化提交必须独占一个批次')
-                if runtime_calls:
+                hybrid_submission = self.schema.__name__ == 'FinishRepair' and bool(output_calls)
+                if runtime_calls or hybrid_submission:
                     if self.tool_round >= self.gateway.max_tool_rounds:
-                        raise await self.fail('tool_protocol', '模型工具轮次已达到上限')
-                    try:
-                        self.registry.validate_batch(runtime_calls, self.phase, self.completed,
-                                                     wire_names=True)
-                    except (ValueError, TypeError) as error:
-                        raise await self.fail('tool_protocol', str(error), error)
+                        raise await self.fail('tool_protocol', '模型工具轮次已达到上限',
+                                              reason='max_tool_rounds', max_tool_rounds=self.gateway.max_tool_rounds)
+                    if runtime_calls:
+                        try:
+                            self.registry.validate_batch(runtime_calls, self.phase, self.completed,
+                                                         wire_names=True)
+                        except (ValueError, TypeError) as error:
+                            raise await self.fail('tool_protocol', str(error), error)
                     self.tool_round += 1
             elif choice.get('finish_reason') != 'stop' or message.get('refusal'):
                 raise await self.fail('incomplete_output', '模型响应未正常结束',

@@ -1,0 +1,6 @@
+{"type":"fixture.metadata","payload":{"source":"scripted","scenario":"signature_stagnation","real_model":false}}
+{"event":"run_tests","payload":{"target":"unit","normalized_diff_fingerprint":"A","result":{"failure_signatures":["failure-a"],"summary":{"passed":1,"failed":1,"unparsed":false}}}}
+{"event":"run_tests","payload":{"target":"unit","normalized_diff_fingerprint":"B","result":{"failure_signatures":["failure-a"],"summary":{"passed":1,"failed":1,"unparsed":false}}}}
+{"event":"run_tests","payload":{"target":"unit","normalized_diff_fingerprint":"C","result":{"failure_signatures":["failure-a"],"summary":{"passed":1,"failed":1,"unparsed":false}}}}
+{"event":"run_tests","payload":{"target":"unit","normalized_diff_fingerprint":"D","result":{"failure_signatures":["failure-a"],"summary":{"passed":1,"failed":1,"unparsed":false}}}}
+{"event":"run_tests","payload":{"target":"unit","normalized_diff_fingerprint":"E","result":{"failure_signatures":["failure-a"],"summary":{"passed":1,"failed":1,"unparsed":false}}}}

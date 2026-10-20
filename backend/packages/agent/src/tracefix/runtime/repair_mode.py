@@ -5,8 +5,8 @@ from collections.abc import Mapping
 
 REPAIR_MODES = ('hybrid', 'pipeline')
 DEFAULT_REPAIR_MODE = 'hybrid'
-HYBRID_AVAILABLE = False
-FINDING_REPAIR_AVAILABLE = False
+HYBRID_AVAILABLE = True
+FINDING_REPAIR_AVAILABLE = True
 REPAIR_MODE_FIELDS = ('repair_mode', 'repair_mode_requested', 'repair_mode_reason')
 
 

@@ -336,13 +336,15 @@ async def _resolve(value):
 class ToolPipeline:
     def __init__(self, registry, handlers: Mapping[str, Callable], phase, *, operation=None,
                  emit=None, store_artifact=None, count_tokens=None, scope_check=None,
-                 approve=None, resource_resolver=None):
+                 approve=None, resource_resolver=None, submission_resolver=None):
         self.registry, self.handlers, self.phase = registry, dict(handlers), Phase(phase)
         self.operation, self.emit, self.store_artifact = operation, emit, store_artifact
         self.count_tokens = count_tokens or estimate_tokens
         self.scope_check, self.approve = scope_check, approve
         self.resource_resolver = resource_resolver
+        self.submission_resolver = submission_resolver
         self.submission_value = None
+        self._submission_values = {}
         self.completed_calls = {}
 
     async def _event(self, kind, payload):
@@ -350,6 +352,15 @@ class ToolPipeline:
             await _resolve(self.emit(kind, payload))
 
     def _submission(self, call, result):
+        if self.submission_resolver:
+            accepted = self.submission_resolver(call.name)
+            if accepted is not None:
+                return accepted
+        from tracefix.runtime.contracts import FinishRepair, PatchProposal
+        if call.spec.submission_schema is FinishRepair:
+            if not isinstance(result.result, dict) or not result.result.get('accepted'):
+                raise ToolProtocolError('完成修复缺少运行时验收结果')
+            return PatchProposal.model_validate(result.result['proposal'])
         if call.spec.submission_schema is not None:
             value = (result.result['value'] if isinstance(result.result, dict)
                      and 'value' in result.result else call.input.model_dump(mode='json'))
@@ -458,12 +469,14 @@ class ToolPipeline:
                 result = self._rejected(call, error)
             else:
                 raise
+        if call.spec.submission and not result.is_error:
+            # 补丁正文可能超过模型结果窗口，先提取可信提交，再裁剪模型可见回执。
+            self.submission_value = self._submission(call, result)
+            self._submission_values[call.call_id] = (call.identity, self.submission_value)
         result = await self._shape(call, result)
         if not effect:
             await self._event('tool.error' if result.is_error else 'tool.completed',
                               {'tool_call_id': call.call_id, 'receipt': result.model_dump(mode='json', by_alias=True)})
-        if call.spec.submission and not result.is_error:
-            self.submission_value = self._submission(call, result)
         return result
 
     async def execute_batch(self, calls, completed_calls=None):
@@ -490,7 +503,9 @@ class ToolPipeline:
                 result = (ToolResult.model_validate_json(saved) if isinstance(saved, str)
                           else ToolResult.model_validate(saved))
                 if call.spec.submission and not result.is_error:
-                    self.submission_value = self._submission(call, result)
+                    cached = self._submission_values.get(call.call_id)
+                    self.submission_value = (cached[1] if cached and cached[0] == call.identity
+                                             else self._submission(call, result))
             else:
                 result = await self._execute(call)
                 completed[call.call_id] = (call.identity, result.to_content())

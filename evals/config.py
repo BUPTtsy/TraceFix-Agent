@@ -13,10 +13,16 @@ from tracefix.runtime.contracts import digest
 class AblationGroup:
     agent_mode: str
     cross_run_memory: bool
+    arm: str | None = None
+
+    def __post_init__(self):
+        if self.agent_mode not in {'single', 'multi'} or self.arm not in {None, 'pipeline', 'hybrid'}:
+            raise ValueError('实验组或修复模式无效')
 
     @property
     def name(self):
-        return f'{self.agent_mode}-memory-{"on" if self.cross_run_memory else "off"}'
+        prefix = self.arm + '-' if self.arm else ''
+        return prefix + f'{self.agent_mode}-memory-{"on" if self.cross_run_memory else "off"}'
 
 
 GROUPS = tuple(AblationGroup(mode, memory) for mode in ('single', 'multi')
@@ -50,8 +56,13 @@ class EvaluationConfig:
     mutation_after: str | None = None
     timeout_seconds: int = 1800
     command: tuple[str, ...] = ()
+    track: str = 'compare'
+    category: str | None = None
+    known_bug: bool | None = None
 
     def __post_init__(self):
+        if self.track not in {'compare', 'capability'}:
+            raise ValueError('track 必须为 compare 或 capability')
         if not re.fullmatch(r'[a-f0-9]{40}|[a-f0-9]{64}', self.source_revision):
             raise ValueError('source_revision 必须是完整提交 SHA')
         if not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', self.project):
@@ -114,4 +125,5 @@ class EvaluationConfig:
             }),
             'mutation_hash': digest([self.mutation_file, self.mutation_before, self.mutation_after]),
             'allowed_files': list(self.allowed_files), 'held_out': self.held_out,
+            'track': self.track, 'category': self.category or self.family, 'known_bug': self.known_bug,
         }

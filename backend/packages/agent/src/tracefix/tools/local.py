@@ -22,7 +22,7 @@ from tracefix.execution.workspace import CandidateRejected
 from tracefix.execution.runner import DockerRunner, process
 from tracefix.runtime.contracts import Contract, Phase, RunState, digest, new_id
 from tracefix.tools.core import ToolRejected, ToolResult
-from tracefix.tools.effects import apply_effect_receipt, run_effect
+from tracefix.tools.effects import EffectBoundaryError, apply_effect_receipt, run_effect
 from tracefix.tools.fingerprints import diff_fingerprint, record_tool_action
 from tracefix.workers.locks import WorkspaceMutex
 
@@ -570,6 +570,9 @@ class LocalTools:
             with self.mutex.workspace_write():
                 view = {'overlay_revision': self.workspace.overlay_revision,
                         'diff_fingerprint': diff_fingerprint(self.workspace, self.state)}
+                if self.state.repair_mode == 'hybrid':
+                    from tracefix.runtime.repair_progress import normalized_diff_fingerprint
+                    view['normalized_diff_fingerprint'] = normalized_diff_fingerprint(self.workspace, self.state)
                 for source in self.files():
                     relative = source.relative_to(self.root).as_posix()
                     if mounted(relative):
@@ -677,21 +680,43 @@ def register_local_tools(engine, state, context, bind):
         if writing and not tools.write_enabled:
             continue
         async def handler(arguments, call_id, callback=callback, name=name, writing=writing):
+            previous_revision = tools.workspace.overlay_revision
+            write_completed = False
+
+            def require_unchanged_overlay(error):
+                if writing and tools.workspace.overlay_revision != previous_revision:
+                    raise EffectBoundaryError('overlay 已改变，后续处理失败，需核对操作结果') from error
+
             try:
                 if writing:
                     result = await tools.write_effect(arguments, name)
+                    write_completed = True
                     record_tool_action(engine, state, name, arguments, result)
                     return result
-                return await asyncio.to_thread(callback, arguments)
+                result = await asyncio.to_thread(callback, arguments)
+                if name == 'Read' and state.repair_mode == 'hybrid':
+                    from tracefix.runtime.repair_progress import observe_repair
+                    observe_repair(engine, state, 'read', path=result['relative_path'])
+                return result
+            except ToolRejected as error:
+                # prepare 检测到其他写入者的版本变化时，当前操作仍是确定未执行。
+                if write_completed:
+                    raise EffectBoundaryError('写入已完成，后续处理失败，需核对操作结果') from error
+                raise
             except CandidateRejected as error:
+                require_unchanged_overlay(error)
                 return ToolResult(call_id=call_id, name=name, isError=True,
                     result=error.details, error={**error.details, 'message': str(error), 'executed': False})
             except PermissionError as error:
+                require_unchanged_overlay(error)
                 if getattr(error, 'error_code', None) != 'protected_path':
-                    raise
+                    raise ToolRejected(str(error)) from error
                 details = {'error_code': error.error_code, **error.details}
                 return ToolResult(call_id=call_id, name=name, isError=True,
                     result=details, error={**details, 'message': str(error), 'executed': False})
+            except (ValueError, FileNotFoundError) as error:
+                require_unchanged_overlay(error)
+                raise ToolRejected(str(error)) from error
         bind(name, description, model, handler, phases=set(Phase),
              side_effect='write' if writing else 'read', parallel_safe=not writing)
     if tools.worker and tools.worker_allowed_tools is not None and not ({'Bash', 'shell', 'shell.readonly', 'shell.patch'} & tools.worker_allowed_tools):

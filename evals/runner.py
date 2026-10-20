@@ -182,7 +182,8 @@ class SessionAdapter:
             console_db=str(Path(root) / 'data' / 'console.sqlite3'), data=str(Path(root) / 'data'),
             goal=config.goal, mode='repair', plain=True, url=None, spec=str(config.spec),
             skills=str(config.skills_root), run=True, command=None, continue_run=None,
-            instruction='', execution_mode='batch', parent_run=None, rule=None, repair_mode=None)
+            instruction='', execution_mode='batch', parent_run=None, rule=None,
+            repair_mode=env.get('TRACEFIX_REPAIR_MODE', 'pipeline'))
         async def execute():
             async with contextlib.AsyncExitStack() as resources:
                 session = Session(args, None, None)
@@ -226,6 +227,10 @@ class SessionAdapter:
                     base = state.patch_base_commit or 'HEAD'
                     return {'status': 'completed', 'outcome': str(state.outcome) if state.outcome else None,
                             'internal_success': str(state.outcome) == 'FIX_VERIFIED',
+                            'repair_mode': state.repair_mode,
+                            'repair_mode_requested': state.repair_mode_requested,
+                            'repair_mode_reason': state.repair_mode_reason,
+                            'reproduced': state.reproduced,
                             'candidate_patch': str(candidate_path) if candidate_path.is_file() else None,
                             'materialized_patch_hash': digest(workspace.diff(base).encode()),
                             'verify_candidate': lambda: digest(workspace.diff(base).encode()),
@@ -480,6 +485,7 @@ class FourCellRunner:
         env.update(self.base_env)
         env.update({
             'TRACEFIX_AGENT_MODE': group.agent_mode,
+            'TRACEFIX_REPAIR_MODE': group.arm or 'pipeline',
             'TRACEFIX_CROSS_RUN_MEMORY': 'on' if group.cross_run_memory else 'off',
             'TRACEFIX_RUN_ID': f'eval-{self.config.case_id}-{group.name}',
             'TRACEFIX_EVAL_GROUP': group.name,
@@ -517,7 +523,9 @@ class FourCellRunner:
     @staticmethod
     def _trace_summary(result, group):
         trace = result.get('trace') if isinstance(result, dict) else None
-        if not isinstance(trace, list) or result.get('trace_origin') != 'runtime_audit' or result.get('gui_real') is not True:
+        if (not isinstance(trace, list) or result.get('trace_origin') != 'runtime_audit'
+                or result.get('gui_real') is not True or result.get('source') == 'scripted'
+                or result.get('real_model') is False):
             return {'evidence_kind': 'inconclusive', 'model_agent_ids': [],
                     'delegations': [], 'memory_calls': [], 'trace_proven': False}
         if not isinstance(trace, list):
@@ -534,7 +542,8 @@ class FourCellRunner:
         if group.agent_mode == 'single':
             proven = proven and len(models) == 1
         if group.agent_mode == 'multi':
-            proven = proven and bool(delegations) and len(models) >= 2
+            if group.arm != 'hybrid':
+                proven = proven and bool(delegations) and len(models) >= 2
         return {'evidence_kind': 'real' if proven else 'inconclusive',
                 'model_agent_ids': models, 'delegations': delegations,
                 'model_calls': [item for item in trace if item.get('event') == 'model_call'],
@@ -581,6 +590,7 @@ class FourCellRunner:
         except Exception as error:
             result = {'status': 'inconclusive', 'outcome': 'INFRA_FAILURE',
                       'infra_failure': True, 'error': str(error)}
+        agent_seconds = time.monotonic() - started
         summary = self._trace_summary(result, group)
         candidate = Path(result['candidate_patch']) if result.get('candidate_patch') else None
         if candidate and not candidate.is_absolute():
@@ -607,12 +617,35 @@ class FourCellRunner:
                 verify_candidate=verify_candidate if callable(verify_candidate)
                 else lambda: materialized_hash)
             oracle_result = self._read_oracle_record(binding, oracle_result)
+        scoring_seconds = time.monotonic() - started - agent_seconds
         isolation_proven = all((oracle_result or {}).get(field, {}).get('real_isolation') is True
                                for field in ('boundary', 'boundary_after'))
         summary['oracle_isolation_proven'] = isolation_proven
         if not isolation_proven or result.get('infra_failure'):
             summary['evidence_kind'] = 'inconclusive'
+        requested_mode = group.arm or 'pipeline'
+        actual_mode = result.get('repair_mode')
+        mode_matches = actual_mode == requested_mode
+        patch_files, patch_lines, has_patch = set(), 0, False
+        if candidate and candidate.is_file():
+            patch_text = candidate.read_text(encoding='utf-8', errors='replace')
+            has_patch = bool(patch_text.strip())
+            for line in patch_text.splitlines():
+                if line.startswith(('+++ b/', '--- a/')):
+                    patch_files.add(line[6:])
+                elif line.startswith(('+', '-')) and not line.startswith(('+++', '---')):
+                    patch_lines += 1
         row = {'attempted': True, 'configuration': group.name, 'case_id': self.config.case_id,
+               'arm': requested_mode, 'category': self.config.category or self.config.family,
+               'track': self.config.track, 'known_bug': self.config.known_bug,
+               'repair_mode': requested_mode, 'repair_mode_actual': actual_mode,
+               'repair_mode_reason': result.get('repair_mode_reason'),
+               'mode_comparison_eligible': mode_matches,
+               'held_out': self.config.held_out,
+               'repeat': self.config.seed, 'termination': result.get('outcome'),
+               'agent_seconds': agent_seconds, 'scoring_seconds': scoring_seconds,
+               'patch_files': len(patch_files), 'patch_lines': patch_lines, 'has_patch': has_patch,
+               'reproduced': result.get('reproduced'),
                'family': self.config.family, 'run_id': run_id, 'agent_mode': group.agent_mode,
                'cross_run_memory': group.cross_run_memory, 'outcome': result.get('outcome'),
                'status': result.get('status'), 'error': result.get('error'),
@@ -629,6 +662,7 @@ class FourCellRunner:
                'recovery_effective': bool(result.get('recovery_effective')),
                'internal_success': bool(result.get('internal_success')),
                'evidence_kind': summary['evidence_kind'], 'trace_summary': summary,
+               'source': result.get('source'), 'real_model': result.get('real_model'),
                'binding': binding.as_dict(), 'materialized_patch_hash': materialized_hash}
         self.rows.append(row)
         return row

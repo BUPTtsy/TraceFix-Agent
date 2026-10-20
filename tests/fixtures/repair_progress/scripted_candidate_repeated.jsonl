@@ -1,0 +1,4 @@
+{"type":"fixture.metadata","payload":{"source":"scripted","scenario":"candidate_repeated","real_model":false}}
+{"event":"finish_repair","payload":{"accepted":false,"error_code":"FAILED_CANDIDATE_REPEATED","candidate_fingerprint":"failed-candidate","normalized_diff_fingerprint":"A"}}
+{"event":"finish_repair","payload":{"accepted":false,"error_code":"FAILED_CANDIDATE_REPEATED","candidate_fingerprint":"failed-candidate","normalized_diff_fingerprint":"A"}}
+{"event":"finish_repair","payload":{"accepted":false,"error_code":"FAILED_CANDIDATE_REPEATED","candidate_fingerprint":"failed-candidate","normalized_diff_fingerprint":"A"}}

@@ -21,8 +21,8 @@ def clean_mode_environment(monkeypatch):
     monkeypatch.delenv('TRACEFIX_REPAIR_MODE', raising=False)
 
 
-def test_default_requests_hybrid_but_keeps_existing_pipeline():
-    assert resolve() == ('pipeline', 'hybrid', 'not_implemented')
+def test_default_uses_hybrid_after_repair_loop_is_available():
+    assert resolve() == ('hybrid', 'hybrid', None)
 
 
 def test_request_project_environment_default_priority(monkeypatch):
@@ -54,6 +54,8 @@ def test_invalid_selected_mode_is_rejected(monkeypatch, source, value):
 def test_fallback_reasons_follow_documented_order(monkeypatch):
     no_tools = SimpleNamespace(supports_tool_executor=False)
     source = object()
+    monkeypatch.setattr(repair_mode, 'HYBRID_AVAILABLE', False)
+    monkeypatch.setattr(repair_mode, 'FINDING_REPAIR_AVAILABLE', False)
     assert resolve(run_mode='test', model=no_tools, repair_source=source)[2] == 'test_mode'
     assert resolve(model=no_tools, repair_source=source)[2] == 'not_implemented'
     monkeypatch.setattr(repair_mode, 'HYBRID_AVAILABLE', True)
@@ -108,9 +110,8 @@ def test_finding_new_repair_resolves_test_source_but_inherits_repair_source(monk
     session = SimpleNamespace(documents=None, artifacts=None,
         store=SimpleNamespace(load=lambda *args: source))
     result = finding.finding_repair_state(request, session, None, SimpleNamespace(finding=lambda _: None))
-    assert result.repair_mode == 'pipeline'
     if source_mode == 'test':
-        assert (result.repair_mode_requested, result.repair_mode_reason) == ('hybrid', 'not_implemented')
+        assert (result.repair_mode, result.repair_mode_requested, result.repair_mode_reason) == ('hybrid', 'hybrid', None)
     else:
         assert repair_mode.repair_mode_fields(result) == repair_mode.repair_mode_fields(source)
 

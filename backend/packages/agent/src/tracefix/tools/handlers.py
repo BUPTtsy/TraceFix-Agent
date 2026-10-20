@@ -58,6 +58,7 @@ class RuntimeTools:
     resource_resolver: object = None
 
     def pipeline(self, **callbacks):
+        callbacks['submission_resolver'] = lambda name: self.submissions.get(name)
         if self.operation_executor is not None:
             callbacks['operation'] = self.operation_executor
         if self.resource_resolver is not None:
@@ -131,6 +132,10 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
 
     from tracefix.tools.test_runner import register_test_runner
     register_test_runner(engine, state, context, bind)
+
+    from tracefix.tools.repair import register_repair_tools
+    register_repair_tools(engine, state, context, bind, schema=schema,
+                          submissions=submissions, validate_output=validate_output)
 
     from tracefix.tools.code_analysis import register_code_analysis_tool
     from tracefix.tools.task import register_task_tools
@@ -327,7 +332,7 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
         submission = ('submit_test_spec', StrictTestSpec, Phase.PREPARE)
     elif schema in {Decision, BrowserAction}:
         submission = ('finish_exploration', schema, Phase.EXPLORE)
-    elif schema is PatchProposal:
+    elif schema is PatchProposal and state.repair_mode != 'hybrid':
         submission = ('propose_patch', PatchProposal, Phase.DIAGNOSE)
     elif schema is ReportFindings:
         submission = ('report_findings', ReportFindings, phase)
@@ -378,7 +383,7 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
     def resources(name, arguments):
         if name in {'Write', 'Edit', 'NotebookEdit'}:
             return [file_resource(arguments.get('file_path') or arguments['notebook_path'])]
-        if name == 'Bash':
+        if name in {'Bash', 'RevertOverlay', 'finish_repair'}:
             return [file_resource(engine.workspace.root)]
         if name == 'memory.note':
             return [file_resource(memory.path)]
