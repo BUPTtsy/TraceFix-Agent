@@ -9,7 +9,7 @@ from tracefix.runtime.contracts import digest
 from tracefix.execution.platforms import subprocess_options, terminate_tree, container_user, bind_mount
 
 
-async def process(argv, timeout=120):
+async def process(argv, timeout=120, *, output_limit=100_000):
     """No shell. Arguments originate exclusively from audited host configuration."""
     p = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.PIPE,
                                              stderr=asyncio.subprocess.STDOUT, **subprocess_options())
@@ -19,7 +19,8 @@ async def process(argv, timeout=120):
         await terminate_tree(p)
         raise
     text = output.decode(errors='replace')
-    return {'passed': p.returncode == 0, 'exit_code': p.returncode, 'output': text[-100_000:]}
+    return {'passed': p.returncode == 0, 'exit_code': p.returncode,
+            'output': text if output_limit is None else text[-output_limit:]}
 
 
 class DockerRunner:

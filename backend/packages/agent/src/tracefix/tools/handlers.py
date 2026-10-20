@@ -129,6 +129,9 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
 
     register_local_tools(engine, state, context, bind)
 
+    from tracefix.tools.test_runner import register_test_runner
+    register_test_runner(engine, state, context, bind)
+
     from tracefix.tools.code_analysis import register_code_analysis_tool
     from tracefix.tools.task import register_task_tools
     from tracefix.tools.web import register_web_tools
@@ -358,10 +361,13 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
                 if (getattr(error, 'status', 'FAILED') != 'FAILED'
                         or getattr(error, 'details', {}).get('requires_manual_review')):
                     raise
-                if schema is PatchProposal and getattr(error, 'details', {}).get('error_code'):
+                details = dict(getattr(error, 'details', {}))
+                if getattr(error, 'error_code', None):
+                    details.setdefault('error_code', error.error_code)
+                if schema is PatchProposal and details.get('error_code'):
                     from tracefix.tools.core import ToolResult
                     return ToolResult(call_id=call_id, name=name, isError=True,
-                        result=error.details, error={**error.details, 'message': str(error), 'executed': False})
+                        result=details, error={**details, 'message': str(error), 'executed': False})
                 raise ToolRejected(str(error)) from error
             submissions[name] = value
             return {'accepted': True, 'submission': name, 'value': value.model_dump(mode='json')}

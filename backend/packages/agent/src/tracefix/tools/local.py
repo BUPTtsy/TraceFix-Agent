@@ -17,12 +17,13 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
-from tracefix.execution.platforms import container_user, is_link
+from tracefix.execution.platforms import bind_mount, container_user, is_link
 from tracefix.execution.workspace import CandidateRejected
-from tracefix.execution.runner import process
+from tracefix.execution.runner import DockerRunner, process
 from tracefix.runtime.contracts import Contract, Phase, RunState, digest, new_id
 from tracefix.tools.core import ToolRejected, ToolResult
 from tracefix.tools.effects import apply_effect_receipt, run_effect
+from tracefix.tools.fingerprints import diff_fingerprint, record_tool_action
 from tracefix.workers.locks import WorkspaceMutex
 
 
@@ -107,6 +108,7 @@ LOCAL_TOOL_ALIASES = {
     'Edit': {'Edit', 'file.write', 'code.write'},
     'NotebookEdit': {'NotebookEdit', 'file.write', 'code.write'},
     'Bash': {'Bash', 'shell', 'shell.readonly', 'shell.patch'},
+    'RunTests': {'RunTests'},
 }
 
 
@@ -529,19 +531,49 @@ class LocalTools:
         self.require_managed()
         with apply_effect_receipt():
             pass
+        result = await self.sandbox_run(arguments.command, writable=self.shell_write_enabled,
+                                        timeout=arguments.timeout)
+        if result['passed']:
+            record_tool_action(self.engine, self.state, 'Bash', arguments, result)
+        return result
+
+    async def sandbox_run(self, argv_or_command, *, writable, timeout, extra_mounts=(),
+                          output_limit=100_000):
+        """在当前 overlay 的临时副本执行命令；绝不回退到宿主执行。"""
         profile = getattr(self.engine, 'profile', None)
         if profile is None:
-            raise ToolRejected('Bash 需要配置 Docker sandbox 镜像')
+            raise ToolRejected('命令执行需要配置 Docker sandbox 镜像')
+        runner = getattr(self.engine, 'runner', None)
+        ready = isinstance(runner, DockerRunner) and runner._started
+        mounts = list(extra_mounts)
+        excluded = set()
+        if ready:
+            mounts.append(f'type=volume,src={runner.dependency_volume},dst=/workspace/node_modules,readonly')
+            excluded.update({'node_modules', 'dist'})
+        for mount_spec in mounts:
+            fields = next(csv.reader([mount_spec]))
+            destination = next((field.split('=', 1)[1] for field in fields
+                                if field.startswith(('dst=', 'destination=', 'target='))), '')
+            if destination.startswith('/workspace/'):
+                excluded.add(destination.removeprefix('/workspace/').strip('/'))
+
+        def mounted(relative):
+            return any(relative == item or relative.startswith(item + '/') for item in excluded)
+
         name = new_id('tf-shell')
         with tempfile.TemporaryDirectory(prefix='tracefix-shell-') as folder:
             staging = Path(folder)
-            staging.chmod(0o777 if self.shell_write_enabled else 0o755)
+            staging.chmod(0o777 if writable else 0o755)
             originals = {}
             baselines = {}
             overlays = {}
-            with self.mutex.workspace_read():
+            with self.mutex.workspace_write():
+                view = {'overlay_revision': self.workspace.overlay_revision,
+                        'diff_fingerprint': diff_fingerprint(self.workspace, self.state)}
                 for source in self.files():
                     relative = source.relative_to(self.root).as_posix()
+                    if mounted(relative):
+                        continue
                     staged = self.staged_content(relative)
                     overlays[relative] = staged
                     originals[relative] = staged if staged is not None else source.read_bytes()
@@ -550,31 +582,54 @@ class LocalTools:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(originals[relative])
                     target.chmod(0o666)
-            if self.shell_write_enabled:
+            for relative in excluded:
+                (staging / relative).mkdir(parents=True, exist_ok=True)
+            if writable:
                 for directory in staging.rglob('*'):
                     if directory.is_dir():
                         directory.chmod(0o777)
             mount = io.StringIO()
-            fields = ['type=bind', 'src=' + str(staging), 'dst=/workspace']
-            if not self.shell_write_enabled:
+            fields = next(csv.reader([bind_mount(staging)]))
+            fields = [field for field in fields if field != 'readonly']
+            fields[fields.index('dst=/app')] = 'dst=/workspace'
+            if not writable:
                 fields.append('readonly')
             csv.writer(mount, lineterminator='').writerow(fields)
             command = ['docker', 'run', '--rm', '--name', name, '--network=none',
                        '--cap-drop=ALL', '--security-opt=no-new-privileges', '--read-only',
                        '--pids-limit=128', '--memory=1g', '--cpus=2', '--user', container_user(),
-                       '--tmpfs', '/tmp:rw,nosuid,size=128m,mode=1777', '--mount', mount.getvalue(),
-                       '--workdir', '/workspace', '--entrypoint', '/bin/bash', profile.image,
-                       '--noprofile', '--norc', '-c', arguments.command]
+                       '--tmpfs', '/tmp:rw,nosuid,size=128m,mode=1777', '--mount', mount.getvalue()]
+            for dependency_mount in mounts:
+                command += ['--mount', dependency_mount]
+            if ready:
+                command += ['--tmpfs', '/workspace/dist:rw,nosuid,size=128m,mode=1777']
+            image = (runner.resolved_image_ids or {}).get('app', profile.image) if ready else profile.image
+            if isinstance(argv_or_command, str):
+                command += ['--workdir', '/workspace', '--entrypoint', '/bin/bash', image,
+                            '--noprofile', '--norc', '-c', argv_or_command]
+            else:
+                if not argv_or_command or any(not isinstance(value, str) or not value
+                                              for value in argv_or_command):
+                    raise ToolRejected('沙箱命令必须是非空 argv')
+                command += ['--workdir', '/workspace', '--entrypoint', argv_or_command[0], image,
+                            *argv_or_command[1:]]
             try:
-                result = await process(command, arguments.timeout)
+                if output_limit == 100_000:
+                    result = await process(command, timeout)
+                else:
+                    result = await process(command, timeout, output_limit=output_limit)
+                result = {**result, **view}
             finally:
                 await process(['docker', 'rm', '-f', name], 15)
             updated = {}
             for target in staging.rglob('*'):
+                relative = target.relative_to(staging).as_posix()
+                if mounted(relative):
+                    continue
                 if is_link(target):
                     raise ToolRejected('Bash 输出不能包含符号链接')
                 if target.is_file():
-                    updated[target.relative_to(staging).as_posix()] = target.read_bytes()
+                    updated[relative] = target.read_bytes()
             removed = set(originals) - set(updated)
             if removed:
                 raise ToolRejected('Bash 删除文件不会回写工作区；请使用文件编辑工具')
@@ -583,7 +638,7 @@ class LocalTools:
             if not result['passed']:
                 return {**result, 'files_changed': [], 'discarded_changes': list(changes),
                         'cwd': '/workspace'}
-            if not self.shell_write_enabled:
+            if not writable:
                 return {**result, 'files_changed': [], 'discarded_changes': list(changes),
                         'cwd': '/workspace'}
             targets = {relative: self.path(str(self.root / relative), write=True) for relative in changes}
@@ -624,20 +679,38 @@ def register_local_tools(engine, state, context, bind):
         async def handler(arguments, call_id, callback=callback, name=name, writing=writing):
             try:
                 if writing:
-                    return await tools.write_effect(arguments, name)
+                    result = await tools.write_effect(arguments, name)
+                    record_tool_action(engine, state, name, arguments, result)
+                    return result
                 return await asyncio.to_thread(callback, arguments)
             except CandidateRejected as error:
                 return ToolResult(call_id=call_id, name=name, isError=True,
                     result=error.details, error={**error.details, 'message': str(error), 'executed': False})
+            except PermissionError as error:
+                if getattr(error, 'error_code', None) != 'protected_path':
+                    raise
+                details = {'error_code': error.error_code, **error.details}
+                return ToolResult(call_id=call_id, name=name, isError=True,
+                    result=details, error={**details, 'message': str(error), 'executed': False})
         bind(name, description, model, handler, phases=set(Phase),
              side_effect='write' if writing else 'read', parallel_safe=not writing)
     if tools.worker and tools.worker_allowed_tools is not None and not ({'Bash', 'shell', 'shell.readonly', 'shell.patch'} & tools.worker_allowed_tools):
         return
     if tools.worker and tools.worker_shell_mode == 'disabled':
         return
+    async def bash_handler(arguments, call_id):
+        try:
+            return await tools.bash(arguments, call_id)
+        except PermissionError as error:
+            if getattr(error, 'error_code', None) != 'protected_path':
+                raise
+            details = {'error_code': error.error_code, **error.details}
+            return ToolResult(call_id=call_id, name='Bash', isError=True,
+                result=details, error={**details, 'message': str(error), 'executed': False})
+
     bind('Bash', '在独立 Docker Linux sandbox 执行 Bash，工作目录 /workspace；只复制授权文件，禁网、禁宿主访问。'
          '提供 command/description，timeout 为秒（最多 120）。优先用 Read/Glob/Grep/Edit 操作文件。'
          '子 Agent 默认只读，只有 Supervisor 显式启用写权限才回写 writable_files；删除、越权或并发 hash 冲突不回写。'
          '不要 push、后台运行、索取凭据或宣称失败命令成功；检查 exit_code/output。',
-         BashInput, tools.bash, phases=set(Phase), side_effect='write', parallel_safe=False,
+         BashInput, bash_handler, phases=set(Phase), side_effect='write', parallel_safe=False,
          timeout_s=150)
