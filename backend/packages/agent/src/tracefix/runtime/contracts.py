@@ -500,6 +500,11 @@ class RunState(Contract):
     repo_id: str | None = None
     goal: str
     job_id: str | None = None
+    harness_job_id: str | None = None
+    harness_session_id: str | None = None
+    harness_task_id: str | None = None
+    harness_stage: str | None = None
+    sdk_execution_id: str | None = None
     parent_run_id: str | None = None
     continuation_instruction: str | None = None
     continuation_count: int = 0
@@ -657,7 +662,9 @@ def reduce_state(state: RunState, expected_revision: int, **delta) -> RunState:
     phase = Phase(delta.get("phase", state.phase))
     detected_failure = bool(state.check_plan_ref and state.check_suite_completed
                             and state.initial_check_result_refs and state.check_summary.get('failed', 0) > 0)
-    if phase == Phase.DIAGNOSE and state.phase == Phase.EXPLORE and not detected_failure:
+    planned_increment = bool(state.harness_job_id and state.harness_task_id
+        and state.check_suite_completed and state.initial_check_result_refs)
+    if phase == Phase.DIAGNOSE and state.phase == Phase.EXPLORE and not (detected_failure or planned_increment):
         raise ValueError('诊断门禁：需要完整检查套件的失败证据')
     if phase != state.phase and phase not in TRANSITIONS[state.phase]:
         if not (state.continuation_count and state.phase == Phase.PREPARE and phase == Phase.VERIFY
@@ -681,9 +688,11 @@ def reduce_state(state: RunState, expected_revision: int, **delta) -> RunState:
 
 
 def verification_gate(state: RunState, validations: list[Validation], artifact_exists, *,
-                      artifact_read=None, artifact_read_bytes=None) -> bool:
+                      artifact_read=None, artifact_read_bytes=None,
+                      allow_passing_baseline=False) -> bool:
     from tracefix.runtime.verification import verify_artifacts
 
     # passed 是生产者声明，不是证明；门禁须核验类型、当前运行绑定与原始证据，并从快照重算 GUI 断言。
     # 只有引用存在还不够，缺少 JSON 或截图字节读取器时必须拒绝放行。
-    return verify_artifacts(state, validations, artifact_exists, artifact_read, artifact_read_bytes)
+    return verify_artifacts(state, validations, artifact_exists, artifact_read, artifact_read_bytes,
+                            allow_passing_baseline=allow_passing_baseline)

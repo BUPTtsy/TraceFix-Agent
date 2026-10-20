@@ -241,7 +241,7 @@ def initial_check_failure(state, exists, read, read_bytes):
         return False
 
 
-def _check_suite_verified(state, exists, read, read_bytes):
+def _check_suite_verified(state, exists, read, read_bytes, *, allow_passing_baseline=False):
     plan = _frozen_check_plan(state, exists, read)
     if plan is None:
         return False
@@ -250,15 +250,19 @@ def _check_suite_verified(state, exists, read, read_bytes):
         return False
     final = _check_results(state, plan, state.check_result_refs, 'verify', state.patch_hash,
                            exists, read, read_bytes)
-    return (initial_check_failure(state, exists, read, read_bytes)
+    baseline = _check_results(state, plan, state.initial_check_result_refs, 'explore', None,
+                              exists, read, read_bytes)
+    baseline_valid = (baseline is not None and all(result.status in {'pass', 'fail'}
+                      for result in baseline.values()))
+    return ((baseline_valid if allow_passing_baseline else initial_check_failure(state, exists, read, read_bytes))
             and final is not None and all(result.status in {'pass', 'fail'}
                 and (result.severity != 'blocker' or result.status == 'pass') for result in final.values()))
 
 
-def _verify_commands(state, validations, spec, plan, exists, read):
+def _verify_commands(state, validations, spec, plan, exists, read, *, allow_passing_baseline=False):
     from tracefix.runtime.command_tests import KINDS, baseline_reproduced, command_body, valid_plan
 
-    if not valid_plan(plan, spec) or not state.reproduced:
+    if not valid_plan(plan, spec) or not (state.reproduced or allow_passing_baseline):
         return False
     plan_hash = digest(plan)
     binding = verification_binding(state, plan_hash)
@@ -267,7 +271,14 @@ def _verify_commands(state, validations, spec, plan, exists, read):
     reproduction = _read(state.reproduction_binding_ref, exists, read)
     expected = {key: binding[key] for key in ('scope_id', 'run_id', 'source_manifest',
                                              'environment_digest', 'test_spec_hash', 'plan_hash')}
-    if reproduction != expected or not baseline_reproduced(state, plan, exists, read):
+    baseline_valid = baseline_reproduced(state, plan, exists, read)
+    if allow_passing_baseline:
+        baselines = [_read(ref, exists, read) for ref in state.baseline_validation_refs]
+        baseline_binding = {**binding, 'patch_hash': None}
+        baseline_valid = bool(baselines) and all(
+            _bound(result, baseline_binding, 'command_baseline', 'baseline_' + plan['target'])
+            and command_body(result, plan, plan['target']) for result in baselines)
+    if reproduction != expected or not baseline_valid:
         return False
     latest = {}
     for raw in validations:
@@ -305,14 +316,15 @@ def _verify_commands(state, validations, spec, plan, exists, read):
     return True
 
 
-def verify_artifacts(state, validations, exists, read, read_bytes):
+def verify_artifacts(state, validations, exists, read, read_bytes, *, allow_passing_baseline=False):
     try:
         if (not callable(exists) or not callable(read) or not callable(read_bytes)
                 or not state.source_aligned or not state.patch_hash
                 or not state.reproduction_plan_frozen or not state.test_spec_ref or not state.replay_plan_ref):
             return False
         if state.check_plan_ref:
-            if not _check_suite_verified(state, exists, read, read_bytes):
+            if not _check_suite_verified(state, exists, read, read_bytes,
+                                         allow_passing_baseline=allow_passing_baseline):
                 return False
         elif not state.reproduced:
             return False
@@ -322,7 +334,8 @@ def verify_artifacts(state, validations, exists, read, read_bytes):
         spec = TestSpec.model_validate(raw_spec)
         plan = _read(state.replay_plan_ref, exists, read)
         if spec.mode != 'gui':
-            return _verify_commands(state, validations, spec, plan, exists, read)
+            return _verify_commands(state, validations, spec, plan, exists, read,
+                                    allow_passing_baseline=allow_passing_baseline)
         if type(plan) is not list or not plan:
             return False
         for raw_action in plan:

@@ -11,6 +11,7 @@ import os
 import re
 import time
 from collections import Counter
+from contextlib import ExitStack
 from pathlib import Path
 from typing import TypedDict
 
@@ -230,7 +231,7 @@ class Engine:
 
     def __init__(self, store, artifacts, scopes, context, profile, workspace, runner,
                  browser, model, retriever, source, checkpointer, notify=None,
-                 rule_resolver=None, rule_library=None):
+                 rule_resolver=None, rule_library=None, harness=None):
         self.store, self.artifacts, self.scopes, self.context = store, artifacts, scopes, context
         self.profile, self.workspace, self.runner = profile, workspace, runner
         self.browser, self.model, self.retriever, self.source = browser, model, retriever, source
@@ -250,6 +251,7 @@ class Engine:
         self.event_adapter = EventAdapter(store)
         self.recovery = RecoveryController()
         self.runtime_services = None
+        self.harness = harness
         self.skills = SkillCatalog(Path(__file__).resolve().parents[5] / 'skills')
         self.skill_store = SkillStore(self.artifacts)
         self.graph = self._graph(checkpointer)
@@ -318,6 +320,8 @@ class Engine:
         return None
 
     def submit_guidance(self, s, text, *, level=None, expires='run', constraints=None, author='user'):
+        if s.harness_job_id:
+            raise PermissionError('SDK Job 运行期间不能接收补充指令')
         if s.run_status in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL,
                             RunStatus.FAILED, RunStatus.SUPERSEDED}:
             raise ValueError('只有活动 Run 可以接收运行中引导')
@@ -1001,7 +1005,9 @@ class Engine:
             validations = [Validation(**self.get(s, ref)) for ref in s.validation_refs]
             return verification_gate(s, validations, lambda ref: self.bundle_exists(s, ref),
                 artifact_read=lambda ref: self.get(s, ref),
-                artifact_read_bytes=lambda ref: self.artifacts.read(s.scope_id, s.run_id, ref))
+                artifact_read_bytes=lambda ref: self.artifacts.read(s.scope_id, s.run_id, ref),
+                allow_passing_baseline=bool(s.harness_job_id and self.harness
+                    and self.harness.has_verified_predecessor(self, s)))
         except Exception:
             return False
 
@@ -1385,6 +1391,9 @@ class Engine:
             'patch_hash': s.patch_hash,
         }
         semantic = {key: value for key, value in intent.items() if key not in {'call_id', 'tool_call_id'}}
+        final_attempt = getattr(self, '_harness_final_attempt', None)
+        if final_attempt:
+            semantic['harness_final_attempt'] = final_attempt
         if idempotency_key:
             return {**semantic, 'resources': self.operation_resources(name, intent)}
         return {**semantic, 'execution': execution,
@@ -1392,6 +1401,9 @@ class Engine:
 
     async def operation(self, s, name, intent, fn, reconcile=None, idempotency_key=None,
                         tool_call_id=None):
+        final_attempt = getattr(self, '_harness_final_attempt', None)
+        if final_attempt and idempotency_key:
+            idempotency_key = digest([final_attempt, idempotency_key])
         prepared = self.operation_intent(s, name, intent, idempotency_key=idempotency_key)
         correlation = tool_call_id if tool_call_id is not None else intent.get('tool_call_id')
         if correlation is not None or intent.get('call_id') is not None:
@@ -1877,7 +1889,9 @@ class Engine:
     def _graph(self, saver):
         graph = StateGraph(GraphState)
         names = ['prelude', 'prepare', 'decide', 'execute', 'explore_gate', 'reproduce',
-                 'check_suite', 'diagnose', 'repair_loop', 'patch', 'verify', 'review', 'paused', 'finalize']
+                 'check_suite', 'diagnose', 'repair_loop', 'patch', 'verify', 'review', 'paused', 'finalize',
+                 'harness_initialize', 'harness_claim', 'harness_code', 'harness_review',
+                 'harness_accept', 'harness_final']
         for name in names:
             async def wrapped(data, node=name):
                 s = RunState(**data['data'])
@@ -1912,6 +1926,22 @@ class Engine:
                 except GraphInterrupt:
                     raise
                 except Exception as e:
+                    if s.harness_job_id:
+                        job = self.harness.job(s)
+                        if job.status == 'RUNNING':
+                            self.harness.store.block_job(job.job_id, 'HARNESS_NODE_FAILED',
+                                scope_id=s.scope_id, expected_revision=job.revision)
+                        current = self.store.load(s.run_id, s.scope_id)
+                        if str(current.run_status) in {'COMPLETED', 'FAILED', 'CANCELLED', 'ABNORMAL', 'SUPERSEDED'}:
+                            return self.output(current, 'end')
+                        current = self.changed(current, run_status=RunStatus.FAILED,
+                            error=sanitize(error_message(e))[:1500],
+                            error_details={'source': 'harness', 'node': node,
+                                'type': type(e).__name__, 'requires_manual_review': True})
+                        self.event(current, 'run.error', {'error': current.error,
+                            'error_details': current.error_details})
+                        self.harness.project(current)
+                        return self.output(current, 'end')
                     if node == 'finalize':
                         raise
                     if isinstance(e, ContextWindowError) or getattr(e, 'status', None) == 'UNKNOWN_OPERATION':
@@ -2096,6 +2126,15 @@ class Engine:
         return ref, detail
 
     def route(self, s):
+        if s.harness_job_id:
+            if self.harness is None:
+                raise RuntimeError('SDK Job 缺少持久化 Harness 执行入口')
+            if s.harness_stage == 'initialize' and s.phase != Phase.PREPARE:
+                return 'harness_initialize'
+            if s.phase == Phase.DIAGNOSE and not (s.check_suite_stage and not s.check_suite_completed):
+                return 'harness_code'
+            if s.phase == Phase.REVIEW:
+                return 'harness_review'
         if s.phase != Phase.FINALIZE and s.check_suite_stage and not s.check_suite_completed:
             return 'check_suite'
         return {Phase.PREPARE: 'prepare', Phase.EXPLORE: 'decide', Phase.REPRODUCE: 'reproduce',
@@ -2104,6 +2143,12 @@ class Engine:
                 Phase.REVIEW: 'review', Phase.FINALIZE: 'finalize'}[s.phase]
 
     async def prelude(self, s, _):
+        if s.harness_job_id:
+            if self.harness is None:
+                raise RuntimeError('SDK Job 缺少持久化 Harness 执行入口')
+            self.harness._check(self, s)
+            if self.notes or any(entry.status in {'queued', 'active'} for entry in s.guidance):
+                raise PermissionError('SDK Job 不接收运行中补充指令')
         from tracefix.runtime.test_edit_approval import restore_test_edit_approval
         restore_test_edit_approval(self, s)
         self.scopes.assert_current(self.context)
@@ -2264,9 +2309,12 @@ class Engine:
                 raise PermissionError('运行状态与源码快照摘要不一致')
             if not s.repo_snapshot_ref or self.get(s, s.repo_snapshot_ref) != snapshot:
                 raise PermissionError('运行状态与绑定源码快照不一致')
-            self.workspace.validate_repository(self.scopes, self.context, snapshot,
-                base_commit=s.patch_base_commit, patch_hash=s.patch_hash,
-                branch=s.local_branch or 'tracefix/' + s.run_id)
+            if s.harness_job_id and snapshot.get('harness_revision'):
+                self.harness.validate_workspace(self, s, snapshot)
+            else:
+                self.workspace.validate_repository(self.scopes, self.context, snapshot,
+                    base_commit=s.patch_base_commit, patch_hash=s.patch_hash,
+                    branch=s.local_branch or 'tracefix/' + s.run_id)
             async def prepare_env():
                 if s.continuation_count:
                     await self.runner.close()
@@ -2300,6 +2348,8 @@ class Engine:
             ref = self.put(s, {**result, 'kind': 'baseline_unit', 'source_manifest': s.source_manifest}, name='基线单元测试')
             s = self.changed(s, step=2, baseline_validation_refs=[ref])
             return self.output(s, 'prelude')
+        if s.harness_job_id and s.harness_stage == 'initialize':
+            return self.output(s, 'harness_initialize')
         if command_mode:
             phase = Phase.VERIFY if s.continuation_count and s.patch_hash and s.reproduced else Phase.EXPLORE
             return self.output(self.changed(s, phase=phase, step=0), 'prelude')
@@ -2781,6 +2831,8 @@ class Engine:
             validation_failed = any(value.get('patch_hash') == s.patch_hash
                                     and value.get('passed') is not True for value in validations)
             if overall in {'FAILED', 'INCONCLUSIVE'} or validation_failed:
+                if s.harness_job_id and s.harness_stage != 'final_acceptance':
+                    self.harness.failed_feedback(self, s)
                 return self.output(self.changed(s, phase=Phase.DIAGNOSE,
                     error='修复后的检查套件未通过，参见逐项检查证据'), 'prelude')
             return await self.complete_verification(s)
@@ -2801,6 +2853,10 @@ class Engine:
             return self.output(self.changed(s, phase=phase, pending_action=None), 'prelude')
         outcome = (Outcome.INCONCLUSIVE if overall in {'FAILED', 'INCONCLUSIVE'}
                    or not self.rules_fully_checked(s, Phase.EXPLORE) or s.repair_source else Outcome.NO_BUG_FOUND)
+        if (s.harness_job_id and overall == 'PASSED' and not s.repair_source
+                and self.harness.has_verified_predecessor(self, s)):
+            s = await self.freeze_reproduction_plan(s)
+            return self.output(self.changed(s, phase=Phase.DIAGNOSE, pending_action=None), 'harness_code')
         return self.output(self.changed(s, phase=Phase.FINALIZE, outcome=outcome), 'prelude')
 
     async def reset(self, s):
@@ -2969,8 +3025,36 @@ class Engine:
                             reproduction_binding_ref=binding, reproduction_plan_frozen=True)
 
     async def repair_loop(self, s, _):
+        if s.harness_job_id:
+            return await self.harness.code(self, s)
         from tracefix.runtime.repair_loop import run_segment
         return await run_segment(self, s)
+
+    async def harness_initialize(self, s, _):
+        output = await self.harness.initialize(self, s)
+        self.harness.project(s)
+        return output
+
+    async def harness_claim(self, s, _):
+        output = await self.harness.claim(self, s)
+        self.harness.project(s)
+        return output
+
+    async def harness_code(self, s, _):
+        output = await self.harness.code(self, s)
+        self.harness.project(s)
+        return output
+
+    async def harness_review(self, s, _):
+        return await self.harness.review(self, s)
+
+    async def harness_accept(self, s, _):
+        output = await self.harness.accept(self, s)
+        self.harness.project(s)
+        return output
+
+    async def harness_final(self, s, _):
+        return await self.harness.final(self, s)
 
     async def diagnose(self, s, _):
         if s.mode == 'repair':
@@ -3324,7 +3408,7 @@ class Engine:
             raise ValueError('Finding Repair 必须重新复现，不能复用来源 Run 的修复结论')
         if s.check_plan_ref:
             from tracefix.runtime.verification import initial_check_failure
-            if not initial_check_failure(s, lambda ref: self.bundle_exists(s, ref),
+            if not (s.harness_job_id and self.harness.has_verified_predecessor(self, s)) and not initial_check_failure(s, lambda ref: self.bundle_exists(s, ref),
                     lambda ref: self.get(s, ref),
                     lambda ref: self.artifacts.read(s.scope_id, s.run_id, ref)):
                 raise ValueError('补丁门禁：初始检查失败证据不存在、损坏或绑定不匹配')
@@ -3346,6 +3430,8 @@ class Engine:
         diff = self.put(s, self.workspace.diff(s.patch_base_commit), 'diff', name='补丁差异')
         self.event(s, 'patch.applied', {'diff_ref': diff, 'patch_hash': r['patch_hash']})
         s = self.changed(s, phase=Phase.VERIFY, patch_hash=r['patch_hash'], validation_index=0, replay_index=0)
+        if s.harness_job_id:
+            self.harness.bind_candidate(self, s)
         return self.output(s, 'prelude')
 
     async def verify(self, s, _):
@@ -3462,6 +3548,10 @@ class Engine:
             s = self.changed(s, diagnosis_feedback_refs=s.diagnosis_feedback_refs + [feedback_ref],
                              failed_candidate_signatures=failed[-50:])
             self.event(s, 'gate.decided', {'validation': kind, 'passed': False})
+            if s.harness_job_id and s.harness_stage != 'final_acceptance':
+                self.harness.failed_feedback(self, s)
+                return self.output(self.changed(s, phase=Phase.DIAGNOSE,
+                    harness_stage='coding'), 'harness_code')
             if not s.check_plan_ref:
                 return self.output(self.changed(s, phase=Phase.DIAGNOSE), 'prelude')
         if s.validation_index < len(kinds)-1:
@@ -3489,6 +3579,9 @@ class Engine:
             self.event(s, 'run.error', {'error': s.error, 'error_details': s.error_details,
                                         'action': '保留未验证补丁并清理运行环境'})
             return self.output(s, 'finalize')
+        if s.harness_job_id:
+            return self.output(self.changed(s, phase=Phase.REVIEW, outcome=Outcome.FIX_VERIFIED,
+                run_status=RunStatus.RUNNING, approval_ref=None), 'harness_review')
         if s.execution_mode == 'batch':
             s = self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.FIX_VERIFIED,
                              run_status=RunStatus.RUNNING, approval_ref=None,
@@ -3500,6 +3593,8 @@ class Engine:
         return self.output(s, 'review')
 
     async def review(self, s, _):
+        if s.harness_job_id:
+            return await self.harness.review(self, s)
         # This node re-enters after interrupt. Approval parser wrote a bound record;
         # model or webpage strings cannot supply authorization.
         interrupt({'approval_id': s.approval_ref, 'patch_hash': s.patch_hash,
@@ -3604,7 +3699,7 @@ class Engine:
                     error_details={'integration_blocker': 'finding_source_invalid', 'reason': str(error)})
                 patch_verification = 'unverified' if patch_available else 'none'
         repair_commit = None
-        if verified and s.execution_mode == 'batch' and not s.local_branch:
+        if verified and (s.execution_mode == 'batch' or s.harness_job_id) and not s.local_branch:
             action = {'action': 'local_commit', 'branch': 'tracefix/'+s.run_id}
             try:
                 async def commit():
@@ -3787,7 +3882,14 @@ class Engine:
         self.put(s, events, name='完整事件数据')
         self.put(s, '\n\n'.join(json.dumps(readable(event), ensure_ascii=False, indent=2) for event in events),
                  'txt', name='中文事件日志')
-        return self.output(s, 'end')
+        if s.harness_job_id and s.outcome != Outcome.FIX_VERIFIED:
+            job = self.harness.job(s)
+            if job.status == 'RUNNING':
+                self.harness.store.block_job(job.job_id, 'INCREMENT_NOT_VERIFIED',
+                    scope_id=s.scope_id, expected_revision=job.revision)
+                self.harness.project(s)
+        return self.output(s, 'harness_accept' if s.harness_job_id
+                           and s.outcome == Outcome.FIX_VERIFIED else 'end')
 
     async def run(self, state=None, resume=None):
         close_services = True
@@ -3805,11 +3907,26 @@ class Engine:
             if close_services and self.runtime_services is not None:
                 await self.runtime_services.aclose()
 
+    def claim_harness_writer(self, run_id):
+        stack = getattr(self, '_harness_writer_stack', None)
+        if stack is not None and run_id not in self._harness_writer_ids:
+            stack.enter_context(self.store.writer(run_id))
+            self._harness_writer_ids.add(run_id)
+
     async def _run_graph(self, state=None, resume=None):
         run_id = state.run_id if state else self.current_run
         self.current_run = run_id
-        config = {'configurable': {'thread_id': run_id}, 'recursion_limit': 1500}
-        with self.store.writer(run_id):
+        initial = state or self.store.load(run_id, self.context.active_scope)
+        if initial.harness_job_id and state is None:
+            raise RuntimeError('SDK Job 跨进程继续尚未通过 M4 恢复门禁')
+        thread_id = initial.harness_job_id or run_id
+        config = {'configurable': {'thread_id': thread_id}, 'recursion_limit': 1500}
+        with ExitStack() as writers:
+            writers.enter_context(self.store.writer(run_id))
+            if initial.harness_job_id:
+                writers.enter_context(self.store.writer('harness:' + initial.harness_job_id))
+                self._harness_writer_stack = writers
+                self._harness_writer_ids = {run_id}
             if state:
                 self.store.save(state)
                 if state.continuation_count:
@@ -3829,7 +3946,9 @@ class Engine:
                 raise
             except Exception as e:
                 scope_id = state.scope_id if state else self.context.active_scope
-                current = self.store.load(run_id, scope_id)
+                current = self.store.load(self.current_run, scope_id)
+                if current.harness_job_id:
+                    raise
                 if current.execution_mode != 'batch' and not isinstance(e, GraphRecursionError):
                     raise
                 if current.run_status in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL,
@@ -3846,3 +3965,5 @@ class Engine:
                 self.event(current, 'run.error', {'error': current.error,
                     'error_details': current.error_details})
                 return await self.finalize(current, 'finalize')
+            finally:
+                self._harness_writer_stack = None
