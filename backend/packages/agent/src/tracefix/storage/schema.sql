@@ -50,4 +50,47 @@ CREATE TABLE IF NOT EXISTS approvals (
  decision text, consumed boolean NOT NULL DEFAULT false
 );
 ALTER TABLE approvals ALTER COLUMN patch_hash DROP NOT NULL;
+CREATE TABLE IF NOT EXISTS harness_jobs (
+ id text PRIMARY KEY, job_id text NOT NULL UNIQUE, scope_id text NOT NULL,
+ revision integer NOT NULL CHECK(revision >= 0),
+ status text NOT NULL CHECK(status IN ('CREATED','RUNNING','STOPPING','STOPPED','COMPLETED','BLOCKED','FAILED')),
+ state jsonb NOT NULL
+);
+CREATE TABLE IF NOT EXISTS harness_work_items (
+ id text PRIMARY KEY, job_id text NOT NULL REFERENCES harness_jobs(id), scope_id text NOT NULL,
+ revision integer NOT NULL CHECK(revision >= 0),
+ status text NOT NULL CHECK(status IN ('PENDING','READY','LEASED','CANDIDATE','VERIFIED','BLOCKED')),
+ lease_owner text, lease_epoch bigint NOT NULL DEFAULT 0, state jsonb NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS harness_one_claimed_work_item ON harness_work_items(job_id)
+ WHERE status IN ('LEASED','CANDIDATE');
+CREATE TABLE IF NOT EXISTS harness_sessions (
+ id text PRIMARY KEY, job_id text NOT NULL REFERENCES harness_jobs(id), scope_id text NOT NULL,
+ revision integer NOT NULL CHECK(revision >= 0),
+ status text NOT NULL CHECK(status IN ('CREATED','RUNNING','STOPPING','STOPPED','COMPLETED','BLOCKED','FAILED')),
+ kind text NOT NULL CHECK(kind IN ('initializer','coder')), harness_task_id text REFERENCES harness_work_items(id),
+ state jsonb NOT NULL,
+ CHECK((kind='initializer' AND harness_task_id IS NULL) OR (kind='coder' AND harness_task_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS harness_one_active_session ON harness_sessions(job_id)
+ WHERE status NOT IN ('COMPLETED','FAILED');
+CREATE TABLE IF NOT EXISTS sdk_executions (
+ id text PRIMARY KEY, job_id text NOT NULL REFERENCES harness_jobs(id), scope_id text NOT NULL,
+ revision integer NOT NULL CHECK(revision >= 0),
+ status text NOT NULL CHECK(status IN ('PREPARED','STARTING','RUNNING','SUCCEEDED','INTERRUPTING','STOPPED','FAILED','UNKNOWN')),
+ session_id text NOT NULL REFERENCES harness_sessions(id), node_kind text NOT NULL,
+ logical_invocation_id text NOT NULL, owner_epoch bigint NOT NULL, state jsonb NOT NULL,
+ UNIQUE(session_id,node_kind,logical_invocation_id)
+);
+CREATE TABLE IF NOT EXISTS harness_outbox (
+ job_id text NOT NULL REFERENCES harness_jobs(id), scope_id text NOT NULL, seq bigint NOT NULL,
+ event_id text NOT NULL UNIQUE, owner_epoch bigint NOT NULL, payload jsonb NOT NULL,
+ delivered boolean NOT NULL DEFAULT false, PRIMARY KEY(job_id,seq)
+);
+CREATE TABLE IF NOT EXISTS harness_projection_offsets (
+ consumer_id text NOT NULL, job_id text NOT NULL REFERENCES harness_jobs(id),
+ last_seq bigint NOT NULL, state jsonb NOT NULL, PRIMARY KEY(consumer_id,job_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS sdk_one_execution_per_invocation ON sdk_executions
+ (session_id, (state->>'invocation_no'));
 
