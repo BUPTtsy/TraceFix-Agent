@@ -526,6 +526,7 @@ async def test_production_timeout_cancel_blocks_new_call_and_epoch(tmp_path, can
         with pytest.raises(UnknownOperation):
             await build_runtime_tools(engine, changed, None).pipeline().execute(
                 'memory.note', {'text': 'different arguments'}, 'different-call')
+    state = engine.store.load(state.run_id, state.scope_id)
     result = await build_runtime_tools(engine, state, None).pipeline().execute(
         'Write', {'file_path': str(source), 'content': 'independent\n'}, 'independent-call')
     assert not result.is_error
