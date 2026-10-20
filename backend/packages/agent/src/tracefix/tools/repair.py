@@ -45,11 +45,14 @@ def build_repair_proposal(engine, state, finish):
     edits = []
     for relative, content in sorted(workspace._staged_files.items()):
         path = workspace.path(relative, write=True)
-        disk = path.read_bytes()
-        if digest(disk) != workspace._staged_disk_hashes.get(relative):
+        disk = workspace.baseline_bytes(relative)
+        if (digest(disk) != workspace._staged_disk_hashes.get(relative)
+                or path.exists() != workspace._staged_disk_exists.get(relative, True)):
             raise RepairRejected('DISK_DRIFT', '磁盘源码在编辑后发生变化，请重读并重建候选', path=relative)
-        if content != disk:
-            edits.append(FileEdit(path=relative, before_hash=digest(disk), content=content.decode('utf-8')))
+        operation = workspace.edit_operation(relative)
+        if content != disk or operation == 'create':
+            edits.append(FileEdit(path=relative, before_hash=digest(disk),
+                                  content=content.decode('utf-8'), operation=operation))
     if not edits:
         raise RepairRejected('NO_CHANGE', '当前 overlay 没有相对磁盘的实际字节变化')
     if len(edits) > 8:

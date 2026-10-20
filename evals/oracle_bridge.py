@@ -109,7 +109,7 @@ class OracleBridge:
             'environment_digest', 'seed', 'spec_hash', 'protocol_hash', 'patch_hash',
         }
         if (not required <= binding.keys()
-                or any((not isinstance(binding[key], (str, int)) or not binding[key])
+                or any(type(binding[key]) is not int
                        if key == 'seed' else
                        (not isinstance(binding[key], str) or not binding[key])
                        for key in required)

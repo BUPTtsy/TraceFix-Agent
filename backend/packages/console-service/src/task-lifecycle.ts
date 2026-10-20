@@ -79,9 +79,22 @@ export function normalizeTask(fields: Data, projects: Data[]): Data {
   }
   if (execution.spec !== undefined && (!execution.spec || typeof execution.spec !== 'object' || Array.isArray(execution.spec) ||
       Buffer.byteLength(JSON.stringify(execution.spec)) > 32768 ||
-      Object.keys(execution.spec).some(key => !['goal', 'preconditions', 'executable_preconditions', 'authorized_actions', 'assertions',
+      Object.keys(execution.spec).some(key => !['mode', 'goal', 'preconditions', 'executable_preconditions', 'authorized_actions', 'assertions',
         'regression_plan', 'regression_assertions', 'behavior_scenarios', 'guidance_ack'].includes(key))))
     throw taskError('INVALID_SPEC', 'spec 必须是最大 32 KiB 的结构化 TestSpec', 400);
+  if (execution.spec !== undefined) {
+    const spec = execution.spec, mode = spec.mode ?? 'gui';
+    if (!['gui', 'unit', 'static', 'build'].includes(mode) || typeof spec.goal !== 'string' || spec.goal.length < 5)
+      throw taskError('INVALID_SPEC', 'spec 必须指定有效目标及执行模式', 400);
+    if (mode === 'gui') {
+      if (!Array.isArray(spec.assertions) || !spec.assertions.length ||
+          !Array.isArray(spec.regression_assertions) || !spec.regression_assertions.length)
+        throw taskError('INVALID_SPEC', 'GUI spec 必须包含原问题及回归断言', 400);
+    } else if (['assertions', 'regression_assertions', 'regression_plan', 'executable_preconditions',
+        'behavior_scenarios', 'authorized_actions'].some(key => spec[key] !== undefined &&
+          (!Array.isArray(spec[key]) || spec[key].length)))
+      throw taskError('INVALID_SPEC', '非 GUI spec 不能混用浏览器计划', 400);
+  }
   const list = (value: any, label: string, limit = 50) => {
     if (value === undefined) return [];
     if (!Array.isArray(value) || value.length > limit || value.some(id => typeof id !== 'string' || !id || id.length > 160))

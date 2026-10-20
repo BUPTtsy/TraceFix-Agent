@@ -9,9 +9,10 @@ from tracefix.execution.workspace import Workspace
 from tracefix.runtime.contracts import digest
 
 
-def _validate_paths(checkout, base, allowed_files):
-    workspace = Workspace(checkout, allowed_files)
-    paths = run_git(checkout, 'diff', '--name-only', '-z', base, '--').split(b'\0')
+def _validate_paths(checkout, base, allowed_files, *, protected_paths=(), approved_test_files=()):
+    workspace = Workspace(checkout, allowed_files, protected_paths=protected_paths,
+                          approved_test_files=approved_test_files)
+    paths = run_git(checkout, 'diff', '--no-renames', '--name-only', '-z', base, '--').split(b'\0')
     selected = []
     for encoded in paths:
         if not encoded:
@@ -19,18 +20,22 @@ def _validate_paths(checkout, base, allowed_files):
         relative = encoded.decode('utf-8')
         path = workspace.path(relative, write=True)
         if not path.is_file():
-            raise PermissionError('发布补丁只能修改已有普通文件')
+            raise PermissionError('发布补丁只能写入普通文件')
         selected.append(relative)
-    for record in run_git(checkout, 'diff', '--raw', '--no-abbrev', base, '--').splitlines():
-        metadata = record.split(b'\t', 1)[0].split()
-        if len(metadata) != 5 or metadata[0][1:] != metadata[1] or metadata[4] != b'M':
-            raise PermissionError('发布补丁不能增删、重命名或修改文件模式')
+    records = run_git(checkout, 'diff', '--raw', '--no-abbrev', '--no-renames', '-z', base, '--').split(b'\0')
+    for record in records[0:-1:2]:
+        metadata = record.split()
+        if (len(metadata) != 5 or metadata[1] != b'100644'
+                or (metadata[4] == b'M' and metadata[0] != b':100644')
+                or (metadata[4] == b'A' and metadata[0] != b':000000')
+                or metadata[4] not in {b'M', b'A'}):
+            raise PermissionError('发布补丁不能删除、重命名或修改文件模式')
     if not selected:
         raise ValueError('发布补丁为空')
     return selected
 
 
-def prepare_publication(result, config, settings, *, run_id):
+def prepare_publication(result, config, settings, *, run_id, approved_test_files=()):
     publication = {'status': 'skipped', 'branch': None, 'commit': None, 'error': None}
     if (result.get('outcome') != 'FIX_VERIFIED' or result.get('run_status') != 'COMPLETED'
             or result.get('patch_verification') != 'verified' or not result.get('diff')):
@@ -58,18 +63,21 @@ def prepare_publication(result, config, settings, *, run_id):
             run_git(checkout, 'remote', 'set-url', 'origin', f'https://github.com/{repository}.git')
             run_git(checkout, 'checkout', '-b', branch, base)
             statistics = run_git(checkout, 'apply', '--numstat', '-z', input_data=raw)
-            workspace = Workspace(checkout, config['allowed_files'])
+            workspace = Workspace(checkout, config['allowed_files'],
+                protected_paths=config.get('protected_paths', []), approved_test_files=approved_test_files)
             for record in statistics.split(b'\0'):
                 if not record:
                     continue
                 additions, deletions, encoded = record.split(b'\t', 2)
                 if not additions.isdigit() or not deletions.isdigit() or not encoded:
                     raise PermissionError('发布补丁不支持二进制或重命名')
-                if not workspace.path(encoded.decode('utf-8'), write=True).is_file():
-                    raise PermissionError('发布补丁只能修改已有文件')
+                path = workspace.path(encoded.decode('utf-8'), write=True)
+                if path.exists() and not path.is_file():
+                    raise PermissionError('发布补丁只能写入普通文件')
             run_git(checkout, 'apply', '--check', '--index', input_data=raw)
             run_git(checkout, 'apply', '--index', input_data=raw)
-            paths = _validate_paths(checkout, base, config['allowed_files'])
+            paths = _validate_paths(checkout, base, config['allowed_files'],
+                protected_paths=config.get('protected_paths', []), approved_test_files=approved_test_files)
             actual = run_git(checkout, 'diff', '--no-color', base, '--')
             if digest(actual) != digest(raw):
                 raise ValueError('应用后的差异与已验证补丁不一致')
@@ -80,7 +88,8 @@ def prepare_publication(result, config, settings, *, run_id):
         parent = run_git(checkout, 'rev-parse', 'HEAD^').decode().strip()
         if parent != base:
             raise PermissionError('发布提交必须直接继承冻结源版本')
-        _validate_paths(checkout, base, config['allowed_files'])
+        _validate_paths(checkout, base, config['allowed_files'],
+            protected_paths=config.get('protected_paths', []), approved_test_files=approved_test_files)
         if digest(run_git(checkout, 'diff', '--no-color', base, 'HEAD', '--')) != digest(raw):
             raise PermissionError('发布 checkout 与已验证补丁不一致')
         publication.update(status='local', branch=branch, commit=commit)

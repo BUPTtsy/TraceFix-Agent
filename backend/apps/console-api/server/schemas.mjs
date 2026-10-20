@@ -20,11 +20,18 @@ const action = {type: 'object', additionalProperties: false, required: ['kind'],
   wait: {type: ['object', 'null'], additionalProperties: false, properties: {assertions,
     timeout_seconds: {type: 'number', exclusiveMinimum: 0, maximum: 30}, interval_seconds: {type: 'number', exclusiveMinimum: 0, maximum: 2},
     max_observations: {type: 'integer', minimum: 1, maximum: 30}}}}};
-export const testSpec = {type: 'object', additionalProperties: false, required: ['goal', 'assertions', 'regression_assertions'], properties: {
+export const testSpec = {type: 'object', additionalProperties: false, required: ['goal'], allOf: [{
+  if: {required: ['mode'], properties: {mode: {enum: ['unit', 'static', 'build']}}},
+  then: {properties: {assertions: {maxItems: 0}, regression_assertions: {maxItems: 0},
+    regression_plan: {maxItems: 0}, executable_preconditions: {maxItems: 0},
+    behavior_scenarios: {maxItems: 0}, authorized_actions: {maxItems: 0}}},
+  else: {required: ['assertions', 'regression_assertions'], properties: {
+    assertions: {minItems: 1}, regression_assertions: {minItems: 1}}}}], properties: {
+  mode: {type: 'string', enum: ['gui', 'unit', 'static', 'build']},
   goal: {type: 'string', minLength: 5, maxLength: 4000}, preconditions: {type: 'array', maxItems: 100, items: {type: 'string', maxLength: 2000}},
   executable_preconditions: assertions,
   authorized_actions: {type: 'array', uniqueItems: true, maxItems: 7, items: action.properties.kind},
-  assertions: {...assertions, minItems: 1}, regression_assertions: {...assertions, minItems: 1},
+  assertions, regression_assertions: assertions,
   regression_plan: {type: 'array', maxItems: 100, items: action},
   behavior_scenarios: {type: 'array', maxItems: 50, items: {type: 'object', additionalProperties: false, required: ['id', 'steps'], properties: {
     id: text, description: {type: 'string', maxLength: 4000}, steps: {type: 'array', minItems: 1, maxItems: 100,

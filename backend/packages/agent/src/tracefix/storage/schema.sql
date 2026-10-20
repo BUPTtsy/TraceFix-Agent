@@ -46,7 +46,8 @@ ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS verification_refs jsonb NOT NU
 CREATE INDEX IF NOT EXISTS memory_lexical ON memory_items USING gin(search);
 CREATE TABLE IF NOT EXISTS approvals (
  id text PRIMARY KEY, run_id text NOT NULL, scope_id text NOT NULL,
- action_hash text NOT NULL, patch_hash text NOT NULL, expires_at double precision NOT NULL,
+ action_hash text NOT NULL, patch_hash text, expires_at double precision NOT NULL,
  decision text, consumed boolean NOT NULL DEFAULT false
 );
+ALTER TABLE approvals ALTER COLUMN patch_hash DROP NOT NULL;
 

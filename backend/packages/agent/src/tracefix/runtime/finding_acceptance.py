@@ -64,6 +64,7 @@ class AcceptanceScenario(BehaviorScenario, AcceptanceContract):
 
 
 class AcceptanceSpec(TestSpec, AcceptanceContract):
+    mode: Literal['gui'] = 'gui'
     goal: str = Field(min_length=5, max_length=16384)
     preconditions: list[str] = Field(default_factory=list, max_length=32)
     executable_preconditions: list[AcceptanceAssertion] = Field(default_factory=list, max_length=32)

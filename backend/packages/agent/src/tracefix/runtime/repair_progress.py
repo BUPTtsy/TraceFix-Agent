@@ -134,15 +134,16 @@ def normalized_diff_fingerprint(workspace, state) -> str:
     base = state.patch_base_commit or workspace.head()
     changed = git(workspace.root, 'diff', '--no-ext-diff', '--no-textconv', '--name-only', '-z', base, '--')
     paths = {item for item in changed.decode('utf-8').split('\0') if item}
-    snapshot = workspace.require_repository_snapshot()
-    paths.update(path for path in snapshot['files'] if workspace.staged_content(path) is not None)
+    workspace.require_repository_snapshot()
+    paths.update(workspace._staged_files)
     entries = []
     for path in sorted(paths):
-        before = normalize_source(git(workspace.root, 'show', f'{base}:{path}'), path)
+        before = normalize_source(workspace.commit_bytes(base, path), path)
         staged = workspace.staged_content(path)
         after = normalize_source(staged if staged is not None else workspace.path(path).read_bytes(), path)
-        if before != after:
-            entries.append([path, before, after])
+        exists = bool(git(workspace.root, 'ls-tree', '-z', base, '--', ':(literal)' + path))
+        if before != after or not exists:
+            entries.append([path, before, after, 'modify' if exists else 'create'])
     return digest(entries)
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 from pydantic import ConfigDict, Field
@@ -145,6 +146,28 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
     register_task_tools(engine, state, context, bind)
     register_web_tools(engine, state, context, bind)
 
+    from tracefix.tools.git_history import register_git_history
+    register_git_history(engine, state, context, bind)
+    if (not worker_mode and state.mode == 'repair' and state.repair_mode == 'hybrid'
+            and phase == Phase.DIAGNOSE and engine.spec(state).mode == 'gui'):
+        from tracefix.tools.browser import execute_browser_tool, native_browser_tools
+        for definition in native_browser_tools(BrowserAction):
+            tool = definition['function']
+
+            async def diagnostic_browser(arguments, call_id, name=tool['name']):
+                result, updated_context = await execute_browser_tool(engine, state, context,
+                    name, arguments, call_id, state.budget.model_calls)
+                context.update(updated_context)
+                if result.get('isError'):
+                    from tracefix.tools.core import ToolResult
+                    return ToolResult(call_id=call_id, name=name, result=result,
+                                      isError=True, error=result.get('error'))
+                return result
+
+            bind(tool['name'], tool['description'] + ' Diagnostic only: never changes frozen replay plan.',
+                 tool['parameters'], diagnostic_browser, phases={Phase.DIAGNOSE},
+                 side_effect='external', parallel_safe=False)
+
     if not worker_mode and os.getenv('TRACEFIX_AGENT_MODE', '').lower() != 'single':
         from tracefix.workers.contracts import WorkerResult, WorkerTask
         from tracefix.tools.supervisor import supervisor_tools
@@ -217,16 +240,23 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
             engine.event(state, 'subtask.started', {'child_run_id': child.run_id,
                 'parent_step_id': parent_step, 'role': task.role, 'generation': task.source_revision})
             try:
-                call = engine.model_call(child, WorkerResult, {
-                    'worker_depth': 1, 'worker_write_enabled': task.write_enabled,
-                    'worker_allowed_files': task.allowed_files,
-                    'worker_writable_files': task.writable_files,
-                    'allowed_tools': task.allowed_tools,
-                    'worker_shell_mode': task.shell_mode,
-                    'goal': task.goal, 'instruction': task.prompt,
-                    'role': task.role, 'allowed_evidence_refs': child.evidence_refs})
-                result = await (asyncio.wait_for(call, timeout=task.timeout_seconds)
-                                if task.timeout_seconds is not None else call)
+                from tracefix.runtime.attempt_worker import attempt_candidate, attempt_workspace
+                isolation = (attempt_workspace(engine, state, child, task) if task.write_enabled
+                             else nullcontext((engine, None)))
+                with isolation as (worker_engine, baseline):
+                    call = worker_engine.model_call(child, WorkerResult, {
+                        'worker_depth': 1, 'worker_write_enabled': task.write_enabled,
+                        'worker_attempt': task.write_enabled, 'worker_same_model': True,
+                        'worker_allowed_files': task.allowed_files,
+                        'worker_writable_files': task.writable_files,
+                        'allowed_tools': task.allowed_tools,
+                        'worker_shell_mode': task.shell_mode,
+                        'goal': task.goal, 'instruction': task.prompt,
+                        'role': task.role, 'allowed_evidence_refs': child.evidence_refs})
+                    result = await (asyncio.wait_for(call, timeout=task.timeout_seconds)
+                                    if task.timeout_seconds is not None else call)
+                    attempt = (attempt_candidate(engine, state, worker_engine, child, task, baseline)
+                               if task.write_enabled else None)
                 reverse_artifacts = {value: key for key, value in copied_artifacts.items()}
                 result.evidence_refs = [reverse_artifacts.get(reference, reference)
                                         for reference in result.evidence_refs]
@@ -241,6 +271,10 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
                 result.task_id, result.run_id = task.task_id, state.run_id
                 result.role, result.phase = task.role, task.phase
                 result.data['child_run_id'] = child.run_id
+                if attempt is not None:
+                    result.data['attempt'] = attempt
+                    # 子模型自报 hash/成功只代表尝试结果，不能作为父候选或最终验证。
+                    result.patch_hash = None
                 result.data['usage'] = child.budget.model_dump()
                 engine.event(state, 'subtask.completed', {'child_run_id': child.run_id,
                     'parent_step_id': parent_step, 'role': task.role, 'usage': result.data['usage']})

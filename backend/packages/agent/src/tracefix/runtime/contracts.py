@@ -8,7 +8,7 @@ import time
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 SCHEMA_VERSION = "tracefix/1"
 
@@ -183,18 +183,37 @@ class GuidanceAck(Contract):
 class TestSpec(Contract):
     # Ignore the removed max_steps field when reading old artifacts.
     model_config = ConfigDict(extra="ignore")
+    mode: Literal['gui', 'unit', 'static', 'build'] = 'gui'
     goal: str = Field(min_length=5)
     preconditions: list[str] = Field(default_factory=list)
     executable_preconditions: list[Assertion] = Field(default_factory=list)
     authorized_actions: list[ActionKind] = Field(default_factory=lambda: ["navigate", "click", "type", "select", "press", "observe", "finish"],
         description='Exact action kinds, never sentences. Include navigate and finish; authorize only actions needed by the goal.')
-    assertions: list[Assertion] = Field(min_length=1)
+    assertions: list[Assertion] = Field(default_factory=list)
     regression_plan: list[BrowserAction] = Field(default_factory=list)
-    regression_assertions: list[Assertion] = Field(min_length=1)
+    regression_assertions: list[Assertion] = Field(default_factory=list)
     behavior_scenarios: list[BehaviorScenario] = Field(default_factory=list)
     guidance_ack: list[GuidanceAck] = Field(default_factory=list)
+
+    @model_serializer(mode='wrap')
+    def legacy_gui_serialization(self, handler):
+        value = handler(self)
+        if self.mode == 'gui':
+            value.pop('mode', None)
+        else:
+            value['authorized_actions'] = []
+        return value
+
     @model_validator(mode="after")
     def validate_actions(self):
+        if self.mode != 'gui':
+            if (self.assertions or self.regression_assertions or self.regression_plan
+                    or self.behavior_scenarios or self.executable_preconditions
+                    or 'authorized_actions' in self.model_fields_set and self.authorized_actions):
+                raise ValueError('非 GUI TestSpec 只能执行冻结的 Profile 命令，不能混用浏览器计划')
+            return self
+        if not self.assertions or not self.regression_assertions:
+            raise ValueError('GUI TestSpec 必须包含原问题及回归断言')
         if not {'navigate', 'finish'} <= set(self.authorized_actions):
             raise ValueError('authorized_actions 必须包含流程必需的 navigate 和 finish')
         if any(action.kind not in self.authorized_actions for action in self.regression_plan):
@@ -348,6 +367,20 @@ class FileEdit(Contract):
     path: str
     before_hash: str
     content: str = Field(max_length=150_000)
+    operation: Literal['modify', 'create'] = 'modify'
+
+    @model_validator(mode='after')
+    def validate_creation(self):
+        if self.operation == 'create' and self.before_hash != digest(b''):
+            raise ValueError('新建文件的 before_hash 必须为 digest(b\'\')')
+        return self
+
+    @model_serializer(mode='wrap')
+    def legacy_modify_serialization(self, handler):
+        value = handler(self)
+        if self.operation == 'modify':
+            value.pop('operation', None)
+        return value
 
 
 class CandidatePath(Contract):
@@ -521,6 +554,10 @@ class RunState(Contract):
     budget: Usage = Field(default_factory=Usage)
     subtask_refs: list[str] = Field(default_factory=list)
     approval_ref: str | None = None
+    test_edit_requested_files: list[str] = Field(default_factory=list)
+    approved_test_files: list[str] = Field(default_factory=list)
+    test_edit_approval_ref: str | None = None
+    test_edit_approval_id: str | None = None
     report_ref: str | None = None
     environment_digest: str = ""
     source_manifest: str = ""

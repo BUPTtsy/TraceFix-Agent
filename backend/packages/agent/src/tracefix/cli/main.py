@@ -438,6 +438,12 @@ class Session:
             state.agent_instructions_ref = self.artifacts.put(self.scope, state.run_id, instructions, 'txt', label='项目约束')
             state.agent_instructions_hash = digest(instructions.encode())
             state.agent_instructions_path = instructions_path
+        approved_files = getattr(self.args, 'approve_test_file', []) or []
+        if approved_files and not reuse_workspace:
+            import getpass
+            from tracefix.runtime.test_edit_approval import authorize_test_edits
+            state = authorize_test_edits(self.store, self.artifacts, state, workspace,
+                approved_files, reviewer='cli:' + getpass.getuser())
         if self.args.spec and not reuse_workspace:
             spec = TestSpec.model_validate_json(Path(self.args.spec).read_text(encoding='utf-8'))
             state.test_spec_hash = digest(spec)
@@ -465,6 +471,8 @@ class Session:
                                            protected_paths=(config or {}).get('protected_paths', []))
         if state.scope_id != self.ctx.active_scope or state.source_manifest != digest(source):
             raise PermissionError('运行状态与源码快照身份不一致')
+        from tracefix.runtime.test_edit_approval import verified_test_edit_files
+        workspace.approved_test_files = verified_test_edit_files(self.store, self.artifacts, state, workspace)
         workspace.validate_repository(self.scopes, self.ctx, source,
             base_commit=state.patch_base_commit, patch_hash=state.patch_hash,
             branch=state.local_branch or 'tracefix/' + state.run_id)
@@ -1115,6 +1123,8 @@ def main():
     parser.add_argument('--execution-mode', choices=['interactive', 'batch'], default=None,
                         help='运行策略；--run 默认 batch，interactive 保留人工暂停/审批')
     parser.add_argument('--spec')
+    parser.add_argument('--approve-test-file', action='append', default=[], metavar='PATH',
+        help='在测试规范冻结前人工批准一个精确测试文件；可重复指定，仍受项目写入范围约束')
     parser.add_argument('--plain',action='store_true')
     execution = parser.add_mutually_exclusive_group()
     execution.add_argument('--run',action='store_true',help='执行一次批处理运行并输出最终报告与补丁；不创建提交')

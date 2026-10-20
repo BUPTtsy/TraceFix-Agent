@@ -31,8 +31,9 @@ def register_test_runner(engine, state, context, bind):
         if not isinstance(argv, list) or not argv or any(not isinstance(value, str) or not value for value in argv):
             raise ToolRejected('RunTests target 未配置有效的 Profile argv')
         try:
+            options = {'complete_source': True} if getattr(engine, 'worker_attempt', False) else {}
             result = await tools.sandbox_run(argv, writable=False, timeout=profile.timeout_seconds,
-                                             output_limit=None)
+                                             output_limit=None, **options)
         except FileNotFoundError as error:
             raise ToolRejected('RunTests Docker sandbox 不可用；未找到 Docker CLI，不能在宿主机执行') from error
         if result['exit_code'] == 125:

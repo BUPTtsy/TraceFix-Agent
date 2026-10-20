@@ -29,28 +29,36 @@ class DockerRunner:
     def __init__(self, profile, workspace, run_id):
         """保存运行配置并派生稳定的容器和网络名称。"""
         self.profile, self.workspace, self.run_id = profile, workspace, run_id
-        self.name = 'tf-' + run_id
+        resource_prefix = os.getenv('TRACEFIX_DOCKER_RESOURCE_PREFIX')
+        if resource_prefix is not None and re.fullmatch(r'tf-[A-Za-z0-9_-]{3,100}', resource_prefix) is None:
+            raise ValueError('Docker 资源前缀必须符合 tf-[A-Za-z0-9_-]{3,100}')
+        self.name = resource_prefix if resource_prefix is not None else 'tf-' + run_id
         self.network = self.name + '-net'
         self.dependency_volume = self.name + '-node-modules'
         self.resolved_image_ids = None
         self._browser_command = None
         self._browser_image_index = None
         self._started = False
+        self.command_only = False
         self.actual_digest = ''
 
-    async def docker(self, *args, check=True):
+    async def docker(self, *args, check=True, output_limit=100_000):
         """通过无 shell 的 Docker CLI 调用执行一条受控命令。"""
-        result = await process(['docker', *args], self.profile.timeout_seconds)
+        result = await process(['docker', *args], self.profile.timeout_seconds, output_limit=output_limit)
         if check and not result['passed']:
             raise RuntimeError(f'Docker 命令执行失败（退出码 {result["exit_code"]}）：' + result['output'][-1500:])
         return result
 
     def _environment_digest(self, image_ids):
+        if self.command_only:
+            return digest({'profile': self.profile.model_dump(), 'image_ids': image_ids, 'mode': 'command'})
         return digest({'profile': self.profile.model_dump(), 'image_ids': image_ids})
 
     def _bind_image_ids(self, image_ids):
-        self.resolved_image_ids = {'app': image_ids[0], 'browser': image_ids[1]}
-        if self._browser_command is not None:
+        self.resolved_image_ids = {'app': image_ids[0]}
+        if not self.command_only:
+            self.resolved_image_ids['browser'] = image_ids[1]
+        if not self.command_only and self._browser_command is not None:
             # CLI 在异步准备前已持有此列表；原位更新使首次启动及后续重启都使用同一 ID。
             self._browser_command[self._browser_image_index] = image_ids[1]
 
@@ -62,9 +70,10 @@ class DockerRunner:
         """启动前只解析一次 tag，后续启动参数使用不可变镜像 ID。"""
         snapshot = self.workspace.require_repository_snapshot()
         self.workspace.check_frozen(snapshot)
-        info = await self.docker('image', 'inspect', self.profile.image, self.profile.browser_image)
+        tags = [self.profile.image] if self.command_only else [self.profile.image, self.profile.browser_image]
+        info = await self.docker('image', 'inspect', *tags)
         images = json.loads(info['output'])
-        if type(images) is not list or len(images) != 2 or any(type(image) is not dict for image in images):
+        if type(images) is not list or len(images) != len(tags) or any(type(image) is not dict for image in images):
             raise RuntimeError('镜像 inspect 返回结构无效')
         image_ids = [image.get('Id') for image in images]
         if any(not self._valid_image_id(image_id) for image_id in image_ids):
@@ -78,17 +87,18 @@ class DockerRunner:
             if self.resolved_image_ids is None:
                 self.actual_digest = await self._resolve_image_ids()
             else:
-                self.actual_digest = self._environment_digest([
-                    self.resolved_image_ids['app'], self.resolved_image_ids['browser']])
+                self.actual_digest = self._environment_digest([self.resolved_image_ids['app']] if self.command_only
+                    else [self.resolved_image_ids['app'], self.resolved_image_ids['browser']])
             return self.actual_digest
         # 即使 runner 刚在审批恢复时重建，最终门禁也不得回退到 tag 或旧缓存。
         self.actual_digest = ''
-        info = await self.docker('container', 'inspect', self.name, self.name+'-browser')
+        names = (self.name,) if self.command_only else (self.name, self.name+'-browser')
+        info = await self.docker('container', 'inspect', *names)
         records = json.loads(info['output'])
-        if type(records) is not list or len(records) != 2 or any(type(record) is not dict for record in records):
+        if type(records) is not list or len(records) != len(names) or any(type(record) is not dict for record in records):
             raise RuntimeError('运行期 app/browser 容器 inspect 返回结构无效')
         image_ids = []
-        for name, record in zip((self.name, self.name+'-browser'), records):
+        for name, record in zip(names, records):
             labels = (record.get('Config') or {}).get('Labels') or {}
             running = (record.get('State') or {}).get('Running') is True
             networks = (record.get('NetworkSettings') or {}).get('Networks') or {}
@@ -138,6 +148,8 @@ class DockerRunner:
             except BaseException:
                 await self.close()
                 raise
+        entrypoint = ['--entrypoint', 'node'] if self.command_only else []
+        command = ['--input-type=module', '-e', 'setInterval(()=>{}, 1000)'] if self.command_only else self.profile.commands['start']
         await self.docker('run', '-d', '--name', self.name, '--network', self.network, '--network-alias', 'app',
             '--label', 'tracefix.run='+self.run_id, '--user', container_user(),
             '--cap-drop=ALL', '--security-opt=no-new-privileges', '--pids-limit=128', '--memory=1g', '--cpus=2',
@@ -146,14 +158,23 @@ class DockerRunner:
             '--mount', bind_mount(self.workspace.root),
             '--mount', 'type=volume,src='+self.dependency_volume+',dst=/app/node_modules,readonly',
             '-e', 'NODE_PATH=/deps/node_modules', '-e', 'TRACEFIX_SOURCE='+source_manifest,
-            self.resolved_image_ids['app'], *self.profile.commands['start'])
+            *entrypoint, self.resolved_image_ids['app'], *command)
+        if self.command_only:
+            await self.inspect_images(runtime=True)
+            return {'passed': True}
         return await self.health()
+
+    async def start_commands(self, source_manifest):
+        """准备命令沙箱；构建失败的源码不需要先启动应用或浏览器。"""
+        self.command_only = True
+        return await self.start(source_manifest)
 
     async def command(self, name):
         """在应用容器内执行配置中的非启动命令。"""
         if name not in self.profile.commands or name == 'start':
             raise PermissionError("未知的命令模板")
-        result = await self.docker('exec', self.name, *self.profile.commands[name], check=False)
+        options = {'output_limit': None} if self.command_only else {}
+        result = await self.docker('exec', self.name, *self.profile.commands[name], check=False, **options)
         return result
 
     async def health(self):
@@ -173,6 +194,8 @@ class DockerRunner:
     async def rebuild(self):
         """执行构建并重启服务，使补丁后的进程重新加载。"""
         result = await self.command('build')
+        if self.command_only:
+            return result
         if result['passed']:
             # A new server process is required after a server-side patch.
             await self.docker('restart', self.name)

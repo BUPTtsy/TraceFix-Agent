@@ -79,7 +79,7 @@ class ScopeResolver:
         candidates = [p for p in self.projects.values() if path.resolve().is_relative_to(p.root.resolve())]
         return max(candidates, key=lambda p: len(p.root.parts)).id if candidates else None
 
-    def path(self, ctx: ProjectContext, relative: str, write=False) -> Path:
+    def path(self, ctx: ProjectContext, relative: str, write=False, *, approved_test_files=()) -> Path:
         """解析并授权项目内路径，拒绝越界、链接、受保护目录和未授权写入。"""
         self.assert_current(ctx)
         safe_relative(relative)
@@ -102,7 +102,8 @@ class ScopeResolver:
             if not any(fnmatchcase(relative, pattern) for pattern in allowed):
                 raise PermissionError("写入路径不在允许列表中")
             # 与 Workspace.path(write=True) 共用同一实现，避免两处策略产生分歧。
-            if is_frozen_path(relative):
+            from tracefix.execution.workspace import test_write_is_approved
+            if is_frozen_path(relative) and not test_write_is_approved(relative, approved_test_files, protected_paths):
                 raise PermissionError("冻结的测试/判定/锁文件不可被补丁修改")
         elif relative == self.projects[ctx.active_scope].agent_instructions:
             return p

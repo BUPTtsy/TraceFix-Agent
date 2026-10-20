@@ -185,8 +185,6 @@ class LocalTools:
     def store_content(self, path, content):
         """仅在受管资源 fence 内暂存候选补丁，禁止直接改写磁盘。"""
         self.require_managed()
-        if not path.is_file():
-            raise ToolRejected('本地编辑工具不支持创建新文件')
         with apply_effect_receipt():
             return self.workspace.stage(path.relative_to(self.root).as_posix(), content)
 
@@ -213,13 +211,23 @@ class LocalTools:
         if not base.is_absolute() or not base.resolve().is_relative_to(self.root):
             raise ToolRejected('检索目录必须是工作区内的绝对路径')
         candidates = [base] if base.is_file() else base.rglob('*')
+        seen = set()
         for candidate in candidates:
             if candidate.is_file():
                 try:
-                    yield self.path(str(candidate))
+                    authorized = self.path(str(candidate))
+                    seen.add(authorized)
+                    yield authorized
                 except PermissionError:
                     continue
                 except ToolRejected:
+                    continue
+        for relative in self.workspace._staged_files:
+            candidate = self.root / relative
+            if candidate not in seen and (candidate == base or candidate.is_relative_to(base)):
+                try:
+                    yield self.path(str(candidate))
+                except (PermissionError, ToolRejected):
                     continue
 
     def read(self, arguments):
@@ -227,12 +235,15 @@ class LocalTools:
         path = self.path(arguments.file_path)
         relative = path.relative_to(self.root).as_posix()
         with self.mutex.read_lock(path):
-            disk_version = path.stat()
+            disk_version = path.stat() if path.exists() else None
             staged = self.staged_content(relative)
-            baseline = path.read_bytes()
-            disk_after = path.stat()
-            if (disk_version.st_size, disk_version.st_mtime_ns, disk_version.st_ctime_ns) != (
-                    disk_after.st_size, disk_after.st_mtime_ns, disk_after.st_ctime_ns):
+            if disk_version is None and staged is None:
+                raise FileNotFoundError(str(path))
+            baseline = path.read_bytes() if disk_version is not None else b''
+            disk_after = path.stat() if path.exists() else None
+            version = lambda stat: ((stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+                                    if stat is not None else None)
+            if version(disk_version) != version(disk_after):
                 raise ToolRejected('读取期间磁盘文件发生变化，拒绝使用过期源码')
             data = staged if staged is not None else baseline
             if staged != self.staged_content(relative):
@@ -299,10 +310,10 @@ class LocalTools:
                 with apply_effect_receipt():
                     return self._local_edit(relative, arguments)
             staged = self.staged_content(relative)
-            if not path.is_file():
-                raise ToolRejected('本地编辑工具不支持创建新文件')
-            baseline = path.read_bytes()
-            content = staged if staged is not None else baseline
+            if not path.exists() and staged is None and tool_name != 'Write':
+                raise ToolRejected('编辑不存在文件前应先使用 Write 创建 overlay')
+            baseline = path.read_bytes() if path.exists() else None
+            content = staged if staged is not None else (baseline or b'')
             with apply_effect_receipt():
                 pass
             prepared = await run_effect('local.prepare', {
@@ -352,7 +363,7 @@ class LocalTools:
         paths = [path for path in self.files(str(base))
                  if path.relative_to(base).match(arguments.pattern)
                  or arguments.pattern.startswith('**/') and path.relative_to(base).match(arguments.pattern[3:])]
-        paths.sort(key=lambda path: (-path.stat().st_mtime_ns, str(path)))
+        paths.sort(key=lambda path: (-path.stat().st_mtime_ns if path.exists() else 0, str(path)))
         return {'files': [str(path) for path in paths]}
 
     def grep(self, arguments):
@@ -372,13 +383,16 @@ class LocalTools:
         with self.mutex.workspace_read():
             for path in paths:
                 relative = path.relative_to(self.root).as_posix()
-                disk_version = path.stat()
-                baseline = path.read_bytes()
+                disk_version = path.stat() if path.exists() else None
+                baseline = path.read_bytes() if disk_version is not None else b''
                 staged = self.staged_content(relative)
                 data = staged if staged is not None else baseline
-                disk_after = path.stat()
-                version = (disk_version.st_size, disk_version.st_mtime_ns, disk_version.st_ctime_ns)
-                if version != (disk_after.st_size, disk_after.st_mtime_ns, disk_after.st_ctime_ns):
+                disk_after = path.stat() if path.exists() else None
+                version = ((disk_version.st_size, disk_version.st_mtime_ns, disk_version.st_ctime_ns)
+                           if disk_version is not None else None)
+                after_version = ((disk_after.st_size, disk_after.st_mtime_ns, disk_after.st_ctime_ns)
+                                 if disk_after is not None else None)
+                if version != after_version:
                     raise ToolRejected('Grep 扫描前磁盘文件发生变化，拒绝使用过期源码')
                 disk_versions[relative] = version
                 records.append((path, relative, baseline, data, staged is not None))
@@ -406,9 +420,11 @@ class LocalTools:
                                           encoding='utf-8', errors='replace')
                 for path, relative, baseline, data, overlay in records:
                     current_path = self.path(str(path))
-                    disk_after = current_path.stat()
-                    version = (disk_after.st_size, disk_after.st_mtime_ns, disk_after.st_ctime_ns)
-                    if (version != disk_versions[relative] or current_path.read_bytes() != baseline
+                    disk_after = current_path.stat() if current_path.exists() else None
+                    version = ((disk_after.st_size, disk_after.st_mtime_ns, disk_after.st_ctime_ns)
+                               if disk_after is not None else None)
+                    disk = current_path.read_bytes() if current_path.exists() else b''
+                    if (version != disk_versions[relative] or disk != baseline
                             or self.staged_content(relative) != (data if overlay else None)):
                         raise ToolRejected('Grep 扫描期间源码发生变化，拒绝使用过期命中')
         if response.returncode not in {0, 1}:
@@ -538,7 +554,7 @@ class LocalTools:
         return result
 
     async def sandbox_run(self, argv_or_command, *, writable, timeout, extra_mounts=(),
-                          output_limit=100_000):
+                          output_limit=100_000, complete_source=False):
         """在当前 overlay 的临时副本执行命令；绝不回退到宿主执行。"""
         profile = getattr(self.engine, 'profile', None)
         if profile is None:
@@ -560,7 +576,8 @@ class LocalTools:
         def mounted(relative):
             return any(relative == item or relative.startswith(item + '/') for item in excluded)
 
-        name = new_id('tf-shell')
+        name = (runner.name + '-shell-' + new_id('shell').removeprefix('shell_')[:12]
+                if ready else new_id('tf-shell'))
         with tempfile.TemporaryDirectory(prefix='tracefix-shell-') as folder:
             staging = Path(folder)
             staging.chmod(0o777 if writable else 0o755)
@@ -573,14 +590,31 @@ class LocalTools:
                 if self.state.repair_mode == 'hybrid':
                     from tracefix.runtime.repair_progress import normalized_diff_fingerprint
                     view['normalized_diff_fingerprint'] = normalized_diff_fingerprint(self.workspace, self.state)
-                for source in self.files():
-                    relative = source.relative_to(self.root).as_posix()
+                sources = {source.relative_to(self.root).as_posix(): source for source in self.files()}
+                if complete_source:
+                    if (not getattr(self.engine, 'worker_attempt', False) or writable
+                            or not isinstance(argv_or_command, list)
+                            or argv_or_command not in [profile.commands.get(target)
+                                                       for target in ('unit', 'static', 'build')]):
+                        raise ToolRejected('完整 Worker 测试源码仅供 Profile 固定只读自测使用')
+                    sources = {relative: self.workspace.path(relative)
+                               for relative in self.workspace.require_repository_snapshot()['files']}
+                created = {relative for relative, entry in self.workspace._created_entries.items()
+                           if entry['kind'] == 'file'}
+                for relative in set(self.workspace._staged_files) | created:
+                    if relative not in sources:
+                        try:
+                            sources[relative] = (self.workspace.path(relative) if complete_source
+                                                 else self.path(str(self.root / relative)))
+                        except (PermissionError, ToolRejected):
+                            continue
+                for relative, source in sources.items():
                     if mounted(relative):
                         continue
                     staged = self.staged_content(relative)
                     overlays[relative] = staged
                     originals[relative] = staged if staged is not None else source.read_bytes()
-                    baselines[relative] = source.read_bytes()
+                    baselines[relative] = source.read_bytes() if source.exists() else None
                     target = staging / relative
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(originals[relative])
@@ -652,9 +686,6 @@ class LocalTools:
                             or self.staged_content(relative) != overlays.get(relative)):
                         raise ToolRejected('Bash 执行期间文件已变化，拒绝覆盖并发修改')
                     changes[relative].decode('utf-8')
-                for target in targets.values():
-                    if not target.exists():
-                        raise ToolRejected('Bash 不支持创建新文件')
                 if changes:
                     with apply_effect_receipt():
                         self.require_managed()
@@ -670,7 +701,7 @@ def register_local_tools(engine, state, context, bind):
          '读取当前授权工作区内的绝对路径。文本默认最多 2000 行，可用 offset/limit 分页；支持图片、PDF 页文本、Jupyter cell。倾向并行读取多个文件。'),
         ('Glob', GlobInput, tools.glob, False, '按文件名 glob（如 **/*.ts）列出授权文件的绝对路径，按修改时间降序排序；path 为绝对目录，省略时从当前工作区根搜索。可定位页面组件供 Read 核对。'),
         ('Grep', GrepInput, tools.grep, False, '正则内容搜索；支持 glob/type 过滤、multiline 和 content/files_with_matches/count 三种输出。path 为工作区内绝对路径，省略时搜索当前工作区；可搜索页面文案、可访问名称和事件绑定辅助识别可操作元素。'),
-        ('Write', WriteInput, tools.write, True, '覆盖授权绝对路径的已有文件，仅暂存到 overlay；禁止新建文件，精确替换优先 Edit。'),
+        ('Write', WriteInput, tools.write, True, '创建或覆盖授权绝对路径的文件，仅暂存到 overlay；精确替换优先 Edit。'),
         ('Edit', EditInput, tools.edit, True, '旧模式支持单块精确替换；局部模式用 edits 在同一共同基线提交多个唯一、不重叠块，带 expected_overlay_revision/hash，失败返回可纠正错误，不自动模糊匹配或 replace_all。'),
         ('NotebookEdit', NotebookEditInput, tools.notebook_edit, True, '按零起始 cell_number 替换、插入或删除 Jupyter cell；保留 notebook 元数据，代码修改清空旧输出。'),
     ]

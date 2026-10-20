@@ -550,6 +550,14 @@ class FourCellRunner:
                 'memory_calls': memory, 'trace_proven': proven}
 
     def run_group(self, group: AblationGroup) -> dict[str, Any]:
+        try:
+            return self._run_group(group)
+        finally:
+            close = getattr(self.adapter, 'close', None)
+            if callable(close):
+                close()
+
+    def _run_group(self, group: AblationGroup) -> dict[str, Any]:
         fixed = self.config.fixed_inputs()
         if fixed != self._fixed_inputs:
             raise RuntimeError('固定评测输入在分组间发生漂移')
@@ -559,15 +567,20 @@ class FourCellRunner:
         revision = _copy_source(self.config.source_root, self.config.source_revision, source)
         if revision != self.config.source_revision:
             raise RuntimeError('源码导出 revision 与固定输入不一致')
-        if self.config.mutation_file:
-            target = source / self.config.mutation_file
-            if target.is_symlink() or not target.is_file():
+        mutations = self.config.case_mutations()
+        for mutation in mutations:
+            target = source / mutation['file']
+            if (target.is_symlink() or not target.is_file()
+                    or not target.resolve().is_relative_to(source.resolve())
+                    or any(parent.is_symlink() or parent.is_junction()
+                           for parent in target.parents if parent != source.parent)):
                 raise ValueError('缺陷注入目标必须是源码内普通文件')
             content = target.read_text(encoding='utf-8')
-            if content.count(self.config.mutation_before) != 1:
-                raise ValueError('缺陷注入 before 片段不存在')
-            target.write_text(content.replace(self.config.mutation_before, self.config.mutation_after, 1), encoding='utf-8')
-            _git(source, 'add', '--', self.config.mutation_file)
+            if content.count(mutation['before']) != 1:
+                raise ValueError('缺陷注入 before 片段必须唯一')
+            target.write_bytes(content.replace(mutation['before'], mutation['after'], 1).encode('utf-8'))
+        if mutations:
+            _git(source, 'add', '--', *(mutation['file'] for mutation in mutations))
             _git(source, 'commit', '-qm', '冻结评测缺陷注入')
         source_hash = _tree_hash(source)
         environment_digest = fixed['environment_digest']

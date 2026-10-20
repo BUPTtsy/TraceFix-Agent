@@ -281,8 +281,16 @@ async def execute_request(request, settings, *, session_factory=Session,
             result['cleanup_errors'] = services.cleanup_errors
         if (session is not None and result.get('outcome') == 'FIX_VERIFIED'
                 and result.get('run_status') == 'COMPLETED' and result.get('patch_verification') == 'verified'):
-            publication = await asyncio.to_thread(prepare_publication, result,
-                request.repository_snapshot.repository_config, settings, run_id=request.run_id)
+            from tracefix.runtime.test_edit_approval import verified_test_edit_files
+            try:
+                latest = session.state()
+                approved = verified_test_edit_files(session.store, session.artifacts, latest, session.engine.workspace)
+                publication = await asyncio.to_thread(prepare_publication, result,
+                    request.repository_snapshot.repository_config, settings, run_id=request.run_id,
+                    approved_test_files=approved)
+            except Exception:
+                publication = {'status': 'failed', 'branch': None, 'commit': None,
+                               'error': {'code': 'publication_approval_invalid'}}
             try:
                 latest = session.state()
                 report = session.artifacts.json(latest.scope_id, latest.run_id, latest.report_ref)

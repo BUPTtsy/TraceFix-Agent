@@ -8,6 +8,7 @@ from collections import Counter
 from contextlib import nullcontext
 import os
 import re
+import tempfile
 from fnmatch import fnmatchcase
 from pathlib import Path
 
@@ -79,6 +80,19 @@ def is_frozen_path(relative, protected_paths=()) -> bool:
     return any(FROZEN_TOKENS & tokens(part) for part in parts)
 
 
+def test_write_is_approved(relative, approved_test_files=(), protected_paths=()):
+    """人工精确文件审批只能放开测试代码，不能覆盖判定或执行依据。"""
+    safe_relative(relative)
+    parts = Path(relative).parts
+    if (is_protected_path(relative, protected_paths)
+            or any({'oracle', 'oracles'} & tokens(part) for part in parts)
+            or any(fnmatchcase(parts[-1].lower(), pattern) for pattern in LOCKFILE_PATTERNS)):
+        return False
+    if not any({'test', 'tests', 'conftest', 'spec', 'specs'} & tokens(part) for part in parts):
+        return False
+    return relative in approved_test_files
+
+
 def source_query_terms(query):
     """提取症状文案、API 路径和标识符，优先保持完整文案。"""
     text = str(query)
@@ -128,11 +142,13 @@ class CandidateRejected(ValueError):
 class Workspace:
     """在项目根目录内提供经过路径和文件白名单校验的读写接口。"""
 
-    def __init__(self, root: Path, allowed_files: list[str], *, protected_paths=()):
+    def __init__(self, root: Path, allowed_files: list[str], *, protected_paths=(), approved_test_files=()):
         """绑定根目录和允许写入的 glob 模式。"""
         self.root = plain_root(root)
         self.allowed_files = allowed_files
         self.protected_paths = validate_protected_paths(protected_paths)
+        # 仅可信人工审批恢复入口设置；工具参数不得传入此授权。
+        self.approved_test_files = tuple(approved_test_files)
         self.guidance_constraints = []
         # Local edit tools write into this overlay until a PatchProposal is
         # accepted by the normal patch transaction.  Keeping the overlay out
@@ -141,7 +157,9 @@ class Workspace:
         self._overlay_revision = 0
         self._staged_versions = {}
         self._staged_disk_hashes = {}
+        self._staged_disk_exists = {}
         self._staged_candidates = {}
+        self._created_entries = {}
         self.repository_snapshot = None
 
     @classmethod
@@ -298,15 +316,23 @@ class Workspace:
                         if mode != '100644' or kind != 'blob':
                             raise PermissionError('候选提交存在链接/类型变化')
                         tree_files[relative] = digest(git(self.root, 'cat-file', 'blob', blob))
-                if tree_files.keys() != snapshot['files'].keys():
-                    raise PermissionError('候选提交存在文件新增/删除')
+                if not snapshot['files'].keys() <= tree_files.keys():
+                    raise PermissionError('候选提交存在文件删除')
                 for relative, content in tree_files.items():
-                    if content != snapshot['files'][relative]:
+                    if content != snapshot['files'].get(relative):
                         self.path(relative, write=True)
-        self.check_frozen(snapshot)
         diff = self.diff(base=baseline)
         if (patch_hash and digest(diff.encode()) != patch_hash) or (not patch_hash and diff):
             raise PermissionError('原任务补丁已变化，请核对工作区后继续')
+        previous_entries = self._created_entries
+        try:
+            # 重启后只能从已绑定 patch_hash 的索引差异恢复新增 manifest。
+            if patch_hash:
+                self._created_entries = self._new_entries(snapshot, file_manifest(self.root))
+            self.check_frozen(snapshot)
+        except Exception:
+            self._created_entries = previous_entries
+            raise
         self.repository_snapshot = snapshot
         return snapshot
 
@@ -324,7 +350,8 @@ class Workspace:
         if write and is_protected_path(relative, self.protected_paths):
             raise ProtectedPathError(relative)
         if write and (not any(fnmatchcase(relative, x) for x in self.allowed_files)
-                      or is_frozen_path(relative)):
+                      or (is_frozen_path(relative) and not test_write_is_approved(
+                          relative, self.approved_test_files, self.protected_paths))):
             raise PermissionError("补丁路径被拒绝")
         if write:
             normalized = relative.replace('\\', '/')
@@ -339,11 +366,26 @@ class Workspace:
     def read(self, relative):
         """读取已授权文件的 UTF-8 文本内容。"""
         p = self.path(relative)
-        if p.stat().st_size > 200_000:
-            raise ValueError("文件过大")
         # read_text's universal-newline conversion would invalidate CRLF hashes.
         staged = self._staged_files.get(relative)
-        return (staged if staged is not None else p.read_bytes()).decode('utf-8')
+        data = staged if staged is not None else p.read_bytes()
+        if len(data) > 200_000:
+            raise ValueError("文件过大")
+        return data.decode('utf-8')
+
+    def baseline_bytes(self, relative):
+        """不存在的新文件以空字节计算哈希，存在性另由 operation 绑定。"""
+        path = self.path(relative)
+        if any(parent.exists() and not parent.is_dir() for parent in path.parents if parent.is_relative_to(self.root)):
+            raise PermissionError('补丁目标的父路径必须是目录')
+        if path.exists() and not path.is_file():
+            raise PermissionError('补丁目标必须是普通文件')
+        return path.read_bytes() if path.exists() else b''
+
+    def edit_operation(self, relative):
+        path = self.path(relative)
+        self.baseline_bytes(relative)
+        return 'modify' if path.exists() else 'create'
 
     def staged_content(self, relative):
         return self._staged_files.get(relative)
@@ -359,9 +401,10 @@ class Workspace:
                          expected_overlay_hash=None):
         """在共同 overlay 基线上执行唯一 exact replacements，返回可物化候选。"""
         p = self.path(relative, write=True)
-        if not p.exists() or not p.is_file():
+        if not p.is_file() and relative not in self._staged_files:
             raise PermissionError('本地编辑工具不支持创建新文件')
-        disk = p.read_bytes()
+        disk = self.baseline_bytes(relative)
+        disk_exists = p.exists()
         current = self._staged_files.get(relative, disk)
         revision = self.file_overlay_revision(relative)
         reject = lambda code, **details: CandidateRejected(
@@ -373,7 +416,8 @@ class Workspace:
         if expected_overlay_hash is not None and expected_overlay_hash != digest(current):
             raise reject('STALE_BASE', expected_overlay_hash=expected_overlay_hash)
         disk_hash = self._staged_disk_hashes.get(relative, digest(disk))
-        if disk_hash != digest(disk):
+        if (disk_hash != digest(disk)
+                or self._staged_disk_exists.get(relative, disk_exists) != disk_exists):
             raise reject('DISK_DRIFT', expected_before_hash=disk_hash, actual_before_hash=digest(disk))
         if not edits:
             raise ValueError('局部编辑不能为空')
@@ -415,15 +459,17 @@ class Workspace:
         if updated == current:
             raise reject('NO_CHANGE')
         diagnostics = self.validate_candidate_syntax(
-            [FileEdit(path=relative, before_hash=disk_hash, content=text)], baseline_contents={relative: current})
+            [FileEdit(path=relative, before_hash=disk_hash, content=text,
+                      operation='modify' if disk_exists else 'create')], baseline_contents={relative: current})
         before_text = disk.decode('utf-8').splitlines(keepends=True)
         after_text = updated.decode('utf-8').splitlines(keepends=True)
         diff = ''.join(difflib.unified_diff(before_text, after_text,
                                              fromfile='a/' + relative, tofile='b/' + relative))
         previous = self._staged_files.get(relative)
-        if p.read_bytes() != disk or self._staged_files.get(relative, disk) != current:
+        if (p.exists() != disk_exists or self.baseline_bytes(relative) != disk
+                or self._staged_files.get(relative, disk) != current):
             raise reject('DISK_DRIFT', expected_before_hash=disk_hash,
-                         actual_before_hash=digest(p.read_bytes()))
+                         actual_before_hash=digest(self.baseline_bytes(relative)))
         self._staged_files[relative] = updated
         try:
             self._validate_staged_constraints()
@@ -436,10 +482,12 @@ class Workspace:
         self._overlay_revision += 1
         self._staged_versions[relative] = revision + 1
         self._staged_disk_hashes[relative] = disk_hash
+        self._staged_disk_exists[relative] = disk_exists
         ref = 'staged_' + new_id('candidate')
         candidate = {
             'ref': ref, 'path': relative, 'expected_overlay_revision': revision + 1,
             'overlay_hash': digest(updated), 'disk_before_hash': digest(disk),
+            'disk_exists': disk_exists,
             'diff_ref': ref + '.diff', 'diff': diff, 'patch_hash': digest(diff.encode('utf-8')),
         }
         self._staged_candidates[ref] = candidate
@@ -513,9 +561,10 @@ class Workspace:
             if candidate['path'] != path or candidate['expected_overlay_revision'] != expected:
                 raise reject('STALE_REF', candidate_ref=ref)
             p = self.path(path, write=True)
-            disk = p.read_bytes()
+            disk = self.baseline_bytes(path)
             staged = self._staged_files.get(path)
-            if digest(disk) != candidate['disk_before_hash']:
+            disk_exists = candidate.get('disk_exists', True)
+            if p.exists() != disk_exists or digest(disk) != candidate['disk_before_hash']:
                 raise reject('DISK_DRIFT', expected_before_hash=candidate['disk_before_hash'],
                              actual_before_hash=digest(disk))
             if staged is None and state is not None and revision == 0:
@@ -538,7 +587,8 @@ class Workspace:
             if digest(actual_diff.encode('utf-8')) != candidate['patch_hash']:
                 raise reject('STALE_REF', candidate_ref=ref)
             edits.append(FileEdit(path=path, before_hash=candidate['disk_before_hash'],
-                                  content=staged.decode('utf-8')))
+                                  content=staged.decode('utf-8'),
+                                  operation='modify' if disk_exists else 'create'))
         return edits
 
     @staticmethod
@@ -585,7 +635,8 @@ class Workspace:
         diagnostics = []
         for edit in edits:
             path = self.path(edit.path)
-            baseline = (baseline_contents or {}).get(edit.path, path.read_bytes()).decode('utf-8')
+            baseline = ((baseline_contents or {})[edit.path] if edit.path in (baseline_contents or {})
+                        else self.baseline_bytes(edit.path)).decode('utf-8')
             before = self.syntax_diagnostics(edit.path, baseline)
             after = self.syntax_diagnostics(edit.path, edit.content)
             before_errors = [item for item in before if item['kind'] == 'syntax']
@@ -609,10 +660,11 @@ class Workspace:
         return diagnostics
 
     def stage(self, relative, content):
-        """Stage an existing authorized file and enforce guidance limits."""
+        """暂存授权的已有或新文件，并绑定磁盘存在性与用户约束。"""
         p = self.path(relative, write=True)
-        if not p.exists() or not p.is_file():
-            raise PermissionError('本地编辑工具不支持创建新文件')
+        baseline = self.baseline_bytes(relative)
+        exists = p.exists()
+        self._check_staged_disk(relative, baseline, exists)
         data = content.encode('utf-8')
         if not data.strip():
             raise ValueError('不能暂存空文件')
@@ -628,17 +680,20 @@ class Workspace:
             raise
         self._overlay_revision += 1
         self._staged_versions[relative] = self.file_overlay_revision(relative) + 1
-        self._staged_disk_hashes.setdefault(relative, digest(p.read_bytes()))
+        self._staged_disk_hashes.setdefault(relative, digest(baseline))
+        self._staged_disk_exists.setdefault(relative, exists)
         return {'path': str(p), 'after_hash': digest(data), 'staged': True,
                 'overlay_revision': self._overlay_revision}
 
     def stage_many(self, changes):
         previous = dict(self._staged_files)
+        disk_records = {}
         try:
             for relative, content in changes.items():
                 p = self.path(relative, write=True)
-                if not p.exists() or not p.is_file():
-                    raise PermissionError('本地编辑工具不支持创建新文件')
+                baseline, exists = self.baseline_bytes(relative), p.exists()
+                self._check_staged_disk(relative, baseline, exists)
+                disk_records[relative] = (digest(baseline), exists)
                 data = content.encode('utf-8') if isinstance(content, str) else content
                 if not data.strip():
                     raise ValueError('不能暂存空文件')
@@ -650,14 +705,23 @@ class Workspace:
         self._overlay_revision += 1
         for relative in changes:
             self._staged_versions[relative] = self.file_overlay_revision(relative) + 1
-            self._staged_disk_hashes.setdefault(relative, digest(self.path(relative).read_bytes()))
+            self._staged_disk_hashes.setdefault(relative, disk_records[relative][0])
+            self._staged_disk_exists.setdefault(relative, disk_records[relative][1])
         return {'files_changed': list(changes), 'staged': True,
                 'overlay_revision': self._overlay_revision}
+
+    def _check_staged_disk(self, relative, baseline, exists):
+        if (relative in self._staged_disk_hashes
+                and (digest(baseline) != self._staged_disk_hashes[relative]
+                     or exists != self._staged_disk_exists.get(relative, True))):
+            raise CandidateRejected('DISK_DRIFT', path=relative,
+                                    overlay_revision=self.file_overlay_revision(relative))
 
     def clear_staged(self):
         self._staged_files.clear()
         self._staged_candidates.clear()
         self._staged_disk_hashes.clear()
+        self._staged_disk_exists.clear()
         for relative in self._staged_versions:
             self._staged_versions[relative] += 1
         self._overlay_revision += 1
@@ -673,6 +737,7 @@ class Workspace:
         for relative in removed:
             self._staged_files.pop(relative, None)
             self._staged_disk_hashes.pop(relative, None)
+            self._staged_disk_exists.pop(relative, None)
             self._staged_versions[relative] = self.file_overlay_revision(relative) + 1
         self._staged_candidates = {ref: item for ref, item in self._staged_candidates.items()
                                    if item.get('path') not in removed}
@@ -686,8 +751,10 @@ class Workspace:
             snapshot = self.require_repository_snapshot()
             return {'version': 1, 'repository_snapshot': digest(snapshot), 'head': self.head(),
                     'overlay_revision': self._overlay_revision,
+                    'created_entries': json.loads(json.dumps(self._created_entries)),
                     'files': {path: {'content_b64': base64.b64encode(body).decode('ascii'),
-                                     'disk_hash': self._staged_disk_hashes[path]}
+                                     'disk_hash': self._staged_disk_hashes[path],
+                                     'disk_exists': self._staged_disk_exists.get(path, True)}
                               for path, body in self._staged_files.items()},
                     'file_versions': dict(self._staged_versions),
                     'candidates': json.loads(json.dumps(self._staged_candidates))}
@@ -707,24 +774,29 @@ class Workspace:
             if (type(revision) is not int or revision < 0 or not isinstance(versions, dict)
                     or not isinstance(files, dict) or not isinstance(candidates, dict)):
                 raise ValueError('overlay 快照格式不完整')
-            restored, disk_hashes = {}, {}
+            restored, disk_hashes, disk_exists = {}, {}, {}
             for relative, file_revision in versions.items():
                 self.path(relative, write=True)
                 if type(file_revision) is not int or not 0 <= file_revision <= revision:
                     raise ValueError('overlay 文件版本无效')
             for relative, record in files.items():
                 path = self.path(relative, write=True)
-                if (relative not in versions or not path.is_file() or not isinstance(record, dict)
+                if (relative not in versions or not isinstance(record, dict)
                         or not isinstance(record.get('content_b64'), str)):
                     raise ValueError('overlay 文件记录无效')
                 body = base64.b64decode(record['content_b64'], validate=True)
                 body.decode('utf-8')
                 if not body.strip():
                     raise ValueError('不能恢复空 overlay 文件')
-                if digest(path.read_bytes()) != record.get('disk_hash'):
+                existed = record.get('disk_exists', True)
+                if type(existed) is not bool:
+                    raise ValueError('overlay 磁盘存在性记录无效')
+                if (path.exists() != existed or digest(self.baseline_bytes(relative)) != record.get('disk_hash')
+                        or (not existed and record.get('disk_hash') != digest(b''))):
                     raise CandidateRejected('DISK_DRIFT', path=relative,
                                             overlay_revision=revision)
                 restored[relative], disk_hashes[relative] = body, record['disk_hash']
+                disk_exists[relative] = existed
             for ref, candidate in candidates.items():
                 if not isinstance(ref, str) or not isinstance(candidate, dict):
                     raise ValueError('overlay 候选记录无效')
@@ -733,19 +805,27 @@ class Workspace:
                 # 旧版本候选仍可用于审计；只允许引用当前快照中的路径和基线。
                 if (relative not in restored or candidate.get('ref') != ref
                         or candidate.get('disk_before_hash') != disk_hashes[relative]
+                        or candidate.get('disk_exists', True) != disk_exists[relative]
                         or type(candidate.get('expected_overlay_revision')) is not int
                         or not 0 < candidate['expected_overlay_revision'] <= versions[relative]):
                     raise ValueError('overlay 候选绑定无效')
-            old = (self._staged_files, self._staged_disk_hashes,
+            created_entries = value.get('created_entries', {})
+            if not isinstance(created_entries, dict):
+                raise ValueError('overlay 新增文件 manifest 无效')
+            old = (self._staged_files, self._staged_disk_hashes, self._staged_disk_exists,
+                   self._created_entries,
                    self._staged_versions, self._staged_candidates, self._overlay_revision)
             try:
                 self._staged_files, self._staged_disk_hashes = restored, disk_hashes
+                self._staged_disk_exists = disk_exists
+                self._created_entries = created_entries
                 self._staged_versions, self._staged_candidates = dict(versions), dict(candidates)
                 self._overlay_revision = revision
                 self.check_frozen(snapshot)
                 self._validate_staged_constraints()
             except Exception:
-                (self._staged_files, self._staged_disk_hashes, self._staged_versions,
+                (self._staged_files, self._staged_disk_hashes, self._staged_disk_exists,
+                 self._created_entries, self._staged_versions,
                  self._staged_candidates, self._overlay_revision) = old
                 raise
 
@@ -755,7 +835,7 @@ class Workspace:
         changed_paths = set()
         changed_lines = 0
         for relative, data in self._staged_files.items():
-            baseline = self.path(relative).read_bytes()
+            baseline = self.baseline_bytes(relative)
             if baseline == data:
                 continue
             self.path(relative, write=True)
@@ -771,7 +851,7 @@ class Workspace:
             if relative in self._staged_files:
                 continue
             current = self.path(relative).read_bytes()
-            baseline = git(self.root, 'show', 'HEAD:' + relative)
+            baseline = self._commit_bytes('HEAD', relative)
             if current == baseline:
                 continue
             changed_paths.add(relative)
@@ -792,6 +872,7 @@ class Workspace:
     def files(self):
         """枚举根目录下可读的普通文件，排除链接和受保护目录。"""
         from tracefix.rules.codegraph import CODEGRAPH_SUPPORTED_SUFFIXES
+        seen = set()
         for p in sorted(self.root.rglob('*')):
             if p.is_file() and p.suffix in CODEGRAPH_SUPPORTED_SUFFIXES | {'.css', '.json', '.html', '.htm'}:
                 rel = p.relative_to(self.root).as_posix()
@@ -799,7 +880,12 @@ class Workspace:
                     self.path(rel)
                 except PermissionError:
                     continue
+                seen.add(rel)
                 yield rel
+        for relative in sorted(self._staged_files.keys() - seen):
+            self.path(relative)
+            if Path(relative).suffix in CODEGRAPH_SUPPORTED_SUFFIXES | {'.css', '.json', '.html', '.htm'}:
+                yield relative
 
     def cards(self, limit_chars=60_000, preferred_paths=()):
         """按偏好顺序收集受字符预算限制的文件上下文卡片。"""
@@ -810,13 +896,18 @@ class Workspace:
             if total + len(body) > limit_chars:
                 continue
             total += len(body)
-            baseline = self.path(path).read_bytes()
+            baseline = self.baseline_bytes(path)
             result.append({"path": path, "content": body, "before_hash": digest(baseline)})
         return result
 
     def source_bytes(self, relative):
         """取得同次读取的磁盘基线与 overlay 内容，并拒绝读取期间变化。"""
         path = self.path(relative)
+        if not path.exists() and relative in self._staged_files:
+            body = self._staged_files[relative]
+            if path.exists():
+                raise ValueError('源码读取期间发生变化')
+            return b'', body
         before = path.stat()
         staged = self.staged_content(relative)
         baseline = path.read_bytes()
@@ -908,7 +999,7 @@ class Workspace:
             current = replacements.get(relative)
             if current is None:
                 current = self.path(relative).read_bytes()
-            baseline = git(self.root, 'show', 'HEAD:' + relative)
+            baseline = self._commit_bytes('HEAD', relative)
             if current == baseline:
                 continue
             self.path(relative, write=True)
@@ -931,30 +1022,110 @@ class Workspace:
         """先完整校验补丁，再逐文件替换，返回可恢复的补丁摘要。"""
         if len({e.path for e in patch.edits}) != len(patch.edits):
             raise ValueError("存在重复的编辑路径")
+        if self.repository_snapshot:
+            self.check_frozen(self.repository_snapshot)
         changes = []
         for edit in patch.edits:
             p = self.path(edit.path, write=True)
-            old = p.read_bytes()
+            exists = p.exists()
+            operation = getattr(edit, 'operation', 'modify')
+            if (operation not in {'modify', 'create'} or exists != (operation == 'modify')):
+                raise ValueError('补丁操作与目标存在性不匹配')
+            old = self.baseline_bytes(edit.path)
             if digest(old) != edit.before_hash:
                 raise ValueError("基准哈希不匹配；请重新读取文件")
             if not edit.content.strip() or old == edit.content.encode():
                 raise ValueError("空补丁或无实际改动")
-            changes.append((p, old, edit.content.encode()))
+            changes.append((p, old if exists else None, edit.content.encode()))
         self.validate_guidance_patch(patch)
-        # 所有校验在首次写入前完成；恢复时核对完整 before/after 集合。
-        # 文件只部分替换时保持 UNKNOWN，由人工检查后再恢复。
-        for p, before, after in changes:
-            tmp = p.with_name(p.name + '.tracefix-tmp')
-            tmp.write_bytes(after)
-            os.replace(tmp, p)
+        new_paths = [p.relative_to(self.root).as_posix() for p, before, _ in changes if before is None]
+        created_dirs, written = [], []
+        index = self.root / '.git' / 'index'
+        index_before = index.read_bytes() if index.exists() else None
+        entries_before = dict(self._created_entries)
+        try:
+            for p, before, after in changes:
+                self.path(p.relative_to(self.root).as_posix(), write=True)
+                if p.exists() != (before is not None) or self.baseline_bytes(p.relative_to(self.root).as_posix()) != (before or b''):
+                    raise ValueError('补丁物化前磁盘已漂移')
+                missing = []
+                parent = p.parent
+                while not parent.exists():
+                    missing.append(parent)
+                    parent = parent.parent
+                for directory in reversed(missing):
+                    directory.mkdir()
+                    created_dirs.append(directory)
+                self._replace_bytes(p, after)
+                written.append((p, before))
+            # Git diff 必须包含新文件，供验证与发布使用同一标准补丁字节。
+            if new_paths:
+                safe_index_files(self.root, new_paths)
+            if self.repository_snapshot:
+                self._created_entries = self._new_entries(self.repository_snapshot, file_manifest(self.root))
+                self.check_frozen(self.repository_snapshot)
+            result = {"patch_hash": digest(self.diff(base).encode()), "files": [e.path for e in patch.edits],
+                      "base_commit": base}
+        except Exception:
+            for p, before in reversed(written):
+                if before is None:
+                    p.unlink()
+                else:
+                    self._replace_bytes(p, before)
+            for directory in reversed(created_dirs):
+                directory.rmdir()
+            if index_before is None:
+                index.unlink(missing_ok=True)
+            else:
+                self._replace_bytes(index, index_before)
+            self._created_entries = entries_before
+            raise
         self.clear_staged()
-        return {"patch_hash": digest(self.diff(base).encode()), "files": [e.path for e in patch.edits],
-                "base_commit": base}
+        return result
+
+    @staticmethod
+    def _replace_bytes(path, data):
+        # 随机临时文件不能覆盖仓库中同名的用户文件。
+        descriptor, temporary = tempfile.mkstemp(prefix='.tracefix-', dir=path.parent)
+        temporary = Path(temporary)
+        try:
+            with os.fdopen(descriptor, 'wb') as stream:
+                stream.write(data)
+            os.chmod(temporary, path.stat().st_mode & 0o777 if path.exists() else 0o644)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _commit_bytes(self, base, relative):
+        self.path(relative)
+        if not git(self.root, 'ls-tree', '-z', base, '--', relative):
+            return b''
+        return git(self.root, 'show', base + ':' + relative)
+
+    def commit_bytes(self, base, relative):
+        """只读取得指定提交的授权文件，新路径以空字节为修复基线。"""
+        return self._commit_bytes(base, relative)
 
     def reconcile(self, patch: PatchProposal, base='HEAD'):
         """确认磁盘状态是否与补丁的全部目标内容一致。"""
-        hashes = [digest(self.path(e.path).read_bytes()) for e in patch.edits]
+        hashes = [digest(self.path(e.path, write=True).read_bytes()) for e in patch.edits]
         if all(h == digest(e.content.encode()) for h, e in zip(hashes, patch.edits)):
+            new_paths = [e.path for e in patch.edits if getattr(e, 'operation', 'modify') == 'create']
+            for relative in new_paths:
+                if ((self.repository_snapshot and relative in self.repository_snapshot['files'])
+                        or git(self.root, 'ls-tree', '-z', base, '--', relative)):
+                    raise RuntimeError('新增补丁目标已存在于冻结基线')
+            if new_paths:
+                safe_index_files(self.root, new_paths)
+            if self.repository_snapshot:
+                entries = self._new_entries(self.repository_snapshot, file_manifest(self.root))
+                permitted = set(new_paths) | {relative for relative, entry in self._created_entries.items()
+                                              if entry['kind'] == 'file'}
+                if any(entry['kind'] == 'file' and relative not in permitted
+                       for relative, entry in entries.items()):
+                    raise RuntimeError('补丁状态含未登记新增文件')
+                self._created_entries = entries
+                self.check_frozen(self.repository_snapshot)
             return {"patch_hash": digest(self.diff(base).encode()), "files": [e.path for e in patch.edits],
                     "base_commit": base}
         raise RuntimeError("补丁状态未知；请先检查工作区再恢复")
@@ -973,7 +1144,13 @@ class Workspace:
             self.require_repository_snapshot(source_manifest)
             self.prepare_mountpoints()
             actual_entries = file_manifest(self.root)
-            expected_entries = source_manifest['entries']
+            # 登记新增项只能扩展基线，不能覆盖或删改冻结 manifest。
+            if source_manifest['entries'].keys() & self._created_entries.keys():
+                raise PermissionError('新增 manifest 覆盖冻结条目')
+            valid_created = self._new_entries(source_manifest, actual_entries)
+            if valid_created.keys() != self._created_entries.keys():
+                raise PermissionError('工作区 manifest 存在未登记新增或删除')
+            expected_entries = {**source_manifest['entries'], **self._created_entries}
             if actual_entries.keys() != expected_entries.keys():
                 raise PermissionError('工作区 manifest 文件/目录集合变化')
             for relative, expected in expected_entries.items():
@@ -982,7 +1159,8 @@ class Workspace:
                     raise PermissionError('工作区 manifest 文件类型/链接/索引变化：' + relative)
                 if actual_entry['content'] != expected['content']:
                     self.path(relative, write=True)
-        tracked = set(source_manifest['files'])
+        tracked = set(source_manifest['files']) | {relative for relative, entry in self._created_entries.items()
+                                                  if entry['kind'] == 'file'}
         actual = set()
         for p in self.root.rglob('*'):
             rel = p.relative_to(self.root).as_posix()
@@ -997,6 +1175,28 @@ class Workspace:
             if digest(self.path(rel).read_bytes()) != expected:
                 self.path(rel, write=True)
 
+    def _new_entries(self, snapshot, actual_entries):
+        """验证新增项均为授权索引普通文件及其必要父目录。"""
+        extra = {relative: entry for relative, entry in actual_entries.items()
+                 if relative not in snapshot['entries']}
+        parents = set()
+        for relative, entry in extra.items():
+            if not isinstance(entry, dict):
+                raise PermissionError('新增 manifest 记录无效')
+            if entry.get('kind') != 'file':
+                continue
+            self.path(relative, write=True)
+            if entry.get('tracked') is not True or entry.get('git_mode') != '100644' or entry.get('mode', 0) & 0o111:
+                raise PermissionError('新增文件必须是已登记的普通索引文件')
+            parents.update(parent.as_posix() for parent in Path(relative).parents if parent != Path('.'))
+        for relative, entry in extra.items():
+            if entry.get('kind') == 'directory':
+                if relative not in parents or entry.get('tracked') is not False or entry.get('git_mode') is not None:
+                    raise PermissionError('新增目录不是补丁文件的必要父目录')
+            elif entry.get('kind') != 'file':
+                raise PermissionError('新增 manifest 含非普通文件')
+        return extra
+
     def branch(self, name):
         """创建并提交验证分支，确保分支名称只能属于本次运行命名空间。"""
         if not isinstance(name, str) or not re.fullmatch(r'tracefix/[A-Za-z0-9_-]{1,80}', name):
@@ -1008,7 +1208,11 @@ class Workspace:
         else:
             git(self.root, "checkout", "-qb", name)
         if git(self.root, 'status', '--porcelain').strip():
-            safe_index_files(self.root, sorted(self.repository_snapshot['files']
-                             if self.repository_snapshot else git(self.root, 'ls-files', '-z').decode().split('\0')[:-1]))
+            if self.repository_snapshot:
+                self.check_frozen(self.repository_snapshot)
+            paths = set(self.repository_snapshot['files'] if self.repository_snapshot else
+                        git(self.root, 'ls-files', '-z').decode().split('\0')[:-1])
+            paths.update(relative for relative, entry in self._created_entries.items() if entry['kind'] == 'file')
+            safe_index_files(self.root, sorted(paths))
             commit_workspace(self.root, "提交通过验证的修复候选")
         return name

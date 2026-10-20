@@ -1008,6 +1008,10 @@ class Engine:
     async def runtime_verification_passed(self, s):
         """在最终成功边界重新采样运行容器；采样失败或漂移必须 fail-closed。"""
         try:
+            if self.spec(s).mode != 'gui':
+                from tracefix.runtime.command_tests import frozen_plan
+                frozen_plan(self, s)
+                self.runner.command_only = True
             live_environment_digest = await self.runner.inspect_images(runtime=True)
         except asyncio.CancelledError:
             raise
@@ -2099,6 +2103,8 @@ class Engine:
                 Phase.REVIEW: 'review', Phase.FINALIZE: 'finalize'}[s.phase]
 
     async def prelude(self, s, _):
+        from tracefix.runtime.test_edit_approval import restore_test_edit_approval
+        restore_test_edit_approval(self, s)
         self.scopes.assert_current(self.context)
         if self.control == 'cancel':
             self.cancel_subagents(s)
@@ -2241,7 +2247,10 @@ class Engine:
             runtime.close()
 
     async def prepare(self, s, _):
+        from tracefix.runtime.test_edit_approval import ensure_test_edit_approval
+        s = ensure_test_edit_approval(self, s)
         self.warn_retrieval_degraded(s)
+        command_mode = bool(s.test_spec_ref and self.spec(s).mode != 'gui')
         if s.step == 0:
             self.scopes.assert_current(self.context)
             if s.scope_id != self.context.active_scope:
@@ -2260,25 +2269,39 @@ class Engine:
             async def prepare_env():
                 if s.continuation_count:
                     await self.runner.close()
+                if command_mode:
+                    self.runner.command_only = True
                 environment = await self.runner.inspect_images()
-                health = await self.runner.start(s.source_manifest)
+                health = await (self.runner.start_commands(s.source_manifest) if command_mode
+                                else self.runner.start(s.source_manifest))
                 if not health['passed']:
                     raise RuntimeError('初始沙箱未通过健康检查')
-                version = await self.runner.version()
-                if version != s.source_manifest:
-                    raise PermissionError('已部署的源码与清单不匹配')
+                if not command_mode:
+                    version = await self.runner.version()
+                    if version != s.source_manifest:
+                        raise PermissionError('已部署的源码与清单不匹配')
                 return {'environment_digest': environment, 'source_aligned': True}
             r = await self.operation(s, 'sandbox.start', {'source': s.source_manifest}, prepare_env)
-            await self.browser.open()
+            if not command_mode:
+                await self.browser.open()
             s = self.changed(s, step=1, **r)
             return self.output(s, 'prelude')
         if s.step == 1:
+            if command_mode:
+                from tracefix.runtime.command_tests import freeze, record_baseline
+                if not s.patch_hash:
+                    s = await freeze(self, s)
+                    s, _ = await record_baseline(self, s)
+                return self.output(self.changed(s, step=2), 'prelude')
             async def baseline():
                 return await self.runner.command('unit')
             result = await self.operation(s, 'baseline.unit', {'source': s.source_manifest}, baseline)
             ref = self.put(s, {**result, 'kind': 'baseline_unit', 'source_manifest': s.source_manifest}, name='基线单元测试')
             s = self.changed(s, step=2, baseline_validation_refs=[ref])
             return self.output(s, 'prelude')
+        if command_mode:
+            phase = Phase.VERIFY if s.continuation_count and s.patch_hash and s.reproduced else Phase.EXPLORE
+            return self.output(self.changed(s, phase=phase, step=0), 'prelude')
         if s.repair_source and self._finding_acceptance(s) is not None and not s.finding_reproduction_ref:
             s = await self.execute_finding_acceptance(s)
             if s.phase == Phase.FINALIZE:
@@ -2351,6 +2374,9 @@ class Engine:
 
     async def decide(self, s, _):
         spec = self.spec(s)
+        if spec.mode != 'gui':
+            from tracefix.runtime.command_tests import explore
+            return await explore(self, s)
         obs = self.get(s, s.observation_ref)
         image = (self.artifacts.read(s.scope_id, s.run_id, obs['screenshot_ref'])
                  if getattr(self.model, 'vision_model', None) else None)
@@ -2428,12 +2454,10 @@ class Engine:
         error = None
         draft = None
         try:
-            draft = await self.model_call(s, GoalCheckDraft, {
-                'goal': s.goal, 'test_spec': self.spec(s).model_dump(mode='json'),
-                'observation': self.get(s, s.observation_ref) if s.observation_ref else None,
-                'instruction': '把用户原始自然语言测试目标提炼为一个准确的检测问题名称和完整检测指标。'
-                    '保留原目标中的所有要求，不得降低标准、遗漏子要求或把用户规则混入目标。'
-                    '只返回 name 和 criteria；不执行页面动作。'})
+            if self.spec(s).mode != 'gui':
+                draft = GoalCheckDraft(name='冻结命令目标检查', criteria=s.goal)
+            else:
+                draft = await self._extract_goal_check(s)
         except asyncio.CancelledError:
             raise
         except (ModelError, ContextWindowError):
@@ -2447,6 +2471,14 @@ class Engine:
         self.event(s, 'check.plan.frozen', {'artifact_ref': ref, 'hash': s.check_plan_hash,
             'items': [item.model_dump(mode='json') for item in plan.items]})
         return s
+
+    async def _extract_goal_check(self, s):
+        return await self.model_call(s, GoalCheckDraft, {
+                'goal': s.goal, 'test_spec': self.spec(s).model_dump(mode='json'),
+                'observation': self.get(s, s.observation_ref) if s.observation_ref else None,
+                'instruction': '把用户原始自然语言测试目标提炼为一个准确的检测问题名称和完整检测指标。'
+                    '保留原目标中的所有要求，不得降低标准、遗漏子要求或把用户规则混入目标。'
+                    '只返回 name 和 criteria；不执行页面动作。'})
 
     def check_plan(self, s):
         plan = CheckPlan.model_validate(self.get(s, s.check_plan_ref))
@@ -2497,6 +2529,9 @@ class Engine:
 
     async def evaluate_goal(self, s, item, observation, refs):
         spec = self.spec(s)
+        if spec.mode != 'gui':
+            from tracefix.runtime.command_tests import goal_result
+            return goal_result(self, s, refs)
         results = []
         if s.check_suite_stage == 'verify':
             validations = [self.get(s, ref) for ref in s.validation_refs]
@@ -2748,6 +2783,8 @@ class Engine:
                 return self.output(self.changed(s, phase=Phase.DIAGNOSE,
                     error='修复后的检查套件未通过，参见逐项检查证据'), 'prelude')
             return await self.complete_verification(s)
+        if self.spec(s).mode != 'gui' and any(result.status == 'fail' for result in results):
+            return self.output(self.changed(s, phase=Phase.REPRODUCE, pending_action=None), 'prelude')
         if s.mode == 'test':
             outcome = (Outcome.BUG_CONFIRMED if any(result.status == 'fail' for result in results)
                 else Outcome.INCONCLUSIVE if overall in {'FAILED', 'INCONCLUSIVE'}
@@ -2793,6 +2830,9 @@ class Engine:
         return await self.operation(s, 'scenario.reset', {'trial': s.trial, 'validation': s.validation_index}, reset_env)
 
     async def reproduce(self, s, _):
+        if self.spec(s).mode != 'gui':
+            from tracefix.runtime.command_tests import reproduce
+            return await reproduce(self, s)
         if s.repair_source and self._finding_acceptance(s) is not None:
             s = await self.execute_finding_acceptance(s)
             if s.phase == Phase.FINALIZE:
@@ -2868,6 +2908,9 @@ class Engine:
         return observations
 
     async def freeze_reproduction_plan(self, s):
+        if self.spec(s).mode != 'gui':
+            from tracefix.runtime.command_tests import freeze
+            return await freeze(self, s)
         if s.patch_hash:
             raise ValueError('修补后不能重新选择复现计划')
         if s.reproduction_plan_frozen:
@@ -3193,7 +3236,11 @@ class Engine:
                 raise ModelOutputError('补丁路径未通过授权校验：' + edit.path,
                     category='output_validation',
                     details=details) from error
-            current = path.read_bytes()
+            exists = path.is_file()
+            if (edit.operation == 'create') == exists:
+                raise ModelOutputError('补丁操作与目标文件是否存在不匹配：' + edit.path,
+                    category='output_validation', details={'error_code': 'STALE_BASE', 'written': False})
+            current = path.read_bytes() if exists else b''
             if digest(current) != edit.before_hash:
                 raise ModelOutputError(
                     '补丁基准哈希不匹配：' + edit.path,
@@ -3236,12 +3283,19 @@ class Engine:
     def candidate_fingerprint(self, patch=None):
         replacements = {edit.path: edit.content.encode('utf-8') for edit in patch.edits} if patch else {}
         changes = {}
-        for path, baseline_hash in self.source.get('files', {}).items():
+        source_files = self.source.get('files', {})
+        staged_files = self.workspace._staged_files
+        created_files = {path for path, entry in self.workspace._created_entries.items()
+                         if entry['kind'] == 'file'}
+        for path in sorted(set(source_files) | set(replacements) | set(staged_files) | created_files):
+            baseline_hash = source_files.get(path, digest(b''))
             current = replacements.get(path)
+            if current is None:
+                current = staged_files.get(path)
             if current is None:
                 current = self.workspace.path(path).read_bytes()
             current_hash = digest(current)
-            if current_hash != baseline_hash:
+            if path not in source_files or current_hash != baseline_hash:
                 changes[path] = current_hash
         return digest(changes)
 
@@ -3303,10 +3357,15 @@ class Engine:
             if s.phase == Phase.FINALIZE:
                 return self.output(s, 'finalize')
         spec = self.spec(s)
-        kinds = ['static', 'unit', 'build', 'health', 'original', 'regression'] + ['behavior'] * len(spec.behavior_scenarios)
+        command_mode = spec.mode != 'gui'
+        kinds = (['static', 'unit', 'build', 'original', 'regression'] if command_mode else
+            ['static', 'unit', 'build', 'health', 'original', 'regression'] + ['behavior'] * len(spec.behavior_scenarios))
         kind = kinds[s.validation_index]
         scenario = spec.behavior_scenarios[s.validation_index - 6] if kind == 'behavior' else None
-        if scenario is not None:
+        if command_mode:
+            from tracefix.runtime.command_tests import verification_result
+            result = await verification_result(self, s, kind)
+        elif scenario is not None:
             if s.replay_index == 0:
                 # 每个场景须自行建立前置状态，隔离探索/上一场景的浏览器与服务端状态，并清空旧检查点。
                 result = await self.reset(s)

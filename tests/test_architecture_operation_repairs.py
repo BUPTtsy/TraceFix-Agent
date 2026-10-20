@@ -92,6 +92,38 @@ def ledger(request):
     return store
 
 
+@pytest.mark.parametrize('legacy', [False, True])
+def test_postgres_pre_spec_test_approval_and_legacy_migration(postgres_pair, tmp_path, legacy):
+    from tracefix.runtime.test_edit_approval import authorize_test_edits, verified_test_edit_files
+    from tracefix.storage.artifacts import Artifacts
+
+    store, resumed_store = postgres_pair
+    if legacy:
+        store.conn.execute('''CREATE TABLE approvals (
+            id text PRIMARY KEY, run_id text NOT NULL, scope_id text NOT NULL,
+            action_hash text NOT NULL, patch_hash text NOT NULL, expires_at double precision NOT NULL,
+            decision text, consumed boolean NOT NULL DEFAULT false)''')
+        store.conn.execute("INSERT INTO approvals VALUES ('old', 'old-run', 'old-scope', 'action', 'patch', 0, 'approve', true)")
+    store.setup()
+    store.setup()
+    root = tmp_path / 'workspace'
+    (root / 'src').mkdir(parents=True)
+    (root / 'src/value.test.ts').write_text('assert(value);\n', encoding='utf-8')
+    workspace = Workspace(root, ['src/**'])
+    artifacts = Artifacts(tmp_path / 'artifacts')
+    state = RunState(scope_id='approval-migration', goal='修正已批准测试', mode='repair',
+        url='http://localhost', source_manifest=digest({'source': True}), repo_snapshot_ref='source.json')
+    store.save(state)
+    authorize_test_edits(store, artifacts, state, workspace, ['src/value.test.ts'], reviewer='cli:human')
+    record = store.conn.execute('SELECT * FROM approvals WHERE id=%s', (state.test_edit_approval_id,)).fetchone()
+    assert record['patch_hash'] is None and record['consumed'] and record['decision'] == 'approve'
+    resumed = resumed_store.load(state.run_id, state.scope_id)
+    resumed.phase, resumed.patch_hash = Phase.VERIFY, digest(b'candidate')
+    assert verified_test_edit_files(resumed_store, artifacts, resumed, workspace) == ('src/value.test.ts',)
+    if legacy:
+        assert store.conn.execute("SELECT patch_hash FROM approvals WHERE id='old'").fetchone()['patch_hash'] == 'patch'
+
+
 def record_for(store, op_id):
     if isinstance(store, PostgresStore):
         return store.conn.execute('SELECT * FROM operations WHERE id=%s', (op_id,)).fetchone()

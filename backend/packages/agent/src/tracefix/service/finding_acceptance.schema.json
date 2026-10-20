@@ -309,6 +309,12 @@
     "AcceptanceSpec": {
       "additionalProperties": false,
       "properties": {
+        "mode": {
+          "const": "gui",
+          "default": "gui",
+          "title": "Mode",
+          "type": "string"
+        },
         "goal": {
           "maxLength": 16384,
           "minLength": 5,

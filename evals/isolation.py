@@ -33,6 +33,14 @@ def _overlaps(first: Path, second: Path) -> bool:
     return first.is_relative_to(second) or second.is_relative_to(first)
 
 
+def _mount_source(value: str) -> Path:
+    if os.name == 'nt':
+        match = re.fullmatch(r'/(?:run/desktop/mnt/host|host_mnt)/([a-zA-Z])(?:/(.*))?', value)
+        if match:
+            value = match[1] + ':/' + (match[2] or '')
+    return _plain_path(Path(value))
+
+
 @dataclass(frozen=True)
 class AgentExposure:
     """Complete inventory supplied by the trusted Agent launcher, never by a model."""
@@ -150,7 +158,7 @@ class DockerAgentBoundary:
                     continue
                 if mount.get('Type') != 'bind' or not isinstance(mount.get('Source'), str):
                     raise IsolationError('uninspectable Agent mount')
-                source = _plain_path(Path(mount['Source']))
+                source = _mount_source(mount['Source'])
                 if (_overlaps(source, private_root)
                         or any(_overlaps(source, _plain_path(path)) for path in private_files)
                         or any(token in str(source).casefold() for token in ('docker.sock', 'docker_engine', '\\pipe\\'))

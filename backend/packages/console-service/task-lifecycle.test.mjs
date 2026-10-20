@@ -6,6 +6,8 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {build} from 'esbuild';
 import {spawn} from 'node:child_process';
+import Ajv from 'ajv';
+import {testSpec} from '../../apps/console-api/server/schemas.mjs';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const bundle = await build({stdin: {contents: "export * from './src/task-lifecycle.ts'; export * from './src/database.ts';",
@@ -14,6 +16,26 @@ const {ConsoleDatabase, TaskLifecycle, normalizeTask} = await import('data:text/
   Buffer.from(bundle.outputFiles[0].text).toString('base64'));
 const input = {repo_id: 'repo', mode: 'test', goal: '测试受控项目', execution: {executionMode: 'batch'}};
 const projects = [{id: 'alpha', repoId: 'repo', ready: true}];
+
+test('非 GUI TestSpec 冻结命令目标并拒绝混用浏览器计划，GUI 仍须双断言', () => {
+  const validate = new Ajv({strict: false}).compile(testSpec);
+  const normalize = spec => normalizeTask({...input, execution: {...input.execution, spec}}, projects);
+  for (const mode of ['unit', 'static', 'build']) {
+    const spec = {mode, goal: '修复冻结命令的失败'};
+    assert.equal(validate(spec), true, JSON.stringify(validate.errors));
+    assert.deepEqual(normalize(spec).execution.spec, spec);
+    for (const key of ['assertions', 'regression_assertions', 'regression_plan',
+      'executable_preconditions', 'behavior_scenarios', 'authorized_actions']) {
+      const mixed = {...spec, [key]: key === 'authorized_actions' ? ['click'] : [{}]};
+      assert.equal(validate(mixed), false, key);
+      assert.throws(() => normalize(mixed), error => error.code === 'INVALID_SPEC', key);
+    }
+  }
+  assert.equal(validate({goal: '旧 GUI 仍须双断言'}), false);
+  assert.throws(() => normalize({goal: '旧 GUI 仍须双断言'}), error => error.code === 'INVALID_SPEC');
+  const assertion = {locator: {role: 'status', name: '已保存'}};
+  assert.equal(validate({goal: '旧 GUI 保持现有兼容', assertions: [assertion], regression_assertions: [assertion]}), true);
+});
 
 test('Task 修复模式保持可选、校验非法值并透传执行定义', context => {
   const {tasks, store} = fixture(context);

@@ -6,7 +6,7 @@ import copy
 import jsonschema
 
 from tracefix.model.contracts import ModelOutputError
-from tracefix.runtime.contracts import BrowserAction, Decision, digest
+from tracefix.runtime.contracts import BrowserAction, Decision, Phase, digest
 from tracefix.storage.artifacts import sanitize
 from tracefix.tools.core import model_tool_name
 
@@ -98,9 +98,18 @@ async def execute_browser_tool(engine, state, context, name, arguments, call_id,
         reference = error.observation_ref
     canonical = action.model_copy(update={'observation_id': None, 'element_ref': None,
                                           'page_generation': None})
-    plan = engine.get(state, state.replay_plan_ref) if state.replay_plan_ref else []
-    plan.append(canonical.model_dump())
-    plan_reference = engine.put(state, plan, name='操作重放计划')
+    diagnostic = state.phase == Phase.DIAGNOSE and state.repair_mode == 'hybrid'
+    if diagnostic:
+        audit_ref = engine.put(state, {'kind': 'repair_browser_diagnostic',
+            'action': canonical.model_dump(), 'observation_ref': reference,
+            'tool_call_id': call_id, 'verification_evidence': False}, name='修复浏览器诊断审计')
+        engine.event(state, 'repair.browser.diagnostic', {'audit_ref': audit_ref,
+            'observation_ref': reference, 'frozen_replay_plan_ref': state.replay_plan_ref})
+        plan_reference = state.replay_plan_ref
+    else:
+        plan = engine.get(state, state.replay_plan_ref) if state.replay_plan_ref else []
+        plan.append(canonical.model_dump())
+        plan_reference = engine.put(state, plan, name='操作重放计划')
     fingerprint = digest([canonical.model_dump(),
                           stable_snapshot(observation['snapshot']) if observation else ''])
     updated = engine.changed(state, observation_ref=reference, replay_plan_ref=plan_reference,

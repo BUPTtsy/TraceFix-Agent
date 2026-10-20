@@ -1,0 +1,6 @@
+{
+  "version": "tracefix-e1-public-v1",
+  "task": "Repair the behavior described by the goal using only the supplied source and public TestSpec.",
+  "completion": "Describe observed evidence accurately. Leave source unchanged when the requested behavior already works.",
+  "verification": "Run public checks and verify the goal behavior. Evaluator scoring and hidden assertions are unavailable."
+}

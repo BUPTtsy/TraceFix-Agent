@@ -78,6 +78,7 @@ class WorkerTool(StrEnum):
     GLOB = "Glob"
     GREP = "Grep"
     NOTEBOOK_EDIT = "NotebookEdit"
+    RUN_TESTS = "RunTests"
     FILE_READ = "file.read"
     FILE_WRITE = "file.write"
     CODE_READ = "code.read"

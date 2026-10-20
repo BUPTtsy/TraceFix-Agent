@@ -86,7 +86,7 @@ def current_diff(engine, state):
     workspace = engine.workspace
     overlay = []
     for path in workspace.export_overlay()['files']:
-        before = workspace.path(path).read_text(encoding='utf-8').splitlines(keepends=True)
+        before = workspace.baseline_bytes(path).decode('utf-8').splitlines(keepends=True)
         after = workspace.read(path).splitlines(keepends=True)
         overlay.extend(difflib.unified_diff(before, after, fromfile='a/' + path, tofile='b/' + path))
     return {'applied': workspace.diff(state.patch_base_commit or 'HEAD'), 'overlay': ''.join(overlay)}
@@ -216,7 +216,9 @@ async def repair_context(engine, state):
         latest_verification=engine.current_diagnosis_feedback(state),
         repair_memory=recipes, segment_feedback=_session(state).get('feedback'),
         correction=(state.error_details or {}).get('recovery') or _session(state).get('correction'),
-        instruction='在授权 overlay 中自主查阅、编辑和自测；按需委派调查。'
+        instruction='在授权 overlay 中自主查阅、编辑和自测；按需委派独立尝试。'
+                    '浏览器操作仅为诊断，不修改冻结复现计划；GitHistory 仅访问冻结提交及其祖先。'
+                    'Worker 候选不会自动合并，采纳时先核对候选并在父 overlay 重新编辑和自测。'
                     '核对真实 diff 后调用 FinishRepair；它仅请求外层补丁与验证，不代表修复通过。'
                     '若仍缺证据或有验证失败，读取反馈并继续同一修复会话，不放宽冻结断言或权限。')
     engine.store.save(state)

@@ -215,6 +215,15 @@ class MemoryStore:
         a["consumed"] = True
         return a["decision"] == "approve"
 
+    def verify_consumed_approval(self, key, state, action, *, patch_hash=None):
+        """复核已经消费的授权；消费后的审计不再受等待审批有效期影响。"""
+        record = self.approvals.get(key)
+        return bool(record and record['run_id'] == state.run_id
+                    and record['scope_id'] == state.scope_id
+                    and record['patch_hash'] == patch_hash
+                    and record['action_hash'] == digest(action)
+                    and record['decision'] == 'approve' and record['consumed'])
+
     @contextmanager
     def writer(self, run_id):
         with self._operation_lock:
@@ -448,6 +457,14 @@ class PostgresStore(MemoryStore):
                 raise PermissionError("审批缺失")
             self.conn.execute("UPDATE approvals SET consumed=true WHERE id=%s", (key,))
             return a["decision"] == "approve"
+
+    def verify_consumed_approval(self, key, state, action, *, patch_hash=None):
+        record = self.conn.execute("SELECT * FROM approvals WHERE id=%s", (key,)).fetchone()
+        return bool(record and record['run_id'] == state.run_id
+                    and record['scope_id'] == state.scope_id
+                    and record['patch_hash'] == patch_hash
+                    and record['action_hash'] == digest(action)
+                    and record['decision'] == 'approve' and record['consumed'])
 
     @contextmanager
     def writer(self, run_id):

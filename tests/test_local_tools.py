@@ -129,22 +129,22 @@ def test_grep_modes_multiline_glob_and_worker_isolation(engine):
 
 
 @pytest.mark.asyncio
-async def test_write_rejects_file_creation_and_glob_orders_by_modification_time(engine):
+async def test_write_creates_overlay_file_and_glob_orders_by_modification_time(engine):
     engine, state = engine
     tools = LocalTools(engine, {}, state)
     path = engine.workspace.root / 'new.py'
-    with pytest.raises(ToolRejected, match='不支持创建新文件'):
+    with pytest.raises(EffectBoundaryError):
         tools.write(WriteInput(file_path=str(path), content='created\n'))
     result = await build_runtime_tools(engine, state, PatchProposal).pipeline().execute(
         'Write', {'file_path': str(path), 'content': 'created\n'}, 'create')
-    assert result.is_error and not result.executed
+    assert not result.is_error and result.executed
     assert not path.exists()
-    assert engine.workspace.staged_content('new.py') is None
+    assert engine.workspace.staged_content('new.py') == b'created\n'
     os.utime(engine.workspace.root / 'app.py', ns=(1000000000, 1000000000))
     recent = engine.workspace.root / 'src/value.ts'
     os.utime(recent, ns=(2000000000, 2000000000))
     assert tools.glob(GlobInput(pattern='**/*.[pt][sy]'))['files'] == [
-        str(recent), str(engine.workspace.root / 'app.py')]
+        str(recent), str(engine.workspace.root / 'app.py'), str(path)]
 
 
 @pytest.mark.parametrize('engine', [{'app.py': 'line\n' * 2001}], indirect=True)

@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from tracefix.runtime.contracts import digest
 
@@ -59,6 +59,7 @@ class EvaluationConfig:
     track: str = 'compare'
     category: str | None = None
     known_bug: bool | None = None
+    mutations: tuple[dict, ...] = ()
 
     def __post_init__(self):
         if self.track not in {'compare', 'capability'}:
@@ -80,6 +81,17 @@ class EvaluationConfig:
         if self.mutation_file and (Path(self.mutation_file).is_absolute()
                                    or '..' in Path(self.mutation_file).parts):
             raise ValueError('缺陷注入路径必须位于源码内')
+        if self.mutations and any(value is not None for value in mutation):
+            raise ValueError('不可同时提供旧单处与 mutations 注入')
+        for item in self.case_mutations():
+            if (set(item) != {'file', 'before', 'after'}
+                    or any(not isinstance(item[field], str) for field in item)
+                    or not item['before'] or item['before'] == item['after']):
+                raise ValueError('mutation 必须包含 file/before/after 且确实改变源码')
+            path = item['file'].replace('\\', '/')
+            if (not path or path.startswith('/') or Path(path).is_absolute() or PureWindowsPath(path).drive
+                    or '..' in Path(path).parts or '.git' in Path(path).parts):
+                raise ValueError('缺陷注入路径必须位于源码内')
         if any(not isinstance(item, str) or not item for item in self.command):
             raise ValueError('command 必须是非空字符串数组')
 
@@ -95,11 +107,33 @@ class EvaluationConfig:
             values['allowed_files'] = tuple(values['allowed_files'])
         if 'command' in values:
             values['command'] = tuple(values['command'])
+        if 'mutations' in values:
+            values['mutations'] = tuple(values['mutations'])
         return cls(**values)
 
     def payload(self):
         return {key: str(value) if isinstance(value, Path) else value
                 for key, value in asdict(self).items()}
+
+    def case_mutations(self):
+        if self.mutations:
+            return tuple(dict(item) for item in self.mutations)
+        if self.mutation_file is not None:
+            return ({'file': self.mutation_file, 'before': self.mutation_before,
+                     'after': self.mutation_after},)
+        return ()
+
+    def mutation_hash(self):
+        mutations = self.case_mutations()
+        if len(mutations) <= 1:
+            return digest([mutations[0][name] for name in ('file', 'before', 'after')]
+                          if mutations else [None, None, None])
+        return digest(list(mutations))
+
+    def agent_payload(self):
+        private = {'mutation_file', 'mutation_before', 'mutation_after', 'mutations', 'source_root',
+                   'source_revision', 'case_id', 'family', 'category', 'known_bug', 'track'}
+        return {key: value for key, value in self.payload().items() if key not in private}
 
     def fixed_inputs(self):
         skills = {path.relative_to(self.skills_root).as_posix(): digest(path.read_bytes())
@@ -123,7 +157,7 @@ class EvaluationConfig:
                 'model': self.model, 'vision_model': self.vision_model, 'effort': self.effort,
                 'thinking': self.thinking,
             }),
-            'mutation_hash': digest([self.mutation_file, self.mutation_before, self.mutation_after]),
+            'mutation_hash': self.mutation_hash(),
             'allowed_files': list(self.allowed_files), 'held_out': self.held_out,
             'track': self.track, 'category': self.category or self.family, 'known_bug': self.known_bug,
         }

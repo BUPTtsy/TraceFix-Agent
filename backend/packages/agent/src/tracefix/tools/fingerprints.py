@@ -12,17 +12,17 @@ def diff_fingerprint(workspace, state):
     base = state.patch_base_commit or workspace.head()
     changed = git(workspace.root, 'diff', '--no-ext-diff', '--name-only', '-z', base, '--')
     paths = {path for path in changed.decode('utf-8').split('\0') if path}
-    snapshot = workspace.require_repository_snapshot()
-    paths.update(relative for relative in snapshot['files']
-                 if workspace.staged_content(relative) is not None)
+    workspace.require_repository_snapshot()
+    paths.update(workspace._staged_files)
     entries = []
     for relative in sorted(paths):
         path = workspace.path(relative)
-        before = git(workspace.root, 'show', f'{base}:{relative}')
+        before = workspace.commit_bytes(base, relative)
         staged = workspace.staged_content(relative)
         after = staged if staged is not None else path.read_bytes()
-        if before != after:
-            entries.append([relative, digest(before), digest(after)])
+        exists = bool(git(workspace.root, 'ls-tree', '-z', base, '--', ':(literal)' + relative))
+        if before != after or not exists:
+            entries.append([relative, digest(before), digest(after), 'modify' if exists else 'create'])
     return digest(entries)
 
 

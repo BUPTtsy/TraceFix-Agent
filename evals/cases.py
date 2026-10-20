@@ -27,3 +27,58 @@ CASES = [
   'before':"filter === 'All' || t.status === filter",'after':"filter === 'All' || t.status !== filter",'goal':'Choose Done and verify only completed tasks are shown.'},
 ]
 CONTROLS = [{'id':'CLEAN','kind':'bug-free'}, {'id':'FLAKY','kind':'nondeterministic oracle control'}, {'id':'INFRA','kind':'unreachable sandbox control'}]
+
+REVISIONS = {
+    'e7': 'e7a9c04002a2d51a14d37da1f4808c2ee4695c57',
+    'natural': '5a280cc3dfb739585ab1523881d72f1bc8e54e6e',
+    'clean_v2': '0e562dfb4d99da36a6905d1e5651918e23678258',
+}
+
+
+def case_mutations(case):
+    if 'mutations' in case:
+        return tuple(dict(mutation) for mutation in case['mutations'])
+    if case.get('file'):
+        return ({name: case[name] for name in ('file', 'before', 'after')},)
+    return ()
+
+
+def frozen_cases(tier='smoke'):
+    if tier not in {'smoke', 'standard'}:
+        raise ValueError('tier 必须为 smoke 或 standard')
+    cases = [dict(case, category='B', track='compare', revision=REVISIONS['e7'],
+                  good_revision=REVISIONS['e7'], oracle_cases=[case['id']], known_bug=True)
+             for case in CASES]
+    by_id = {case['id']: case for case in cases}
+    for identifier, components in [('M01', ('B01', 'B11')), ('M02', ('B02', 'B07')),
+                                   ('M03', ('B06', 'B12'))]:
+        cases.append({'id': identifier, 'family': 'multi-file', 'split': 'dev', 'category': 'M',
+                      'track': 'compare', 'revision': REVISIONS['e7'],
+                      'good_revision': REVISIONS['e7'], 'known_bug': True,
+                      'mutations': [mutation for component in components
+                                    for mutation in case_mutations(by_id[component])],
+                      'oracle_cases': list(components),
+                      'goal': ' '.join(by_id[component]['goal'] for component in components)})
+    natural_goals = [
+        'Change a task priority, save, reload, and verify the priority persists.',
+        'Search for review and verify Review navigation flow and Review security checklist are shown.',
+        'Sort tasks by priority and verify High precedes Medium and Low.',
+        'Navigate through all task pages and verify all thirteen seeded tasks are reachable.',
+        'Export the task board as CSV and verify the download succeeds.',
+    ]
+    for index, goal in enumerate(natural_goals, 1):
+        cases.append({'id': f'N{index:02}', 'family': 'natural', 'split': 'test', 'category': 'N',
+                      'track': 'compare', 'revision': REVISIONS['natural'],
+                      'good_revision': REVISIONS['clean_v2'], 'known_bug': True,
+                      'mutations': [], 'oracle_cases': [f'N{index:02}'], 'goal': goal,
+                      'oracle_status': 'pending'})
+    for identifier, revision in [('CLEAN-e7', REVISIONS['e7']), ('CLEAN-v2', REVISIONS['clean_v2'])]:
+        cases.append({'id': identifier, 'family': 'bug-free', 'split': 'test', 'category': 'CLEAN',
+                      'track': 'compare', 'revision': revision, 'good_revision': revision,
+                      'known_bug': False, 'mutations': [], 'oracle_cases': [],
+                      'goal': 'Verify the task board loads and Add task is enabled without changing source code.',
+                      'oracle_status': 'pending' if identifier == 'CLEAN-v2' else 'existing'})
+    if tier == 'smoke':
+        selected = {'B01', 'B06', 'B11', 'M01', 'CLEAN-e7'}
+        return [case for case in cases if case['id'] in selected]
+    return cases

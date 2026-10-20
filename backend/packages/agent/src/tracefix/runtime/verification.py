@@ -255,6 +255,56 @@ def _check_suite_verified(state, exists, read, read_bytes):
                 and (result.severity != 'blocker' or result.status == 'pass') for result in final.values()))
 
 
+def _verify_commands(state, validations, spec, plan, exists, read):
+    from tracefix.runtime.command_tests import KINDS, baseline_reproduced, command_body, valid_plan
+
+    if not valid_plan(plan, spec) or not state.reproduced:
+        return False
+    plan_hash = digest(plan)
+    binding = verification_binding(state, plan_hash)
+    if any(type(value) is not str or not value for value in binding.values()):
+        return False
+    reproduction = _read(state.reproduction_binding_ref, exists, read)
+    expected = {key: binding[key] for key in ('scope_id', 'run_id', 'source_manifest',
+                                             'environment_digest', 'test_spec_hash', 'plan_hash')}
+    if reproduction != expected or not baseline_reproduced(state, plan, exists, read):
+        return False
+    latest = {}
+    for raw in validations:
+        validation = Validation.model_validate(raw.model_dump())
+        if (validation.kind not in KINDS or validation.scenario_id is not None
+                or validation.scenario_hash is not None):
+            return False
+        latest[validation.kind] = validation
+    if set(latest) != set(KINDS):
+        return False
+    for kind, validation in latest.items():
+        if (validation.type != 'validation' or validation.passed is not True
+                or validation.replay_plan_hash != plan_hash
+                or any(getattr(validation, field) != value for field, value in binding.items()
+                       if field != 'plan_hash')):
+            return False
+        result = _read(validation.artifact_ref, exists, read)
+        if not _bound(result, binding, 'validation_result', kind) or not _command(result):
+            return False
+        if kind != 'regression':
+            target = plan['target'] if kind == 'original' else kind
+            if not command_body(result, plan, target, require_pass=True):
+                return False
+        else:
+            executions = result.get('command_results')
+            if (result.get('execution_plan_hash') != plan_hash or type(executions) is not list
+                    or len(executions) != len(plan['regression_targets'])):
+                return False
+            for target, execution in zip(plan['regression_targets'], executions):
+                if (not _bound(execution, binding, 'command_execution')
+                        or not command_body(execution, plan, target, require_pass=True)):
+                    return False
+    for ref in state.evidence_refs:
+        _read(ref, exists, read)
+    return True
+
+
 def verify_artifacts(state, validations, exists, read, read_bytes):
     try:
         if (not callable(exists) or not callable(read) or not callable(read_bytes)
@@ -271,6 +321,8 @@ def verify_artifacts(state, validations, exists, read, read_bytes):
             return False
         spec = TestSpec.model_validate(raw_spec)
         plan = _read(state.replay_plan_ref, exists, read)
+        if spec.mode != 'gui':
+            return _verify_commands(state, validations, spec, plan, exists, read)
         if type(plan) is not list or not plan:
             return False
         for raw_action in plan:
