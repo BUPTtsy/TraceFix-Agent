@@ -31,13 +31,18 @@ jobs:
           exit $LASTEXITCODE
       - name: Verify PowerShell script encoding and syntax
         run: ./.venv/Scripts/python.exe -m pytest tests/test_web_startup.py -k powershell -q
-      - name: Unit and platform tests
+      - name: Install and check Node runtime dependencies
         run: |
           npm ci --ignore-scripts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./.venv/Scripts/python.exe scripts/codegraph/deploy_codegraph.py --check
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./.venv/Scripts/python.exe -m pytest -q --junitxml=artifacts/pytest-results.xml
+          exit $LASTEXITCODE
+      - name: Build console service for Python integration tests
+        run: npm run build --workspace @tracefix/console-service
+      - name: Prepare pinned test repository and verify all mutation baselines
+        run: ./.venv/Scripts/python.exe bugboard/scripts/prepare_target.py --verify-cases
+      - name: Unit and platform tests
+        run: ./.venv/Scripts/python.exe -m pytest -q --junitxml=artifacts/pytest-results.xml
       - name: Upload Python JUnit results
         if: ${{ always() && hashFiles('artifacts/pytest-results.xml') != '' }}
         uses: actions/upload-artifact@v6
