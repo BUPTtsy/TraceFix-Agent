@@ -8,6 +8,34 @@ import pytest
 from tracefix.storage.artifacts import Artifacts
 
 
+def test_exception_group_preserves_nested_failure_reasons():
+    from tracefix.messages import error_message
+
+    error = ExceptionGroup('unhandled errors in a TaskGroup', [
+        ExceptionGroup('worker', [TimeoutError('provider timed out')]),
+        RuntimeError('missing browser capability'),
+    ])
+
+    message = error_message(error)
+
+    assert 'TimeoutError: 操作超时：provider timed out' in message
+    assert 'RuntimeError: 运行失败：missing browser capability' in message
+
+
+def test_exception_group_validation_error_does_not_expose_input():
+    from pydantic import ValidationError
+    from tracefix.messages import error_message
+    from tracefix.runtime.contracts import BrowserAction
+
+    with pytest.raises(ValidationError) as caught:
+        BrowserAction.model_validate({'kind': 'invalid-action', 'secret': 'private-value'})
+
+    message = error_message(ExceptionGroup('worker', [caught.value]))
+
+    assert 'ValidationError: 数据校验失败' in message
+    assert 'private-value' not in message
+
+
 def test_real_e2e_failure_preserves_batch_report_and_patch_refs(tmp_path, monkeypatch):
     root = Path(__file__).resolve().parents[1]
     module = runpy.run_path(str(root / 'scripts/checks/verify_real_e2e.py'))

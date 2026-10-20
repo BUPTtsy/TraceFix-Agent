@@ -98,6 +98,9 @@ def validation_details(error):
 def error_message(error):
     from pydantic import ValidationError
 
+    if isinstance(error, BaseExceptionGroup):
+        details = [f'{type(cause).__name__}: {error_message(cause)}' for cause in error.exceptions]
+        return '并发操作失败：' + '；'.join(details)
     if isinstance(error, ValidationError):
         details = validation_details(error)
         return '数据校验失败：' + json.dumps(details, ensure_ascii=False)
