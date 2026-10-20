@@ -49,5 +49,8 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: real-e2e-report
-          path: artifacts/real-e2e/report.json
+          path: |
+            artifacts/real-e2e/report.json
+            artifacts/real-e2e/agent.stdout.log
+            artifacts/real-e2e/agent.stderr.log
           if-no-files-found: error

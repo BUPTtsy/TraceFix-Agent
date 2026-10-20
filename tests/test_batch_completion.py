@@ -124,6 +124,36 @@ async def test_batch_model_error_is_terminal_and_not_replayed(tmp_path, status):
                engine.store.trace(state.run_id, state.scope_id))
 
 
+async def test_batch_exception_group_preserves_full_traceback_in_final_report(tmp_path):
+    engine, state = make_engine(tmp_path)
+    state.execution_mode = 'batch'
+
+    async def fail_with_nested_exception(current, next_node):
+        try:
+            raise ConnectionError('api_key=private-credential ' + 'provider detail ' * 300)
+        except ConnectionError as cause:
+            raise ExceptionGroup('unhandled errors in a TaskGroup', [
+                RuntimeError('worker root failure')]) from cause
+
+    engine.prepare = fail_with_nested_exception
+    await engine.run(state)
+
+    finished = engine.store.load(state.run_id, state.scope_id)
+    report = engine.get(finished, finished.report_ref)
+    formatted = report['error_details']['exception_traceback']
+    assert finished.run_status == RunStatus.FAILED
+    assert finished.outcome == Outcome.INFRA_FAILURE
+    assert formatted == finished.error
+    assert len(formatted) > 2500
+    assert 'fail_with_nested_exception' in formatted
+    assert 'ConnectionError: api_key=[REDACTED]' in formatted
+    assert 'The above exception was the direct cause' in formatted
+    assert 'ExceptionGroup: unhandled errors in a TaskGroup' in formatted
+    assert 'RuntimeError: worker root failure' in formatted
+    assert 'private-credential' not in formatted
+    assert engine.runner.closed and engine.browser.closed
+
+
 async def test_batch_browser_unknown_operation_preserves_unreceipted_intent(tmp_path):
     engine, state = make_engine(tmp_path)
     state.execution_mode = "batch"

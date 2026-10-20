@@ -56,7 +56,7 @@ from tracefix.storage.artifacts import redact, sanitize
 from tracefix.storage.presentation import label, readable, report_page
 from tracefix.storage.reporting import collect_issues, collect_report_images, with_check_report
 from tracefix.storage.store import UnknownOperation
-from tracefix.messages import error_message
+from tracefix.messages import error_message, exception_traceback
 
 
 class GraphState(TypedDict):
@@ -2078,8 +2078,9 @@ class Engine:
     def finish_error(self, s, error, *, outcome=Outcome.INFRA_FAILURE, details=None):
         """Return a FINALIZE state without replaying an uncertain operation."""
         s = self.store.load(s.run_id, s.scope_id)
-        message = sanitize(f'{type(error).__name__}: {error_message(error)}')[:1500]
+        message = sanitize(exception_traceback(error))
         details = redact(details or getattr(error, 'details', {}) or {})
+        details['exception_traceback'] = message
         details.setdefault('requires_manual_review', True)
         details.setdefault('terminal_reason', 'batch_runtime_error')
         return self.changed(s, phase=Phase.FINALIZE, run_status=RunStatus.RUNNING,

@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import traceback
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import quote, urlsplit
@@ -29,7 +30,7 @@ DEFAULT_POSTGRES_PASSWORD = "tracefix"
 
 def safe_output(value: str) -> str:
     value = re.sub(r"(?i)(bearer\s+|api[_-]?key\s*[=:]\s*)[^\s,]+", r"\1[REDACTED]", value)
-    return value[-2500:]
+    return value
 
 
 def load_local_env():
@@ -239,6 +240,11 @@ def run_flow(args, output_path: Path) -> int:
                 command(build, env=env, timeout=3600)
         agent_result = command(agent_command(registry, data_root, frozen_spec),
                                env=env, check=False, timeout=3600)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        for channel in ('stdout', 'stderr'):
+            log_path = output_path.parent / f'agent.{channel}.log'
+            log_path.write_text(safe_output(getattr(agent_result, channel, '') or ''), encoding='utf-8')
+            result[f'agent_{channel}_log'] = str(log_path)
         if hashlib.sha256(frozen_spec.read_bytes()).hexdigest() != spec_hash:
             raise RuntimeError("真实 E2E 的冻结规范在执行期间发生变化")
         artifact_root = data_root / "artifacts" / "bugboard"
@@ -263,7 +269,8 @@ def run_flow(args, output_path: Path) -> int:
                        "patch_verification": report.get("patch_verification", "none"),
                        "error_details": report.get("error_details")})
         if str(state.run_status) != "COMPLETED" or str(state.outcome) != "FIX_VERIFIED":
-            raise RuntimeError(f"真实 E2E 未完成确定性验收：status={state.run_status}, outcome={state.outcome}；原因={state.error or report.get('result_summary') or '未生成最终报告'}")
+            failure = (report.get('error_details') or {}).get('exception_traceback') or state.error or '未生成最终报告'
+            raise RuntimeError(f"真实 E2E 未完成确定性验收：status={state.run_status}, outcome={state.outcome}\n{failure}")
         if agent_result.returncode:
             raise RuntimeError(f"Agent 已生成结果，但进程退出码异常：{agent_result.returncode}")
         if not report.get("patch_available") or report.get("patch_verification") != "verified":
@@ -277,6 +284,8 @@ def run_flow(args, output_path: Path) -> int:
         return 0
     except Exception as error:
         result["error"] = safe_output(str(error))
+        result["exception_traceback"] = safe_output(''.join(traceback.TracebackException.from_exception(
+            error, max_group_width=sys.maxsize, max_group_depth=sys.maxsize).format(chain=True)))
         raise
     finally:
         if compose_started:

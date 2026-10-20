@@ -2,6 +2,7 @@ import argparse
 import json
 import re
 import sys
+import traceback
 
 
 def argument_message(message):
@@ -93,6 +94,11 @@ def validation_details(error):
             message = template.format(**context) if template else f'字段校验失败：{detail["msg"]}'
         result.append({'field': list(detail['loc']), 'type': kind, 'message': message})
     return result
+
+
+def exception_traceback(error):
+    return ''.join(traceback.TracebackException.from_exception(
+        error, max_group_width=sys.maxsize, max_group_depth=sys.maxsize).format(chain=True))
 
 
 def error_message(error):
