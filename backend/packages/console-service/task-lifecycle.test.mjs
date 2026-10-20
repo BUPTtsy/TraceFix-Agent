@@ -15,6 +15,21 @@ const {ConsoleDatabase, TaskLifecycle, normalizeTask} = await import('data:text/
 const input = {repo_id: 'repo', mode: 'test', goal: '测试受控项目', execution: {executionMode: 'batch'}};
 const projects = [{id: 'alpha', repoId: 'repo', ready: true}];
 
+test('Task 修复模式保持可选、校验非法值并透传执行定义', context => {
+  const {tasks, store} = fixture(context);
+  assert.equal(normalizeTask(input, projects).execution.repairMode, undefined);
+  for (const repairMode of ['loop', 'HYBRID', null, 1, true])
+    assert.throws(() => normalizeTask({...input, execution: {...input.execution, repairMode}}, projects),
+      error => error.code === 'INVALID_REPAIR_MODE' && error.status === 400);
+  for (const repairMode of ['hybrid', 'pipeline']) {
+    const {task} = tasks.create({...input, mode: 'repair', execution: {...input.execution, repairMode}});
+    const started = tasks.start(task.id, {}, undefined, 'owner');
+    assert.equal(started.run.execution.repairMode, repairMode);
+    assert.equal(store.run(started.run.id).execution.repairMode, repairMode);
+    tasks.finish(task.id, started.run.id, 'owner', {status: 'completed'});
+  }
+});
+
 function fixture(context) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tracefix-beta-task-'));
   const stores = [];

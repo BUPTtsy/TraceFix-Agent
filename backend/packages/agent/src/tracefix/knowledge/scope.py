@@ -7,7 +7,7 @@ from pathlib import Path
 
 from tracefix.config import Project
 from tracefix.execution.platforms import safe_relative, is_link
-from tracefix.execution.workspace import is_frozen_path
+from tracefix.execution.workspace import is_frozen_path, is_protected_path, ProtectedPathError
 
 
 @dataclass(frozen=True)
@@ -66,6 +66,8 @@ class ScopeResolver:
                 old_project, new_project = self.projects[name], fresh.projects[name]
                 if (old_project.root != new_project.root or
                         old_project.allowed_files != new_project.allowed_files or
+                        (old_project.repository_config or {}).get('protected_paths', []) !=
+                        (new_project.repository_config or {}).get('protected_paths', []) or
                         old_project.agent_instructions != new_project.agent_instructions):
                     raise PermissionError('项目路径或写入策略已变更')
         current = self.context(ctx.active_scope)
@@ -93,6 +95,9 @@ class ScopeResolver:
             raise PermissionError("嵌套或非本项目路径")
         if write:
             from fnmatch import fnmatchcase
+            protected_paths = (self.projects[ctx.active_scope].repository_config or {}).get('protected_paths', [])
+            if is_protected_path(relative, protected_paths):
+                raise ProtectedPathError(relative)
             allowed = self.projects[ctx.active_scope].allowed_files
             if not any(fnmatchcase(relative, pattern) for pattern in allowed):
                 raise PermissionError("写入路径不在允许列表中")

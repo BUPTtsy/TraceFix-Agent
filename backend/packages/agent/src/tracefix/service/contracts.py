@@ -37,14 +37,19 @@ class ExecutionRequest(Contract):
     mode: Literal['batch'] = Field(default='batch', validation_alias=AliasChoices('executionMode', 'mode'))
     url: str | None = Field(default=None, max_length=2048)
     spec: ServiceTestSpec | None = None
+    repair_mode: Literal['hybrid', 'pipeline'] | None = Field(
+        default=None, validation_alias=AliasChoices('repairMode', 'repair_mode'))
 
     @model_validator(mode='before')
     @classmethod
     def matching_aliases(cls, value):
-        if isinstance(value, dict) and 'executionMode' in value and 'mode' in value:
-            if value['executionMode'] != value['mode']:
-                raise ValueError('executionMode 与 mode 不能矛盾')
-            return {key: item for key, item in value.items() if key != 'mode'}
+        if isinstance(value, dict):
+            value = dict(value)
+            for public, internal in (('executionMode', 'mode'), ('repairMode', 'repair_mode')):
+                if public in value and internal in value:
+                    if value[public] != value[internal]:
+                        raise ValueError(f'{public} 与 {internal} 不能矛盾')
+                    value.pop(internal)
         return value
 
 

@@ -66,9 +66,11 @@ export function normalizeTask(fields: Data, projects: Data[]): Data {
     throw taskError('TASK_CONTAINS_CREDENTIALS', 'Task 不允许包含真实凭据', 400);
   const execution = fields.execution;
   if (!execution || typeof execution !== 'object' || Array.isArray(execution) ||
-      Object.keys(execution).some(key => !['executionMode', 'url', 'spec'].includes(key)))
+      Object.keys(execution).some(key => !['executionMode', 'url', 'spec', 'repairMode'].includes(key)))
     throw taskError('INVALID_EXECUTION', '必须指定 batch 执行配置', 400);
   if (execution.executionMode !== 'batch') throw taskError('UNSUPPORTED_EXECUTION_MODE', '首版仅支持 batch 执行', 400);
+  if (execution.repairMode !== undefined && !['hybrid', 'pipeline'].includes(execution.repairMode))
+    throw taskError('INVALID_REPAIR_MODE', 'repairMode 必须是 hybrid 或 pipeline', 400);
   if (execution.url !== undefined) {
     let url;
     try {url = new URL(execution.url);} catch {throw taskError('INVALID_URL', '执行 URL 无效', 400);}

@@ -105,6 +105,18 @@ def config_digest(config: dict) -> str:
                    if key not in {'config_digest', 'frozen_run_id', 'snapshot_digest'}})
 
 
+def validate_repair_config(config):
+    """可选修复设置属于仓库配置，不改变历史 Profile 的摘要。"""
+    if 'repair_mode' in config and config['repair_mode'] not in ('hybrid', 'pipeline'):
+        raise RepositoryError('INVALID_REPAIR_MODE', 'repair_mode 必须是 hybrid 或 pipeline')
+    if 'protected_paths' in config:
+        from tracefix.execution.workspace import validate_protected_paths
+        try:
+            validate_protected_paths(config['protected_paths'])
+        except ValueError as error:
+            raise RepositoryError('INVALID_PROTECTED_PATHS', str(error)) from None
+
+
 def validate_stored_config(project: Project):
     config = project.repository_config
     required = {'version', 'repo_id', 'projectId', 'root', 'owner', 'repo', 'default_ref',
@@ -112,6 +124,7 @@ def validate_stored_config(project: Project):
                 'enabled', 'config_digest'}
     if not isinstance(config, dict) or not required <= config.keys() or config.get('version') != 1:
         raise RepositoryError('INVALID_REPOSITORY_CONFIG', '仓库配置记录不完整')
+    validate_repair_config(config)
     if (config.get('checkout_mode', 'existing') not in ('existing', 'managed')
             or not isinstance(config.get('publish_branch', False), bool)):
         raise RepositoryError('INVALID_REPOSITORY_CONFIG', '仓库拉取或分支发布配置无效')
@@ -211,9 +224,10 @@ class RepositoryRegistry:
     def _validate_record(self, fields: dict, identifier: str, *, checkout_root=None):
         allowed = {'repo_id', 'projectId', 'id', 'root', 'owner', 'repo', 'default_ref', 'profile',
                    'profile_ref', 'allowed_files', 'allowed_urls', 'credential_ref', 'enabled',
-                   'checkout_mode', 'publish_branch'}
+                   'checkout_mode', 'publish_branch', 'repair_mode', 'protected_paths'}
         if set(fields) - allowed:
             raise RepositoryError('INVALID_FIELDS', '仓库注册包含未知字段')
+        validate_repair_config(fields)
         for alias in ('repo_id', 'projectId', 'id'):
             if alias in fields and normalize_id(fields[alias]) != identifier:
                 raise RepositoryError('REPO_ID_IMMUTABLE', 'repo_id 与 projectId 必须一致且不可修改', 409)
@@ -294,6 +308,10 @@ class RepositoryRegistry:
                   'allowed_files': allowed_files, 'allowed_urls': allowed_urls,
                   'credential_ref': credential_ref, 'enabled': enabled,
                   'checkout_mode': checkout_mode, 'publish_branch': publish_branch}
+        if 'repair_mode' in fields:
+            config['repair_mode'] = fields['repair_mode']
+        if 'protected_paths' in fields:
+            config['protected_paths'] = list(dict.fromkeys(fields['protected_paths']))
         config['config_digest'] = config_digest(config)
         return config
 

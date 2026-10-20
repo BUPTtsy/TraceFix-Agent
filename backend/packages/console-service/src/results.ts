@@ -13,6 +13,17 @@ function repairMetadata(report?: Data): Data {
     publication: report?.publication ?? null};
 }
 
+function repairModeMetadata(...sources: (Data | undefined)[]): Data {
+  const aliases: Data = {repair_mode: 'repairMode', repair_mode_requested: 'repairModeRequested', repair_mode_reason: 'repairModeReason'};
+  return Object.fromEntries(Object.entries(aliases).map(([key, alias]) => {
+    for (const source of sources) {
+      if (source && Object.hasOwn(source, key)) return [key, source[key]];
+      if (source && Object.hasOwn(source, alias)) return [key, source[alias as string]];
+    }
+    return [key, null];
+  }));
+}
+
 export function executorResult(value: Data, run: Data, view?: Data, patchBytes?: Buffer): Data {
   if (!value || value.schema_version !== 1 || value.task_id !== run.taskId || value.run_id !== run.id || value.repo_id !== run.projectId ||
       value.terminal !== true || !terminal.has(String(value.run_status).toLowerCase()) || !outcomes.has(value.outcome))
@@ -33,11 +44,16 @@ export function executorResult(value: Data, run: Data, view?: Data, patchBytes?:
   if (Object.entries(metadata).some(([key, expected]) => !isDeepStrictEqual(value[key] ?? null, expected)) ||
       (value.report && !isDeepStrictEqual(repairMetadata(value.report), metadata)))
     throw taskError('EXECUTOR_RESULT_INVALID', '执行器修复摘要、分支或提交与权威报告不一致', 503);
+  const repairMode = repairModeMetadata(report, run, value);
+  if ([value, value.report].filter(Boolean).some(source => Object.entries(repairMode).some(([key, expected]) =>
+      Object.hasOwn(source, key) && !isDeepStrictEqual(source[key], expected))))
+    throw taskError('EXECUTOR_RESULT_INVALID', '执行器修复模式与权威报告不一致', 503);
   const error = value.error ? {code: typeof value.error.code === 'string' ? value.error.code : 'EXECUTION_FAILED',
     message: '执行器报告执行失败', retryable: false} : null;
   return {status: String(value.run_status).toLowerCase(), outcome: value.outcome, error,
     executionResult: {outcome: value.outcome, settled: value.outcome !== 'UNKNOWN',
       ...metadata,
+      ...repairMode,
       ruleCoverage: {snapshot: view?.ruleSnapshot ?? null, summary: report?.check_summary ?? null, results: report?.check_results ?? []},
       patch: ref ? {ref, diff: value.diff, available: report.patch_available === true, verification: report.patch_verification ?? 'none',
         branch: metadata.branch, commit: metadata.commit} : null,
@@ -56,10 +72,12 @@ export function resultView(run: Data, findings: Data[]): Data {
   const structuredError = run.error && typeof run.error === 'object' ? run.error : run.error ?
     {code: ready ? 'EXECUTION_FAILED' : 'EXECUTION_PENDING', message: String(run.error), retryable: false} : null;
   const metadata = repairMetadata(report);
+  const repairMode = repairModeMetadata(recorded, report, run);
   for (const key of ['summary', 'branch', 'commit', 'publication'])
     if (recorded && Object.hasOwn(recorded, key)) metadata[key] = recorded[key];
   return {runId: run.id, taskId: run.taskId ?? null, outcome: normalized, settled, ready,
     ...metadata,
+    ...repairMode,
     ruleCoverage: recorded?.ruleCoverage ?? recorded?.rule_coverage ?? {
       snapshot: run.ruleSnapshot, summary: report?.check_summary ?? null, results: report?.check_results ?? []},
     findings, patch: recorded?.patch ?? (report?.patch_diff_ref ? {ref: report.patch_diff_ref,
@@ -72,5 +90,5 @@ export function resultView(run: Data, findings: Data[]): Data {
     provenance: {projectId: run.projectId, consoleRunId: run.id, agentRunId: run.agentRunId ?? null,
       commit: run.repositorySnapshot?.commit ?? null, configDigest: run.repositorySnapshot?.config_digest ?? null,
       sourceRunId: run.source_run_id ?? null, sourceFindingIds: run.source_finding_ids ?? [],
-      reportRef: run.reportRef ?? null}};
+      reportRef: run.reportRef ?? null, ...repairMode}};
 }

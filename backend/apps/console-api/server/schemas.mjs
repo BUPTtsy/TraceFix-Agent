@@ -54,6 +54,7 @@ export const taskInput = {type: 'object', additionalProperties: false, required:
     mode: {type: 'string', enum: ['test', 'repair']}, goal: {type: 'string', minLength: 5, maxLength: 4000},
     execution: {type: 'object', additionalProperties: false, required: ['executionMode'], properties: {
       executionMode: {type: 'string', enum: ['batch']}, url: {type: 'string', format: 'uri', maxLength: 2048},
+      repairMode: {type: 'string', enum: ['hybrid', 'pipeline']},
       spec: testSpec}},
     additionalRuleIds: {...ids, maxItems: 50}, rule_ids: {...ids, maxItems: 50}, source_run_id: text,
     source_finding_ids: ids, github_reads: {type: 'array', maxItems: 50, items: githubRead},
@@ -81,6 +82,8 @@ export const result = {type: 'object', additionalProperties: false,
     runId: text, taskId: {type: ['string', 'null']}, outcome: {type: ['string', 'null']}, settled: {type: 'boolean'}, ready: {type: 'boolean'},
     ruleCoverage: object, findings: {type: 'array', items: object}, patch: nullableObject, verification: nullableObject,
     summary: {type: ['string', 'null']}, branch: {type: ['string', 'null']}, commit: {type: ['string', 'null']}, publication: nullableObject,
+    repair_mode: {type: ['string', 'null'], enum: ['hybrid', 'pipeline', null]},
+    repair_mode_requested: {type: ['string', 'null']}, repair_mode_reason: {type: ['string', 'null']},
     error: nullableObject, provenance: object}};
 const commandArgv = {type: 'array', minItems: 1, maxItems: 200, items: {type: 'string', minLength: 1, maxLength: 8000}};
 const repositoryProfile = {type: 'object', additionalProperties: false, required: ['commands'], properties: {
@@ -100,6 +103,8 @@ const repositoryFields = {
   repo: {type: 'string', pattern: '^[A-Za-z0-9_.-]{1,100}$'},
   default_ref: {type: 'string', minLength: 1, maxLength: 255},
   checkout_mode: {type: 'string', enum: ['existing', 'managed']}, publish_branch: {type: 'boolean'},
+  repair_mode: {type: 'string', enum: ['hybrid', 'pipeline']},
+  protected_paths: {type: 'array', maxItems: 200, uniqueItems: true, items: {type: 'string', minLength: 1, maxLength: 1024}},
   profile: repositoryProfile, profile_ref: {type: ['string', 'null'], minLength: 1, maxLength: 4096},
   allowed_files: {type: 'array', minItems: 1, maxItems: 200, uniqueItems: true, items: {type: 'string', minLength: 1, maxLength: 1024}},
   allowed_urls: {type: 'array', minItems: 1, maxItems: 100, uniqueItems: true, items: {type: 'string', minLength: 1, maxLength: 2048}},

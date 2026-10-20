@@ -88,7 +88,7 @@ async function fixture(context) {
     assert.equal(response.statusCode, 201, response.body);
     return response.json();
   };
-  const finish = async (started, outcome = 'FIX_VERIFIED', settled = true) => {
+  const finish = async (started, outcome = 'FIX_VERIFIED', settled = true, repairMetadata = {}) => {
     const call = fake.calls.find(item => item.request?.run_id === started.run.id);
     const runDirectory = path.join(dataRoot, 'artifacts', 'alpha', started.run.id);
     fs.mkdirSync(runDirectory, {recursive: true});
@@ -104,7 +104,7 @@ async function fixture(context) {
     const runStatus = settled ? 'COMPLETED' : 'ABNORMAL';
     const report = {run_id: started.run.id, scope_id: 'alpha', run_status: runStatus, outcome,
       patch_diff_ref: patchRef, patch_available: Boolean(patchRef), patch_verification: patchRef ? 'verified' : 'none',
-      check_summary: {total: 1, passed: 1}, check_results: [], overall_status: 'PASSED'};
+      check_summary: {total: 1, passed: 1}, check_results: [], overall_status: 'PASSED', ...repairMetadata};
     artifact('0001_report.json', report, '收尾_修复报告数据');
     fs.writeFileSync(path.join(runDirectory, '文件索引.json'), JSON.stringify(index));
     const database = new DatabaseSync(databasePath);
@@ -115,11 +115,40 @@ async function fixture(context) {
     call.child.finish({schema_version: 1, task_id: started.task.id, run_id: started.run.id, repo_id: 'alpha',
       run_status: runStatus, outcome, terminal: true, report_ref: '0001_report.json', report,
       patch_diff_ref: patchRef, diff: patchRef ? diff : null, patch_available: Boolean(patchRef),
-      patch_verification: patchRef ? 'verified' : 'none', error: null});
+      patch_verification: patchRef ? 'verified' : 'none', error: null, ...repairMetadata});
     await controller.drain();
   };
   return {root, target, dataRoot, databasePath, service, serviceOptions, bridge, app, controller, fake, request, create, finish};
 }
+
+test('H0 repairMode 在 HTTP Task 入口校验并透传到 Python 执行请求', async context => {
+  const {request, create, fake, finish} = await fixture(context);
+  for (const repairMode of ['loop', 'HYBRID', null, 1, true]) {
+    const invalid = await request('POST', '/api/v1/tasks',
+      {...body, mode: 'repair', execution: {...body.execution, repairMode}});
+    assert.equal(invalid.statusCode, 400, invalid.body);
+  }
+  assert.equal(fake.calls.length, 0);
+  for (const repairMode of ['hybrid', 'pipeline']) {
+    const created = await create({...body, mode: 'repair', execution: {...body.execution, repairMode}});
+    assert.equal(created.task.definition.execution.repairMode, repairMode);
+    const response = await request('POST', '/api/v1/tasks/' + created.task.id + '/start', {});
+    assert.equal(response.statusCode, 202, response.body);
+    const started = response.json();
+    const call = fake.calls.find(item => item.request?.run_id === started.run.id);
+    assert.equal(call.request.execution.repairMode, repairMode);
+    const metadata = {repair_mode: 'pipeline', repair_mode_requested: repairMode,
+      repair_mode_reason: repairMode === 'hybrid' ? 'not_implemented' : null};
+    await finish(started, 'NO_BUG_FOUND', true, metadata);
+    const responseResult = await request('GET', '/api/v1/runs/' + started.run.id + '/result');
+    assert.equal(responseResult.statusCode, 200, responseResult.body);
+    const result = responseResult.json();
+    for (const [key, value] of Object.entries(metadata)) {
+      assert.equal(result[key], value);
+      assert.equal(result.provenance[key], value);
+    }
+  }
+});
 
 test('Fastify Task lifecycle: 创建不执行、start、活动编辑、终态编辑、新 Run 和历史查询', async context => {
   const {fake, request, create, finish, target} = await fixture(context);

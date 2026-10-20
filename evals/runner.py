@@ -182,7 +182,7 @@ class SessionAdapter:
             console_db=str(Path(root) / 'data' / 'console.sqlite3'), data=str(Path(root) / 'data'),
             goal=config.goal, mode='repair', plain=True, url=None, spec=str(config.spec),
             skills=str(config.skills_root), run=True, command=None, continue_run=None,
-            instruction='', execution_mode='batch', parent_run=None, rule=None)
+            instruction='', execution_mode='batch', parent_run=None, rule=None, repair_mode=None)
         async def execute():
             async with contextlib.AsyncExitStack() as resources:
                 session = Session(args, None, None)

@@ -289,6 +289,7 @@ export function createConsoleService(options: ConsoleOptions = {}) {
           !(frozen.repository_config?.allowed_urls || []).some((origin: string) => new URL(fields.execution.url).origin === origin))
         throw taskError('EXECUTION_URL_NOT_ALLOWED', '执行 URL 超出仓库冻结白名单', 403);
       const record = {id: runId, projectId: project.id, mode: fields.mode,
+        ...(fields.execution ? {execution: {...fields.execution}, executionMode: fields.execution.executionMode} : {}),
         profile: frozen?.profile_path || project.profile, registry: frozen?.projects_path || project.registry,
         repositorySnapshot: frozen,
         goal: fields.goal.trim(), ...(parentRunId ? {parentRunId} : {}), additionalRuleIds,

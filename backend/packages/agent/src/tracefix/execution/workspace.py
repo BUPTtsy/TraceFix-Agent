@@ -21,6 +21,38 @@ FROZEN_TOKENS = frozenset({'test', 'tests', 'conftest', 'spec', 'specs', 'oracle
 # 锁文件只按「文件名整体形态」识别（见 is_frozen_path），它保护的是可复现构建而非判定，
 # 因此不作为通用词元，以免误伤 useLock.ts / LockService.ts / lock/ 这类业务代码。
 LOCKFILE_PATTERNS = ('*.lock', '*.lockb', '*lock.json', '*lock.yaml', '*lock.yml', 'npm-shrinkwrap.json')
+# 快照与 CI 配置也属于不可由修复过程改写的判定/执行依据。
+PROTECTED_PATTERNS = ('**/__snapshots__/**', '*.snap', '.github/**', '.gitlab-ci.yml',
+                      '.gitlab-ci.yaml', '.circleci/**', 'Jenkinsfile', 'Jenkinsfile.*')
+
+
+def validate_protected_paths(value):
+    """校验项目追加的相对 glob；默认策略始终独立保留。"""
+    if not isinstance(value, (list, tuple)):
+        raise ValueError('protected_paths 必须是相对路径列表')
+    for pattern in value:
+        if (not isinstance(pattern, str) or not pattern or '\\' in pattern or ':' in pattern
+                or pattern.startswith('/') or any(ord(char) < 32 for char in pattern)
+                or any(part in {'', '.', '..'} for part in pattern.split('/'))):
+            raise ValueError('protected_paths 必须是不含路径遍历的相对 glob')
+    return list(dict.fromkeys(value))
+
+
+def is_protected_path(relative, protected_paths=()) -> bool:
+    """共用默认保护策略和项目追加策略，兼容根目录的 **/ 匹配。"""
+    normalized = str(relative).replace('\\', '/').casefold()
+    return any(fnmatchcase(normalized, pattern.casefold())
+               or (pattern.startswith('**/') and fnmatchcase(normalized, pattern[3:].casefold()))
+               for pattern in (*PROTECTED_PATTERNS, *protected_paths))
+
+
+class ProtectedPathError(PermissionError):
+    error_code = 'protected_path'
+
+    def __init__(self, relative):
+        normalized = str(relative).replace('\\', '/')
+        super().__init__('受保护路径不可被补丁修改：' + normalized)
+        self.details = {'path': normalized}
 
 
 def tokens(part: str):
@@ -29,7 +61,7 @@ def tokens(part: str):
     return set(re.split(r'[^a-z]+', re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', part).lower()))
 
 
-def is_frozen_path(relative) -> bool:
+def is_frozen_path(relative, protected_paths=()) -> bool:
     """判断补丁路径是否属于测试、判定或锁文件等冻结证据。
 
     唯一的策略实现；knowledge.scope.ScopeResolver.path 复用本函数，两处判定必须一致。
@@ -38,6 +70,8 @@ def is_frozen_path(relative) -> bool:
     'conftest.py'、'tests/'、'__tests__/' 命中；锁文件另按文件名形态单独判定。
     'latest-run/'、'blockchain/'、'Testimonial.tsx'、'useLock.ts' 不再被误伤。
     """
+    if is_protected_path(relative, protected_paths):
+        return True
     parts = Path(relative).parts
     if parts and any(fnmatchcase(parts[-1].lower(), pattern) for pattern in LOCKFILE_PATTERNS):
         return True
@@ -93,10 +127,11 @@ class CandidateRejected(ValueError):
 class Workspace:
     """在项目根目录内提供经过路径和文件白名单校验的读写接口。"""
 
-    def __init__(self, root: Path, allowed_files: list[str]):
+    def __init__(self, root: Path, allowed_files: list[str], *, protected_paths=()):
         """绑定根目录和允许写入的 glob 模式。"""
         self.root = plain_root(root)
         self.allowed_files = allowed_files
+        self.protected_paths = validate_protected_paths(protected_paths)
         self.guidance_constraints = []
         # Local edit tools write into this overlay until a PatchProposal is
         # accepted by the normal patch transaction.  Keeping the overlay out
@@ -150,7 +185,8 @@ class Workspace:
             manifest[relative] = digest(data)
         if not manifest:
             raise ValueError("源码导出为空")
-        workspace = cls(target, scopes.projects[ctx.active_scope].allowed_files)
+        workspace = cls(target, project.allowed_files,
+                        protected_paths=(project.repository_config or {}).get('protected_paths', []))
         git(target, "init", "-q", '--initial-branch=tracefix/export')
         safe_index_files(target, sorted(manifest))
         commit_workspace(target, "Frozen authorized source export")
@@ -219,6 +255,8 @@ class Workspace:
                 raise PermissionError('源码快照与冻结仓库配置不一致')
             if snapshot['commit'] != project.repository_config['commit']:
                 raise PermissionError('源码快照 commit 与仓库配置不一致')
+        self.protected_paths = validate_protected_paths(
+            (project.repository_config or {}).get('protected_paths', []))
         source = plain_root(project.root)
         if (snapshot['scope_id'] != ctx.active_scope or snapshot['repo_id'] != project.repo_id
                 or snapshot['source_root'] != str(source)
@@ -282,6 +320,8 @@ class Workspace:
             raise PermissionError("符号链接")
         if any(v in {'.git', '.env', 'node_modules', '.tracefix'} or v.startswith('.env.') for v in parts):
             raise PermissionError("受保护的文件")
+        if write and is_protected_path(relative, self.protected_paths):
+            raise ProtectedPathError(relative)
         if write and (not any(fnmatchcase(relative, x) for x in self.allowed_files)
                       or is_frozen_path(relative)):
             raise PermissionError("补丁路径被拒绝")
