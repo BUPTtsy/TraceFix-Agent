@@ -361,7 +361,9 @@ class MemoryHarnessStore:
                 'status': status, 'revision': execution.revision + 1})
             self.executions[execution_id] = updated
             if status == 'UNKNOWN':
-                job.status, job.blocker = 'BLOCKED', 'EXECUTOR_STATE_UNKNOWN'
+                job.status = 'BLOCKED'
+                if job.blocker in {None, 'EXECUTOR_STATE_UNKNOWN'}:
+                    job.blocker = 'EXECUTOR_STATE_UNKNOWN'
                 self.sessions[execution.session_id].status = 'BLOCKED'
                 self.sessions[execution.session_id].revision += 1
                 job.revision += 1
@@ -470,14 +472,41 @@ class MemoryHarnessStore:
                 raise HarnessConflict('无法证明执行者结束及工件一致')
             if execution.status != 'STOPPED' or execution.session_id != session.session_id:
                 raise HarnessConflict('执行未安全停止')
+            if inspection_ref != execution.checkpoint_ref:
+                raise HarnessConflict('恢复必须使用当前停止 checkpoint')
             self.artifacts.read(scope_id, session.run_id, inspection.workspace_snapshot_ref)
+            boundary = inspection.recovery_reason or ''
+            if boundary.startswith('node_boundary:'):
+                _prefix, execution_status, session_status = boundary.split(':', 2)
+                if execution_status not in {'SUCCEEDED', 'FAILED'} or session_status not in {'RUNNING', 'COMPLETED'}:
+                    raise HarnessConflict('节点边界恢复状态无效')
+            else:
+                execution_status, session_status = 'STARTING', 'RUNNING'
+            missing_session = not inspection.sdk_session_id
+            if inspection.transcript_ref:
+                try:
+                    self.artifacts.read(scope_id, session.run_id, inspection.transcript_ref)
+                except (OSError, ValueError):
+                    missing_session = True
+            elif execution_status == 'STARTING':
+                missing_session = True
+            if missing_session and execution_status == 'STARTING':
+                execution.attempt_history.append(ExecutionAttempt(attempt_no=execution.attempt_no,
+                    owner_epoch=execution.owner_epoch, reason='SDK session 或 transcript 缺失，显式重建',
+                    sdk_session_id=execution.sdk_session_id, checkpoint_ref=execution.checkpoint_ref))
+                execution.attempt_no += 1
+                execution.sdk_session_id = None
+            elif execution_status == 'STARTING':
+                execution.sdk_session_id = inspection.sdk_session_id
             job.owner_epoch, job.owner, job.status = job.owner_epoch + 1, owner, 'RUNNING'
             job.stop_request_id, job.revision = None, job.revision + 1
-            session.owner, session.owner_epoch, session.status = owner, job.owner_epoch, 'RUNNING'
+            session.owner, session.owner_epoch, session.status = owner, job.owner_epoch, session_status
             session.revision += 1
             execution.owner, execution.owner_epoch = owner, job.owner_epoch
-            execution.status = 'STARTING'
+            execution.status = execution_status
             execution.stop_request_id = None
+            if execution_status == 'STARTING':
+                execution.result_ref = None
             execution.revision += 1
             if session.harness_task_id:
                 item = self.items[session.harness_task_id]

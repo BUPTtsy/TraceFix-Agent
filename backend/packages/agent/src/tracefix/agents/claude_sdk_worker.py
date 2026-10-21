@@ -43,7 +43,8 @@ async def run_worker(request_path, result_path):
 
     loop = asyncio.get_running_loop()
     installed_signals = []
-    for signum in (getattr(signal, 'SIGTERM', None), getattr(signal, 'SIGINT', None)):
+    for signum in (getattr(signal, 'SIGTERM', None), getattr(signal, 'SIGINT', None),
+                   getattr(signal, 'SIGUSR1', None)):
         if signum is None:
             continue
         try:

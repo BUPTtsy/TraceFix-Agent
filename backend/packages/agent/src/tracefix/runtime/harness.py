@@ -184,56 +184,127 @@ class HarnessRuntime:
     async def stop(self, engine, state):
         """先持久化停止意图，再向当前 execution 发送中断。"""
         job = self.job(state)
-        if job.status not in {'CREATED', 'RUNNING'}:
+        if job.status not in {'CREATED', 'RUNNING', 'STOPPING'}:
             raise HarnessConflict('当前 Job 不能停止')
         job = self.store.request_stop(job.job_id, job.revision, scope_id=state.scope_id)
         host = self._read(state)
-        for execution in self.store.list_executions(job.job_id, scope_id=state.scope_id):
-            if execution.status not in {'STARTING', 'RUNNING', 'INTERRUPTING'}:
-                continue
+        executions = self.store.list_executions(job.job_id, scope_id=state.scope_id)
+        active = [execution for execution in executions
+            if execution.status in {'PREPARED', 'STARTING', 'RUNNING', 'INTERRUPTING', 'UNKNOWN'}]
+        selected = active or executions[-1:]
+        for execution in selected:
             entry = host.get('executions', {}).get(execution.execution_id)
             if not entry or not Path(entry.get('directory', '')).is_dir():
                 continue
             from tracefix.execution.candidate_export import SDKWorkspace
             workspace = SDKWorkspace.load(Path(entry['directory']), engine.workspace)
-            runner = self.runner(workspace) if callable(self.runner) else self.runner
-            if hasattr(runner, 'workspace'):
-                runner.workspace = workspace
+            runner = self._execution_runner(workspace, execution)
             interrupt = getattr(runner, 'interrupt', None)
-            if interrupt is None:
-                continue
-            receipt = interrupt(execution.execution_id, job.stop_request_id,
-                self.config.stop_grace_seconds)
-            if inspect.isawaitable(receipt):
-                receipt = await receipt
-            receipt_value = receipt.model_dump(mode='json') if hasattr(receipt, 'model_dump') else receipt
-            receipt_ref = engine.put(state, receipt_value, name='SDK停止回执')
-            host['executions'][execution.execution_id]['stop_receipt_ref'] = receipt_ref
-            self._write(state, host)
-            if not receipt.writers_stopped:
+            session = self.store.get_session(execution.session_id, scope_id=state.scope_id)
+            stop_state = state.model_copy(update={'run_id': session.run_id,
+                'harness_session_id': session.session_id})
+            if interrupt is not None:
+                receipt = interrupt(execution.execution_id, job.stop_request_id,
+                    self.config.stop_grace_seconds)
+                if inspect.isawaitable(receipt):
+                    receipt = await receipt
+                receipt_value = receipt.model_dump(mode='json') if hasattr(receipt, 'model_dump') else receipt
+                receipt_ref = engine.put(stop_state, receipt_value, name='SDK停止回执')
+                host = self._read(state)
+                host['executions'][execution.execution_id]['stop_receipt_ref'] = receipt_ref
+                self._write(state, host)
+            if not await self._writers_stopped(engine, stop_state, execution, runner):
                 try:
                     self._update_execution(state, execution, 'INTERRUPTING',
                         stop_request_id=job.stop_request_id)
                 except HarnessConflict:
                     pass
-        return job
+                continue
+            current = self.store.get_execution(execution.execution_id, scope_id=state.scope_id)
+            if current.status == 'STOPPED':
+                continue
+            try:
+                result = ExecutionResult(execution_id=execution.execution_id, status='STOPPED',
+                    sdk_session_id=current.sdk_session_id, transcript_ref=current.transcript_ref)
+                snapshot = workspace.freeze()
+                snapshot_ref = engine.put(stop_state, snapshot.model_dump(), name='停止完整快照')
+                boundary = ('node_boundary:' + current.status + ':' + session.status
+                    if current.status in {'SUCCEEDED', 'FAILED'} else None)
+                checkpoint_ref = self._checkpoint(engine, stop_state, session, current, workspace,
+                    result, snapshot_ref, writers_stopped=True, recovery_reason=boundary)
+                job = self.job(state)
+                if job.status in {'STOPPING', 'BLOCKED'}:
+                    self.store.confirm_stopped(job.job_id, checkpoint_ref, scope_id=state.scope_id,
+                        expected_revision=job.revision, session_id=session.session_id)
+            except (OSError, ValueError):
+                job = self.job(state)
+                if job.blocker in {None, 'EXECUTOR_STATE_UNKNOWN'}:
+                    self.store.block_job(job.job_id, 'CHECKPOINT_FLUSH_FAILED', scope_id=state.scope_id,
+                        expected_revision=job.revision)
+                raise
+        return self.job(state)
 
     def resume(self, engine, state, inspection_ref, *, owner=None):
         """以新的 owner epoch 恢复已确认停止的同一逻辑 invocation。"""
         job = self.job(state)
-        resumed = self.store.claim_resume(job.job_id, job.revision, owner or self.owner,
-            scope_id=state.scope_id, inspection_ref=inspection_ref)
-        return engine.changed(state, harness_stage='coding', run_status=RunStatus.RUNNING)
+        try:
+            self.store.claim_resume(job.job_id, job.revision, owner or self.owner,
+                scope_id=state.scope_id, inspection_ref=inspection_ref)
+        except (OSError, ValueError) as error:
+            if not isinstance(error, HarnessConflict):
+                current = self.job(state)
+                self.store.block_job(job.job_id, 'RECOVERY_ARTIFACTS_MISSING', scope_id=state.scope_id,
+                    expected_revision=current.revision)
+            raise
+        return engine.changed(state, run_status=RunStatus.RUNNING)
 
     def _update_execution(self, state, execution, status, **fields):
         return self.store.update_execution(execution.execution_id, scope_id=state.scope_id,
             expected_revision=execution.revision, owner=execution.owner,
             owner_epoch=execution.owner_epoch, status=status, **fields)
 
-    def _checkpoint(self, engine, state, session, execution, sdk_workspace, result, snapshot_ref):
+    def _execution_runner(self, workspace, execution):
+        runner = self.runner(workspace) if callable(self.runner) else self.runner
+        if hasattr(runner, 'workspace'):
+            runner.workspace = workspace
+        runner.owner_epoch = execution.owner_epoch
+        return runner
+
+    def _emit_owned(self, engine, state, execution, kind, payload):
+        current = self.store.get_execution(execution.execution_id, scope_id=state.scope_id)
+        job = self.job(state)
+        if ((current.owner, current.owner_epoch) != (execution.owner, execution.owner_epoch)
+                or job.owner_epoch != execution.owner_epoch
+                or current.status not in {'STARTING', 'RUNNING', 'INTERRUPTING'}):
+            return
+        engine.event(state, kind, {**payload, 'execution_id': execution.execution_id,
+            'owner_epoch': execution.owner_epoch})
+
+    async def _writers_stopped(self, engine, state, execution, runner):
+        entry = self._read(state).get('executions', {}).get(execution.execution_id, {})
+        receipt_ref = entry.get('stop_receipt_ref')
+        receipt = engine.get(state, receipt_ref) if receipt_ref else {}
+        confirmed = (receipt.get('execution_id') == execution.execution_id
+            and receipt.get('stop_request_id') == self.job(state).stop_request_id
+            and receipt.get('writers_stopped') is True)
+        inspect_execution = getattr(runner, 'inspect', None)
+        if inspect_execution is not None:
+            inspection = inspect_execution(execution.execution_id)
+            if inspect.isawaitable(inspection):
+                inspection = await inspection
+            if getattr(inspection, 'active', True):
+                return False
+            if getattr(inspection, 'status', 'UNKNOWN') == 'STOPPED':
+                return True
+        return confirmed
+
+    def _checkpoint(self, engine, state, session, execution, sdk_workspace, result, snapshot_ref,
+                    *, writers_stopped=False, recovery_reason=None):
         transcript_ref = None
         if result.transcript_ref:
             transcript = Path(result.transcript_ref)
+            if not transcript.is_file():
+                transcript = sdk_workspace.execution_dir / 'state' / 'transcript.jsonl'
             if transcript.is_file() and not transcript.is_symlink():
                 transcript_ref = engine.put(state, {'kind': 'sdk_transcript',
                     'execution_id': execution.execution_id,
@@ -251,8 +322,10 @@ class HarnessRuntime:
             workspace_snapshot_ref=snapshot_ref, transcript_ref=transcript_ref,
             sdk_session_id=result.sdk_session_id, event_cursor=cursor,
             stop_request_id=self.job(state).stop_request_id,
-            pending_operations=list(result.unresolved) if result.status == 'UNKNOWN' else [],
-            writers_alive=result.status == 'UNKNOWN', artifacts_consistent=True)
+            pending_operations=list(execution.pending_operations), recovery_reason=recovery_reason,
+            writers_alive=not writers_stopped, artifacts_consistent=writers_stopped,
+            stop_receipt_ref=self._read(state).get('executions', {}).get(
+                execution.execution_id, {}).get('stop_receipt_ref'))
         return engine.put(state, checkpoint.model_dump(mode='json'), name='SDK执行checkpoint')
 
     async def _execute(self, engine, state, role, prompt, *, output_schema=None):
@@ -284,21 +357,29 @@ class HarnessRuntime:
             scope_id=state.scope_id, expected_revision=session.revision,
             owner=session.owner or self.owner)
         state = engine.changed(state, sdk_execution_id=execution.execution_id)
-        if execution.result_ref:
+        if execution.result_ref and execution.status in {'SUCCEEDED', 'FAILED'}:
             result = ExecutionResult.model_validate(engine.get(state, execution.result_ref))
             return state, execution, result
         if execution.status not in {'PREPARED', 'STARTING'}:
             raise HarnessConflict('已有执行尚未封存；M4 恢复门禁未完成，禁止重复启动')
+        if execution.status == 'STARTING':
+            checkpoint = (engine.get(state, execution.checkpoint_ref)
+                if execution.checkpoint_ref else {})
+            if (checkpoint.get('status') != 'STOPPED' or checkpoint.get('writers_alive') is not False
+                    or checkpoint.get('artifacts_consistent') is not True
+                    or checkpoint.get('owner_epoch', execution.owner_epoch) >= execution.owner_epoch):
+                job = self.job(state)
+                self.store.block_job(job.job_id, 'EXECUTOR_STATE_UNKNOWN', scope_id=state.scope_id,
+                    expected_revision=job.revision)
+                raise HarnessConflict('STARTING 执行缺少新 owner 的安全恢复领取凭据')
         directory = self._directory(state.harness_job_id) / 'sessions' / session.session_id / 'executions' / execution.execution_id
         existing = host['executions'].get(execution.execution_id)
         prior = [entry for entry in host['executions'].values()
                  if entry['session_id'] == session.session_id and entry is not existing]
         if existing and Path(existing['directory']).is_dir():
             sdk_workspace = SDKWorkspace.load(Path(existing['directory']), engine.workspace)
-            prior_sdk_session = execution.sdk_session_id or existing.get('sdk_session_id')
-            if execution.status == 'STARTING' and not prior_sdk_session:
-                sdk_workspace = sdk_workspace.fork_execution(
-                    execution.execution_id + '-rebuild-' + str(execution.attempt_no))
+            prior_sdk_session = (execution.sdk_session_id if execution.status == 'STARTING'
+                else execution.sdk_session_id or existing.get('sdk_session_id'))
         elif prior:
             previous = prior[-1]
             sdk_workspace = SDKWorkspace.load(Path(previous['directory']), engine.workspace)
@@ -322,9 +403,7 @@ class HarnessRuntime:
             'directory': str(sdk_workspace.execution_dir), 'sdk_session_id': prior_sdk_session,
             'prompt': prompt, 'input_hash': input_hash}
         self._write(state, host)
-        runner = self.runner(sdk_workspace) if callable(self.runner) else self.runner
-        if hasattr(runner, 'workspace'):
-            runner.workspace = sdk_workspace
+        runner = self._execution_runner(sdk_workspace, execution)
         resuming = execution.status == 'STARTING'
         if resuming:
             inspect_execution = getattr(runner, 'inspect', None)
@@ -351,45 +430,52 @@ class HarnessRuntime:
         engine.event(state, 'sdk.execution.started', {'execution_id': execution.execution_id,
             'logical_invocation_id': invocation, 'owner_epoch': execution.owner_epoch})
         try:
-            emit = lambda kind, payload: engine.event(state, kind, payload)
-            resume = getattr(runner, 'resume', None) if resuming and prior_sdk_session else None
+            emit = lambda kind, payload: self._emit_owned(engine, state, execution, kind, payload)
+            resume = getattr(runner, 'resume', None) if resuming else None
             if resume is not None:
-                result = await resume(execution.execution_id, emit=emit)
+                parameters = inspect.signature(resume).parameters
+                options = {'emit': emit}
+                if 'sdk_session_id' in parameters:
+                    options['sdk_session_id'] = execution.sdk_session_id
+                if 'rebuild' in parameters:
+                    options['rebuild'] = not bool(execution.sdk_session_id)
+                result = await resume(execution.execution_id, **options)
             else:
                 result = await runner.start(request, emit)
         except BaseException:
-            self._update_execution(state, execution, 'UNKNOWN')
+            current = self.store.get_execution(execution.execution_id, scope_id=state.scope_id)
+            if ((current.owner, current.owner_epoch) != (execution.owner, execution.owner_epoch)
+                    or current.status in {'STOPPED', 'SUCCEEDED', 'FAILED'}):
+                raise
+            self._update_execution(state, current, 'UNKNOWN')
             job = self.job(state)
-            self.store.block_job(job.job_id, 'EXECUTOR_STATE_UNKNOWN', scope_id=state.scope_id,
-                                 expected_revision=job.revision)
+            if job.blocker in {None, 'EXECUTOR_STATE_UNKNOWN'} and job.status != 'BLOCKED':
+                self.store.block_job(job.job_id, 'EXECUTOR_STATE_UNKNOWN', scope_id=state.scope_id,
+                                     expected_revision=job.revision)
             raise
         result = ExecutionResult.model_validate(result)
+        current_execution = self.store.get_execution(execution.execution_id, scope_id=state.scope_id)
+        if ((current_execution.owner, current_execution.owner_epoch) != (execution.owner, execution.owner_epoch)
+                or current_execution.status == 'STOPPED'):
+            raise HarnessConflict('SDK 旧执行者结果已失效')
+        execution = current_execution
         current_job = self.job(state)
         if result.status == 'STOPPED' and not current_job.stop_request_id:
             result = result.model_copy(update={'status': 'UNKNOWN', 'error_code': 'SDK_STOP_WITHOUT_INTENT'})
         elif current_job.stop_request_id and result.status in {'SUCCEEDED', 'FAILED'}:
             result = result.model_copy(update={'status': 'STOPPED', 'error_code': 'SDK_STOP_REQUESTED'})
+        writers_stopped = await self._writers_stopped(engine, state, execution, runner)
         if result.status == 'STOPPED':
-            entry = self._read(state).get('executions', {}).get(execution.execution_id, {})
-            receipt_ref = entry.get('stop_receipt_ref')
-            receipt = engine.get(state, receipt_ref) if receipt_ref else {}
-            confirmed = receipt.get('writers_stopped') is True
-            inspect_execution = getattr(runner, 'inspect', None)
-            if inspect_execution is not None:
-                inspection = inspect_execution(execution.execution_id)
-                if inspect.isawaitable(inspection):
-                    inspection = await inspection
-                confirmed = confirmed or (getattr(inspection, 'status', None) == 'STOPPED'
-                    and getattr(inspection, 'active', True) is False)
-            if not confirmed:
+            if not writers_stopped:
                 result = result.model_copy(update={'status': 'UNKNOWN',
                     'error_code': 'SDK_STOP_WRITERS_UNCONFIRMED'})
         sdk_workspace = getattr(runner, 'workspace', sdk_workspace)
-        snapshot = sdk_workspace.freeze()
-        snapshot_value = snapshot.model_dump() if hasattr(snapshot, 'model_dump') else snapshot
         try:
+            snapshot = sdk_workspace.freeze()
+            snapshot_value = snapshot.model_dump() if hasattr(snapshot, 'model_dump') else snapshot
             snapshot_ref = engine.put(state, snapshot_value, name='执行完整快照')
-            checkpoint_ref = self._checkpoint(engine, state, session, execution, sdk_workspace, result, snapshot_ref)
+            checkpoint_ref = self._checkpoint(engine, state, session, execution, sdk_workspace, result,
+                snapshot_ref, writers_stopped=writers_stopped)
             result_ref = engine.put(state, result.model_dump(mode='json'), name='SDK执行结果')
             execution = self._update_execution(state, execution, result.status,
                 result_ref=result_ref, sdk_session_id=result.sdk_session_id,
