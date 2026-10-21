@@ -49,6 +49,8 @@ def main():
     with (EVIDENCE / 'pytest-continuation.log').open('w', encoding='utf-8', buffering=1) as output:
         sys.stdout = output
         sys.stderr = output
+        (EVIDENCE / 'pytest-continuation-exit.json').write_text(
+            json.dumps({'status': 'running'}), encoding='utf-8')
         status = pytest.main(['-q', '-p', 'no:cacheprovider',
             '--basetemp=.t456-continue', '--junitxml=artifacts/harness-migration/pytest-continuation.xml'],
             plugins=[BaselineProgress()])
