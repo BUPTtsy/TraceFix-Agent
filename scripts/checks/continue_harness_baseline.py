@@ -43,6 +43,7 @@ class BaselineProgress:
 
 def main():
     os.chdir(ROOT)
+    sys.path.insert(0, str(ROOT))
     sys.path.insert(0, str(ROOT / 'backend/packages/agent/src'))
     EVIDENCE.mkdir(parents=True, exist_ok=True)
     with (EVIDENCE / 'pytest-continuation.log').open('w', encoding='utf-8', buffering=1) as output:
