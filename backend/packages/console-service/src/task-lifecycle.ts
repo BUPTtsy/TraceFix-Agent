@@ -258,6 +258,10 @@ export class TaskLifecycle {
       if (Object.keys(fields).length) throw taskError('INVALID_START', 'start 正文必须为空对象', 400);
       this.assertIdle();
       if (active.has(task.status)) throw taskError('TASK_ACTIVE', 'Task 已在执行');
+      if (task.runIds.some((runId: string) => {
+        const previousRun = this.store.run(runId);
+        return codingBackend(previousRun) === 'claude_sdk' && previousRun.harness_job_id;
+      })) throw taskError('SDK_NEW_TASK_REQUIRED', '已有 SDK Job 的 Task 请使用 resume；新目标须创建新 Task', 409);
       const runId = randomUUID(), now = timestamp();
       const template = task.definition.finding_acceptance;
       if (template?.run_id && template.run_id !== runId)
@@ -273,6 +277,7 @@ export class TaskLifecycle {
           throw taskError('INVALID_FINDING_ACCEPTANCE', '验收模板与唯一来源 Run、仓库或开始 revision 不一致', 409);
       }
       const run = {...prepared, taskId: task.id, execution: task.definition.execution,
+        frozenDefinition: JSON.parse(JSON.stringify(task.definition)),
         source_run_id: prepared.source_run_id ?? task.definition.source_run_id, source_finding_ids: task.definition.source_finding_ids,
         github_reads: task.definition.github_reads,
         ...(template ? {finding_acceptance: {...template, run_id: runId}} : {}),
@@ -300,6 +305,8 @@ export class TaskLifecycle {
       const previousRun = this.store.run(runId);
       if (codingBackend(previousRun) !== 'claude_sdk' && task.definition.execution?.backend !== 'claude_sdk')
         throw taskError('RESUME_UNAVAILABLE', '仅 SDK Job 支持无提示恢复', 409);
+      if (!previousRun.frozenDefinition || previousRun.frozenDefinition.execution?.backend !== 'claude_sdk')
+        throw taskError('RESUME_DEFINITION_MISSING', '原 SDK 执行定义缺失，不能按当前 Task 定义猜测恢复', 409);
       if (!resumable.has(String(previousRun.status).toLowerCase()) || previousRun.status === 'unknown' ||
           previousRun.control_status !== 'STOPPED' || previousRun.can_resume !== true ||
           Array.isArray(previousRun.resume_blockers) && previousRun.resume_blockers.length)

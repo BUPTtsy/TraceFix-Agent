@@ -1,4 +1,4 @@
-import {controlProjection} from './database.js';
+import {codingBackend, controlProjection} from './database.js';
 import {taskError} from './task-lifecycle.js';
 import {isDeepStrictEqual} from 'node:util';
 
@@ -29,8 +29,15 @@ export function executorResult(value: Data, run: Data, view?: Data, patchBytes?:
   if (!value || value.schema_version !== 1 || value.task_id !== run.taskId || value.run_id !== run.id || value.repo_id !== run.projectId ||
       value.terminal !== true || !terminal.has(String(value.run_status).toLowerCase()) || !outcomes.has(value.outcome))
     throw taskError('EXECUTOR_RESULT_INVALID', '执行器终态结果或身份无效', 503);
+  const sdk = codingBackend(run) === 'claude_sdk';
+  const reportRunId = sdk ? value.current_run_id : run.id;
+  if (sdk && (value.coding_backend !== 'claude_sdk' || !reportRunId || reportRunId !== run.agentRunId ||
+      value.harness_job_id !== run.harness_job_id || value.harness_session_id !== run.harness_session_id ||
+      !run.harness_job_id || !run.harness_session_id || run.control_status !== 'COMPLETED' || value.control_status !== 'COMPLETED'))
+    throw taskError('EXECUTOR_RESULT_INVALID', 'SDK 结果与权威 Job、Session 或当前增量不一致', 503);
   const report = view?.issueReport;
-  if (value.report_ref && (run.reportRef !== value.report_ref || run.agentRunId !== run.id || !report ||
+  if (value.report_ref && (run.reportRef !== value.report_ref || run.agentRunId !== reportRunId || !report ||
+      sdk && (report.run_id !== reportRunId || report.scope_id !== run.projectId) ||
       report.run_status !== value.run_status || report.outcome !== value.outcome))
     throw taskError('EXECUTOR_RESULT_INVALID', '执行器结果与权威报告不一致', 503);
   if (!report && !['INFRA_FAILURE', 'CANCELLED', 'UNKNOWN'].includes(value.outcome) && value.run_status !== 'CANCELLED')

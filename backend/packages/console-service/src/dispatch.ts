@@ -32,7 +32,7 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     if (!run.taskId) throw taskError('HARNESS_TASK_REQUIRED', 'SDK 控制必须绑定 Task', 409);
     let authority;
     try {
-      authority = harnessControl(operation, {task_id: run.taskId, scope_id: run.projectId,
+      authority = harnessControl(operation, {task_id: run.taskId, scope_id: run.projectId, run_id: run.id,
         ...(run.harness_job_id ? {job_id: run.harness_job_id} : {})}, {...options,
         engineRoot: options.engineRoot || options.displayRoot, dataRoot: run.dataRoot || dataRoot,
         databasePath: database.filename});
@@ -231,8 +231,8 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     if (operation === 'run.control') return refreshControl(database.run(fields.id));
     if (operation === 'run.harness.stop') return refreshControl(database.run(fields.id), 'stop');
     if (operation === 'run.executor-result') {
-      const record = database.run(fields.id);
       const view = fields.result?.report_ref ? runView(fields.id) : undefined;
+      const record = view || refreshControl(database.run(fields.id));
       const ref = view?.issueReport?.patch_diff_ref;
       const bytes = ref ? Buffer.from(dispatch('artifact', {id: fields.id, ref}).content, 'base64') : undefined;
       return executorResult(fields.result, record, view, bytes);

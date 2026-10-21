@@ -9,11 +9,12 @@ const alive = pid => {try {process.kill(pid, 0); return true;} catch {return fal
 const failure = (code, message, status = 409, retryable = false) => Object.assign(new Error(message), {code, status, retryable});
 
 export function executionRequest(task, run) {
-  return {schema_version: 1, task_id: task.id, run_id: run.id, repo_id: task.definition.projectId,
-    mode: task.definition.mode, goal: task.definition.goal, execution: task.definition.execution,
-    additional_rule_ids: task.definition.additionalRuleIds, repository_snapshot: run.repositorySnapshot,
-    source_run_id: run.source_run_id ?? null, source_finding_ids: task.definition.source_finding_ids,
-    github_reads: task.definition.github_reads, finding_acceptance: run.finding_acceptance ?? null};
+  const definition = run.frozenDefinition || task.definition;
+  return {schema_version: 1, task_id: task.id, run_id: run.id, repo_id: definition.projectId,
+    mode: definition.mode, goal: definition.goal, execution: definition.execution,
+    additional_rule_ids: definition.additionalRuleIds, repository_snapshot: run.repositorySnapshot,
+    source_run_id: run.source_run_id ?? null, source_finding_ids: definition.source_finding_ids,
+    github_reads: definition.github_reads, finding_acceptance: run.finding_acceptance ?? null};
 }
 
 export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAlive = alive,

@@ -7,13 +7,14 @@ import {build} from 'esbuild';
 import {EventEmitter} from 'node:events';
 import {PassThrough} from 'node:stream';
 import {createApi} from '../server/api.mjs';
-import {createExecutor} from '../server/executor.mjs';
+import {createExecutor, executionRequest} from '../server/executor.mjs';
 
 const bundle = await build({stdin: {contents: `export {ConsoleDatabase, controlProjection} from './src/database.ts';
 export {TaskLifecycle, normalizeTask} from './src/task-lifecycle.ts';
-export {createConsoleService} from './src/dispatch.ts';`, resolveDir: path.resolve('backend/packages/console-service')},
+export {createConsoleService} from './src/dispatch.ts';
+export {executorResult} from './src/results.ts';`, resolveDir: path.resolve('backend/packages/console-service')},
   bundle: true, platform: 'node', format: 'esm', write: false});
-const {ConsoleDatabase, controlProjection, TaskLifecycle, normalizeTask, createConsoleService} = await import('data:text/javascript;base64,' + Buffer.from(bundle.outputFiles[0].text).toString('base64'));
+const {ConsoleDatabase, controlProjection, TaskLifecycle, normalizeTask, createConsoleService, executorResult} = await import('data:text/javascript;base64,' + Buffer.from(bundle.outputFiles[0].text).toString('base64'));
 
 test('resume HTTP 正文严格为空对象，未知提示字段返回 400', async context => {
   const calls = [];
@@ -81,7 +82,8 @@ test('控制视图刷新权威记录，恢复先核验 PG 且同键重放不再�
   const database = new ConsoleDatabase(databasePath);
   const now = new Date().toISOString();
   database.updateRun('run', {id: 'run', projectId: 'scope', taskId: 'task', status: 'stopped', coding_backend: 'claude_sdk',
-    control_status: 'RUNNING', can_resume: false, dataRoot: root}, true);
+    control_status: 'RUNNING', can_resume: false, dataRoot: root,
+    frozenDefinition: {execution: {backend: 'claude_sdk'}}}, true);
   database.db.prepare('INSERT INTO console_tasks VALUES (?,?)').run('task', JSON.stringify({id: 'task',
     definition: {execution: {backend: 'claude_sdk'}}, status: 'stopped', currentRunId: 'run', runIds: ['run'],
     version: 1, createdAt: now, updatedAt: now}));
@@ -91,7 +93,7 @@ test('控制视图刷新权威记录，恢复先核验 PG 且同键重放不再�
   const value = service('task.resume', {id: 'task', body: {}, key: 'same', ownerId: 'owner'});
   assert.equal(value.run.id, 'run');
   assert.equal(calls.at(-1).operation, 'resume.check');
-  assert.deepEqual(calls.at(-1).fields, {task_id: 'task', scope_id: 'scope', job_id: 'authority-job'});
+  assert.deepEqual(calls.at(-1).fields, {task_id: 'task', scope_id: 'scope', run_id: 'run', job_id: 'authority-job'});
   state = 'RUNNING';
   const count = calls.length;
   assert.equal(service('task.resume', {id: 'task', body: {}, key: 'same', ownerId: 'owner'}).replayed, true);
@@ -134,4 +136,54 @@ test('SDK executor 用恢复入口并通过权威桥停止，收到 STOPPED 才�
   await controller.drain();
   assert.equal(run.status, 'stopped');
   assert.equal(run.can_resume, true);
+});
+
+test('SDK 恢复重放首次冻结定义，Task 后续编辑不能注入新目标或指令', context => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tf-frozen-request-'));
+  const database = new ConsoleDatabase(path.join(root, 'console.sqlite3'));
+  context.after(() => database.db.close());
+  const lifecycle = new TaskLifecycle(database, fields => fields, (fields, id) => ({id, projectId: fields.projectId,
+    status: 'running', coding_backend: 'claude_sdk', repositorySnapshot: {frozen: id}}));
+  const definition = {projectId: 'scope', mode: 'repair', goal: '修复首次冻结目标', execution: {backend: 'claude_sdk', executionMode: 'batch'},
+    additionalRuleIds: ['original-rule'], source_finding_ids: [], github_reads: []};
+  const created = lifecycle.create(definition);
+  const started = lifecycle.start(created.task.id, {}, 'start', 'owner');
+  const original = executionRequest(started.task, started.run);
+  lifecycle.finish(created.task.id, started.run.id, 'owner', {status: 'stopped', control_status: 'STOPPED',
+    can_resume: true, resume_blockers: [], harness_job_id: 'job'});
+  const changed = lifecycle.update(created.task.id, {...definition, goal: '替换为其他目标', mode: 'test',
+    execution: {backend: 'legacy', spec: {goal: '注入新规范'}}, additionalRuleIds: ['injected-rule'],
+    github_reads: [{source_kind: 'issue', number: 99}], source_finding_ids: ['injected-finding']});
+  assert.throws(() => lifecycle.start(created.task.id, {}, 'restart', 'owner'), error => error.code === 'SDK_NEW_TASK_REQUIRED');
+  const resumed = lifecycle.resume(created.task.id, {}, 'resume', 'owner');
+  assert.equal(changed.definition.goal, '替换为其他目标');
+  assert.deepEqual(executionRequest(resumed.task, resumed.run), original);
+  lifecycle.finish(created.task.id, started.run.id, 'owner', {status: 'stopped', control_status: 'STOPPED', can_resume: true,
+    frozenDefinition: null});
+  assert.throws(() => lifecycle.resume(created.task.id, {}, 'missing', 'owner'), error => error.code === 'RESUME_DEFINITION_MISSING');
+});
+
+test('SDK 终态以原控制台 Run 输出并绑定 PG 当前增量、Session 与权威报告', () => {
+  const patch = Buffer.from('diff --git a/src/value.ts b/src/value.ts\n');
+  const report = {run_id: 'increment', scope_id: 'scope', run_status: 'COMPLETED', outcome: 'FIX_VERIFIED',
+    patch_diff_ref: 'patch.diff', patch_verification: 'verified', patch_available: true, repair_commit: 'commit'};
+  const run = {id: 'console', taskId: 'task', projectId: 'scope', coding_backend: 'claude_sdk', agentRunId: 'increment',
+    harness_job_id: 'job', harness_session_id: 'session', control_status: 'COMPLETED', reportRef: 'report.json'};
+  const value = {schema_version: 1, task_id: 'task', run_id: 'console', repo_id: 'scope', terminal: true,
+    current_run_id: 'increment', coding_backend: 'claude_sdk', harness_job_id: 'job', harness_session_id: 'session',
+    control_status: 'COMPLETED', run_status: 'COMPLETED', outcome: 'FIX_VERIFIED', report_ref: 'report.json', report,
+    patch_diff_ref: 'patch.diff', diff: patch.toString(), patch_available: true, patch_verification: 'verified',
+    summary: null, branch: null, commit: 'commit', publication: null};
+  const view = {issueReport: report};
+  assert.equal(executorResult(value, run, view, patch).status, 'completed');
+  for (const field of ['run_id', 'current_run_id', 'harness_job_id', 'harness_session_id', 'control_status'])
+    assert.throws(() => executorResult({...value, [field]: 'foreign'}, run, view, patch),
+      error => error.code === 'EXECUTOR_RESULT_INVALID', field);
+  assert.throws(() => executorResult(value, {...run, control_status: 'RUNNING'}, view, patch),
+    error => error.code === 'EXECUTOR_RESULT_INVALID');
+  for (const field of ['run_id', 'scope_id', 'outcome'])
+    assert.throws(() => executorResult(value, run, {issueReport: {...report, [field]: 'foreign'}}, patch),
+      error => error.code === 'EXECUTOR_RESULT_INVALID', field);
+  assert.throws(() => executorResult(value, run, view, Buffer.from('changed patch')),
+    error => error.code === 'EXECUTOR_RESULT_INVALID');
 });
