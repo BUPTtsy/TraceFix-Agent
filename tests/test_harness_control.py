@@ -200,6 +200,17 @@ async def test_stopped_view_verifies_disk_before_advertising_resume(control, tmp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('status,active', [('RUNNING', True), ('UNKNOWN', False)])
+async def test_stopped_view_persists_unconfirmed_executor_as_blocked(control, tmp_path, monkeypatch, status, active):
+    _state, _checkpoint, _reference, _source, runner = stopped_control(control, tmp_path, monkeypatch)
+    runner.inspect.return_value = ExecutionInspection(execution_id='checked', status=status, active=active)
+    view = await control.dispatch(control_request())
+    assert view['control_status'] == 'BLOCKED' and not view['can_resume']
+    assert view['resume_blockers'] == ['EXECUTOR_STATE_UNKNOWN']
+    assert control.authority.get_job('job', scope_id='scope').blocker == 'EXECUTOR_STATE_UNKNOWN'
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('damage', ['checkpoint', 'snapshot', 'workspace', 'missing_snapshot'])
 async def test_view_persists_damaged_recovery_artifacts_as_blocked(control, tmp_path, monkeypatch, damage):
     state, checkpoint, reference, source, runner = stopped_control(control, tmp_path, monkeypatch)

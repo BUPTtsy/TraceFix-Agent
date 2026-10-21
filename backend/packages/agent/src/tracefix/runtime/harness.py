@@ -79,6 +79,17 @@ def local_repository_config(config):
         and config['version'] == 1 and config.get('publish_branch') is False)
 
 
+def pending_harness_operations(store, state):
+    if hasattr(store, 'conn'):
+        records = store.conn.execute("SELECT id,scope_id,resources FROM operations "
+            "WHERE status IN ('STARTED','UNKNOWN')").fetchall()
+    else:
+        records = [{'id': identity, **value} for identity, value in store.operations.items()
+            if value.get('status') in {'STARTED', 'UNKNOWN'}]
+    return [record['id'] for record in records if record['scope_id'] == state.scope_id
+        or '*' in (record.get('resources') or ['*'])]
+
+
 class HarnessRuntime:
     def __init__(self, store, runner, config: ClaudeSdkConfig, root: Path, *,
                  owner=None, final_verifier=None, rebind=None, projector=None):
@@ -193,9 +204,14 @@ class HarnessRuntime:
     async def stop(self, engine, state):
         """先持久化停止意图，再向当前 execution 发送中断。"""
         job = self.job(state)
-        if job.status not in {'CREATED', 'RUNNING', 'STOPPING'}:
+        if job.status not in {'CREATED', 'RUNNING', 'STOPPING'} and not (
+                job.status == 'BLOCKED' and job.stop_request_id):
             raise HarnessConflict('当前 Job 不能停止')
         job = self.store.request_stop(job.job_id, job.revision, scope_id=state.scope_id)
+        pending = pending_harness_operations(engine.store, state)
+        if pending and job.blocker != 'EXTERNAL_OPERATION_UNKNOWN':
+            job = self.store.block_job(job.job_id, 'EXTERNAL_OPERATION_UNKNOWN', scope_id=state.scope_id,
+                expected_revision=job.revision)
         host = self._read(state)
         executions = self.store.list_executions(job.job_id, scope_id=state.scope_id)
         active = [execution for execution in executions
@@ -239,9 +255,21 @@ class HarnessRuntime:
                 snapshot_ref = engine.put(stop_state, snapshot.model_dump(), name='停止完整快照')
                 boundary = ('node_boundary:' + current.status + ':' + session.status
                     if current.status in {'SUCCEEDED', 'FAILED'} else None)
-                checkpoint_ref = self._checkpoint(engine, stop_state, session, current, workspace,
+                pending = pending_harness_operations(engine.store, state)
+                checkpoint_execution = current.model_copy(update={'pending_operations': sorted(
+                    set(current.pending_operations) | set(pending))})
+                checkpoint_ref = self._checkpoint(engine, stop_state, session, checkpoint_execution, workspace,
                     result, snapshot_ref, writers_stopped=True, recovery_reason=boundary)
                 job = self.job(state)
+                pending = pending_harness_operations(engine.store, state)
+                if pending and job.blocker != 'EXTERNAL_OPERATION_UNKNOWN':
+                    job = self.store.block_job(job.job_id, 'EXTERNAL_OPERATION_UNKNOWN', scope_id=state.scope_id,
+                        expected_revision=job.revision)
+                if job.blocker not in {None, 'EXECUTOR_STATE_UNKNOWN'}:
+                    host = self._read(state)
+                    host['executions'][execution.execution_id]['checkpoint_ref'] = checkpoint_ref
+                    self._write(state, host)
+                    continue
                 if job.status in {'STOPPING', 'BLOCKED'}:
                     self.store.confirm_stopped(job.job_id, checkpoint_ref, scope_id=state.scope_id,
                         expected_revision=job.revision, session_id=session.session_id)

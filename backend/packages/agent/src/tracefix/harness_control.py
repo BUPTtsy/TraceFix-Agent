@@ -13,6 +13,7 @@ from pydantic import Field, ValidationError
 from tracefix.execution.candidate_export import SDKWorkspace, _snapshot
 from tracefix.execution.workspace import Workspace
 from tracefix.runtime.contracts import Contract
+from tracefix.runtime.harness import pending_harness_operations
 from tracefix.runtime.harness_bootstrap import restore_harness_runtime
 from tracefix.runtime.harness_contracts import ExecutionCheckpoint
 from tracefix.storage.artifacts import Artifacts
@@ -98,14 +99,7 @@ class HarnessControl:
         return state
 
     def pending(self, state):
-        if hasattr(self.store, 'conn'):
-            rows = self.store.conn.execute("SELECT id,scope_id,resources FROM operations "
-                "WHERE status IN ('STARTED','UNKNOWN')").fetchall()
-            return [row['id'] for row in rows if row['scope_id'] == state.scope_id
-                or '*' in (row['resources'] or ['*'])]
-        return [identity for identity, value in self.store.operations.items()
-            if value.get('status') in {'STARTED', 'UNKNOWN'} and
-            (value.get('scope_id') == state.scope_id or '*' in (value.get('resources') or ['*']))]
+        return pending_harness_operations(self.store, state)
 
     def block(self, job, blocker):
         current = self.authority.get_job(job.job_id, scope_id=job.scope_id)
@@ -166,6 +160,7 @@ class HarnessControl:
         runner.owner_epoch = execution.owner_epoch
         inspection = await runner.inspect(execution.execution_id)
         if inspection.active or inspection.status != 'STOPPED':
+            self.block(job, 'EXECUTOR_STATE_UNKNOWN')
             raise HarnessConflict('原执行者尚未确认结束')
         return execution.checkpoint_ref
 

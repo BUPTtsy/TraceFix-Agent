@@ -253,3 +253,72 @@ async def test_interrupt_marks_terminal_result_stopped_when_stop_wins(tmp_path):
     result = await task
     assert receipt.writers_stopped and result.status == 'STOPPED'
     assert clients[0].interrupted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', ['STARTED', 'UNKNOWN'])
+@pytest.mark.parametrize('during_interrupt', [False, True])
+async def test_runtime_stop_preserves_external_fence_and_still_interrupts(
+        ledger, tmp_path, monkeypatch, status, during_interrupt):
+    from tracefix.runtime.contracts import RunState
+    from tracefix.storage.store import MemoryStore
+
+    session = coder(ledger)
+    execution = ledger.prepare_execution(session.session_id, 'coder', 'coder:1', 'frozen',
+        scope_id='scope', owner='owner')
+    state = RunState(scope_id='scope', run_id=session.run_id, goal='目标', url='http://app.test',
+        harness_job_id='job', harness_session_id=session.session_id)
+    store = MemoryStore()
+    operation = dict(scope_id='scope', run_id='older-run', status=status, resources=['repo:repo'])
+    if not during_interrupt:
+        store.operations['external-write'] = operation.copy()
+    directory = tmp_path / 'execution'
+    directory.mkdir()
+    host = {'executions': {execution.execution_id: {'directory': str(directory)}}}
+    runtime = object.__new__(HarnessRuntime)
+    runtime.store, runtime.config = ledger, SimpleNamespace(stop_grace_seconds=15)
+    runtime._read = lambda _state: host
+    runtime._write = lambda _state, _host: None
+    async def interrupt(execution_id, stop_request_id, _grace):
+        job = ledger.get_job('job', scope_id='scope')
+        assert job.stop_request_id == stop_request_id
+        assert job.status == ('STOPPING' if during_interrupt else 'BLOCKED')
+        store.operations['external-write'] = operation.copy()
+        return dict(execution_id=execution_id, stop_request_id=stop_request_id, writers_stopped=True)
+    runner = SimpleNamespace(owner_epoch=0, interrupt=AsyncMock(side_effect=interrupt),
+        inspect=AsyncMock(return_value=ExecutionInspection(execution_id=execution.execution_id,
+            status='STOPPED', active=False)))
+    runtime.runner = lambda _workspace: runner
+    workspace = SimpleNamespace(freeze=lambda: SimpleNamespace(model_dump=lambda: {'entries': {}}))
+    monkeypatch.setattr('tracefix.execution.candidate_export.SDKWorkspace.load', lambda *_args: workspace)
+    engine = SimpleNamespace(store=store, workspace=object(),
+        put=lambda current, value, **_options: ledger.artifacts.put(current.scope_id, current.run_id, value),
+        get=lambda current, ref: ledger.artifacts.json(current.scope_id, current.run_id, ref))
+    stopped = await runtime.stop(engine, state)
+    assert stopped.status == 'BLOCKED' and stopped.blocker == 'EXTERNAL_OPERATION_UNKNOWN'
+    assert stopped.stop_request_id
+    assert store.operations['external-write'] == operation
+    runner.interrupt.assert_awaited_once()
+    checkpoint_ref = host['executions'][execution.execution_id]['checkpoint_ref']
+    assert engine.get(state, checkpoint_ref)['writers_alive'] is False
+    assert engine.get(state, checkpoint_ref)['pending_operations'] == ['external-write']
+    assert 'CHECKPOINT_FLUSH_FAILED' not in [event.payload.get('blocker')
+        for event in ledger.outbox_events('job', scope_id='scope')]
+
+
+@pytest.mark.asyncio
+async def test_runtime_stop_blocks_external_operation_without_sdk_execution(ledger):
+    from tracefix.runtime.contracts import RunState
+    from tracefix.storage.store import MemoryStore
+
+    session = coder(ledger)
+    state = RunState(scope_id='scope', run_id=session.run_id, goal='目标', url='http://app.test',
+        harness_job_id='job', harness_session_id=session.session_id)
+    store = MemoryStore()
+    store.operations['external'] = dict(scope_id='scope', run_id='older-run', status='UNKNOWN', resources=['*'])
+    runtime = object.__new__(HarnessRuntime)
+    runtime.store = ledger
+    runtime._read = lambda _state: {'executions': {}}
+    stopped = await runtime.stop(SimpleNamespace(store=store), state)
+    assert stopped.status == 'BLOCKED' and stopped.blocker == 'EXTERNAL_OPERATION_UNKNOWN'
+    assert stopped.stop_request_id
