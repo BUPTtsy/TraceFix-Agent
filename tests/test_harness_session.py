@@ -40,6 +40,19 @@ async def test_finalize_rejects_stop_before_reading_or_committing_workspace():
     check.assert_called_once_with(engine, state)
 
 
+async def test_sdk_preparation_rejects_guidance_before_job_is_attached():
+    store = MemoryStore()
+    state = RunState(run_id='preparing', scope_id='scope', goal='goal', url='http://app.test',
+        coding_backend='claude_sdk')
+    store.save(state)
+    session = object.__new__(Session)
+    session.run_id, session.scope, session.store = state.run_id, state.scope_id, store
+    session.engine = SimpleNamespace(current_run=state.run_id)
+    with pytest.raises(ValueError, match='不接收补充指令'):
+        await session.dispatch('不得注入正在冻结的任务')
+    assert not store.load(state.run_id, state.scope_id).guidance
+
+
 async def test_stop_during_final_verification_prevents_local_commit(tmp_path, monkeypatch):
     engine, state = make_engine(tmp_path)
     state.harness_job_id = 'job'

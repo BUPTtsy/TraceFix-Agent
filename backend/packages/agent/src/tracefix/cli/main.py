@@ -320,7 +320,7 @@ class Session:
         if record.get('agentRunId'):
             await self.ensure_runtime()
             previous = self.store.load(record['agentRunId'], self.scope)
-            if previous.harness_job_id:
+            if previous.harness_job_id or previous.coding_backend == 'claude_sdk':
                 raise ValueError('SDK Job 不接受补充指令，请使用 /resume JOB_ID')
             if previous.repo_snapshot_ref:
                 self.validate_workspace(previous, data_root=record.get('dataRoot'))
@@ -725,7 +725,7 @@ class Session:
 
     async def dispatch(self, text):
         command, args = parse(text)
-        if self.run_id and self.state().harness_job_id and (
+        if self.run_id and (self.state().harness_job_id or self.state().coding_backend == 'claude_sdk') and (
                 command is None or command in {'hint', 'constrain', 'retarget', 'compact', 'continue', 'interrupt'}):
             raise ValueError('SDK Job 不接收补充指令；仅可 /stop、/resume JOB_ID 或创建新任务')
         if command is None:
@@ -1230,6 +1230,8 @@ def main():
     parser.add_argument('--mode',choices=['test','repair','chat'],default='test')
     parser.add_argument('--repair-mode', choices=REPAIR_MODES, default=None,
                         help='修复模式；默认按项目配置、环境变量和内置默认值解析')
+    parser.add_argument('--coding-backend', choices=['legacy', 'claude_sdk'], default=None,
+                        help='新任务的编码后端；已有 SDK Job 恢复时使用冻结配置')
     parser.add_argument('--execution-mode', choices=['interactive', 'batch'], default=None,
                         help='运行策略；--run 默认 batch，interactive 保留人工暂停/审批')
     parser.add_argument('--spec')
