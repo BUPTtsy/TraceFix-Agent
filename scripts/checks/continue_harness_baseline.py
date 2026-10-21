@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 
 import pytest
 
@@ -51,8 +52,9 @@ def main():
         sys.stderr = output
         (EVIDENCE / 'pytest-continuation-exit.json').write_text(
             json.dumps({'status': 'running'}), encoding='utf-8')
+        baseline_temp = Path(tempfile.gettempdir()) / 'tracefix-harness-baseline'
         status = pytest.main(['-q', '-p', 'no:cacheprovider',
-            '--basetemp=.t456-continue', '--junitxml=artifacts/harness-migration/pytest-continuation.xml'],
+            '--basetemp=' + str(baseline_temp), '--junitxml=artifacts/harness-migration/pytest-continuation.xml'],
             plugins=[BaselineProgress()])
         (EVIDENCE / 'pytest-continuation-exit.json').write_text(
             json.dumps({'exit_code': int(status)}), encoding='utf-8')
