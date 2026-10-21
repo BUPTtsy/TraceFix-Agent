@@ -283,7 +283,7 @@ class Session:
             raise ValueError('当前没有 Run')
         state = self.store.load(self.run_id, self.scope)
         current_run = getattr(getattr(self, 'engine', None), 'current_run', None)
-        if state.harness_job_id and current_run and current_run != state.run_id:
+        if getattr(state, 'harness_job_id', None) and current_run and current_run != state.run_id:
             current = self.store.load(current_run, self.scope)
             if current.harness_job_id != state.harness_job_id:
                 raise PermissionError('当前增量不属于原 SDK Job')
@@ -725,9 +725,11 @@ class Session:
 
     async def dispatch(self, text):
         command, args = parse(text)
-        if self.run_id and (self.state().harness_job_id or self.state().coding_backend == 'claude_sdk') and (
-                command is None or command in {'hint', 'constrain', 'retarget', 'compact', 'continue', 'interrupt'}):
-            raise ValueError('SDK Job 不接收补充指令；仅可 /stop、/resume JOB_ID 或创建新任务')
+        if self.run_id and (command is None or command in {
+                'hint', 'constrain', 'retarget', 'compact', 'continue', 'interrupt'}):
+            current = self.state()
+            if getattr(current, 'harness_job_id', None) or getattr(current, 'coding_backend', None) == 'claude_sdk':
+                raise ValueError('SDK Job 不接收补充指令；仅可 /stop、/resume JOB_ID 或创建新任务')
         if command is None:
             if getattr(self, 'mode', '') == 'chat':
                 await self.chat(text)
