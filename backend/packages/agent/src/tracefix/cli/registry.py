@@ -30,7 +30,8 @@ COMMANDS = [
     CommandSpec('memory','/memory [search QUERY|sources [RUN_ID]]','查看记忆快照、检索经验与实际使用来源'), CommandSpec('context','/context','查看上下文和用量'),
     CommandSpec('skills','/skills','查看流程 Skill 索引'), CommandSpec('scope','/scope [use ID]','查看或切换项目'),
     CommandSpec('pause','/pause','在安全边界暂停'), CommandSpec('interrupt','/interrupt','安全打断并等待纠正提示'),
-    CommandSpec('resume','/resume RUN_ID','校验检查点并继续'), CommandSpec('cancel','/cancel','取消当前 Run'),
+    CommandSpec('resume','/resume JOB_ID','校验持久化停止回执并继续原任务'),
+    CommandSpec('stop','/stop','停止当前任务并保留可恢复工件'), CommandSpec('cancel','/cancel','取消当前 Run'),
     CommandSpec('approve','/approve ID','批准绑定补丁动作'), CommandSpec('reject','/reject ID','拒绝动作并保留产物'),
     CommandSpec('help','/help','显示帮助'), CommandSpec('quit','/quit','退出；活动 Run 先取消'),
 ]

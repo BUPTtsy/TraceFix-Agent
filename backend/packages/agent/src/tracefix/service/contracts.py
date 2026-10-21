@@ -34,6 +34,7 @@ class ServiceTestSpec(TestSpec):
 
 
 class ExecutionRequest(Contract):
+    backend: Literal['legacy', 'claude_sdk'] = 'legacy'
     mode: Literal['batch'] = Field(default='batch', validation_alias=AliasChoices('executionMode', 'mode'))
     url: str | None = Field(default=None, max_length=2048)
     spec: ServiceTestSpec | None = None
@@ -115,6 +116,8 @@ class ServiceRequest(Contract):
 
     @model_validator(mode='after')
     def consistent_identity(self):
+        if self.execution.backend == 'claude_sdk' and self.mode != 'repair':
+            raise ValueError('SDK 后端仅用于 repair 任务')
         snapshot = self.repository_snapshot
         if (snapshot.repo_id != self.repo_id or snapshot.projectId != self.repo_id
                 or snapshot.repository_config.get('frozen_run_id') != self.run_id):

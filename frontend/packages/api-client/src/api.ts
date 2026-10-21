@@ -118,7 +118,7 @@ export function aggregateWorkers(events: TraceEvent[]): WorkerAggregate {
   const active = workers.filter(worker => worker.active && workerActiveStatuses.has(worker.status)).length;
   return {workers, active, maxConcurrency};
 }
-export interface Run {canContinue?: boolean; coding_backend?: string; control_status?: string; can_stop?: boolean; can_resume?: boolean; resume_blockers?: string[]; harness_job_id?: string | null; harness_session_id?: string | null}
+export interface Run {canContinue?: boolean; coding_backend?: string; control_status?: string; can_stop?: boolean; can_resume?: boolean; resume_blockers?: string[]; harness_job_id?: string | null; harness_session_id?: string | null; current_run_id?: string | null; accepted_commit?: string | null; quality?: string | null}
 export interface ReportIssue {id: string; title: string; source: string; status: string; location: string; expected: string; actual: string; steps: string[]; verification: string; evidence_refs: string[]}
 export interface CheckItem {id: string; name: string; criteria: string; severity: 'blocker' | 'critical' | 'major' | 'minor'; source: 'rule' | 'user_goal'; detector: string; rule_version?: number | null}
 export interface CheckResult extends CheckItem {status: 'pass' | 'fail' | 'error' | 'inconclusive'; actual: string; evidence_refs: string[]; error?: string | null; fallback?: {source?: string; reason?: string; status?: string; error?: string} | null; stage?: 'explore' | 'verify'}

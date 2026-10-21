@@ -11,10 +11,34 @@ from tracefix.agents.claude_sdk_config import ClaudeSdkConfig, load_claude_sdk_c
 from tracefix.execution.agent_runner import AgentExecutionRunner
 from tracefix.execution.repository import plain_root
 from tracefix.runtime.contracts import digest
-from tracefix.runtime.harness import HarnessRuntime
+from tracefix.runtime.harness import HarnessRuntime, local_repository_config
 from tracefix.runtime.harness_finding import validate_finding_service_factory
 from tracefix.storage.harness import PostgresHarnessStore
 from tracefix.storage.harness_projection import project_pending
+
+
+def restore_harness_runtime(engine, state, *, store=None, runner_factory=None):
+    authority = store or PostgresHarnessStore(engine.store, engine.artifacts)
+    job = authority.get_job(state.harness_job_id, scope_id=state.scope_id)
+    sessions = authority.list_sessions(job.job_id, scope_id=state.scope_id)
+    initializer = next((session for session in sessions if session.kind == 'initializer'), None)
+    if initializer is None or not job.config_ref:
+        raise PermissionError('SDK Job 缺少冻结配置或初始化 Session')
+    frozen = engine.artifacts.json(state.scope_id, initializer.run_id, job.config_ref)
+    config = ClaudeSdkConfig.model_validate(frozen['config'])
+    if config.backend != job.backend or config.config_hash != job.config_digest:
+        raise PermissionError('SDK Job 的冻结配置摘要不匹配')
+    root = plain_root(Path(engine.artifacts.root).parent)
+
+    def runner(workspace):
+        return (runner_factory or AgentExecutionRunner)(workspace,
+            network=os.environ.get('TRACEFIX_SDK_NETWORK', ''),
+            egress_proxy=os.environ.get('TRACEFIX_SDK_EGRESS_PROXY', ''))
+
+    def project(current, job_id, scope_id):
+        return project_pending(current, root / 'harness-projection.sqlite3', job_id, scope_id)
+
+    return HarnessRuntime(authority, runner, config, root / 'harness', projector=project)
 
 
 def create_harness_job(engine, state, *, console_task_id, local_commit_authorized,
@@ -24,7 +48,8 @@ def create_harness_job(engine, state, *, console_task_id, local_commit_authorize
               ClaudeSdkConfig.model_validate(config))
     if config.backend == 'legacy':
         return state
-    if state.mode != 'repair' or state.remote_config or not local_commit_authorized:
+    if (state.mode != 'repair' or not local_repository_config(state.remote_config)
+            or not local_commit_authorized):
         raise PermissionError('SDK Harness 只接受已授权本地提交且无远端发布的 repair 任务')
     if not state.test_spec_ref or not state.test_spec_hash:
         raise ValueError('SDK Harness 启动前必须冻结 TestSpec')

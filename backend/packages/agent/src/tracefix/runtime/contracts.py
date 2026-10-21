@@ -505,6 +505,8 @@ class RunState(Contract):
     harness_task_id: str | None = None
     harness_stage: str | None = None
     sdk_execution_id: str | None = None
+    coding_backend: Literal['legacy', 'claude_sdk'] = 'legacy'
+    coding_config_ref: str | None = None
     parent_run_id: str | None = None
     continuation_instruction: str | None = None
     continuation_count: int = 0

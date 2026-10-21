@@ -192,6 +192,16 @@ class Session:
                    'repairModeReason': state.repair_mode_reason,
                    'phase': str(state.phase), 'outcome': state.outcome, 'reportRef': state.report_ref,
                    'branch': state.local_branch, 'error': error or state.error}
+        if state.harness_job_id and self.engine.harness is not None:
+            job = self.engine.harness.job(state)
+            changes['agentRunId'] = self.run_id
+            changes.update(coding_backend='claude_sdk', harness_job_id=job.job_id,
+                current_run_id=state.run_id,
+                harness_session_id=state.harness_session_id, control_status=job.status,
+                can_resume=False, resume_blockers=[job.blocker] if job.blocker else [],
+                accepted_commit=job.accepted_commit, quality=job.quality)
+            if job.status in {'STOPPED', 'STOPPING', 'BLOCKED'}:
+                changes['status'] = job.status.lower()
         changes.update({'continuationCount': state.continuation_count,
                         'abnormalTermination': state.abnormal_termination,
                         'continuationMarkers': state.continuation_markers,
@@ -200,7 +210,7 @@ class Session:
             changes['finishedAt'] = timestamp()
         else:
             changes['finishedAt'] = None
-        if error:
+        if error and not state.harness_job_id:
             changes['status'] = str(state.run_status).lower()
         changes['pid'] = os.getpid() if state.run_status in {
             RunStatus.RUNNING, RunStatus.PAUSED, RunStatus.WAITING_INPUT, RunStatus.WAITING_APPROVAL} and not error else None
@@ -271,7 +281,14 @@ class Session:
     def state(self):
         if not self.run_id:
             raise ValueError('当前没有 Run')
-        return self.store.load(self.run_id, self.scope)
+        state = self.store.load(self.run_id, self.scope)
+        current_run = getattr(getattr(self, 'engine', None), 'current_run', None)
+        if state.harness_job_id and current_run and current_run != state.run_id:
+            current = self.store.load(current_run, self.scope)
+            if current.harness_job_id != state.harness_job_id:
+                raise PermissionError('当前增量不属于原 SDK Job')
+            return current
+        return state
 
     async def create(self):
         if self.active():
@@ -303,6 +320,8 @@ class Session:
         if record.get('agentRunId'):
             await self.ensure_runtime()
             previous = self.store.load(record['agentRunId'], self.scope)
+            if previous.harness_job_id:
+                raise ValueError('SDK Job 不接受补充指令，请使用 /resume JOB_ID')
             if previous.repo_snapshot_ref:
                 self.validate_workspace(previous, data_root=record.get('dataRoot'))
         claim = os.getenv('TRACEFIX_CONTINUATION_ID')
@@ -449,6 +468,15 @@ class Session:
             state.test_spec_hash = digest(spec)
             state.test_spec_ref = self.artifacts.put(self.scope, state.run_id, spec.model_dump(), label='测试规范')
         self.bind(state, profile, workspace, source)
+        if not reuse_workspace and state.mode == 'repair':
+            from tracefix.agents.claude_sdk_config import load_claude_sdk_config
+            requested_backend = getattr(self.args, 'coding_backend', None)
+            configuration = load_claude_sdk_config({**os.environ,
+                **({'TRACEFIX_CODING_BACKEND': requested_backend} if requested_backend is not None else {})})
+            if configuration.backend == 'claude_sdk':
+                state.coding_backend = 'claude_sdk'
+                state.coding_config_ref = self.artifacts.put(self.scope, state.run_id,
+                    configuration.model_dump(mode='json'), label='SDK冻结配置')
         self.store.save(state)
         if not reuse_workspace:
             self.engine.event(state, 'repair_mode.resolved', repair_mode_fields(state))
@@ -479,7 +507,8 @@ class Session:
         return workspace, source
 
     def bind(self, state, profile, workspace, source):
-        self.validate_workspace(state, workspace, source)
+        if not (state.harness_job_id and source.get('harness_revision')):
+            self.validate_workspace(state, workspace, source)
         runner = DockerRunner(profile, workspace, state.run_id)
         if self.runtime_services is not None:
             self.runtime_services.own(runner)
@@ -523,6 +552,11 @@ class Session:
     async def stop(self, *, grace=5):
         self.stop_requested = True
         state = self.state()
+        if state.harness_job_id:
+            await self.engine.harness.stop(self.engine, state)
+            self.engine.harness.project(state)
+            self.publish_console()
+            return
         self.engine.control = 'cancel'
         self.engine.cancel_subagents(state)
         task = self.task
@@ -555,6 +589,18 @@ class Session:
             await self.finish_cancelled()
         except Exception as e:
             latest = self.state()
+            if latest.harness_job_id:
+                job = self.engine.harness.job(latest)
+                if job.status == 'RUNNING':
+                    self.engine.harness.store.block_job(job.job_id, 'HARNESS_NODE_FAILED',
+                        scope_id=latest.scope_id, expected_revision=job.revision)
+                self.engine.changed(latest, run_status=RunStatus.PAUSED,
+                    error=sanitize(error_message(e)),
+                    error_details={'source': 'harness', 'requires_manual_review': True})
+                self.engine.harness.project(latest)
+                self.publish_console(error=error_message(e))
+                self.render.status(self.state())
+                return
             terminal = latest.run_status in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.ABNORMAL,
                                             RunStatus.FAILED, RunStatus.SUPERSEDED}
             if latest.execution_mode == 'batch':
@@ -579,7 +625,19 @@ class Session:
         if self.task and not self.task.done():
             raise ValueError('Run 已在执行')
         await self.ensure_runtime()
+        if run_id.startswith('hjob'):
+            from tracefix.harness_control import ControlIdentity, HarnessControl
+            from tracefix.storage.harness import PostgresHarnessStore
+            authority = PostgresHarnessStore(self.store, self.artifacts)
+            job = authority.get_job(run_id, scope_id=self.scope)
+            control = HarnessControl(self.store, self.artifacts, self.args.data, authority=authority)
+            state = control.state(job)
+            await self.restore_harness(state)
+            return
         s = self.store.load(run_id, self.scope)
+        if s.harness_job_id:
+            await self.restore_harness(s)
+            return
         if s.run_status not in {RunStatus.PAUSED, RunStatus.WAITING_APPROVAL}:
             raise ValueError('只可恢复已暂停的安全边界；意外崩溃的 RUNNING 状态须检查操作回执')
         workspace, source = self.validate_workspace(s)
@@ -602,6 +660,51 @@ class Session:
         else:
             self.task = asyncio.create_task(self.drive(resume='resume'))
 
+    async def restore_harness(self, state):
+        from tracefix.harness_control import HarnessControl
+        from tracefix.runtime.harness_bootstrap import restore_harness_runtime
+        from tracefix.storage.harness import PostgresHarnessStore
+        authority = PostgresHarnessStore(self.store, self.artifacts)
+        control = HarnessControl(self.store, self.artifacts, self.args.data, authority=authority)
+        job = authority.get_job(state.harness_job_id, scope_id=self.scope)
+        if job.status != 'STOPPED' or job.blocker:
+            raise ValueError('仅可恢复无 blocker 的 STOPPED Job')
+        state = control.state(job)
+        source = self.artifacts.json(self.scope, state.run_id, state.repo_snapshot_ref)
+        old = self.artifacts.json(self.scope, state.run_id, state.memory_snapshot_ref)
+        if old['epochs'] != [list(entry) for entry in self.ctx.epochs]:
+            raise PermissionError('Scope 权限已变化')
+        project = self.scopes.projects[self.scope]
+        workspace = Workspace(Path(source['workspace_root']), project.allowed_files,
+            protected_paths=(project.repository_config or {}).get('protected_paths', []))
+        workspace.repository_snapshot = source
+        profile = (Profile.model_validate(state.remote_config['profile'])
+            if state.remote_config and state.remote_config.get('version') == 1 else self.project_profile())
+        self.bind(state, profile, workspace, source)
+        runtime = restore_harness_runtime(self.engine, state, store=authority)
+        self.engine.harness = runtime
+        self.run_id = next(session.run_id for session in authority.list_sessions(
+            job.job_id, scope_id=self.scope) if session.kind == 'initializer')
+        if source.get('harness_revision'):
+            runtime.validate_workspace(self.engine, state, source)
+        inspection_ref = await control.inspect(job, state)
+        if self.engine.spec(state).mode == 'gui' and state.harness_stage not in {'coding', 'initialize'}:
+            raise ValueError('浏览器进程已丢失，此阶段须经安全重放恢复')
+        environment = await self.engine.runner.inspect_images()
+        if environment != state.environment_digest:
+            raise PermissionError('恢复环境版本与冻结身份不一致')
+        command_mode = self.engine.spec(state).mode != 'gui'
+        self.engine.runner.command_only = command_mode
+        health = await (self.engine.runner.start_commands(state.source_manifest) if command_mode
+            else self.engine.runner.start(state.source_manifest))
+        if health.get('passed') is not True:
+            raise RuntimeError('恢复后的沙箱健康检查失败')
+        if not command_mode:
+            await self.engine.browser.open()
+        state = runtime.resume(self.engine, state, inspection_ref)
+        self.stop_requested = False
+        self.task = asyncio.create_task(self.drive(state, resume='harness'))
+
     async def chat(self, message, use_knowledge=True):
         # Chat 服务负责落库 reasoning；终端这里只流式展示正文，历史也只保留正文供下一轮使用。
         history = self.chat_history.setdefault(self.scope, [])
@@ -622,6 +725,9 @@ class Session:
 
     async def dispatch(self, text):
         command, args = parse(text)
+        if self.run_id and self.state().harness_job_id and (
+                command is None or command in {'hint', 'constrain', 'retarget', 'compact', 'continue', 'interrupt'}):
+            raise ValueError('SDK Job 不接收补充指令；仅可 /stop、/resume JOB_ID 或创建新任务')
         if command is None:
             if getattr(self, 'mode', '') == 'chat':
                 await self.chat(text)
@@ -740,6 +846,10 @@ class Session:
                 await self.chat(' '.join(request.message), not request.no_knowledge)
         elif command == 'run':
             await self.create()
+        elif command == 'stop':
+            if args:
+                raise ValueError('用法：/stop')
+            await self.stop()
         elif command == 'interrupt':
             if not self.active():
                 raise ValueError('当前没有运行中的 Run')

@@ -1909,6 +1909,15 @@ class Engine:
                 try:
                     return await getattr(self, node)(s, data.get('next_node', 'prepare'))
                 except UnknownOperation as e:
+                    if s.harness_job_id:
+                        job = self.harness.job(s)
+                        self.harness.store.block_job(job.job_id, 'EXTERNAL_OPERATION_UNKNOWN',
+                            scope_id=s.scope_id, expected_revision=job.revision)
+                        current = self.changed(self.store.load(s.run_id, s.scope_id),
+                            run_status=RunStatus.PAUSED, error=str(e),
+                            error_details={'status': 'UNKNOWN_OPERATION', 'requires_manual_review': True})
+                        self.harness.project(current)
+                        return self.output(current, 'end')
                     if s.execution_mode == 'batch':
                         s = self.finish_error(self.store.load(s.run_id, s.scope_id), e, details={
                             'status': 'UNKNOWN_OPERATION', 'category': 'missing_receipt',
@@ -1934,7 +1943,8 @@ class Engine:
                         current = self.store.load(s.run_id, s.scope_id)
                         if str(current.run_status) in {'COMPLETED', 'FAILED', 'CANCELLED', 'ABNORMAL', 'SUPERSEDED'}:
                             return self.output(current, 'end')
-                        current = self.changed(current, run_status=RunStatus.FAILED,
+                        current = self.changed(current, run_status=(RunStatus.PAUSED
+                            if self.harness.job(s).status in {'STOPPING', 'STOPPED', 'BLOCKED'} else RunStatus.FAILED),
                             error=sanitize(error_message(e))[:1500],
                             error_details={'source': 'harness', 'node': node,
                                 'type': type(e).__name__, 'requires_manual_review': True})
@@ -2349,6 +2359,11 @@ class Engine:
             s = self.changed(s, step=2, baseline_validation_refs=[ref])
             return self.output(s, 'prelude')
         if s.harness_job_id and s.harness_stage == 'initialize':
+            return self.output(s, 'harness_initialize')
+        if s.coding_backend == 'claude_sdk' and not s.harness_job_id and s.test_spec_ref:
+            from tracefix.runtime.harness_bootstrap import create_harness_job
+            s = create_harness_job(self, s, console_task_id=s.job_id or s.run_id,
+                local_commit_authorized=True, config=self.get(s, s.coding_config_ref))
             return self.output(s, 'harness_initialize')
         if command_mode:
             phase = Phase.VERIFY if s.continuation_count and s.patch_hash and s.reproduced else Phase.EXPLORE
@@ -3655,6 +3670,8 @@ class Engine:
 
     async def finalize(self, s, _):
         from tracefix.runtime.repair_loop import report_summary
+        if s.harness_job_id:
+            self.harness._check(self, s)
         if s.outcome == Outcome.NO_BUG_FOUND and not self.rules_fully_checked(s, Phase.EXPLORE):
             s = self.changed(s, outcome=Outcome.INCONCLUSIVE,
                 error='必检规则覆盖不足，不能输出 NO_BUG_FOUND')
@@ -3682,6 +3699,8 @@ class Engine:
                             and await self.runtime_verification_passed(s))
             except (OSError, ValueError, KeyError):
                 verified = False
+            if s.harness_job_id:
+                self.harness._check(self, s)
             if not verified:
                 s = self.changed(s, outcome=Outcome.INFRA_FAILURE,
                     error='最终运行环境、补丁或验证证据已失效，无法输出已验证修复',
@@ -3703,6 +3722,8 @@ class Engine:
             action = {'action': 'local_commit', 'branch': 'tracefix/'+s.run_id}
             try:
                 async def commit():
+                    if s.harness_job_id:
+                        self.harness._check(self, s)
                     branch = self.workspace.branch(action['branch'])
                     if digest(self.workspace.diff(s.patch_base_commit).encode()) != s.patch_hash:
                         raise PermissionError('提交后的候选补丁与验证证据不一致')
@@ -3918,7 +3939,7 @@ class Engine:
         self.current_run = run_id
         initial = state or self.store.load(run_id, self.context.active_scope)
         if initial.harness_job_id and state is None:
-            raise RuntimeError('SDK Job 跨进程继续尚未通过 M4 恢复门禁')
+            raise RuntimeError('SDK Job 必须通过权威停止回执 claim 后再恢复')
         thread_id = initial.harness_job_id or run_id
         config = {'configurable': {'thread_id': thread_id}, 'recursion_limit': 1500}
         with ExitStack() as writers:
@@ -3937,7 +3958,7 @@ class Engine:
                     })
                 else:
                     self.event(state, 'run.started', {'manifest_ref': state.repo_snapshot_ref})
-                invocation = self.output(state, 'prepare')
+                invocation = self.output(state, self.route(state) if resume == 'harness' else 'prepare')
             else:
                 invocation = Command(resume=resume)
             try:

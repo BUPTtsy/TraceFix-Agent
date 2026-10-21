@@ -142,6 +142,10 @@ class HarnessRuntime:
                    and job.blocker in {'FINAL_ACCEPTANCE_FAILED', 'TARGET_BASE_CHANGED'})
         if not allowed or job.stop_request_id:
             raise HarnessConflict('SDK Job 当前不允许启动节点')
+        session = self.session(state)
+        if session.owner is not None and (session.owner != self.owner
+                or session.owner_epoch != job.owner_epoch):
+            raise HarnessConflict('SDK Session 执行者或 owner epoch 已失效')
         if not local_repository_config(state.remote_config):
             raise PermissionError('SDK Job 禁止远端 publication')
         engine.scopes.assert_current(engine.context)
