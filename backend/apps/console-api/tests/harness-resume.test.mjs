@@ -7,18 +7,16 @@ import {fileURLToPath} from 'node:url';
 import {build} from 'esbuild';
 import {EventEmitter} from 'node:events';
 import {PassThrough} from 'node:stream';
-import {fileURLToPath} from 'node:url';
 import {createApi} from '../server/api.mjs';
 import {createExecutor, executionRequest} from '../server/executor.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..');
 const consoleServiceRoot = path.join(projectRoot, 'backend/packages/console-service');
-const consoleServiceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../packages/console-service');
 const bundle = await build({stdin: {contents: `export {ConsoleDatabase, controlProjection} from './src/database.ts';
 export {TaskLifecycle, normalizeTask} from './src/task-lifecycle.ts';
 export {createConsoleService} from './src/dispatch.ts';
 export {executorResult} from './src/results.ts';`, resolveDir: consoleServiceRoot},
-  resolveDir: consoleServiceRoot}, bundle: true, platform: 'node', format: 'esm', write: false});
+  bundle: true, platform: 'node', format: 'esm', write: false});
 const {ConsoleDatabase, controlProjection, TaskLifecycle, normalizeTask, createConsoleService, executorResult} = await import('data:text/javascript;base64,' + Buffer.from(bundle.outputFiles[0].text).toString('base64'));
 
 test('resume HTTP 正文严格为空对象，未知提示字段返回 400', async context => {
