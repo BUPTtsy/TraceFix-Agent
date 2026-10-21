@@ -2,9 +2,10 @@ import argparse
 import asyncio
 import json
 import os
+import signal
 from pathlib import Path
 
-from tracefix.agents.claude_sdk_adapter import ClaudeSdkAdapter, SdkExecutionRequest
+from tracefix.agents.claude_sdk_adapter import ClaudeSdkAdapter, ExecutionResult, SdkExecutionRequest
 from tracefix.execution.candidate_export import _snapshot
 
 
@@ -35,10 +36,54 @@ async def run_worker(request_path, result_path):
         print(json.dumps({'type': event, 'data': payload}, ensure_ascii=False, default=str), flush=True)
 
     snapshot('linux_input_manifest.json')
+    stop_requested = asyncio.Event()
+
+    def request_stop(*_args):
+        stop_requested.set()
+
+    loop = asyncio.get_running_loop()
+    installed_signals = []
+    for signum in (getattr(signal, 'SIGTERM', None), getattr(signal, 'SIGINT', None)):
+        if signum is None:
+            continue
+        try:
+            loop.add_signal_handler(signum, request_stop)
+            installed_signals.append(signum)
+        except (NotImplementedError, RuntimeError):
+            try:
+                signal.signal(signum, request_stop)
+                installed_signals.append(signum)
+            except (ValueError, OSError):
+                pass
+    task = asyncio.create_task(adapter.start(request, emit))
+    result = None
     try:
-        result = await adapter.start(request, emit)
+        stop_task = asyncio.create_task(stop_requested.wait())
+        done, _pending = await asyncio.wait((task, stop_task), return_when=asyncio.FIRST_COMPLETED)
+        if stop_task in done and not task.done():
+            receipt = await adapter.interrupt(request.execution_id, 'signal-stop',
+                request.config.stop_grace_seconds)
+            if receipt.writers_stopped:
+                result = await task
+            else:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                result = ExecutionResult(execution_id=request.execution_id, status='UNKNOWN',
+                    error_code='SDK_STOP_WRITERS_UNCONFIRMED')
+        else:
+            result = await task
+        stop_task.cancel()
+        await asyncio.gather(stop_task, return_exceptions=True)
     finally:
+        for signum in installed_signals:
+            try:
+                loop.remove_signal_handler(signum)
+            except (NotImplementedError, RuntimeError):
+                pass
         snapshot('linux_output_manifest.json')
+    if result is None:
+        result = ExecutionResult(execution_id=request.execution_id, status='UNKNOWN',
+            error_code='SDK_RESULT_MISSING')
     temporary = target.with_suffix(target.suffix + '.tmp')
     temporary.write_text(result.model_dump_json(indent=2), encoding='utf-8')
     os.replace(temporary, target)

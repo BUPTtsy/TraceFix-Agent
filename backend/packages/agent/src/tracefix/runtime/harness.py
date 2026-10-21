@@ -15,7 +15,7 @@ from tracefix.runtime.continuation import derive_run
 from tracefix.runtime.contracts import Outcome, Phase, RunState, RunStatus, digest, new_id
 from tracefix.runtime.harness_contracts import (HarnessFeedback, HarnessJob, HarnessSession,
     HarnessWorkItem, InitializationManifest, SessionHandoff, TaskPlan, VerificationCommand,
-    VerificationRecord)
+    VerificationRecord, ExecutionCheckpoint)
 from tracefix.storage.harness import HarnessConflict
 
 
@@ -181,10 +181,79 @@ class HarnessRuntime:
         engine.harness = self
         return state
 
+    async def stop(self, engine, state):
+        """先持久化停止意图，再向当前 execution 发送中断。"""
+        job = self.job(state)
+        if job.status not in {'CREATED', 'RUNNING'}:
+            raise HarnessConflict('当前 Job 不能停止')
+        job = self.store.request_stop(job.job_id, job.revision, scope_id=state.scope_id)
+        host = self._read(state)
+        for execution in self.store.list_executions(job.job_id, scope_id=state.scope_id):
+            if execution.status not in {'STARTING', 'RUNNING', 'INTERRUPTING'}:
+                continue
+            entry = host.get('executions', {}).get(execution.execution_id)
+            if not entry or not Path(entry.get('directory', '')).is_dir():
+                continue
+            from tracefix.execution.candidate_export import SDKWorkspace
+            workspace = SDKWorkspace.load(Path(entry['directory']), engine.workspace)
+            runner = self.runner(workspace) if callable(self.runner) else self.runner
+            if hasattr(runner, 'workspace'):
+                runner.workspace = workspace
+            interrupt = getattr(runner, 'interrupt', None)
+            if interrupt is None:
+                continue
+            receipt = interrupt(execution.execution_id, job.stop_request_id,
+                self.config.stop_grace_seconds)
+            if inspect.isawaitable(receipt):
+                receipt = await receipt
+            receipt_value = receipt.model_dump(mode='json') if hasattr(receipt, 'model_dump') else receipt
+            receipt_ref = engine.put(state, receipt_value, name='SDK停止回执')
+            host['executions'][execution.execution_id]['stop_receipt_ref'] = receipt_ref
+            self._write(state, host)
+            if not receipt.writers_stopped:
+                try:
+                    self._update_execution(state, execution, 'INTERRUPTING',
+                        stop_request_id=job.stop_request_id)
+                except HarnessConflict:
+                    pass
+        return job
+
+    def resume(self, engine, state, inspection_ref, *, owner=None):
+        """以新的 owner epoch 恢复已确认停止的同一逻辑 invocation。"""
+        job = self.job(state)
+        resumed = self.store.claim_resume(job.job_id, job.revision, owner or self.owner,
+            scope_id=state.scope_id, inspection_ref=inspection_ref)
+        return engine.changed(state, harness_stage='coding', run_status=RunStatus.RUNNING)
+
     def _update_execution(self, state, execution, status, **fields):
         return self.store.update_execution(execution.execution_id, scope_id=state.scope_id,
             expected_revision=execution.revision, owner=execution.owner,
             owner_epoch=execution.owner_epoch, status=status, **fields)
+
+    def _checkpoint(self, engine, state, session, execution, sdk_workspace, result, snapshot_ref):
+        transcript_ref = None
+        if result.transcript_ref:
+            transcript = Path(result.transcript_ref)
+            if transcript.is_file() and not transcript.is_symlink():
+                transcript_ref = engine.put(state, {'kind': 'sdk_transcript',
+                    'execution_id': execution.execution_id,
+                    'content': transcript.read_text(encoding='utf-8', errors='replace')},
+                    name='SDKtranscript')
+        cursor = 0
+        if hasattr(self.store, 'outbox_events'):
+            try:
+                cursor = len(self.store.outbox_events(state.harness_job_id, scope_id=state.scope_id))
+            except Exception:
+                cursor = 0
+        identity = self._identity(state, session)
+        checkpoint = ExecutionCheckpoint(**identity, execution_id=execution.execution_id,
+            owner_epoch=execution.owner_epoch, status=result.status,
+            workspace_snapshot_ref=snapshot_ref, transcript_ref=transcript_ref,
+            sdk_session_id=result.sdk_session_id, event_cursor=cursor,
+            stop_request_id=self.job(state).stop_request_id,
+            pending_operations=list(result.unresolved) if result.status == 'UNKNOWN' else [],
+            writers_alive=result.status == 'UNKNOWN', artifacts_consistent=True)
+        return engine.put(state, checkpoint.model_dump(mode='json'), name='SDK执行checkpoint')
 
     async def _execute(self, engine, state, role, prompt, *, output_schema=None):
         from tracefix.execution.candidate_export import SDKWorkspace
@@ -218,18 +287,26 @@ class HarnessRuntime:
         if execution.result_ref:
             result = ExecutionResult.model_validate(engine.get(state, execution.result_ref))
             return state, execution, result
-        if execution.status != 'PREPARED':
+        if execution.status not in {'PREPARED', 'STARTING'}:
             raise HarnessConflict('已有执行尚未封存；M4 恢复门禁未完成，禁止重复启动')
         directory = self._directory(state.harness_job_id) / 'sessions' / session.session_id / 'executions' / execution.execution_id
+        existing = host['executions'].get(execution.execution_id)
         prior = [entry for entry in host['executions'].values()
-                 if entry['session_id'] == session.session_id]
-        if prior:
+                 if entry['session_id'] == session.session_id and entry is not existing]
+        if existing and Path(existing['directory']).is_dir():
+            sdk_workspace = SDKWorkspace.load(Path(existing['directory']), engine.workspace)
+            prior_sdk_session = execution.sdk_session_id or existing.get('sdk_session_id')
+            if execution.status == 'STARTING' and not prior_sdk_session:
+                sdk_workspace = sdk_workspace.fork_execution(
+                    execution.execution_id + '-rebuild-' + str(execution.attempt_no))
+        elif prior:
             previous = prior[-1]
             sdk_workspace = SDKWorkspace.load(Path(previous['directory']), engine.workspace)
             sdk_workspace = sdk_workspace.fork_execution(execution.execution_id)
+            prior_sdk_session = execution.sdk_session_id or previous.get('sdk_session_id')
         else:
             sdk_workspace = SDKWorkspace.create(engine.workspace, directory)
-        prior_sdk_session = prior[-1].get('sdk_session_id') if prior else None
+            prior_sdk_session = execution.sdk_session_id
         arguments = {'execution_id': execution.execution_id, 'session_id': session.session_id,
             'input_hash': input_hash, 'role': role, 'prompt': prompt,
             'workspace': sdk_workspace.source, 'config': self.config,
@@ -248,14 +325,38 @@ class HarnessRuntime:
         runner = self.runner(sdk_workspace) if callable(self.runner) else self.runner
         if hasattr(runner, 'workspace'):
             runner.workspace = sdk_workspace
-        execution = self._update_execution(state, execution, 'STARTING',
-            workspace_ref=str(sdk_workspace.execution_dir), sdk_version=self.config.sdk_version,
-            cli_version=self.config.cli_version, model_id=self.config.model_id)
-        execution = self._update_execution(state, execution, 'RUNNING')
+        resuming = execution.status == 'STARTING'
+        if resuming:
+            inspect_execution = getattr(runner, 'inspect', None)
+            if inspect_execution is not None:
+                inspection = inspect_execution(execution.execution_id)
+                if inspect.isawaitable(inspection):
+                    inspection = await inspection
+                if getattr(inspection, 'active', False):
+                    raise HarnessConflict('恢复前检测到原 execution 仍有活动写入者')
+                if getattr(inspection, 'status', None) == 'UNKNOWN':
+                    job = self.job(state)
+                    if job.status != 'BLOCKED' or job.blocker != 'EXECUTOR_STATE_UNKNOWN':
+                        self.store.block_job(job.job_id, 'EXECUTOR_STATE_UNKNOWN', scope_id=state.scope_id,
+                            expected_revision=job.revision)
+                    raise HarnessConflict('恢复前无法确认原 execution 已停止')
+        if not resuming:
+            execution = self._update_execution(state, execution, 'STARTING',
+                workspace_ref=str(sdk_workspace.execution_dir), sdk_version=self.config.sdk_version,
+                cli_version=self.config.cli_version, model_id=self.config.model_id)
+            execution = self._update_execution(state, execution, 'RUNNING')
+        else:
+            execution = self._update_execution(state, execution, 'RUNNING',
+                workspace_ref=str(sdk_workspace.execution_dir))
         engine.event(state, 'sdk.execution.started', {'execution_id': execution.execution_id,
             'logical_invocation_id': invocation, 'owner_epoch': execution.owner_epoch})
         try:
-            result = await runner.start(request, lambda kind, payload: engine.event(state, kind, payload))
+            emit = lambda kind, payload: engine.event(state, kind, payload)
+            resume = getattr(runner, 'resume', None) if resuming and prior_sdk_session else None
+            if resume is not None:
+                result = await resume(execution.execution_id, emit=emit)
+            else:
+                result = await runner.start(request, emit)
         except BaseException:
             self._update_execution(state, execution, 'UNKNOWN')
             job = self.job(state)
@@ -263,23 +364,62 @@ class HarnessRuntime:
                                  expected_revision=job.revision)
             raise
         result = ExecutionResult.model_validate(result)
+        current_job = self.job(state)
+        if result.status == 'STOPPED' and not current_job.stop_request_id:
+            result = result.model_copy(update={'status': 'UNKNOWN', 'error_code': 'SDK_STOP_WITHOUT_INTENT'})
+        elif current_job.stop_request_id and result.status in {'SUCCEEDED', 'FAILED'}:
+            result = result.model_copy(update={'status': 'STOPPED', 'error_code': 'SDK_STOP_REQUESTED'})
+        if result.status == 'STOPPED':
+            entry = self._read(state).get('executions', {}).get(execution.execution_id, {})
+            receipt_ref = entry.get('stop_receipt_ref')
+            receipt = engine.get(state, receipt_ref) if receipt_ref else {}
+            confirmed = receipt.get('writers_stopped') is True
+            inspect_execution = getattr(runner, 'inspect', None)
+            if inspect_execution is not None:
+                inspection = inspect_execution(execution.execution_id)
+                if inspect.isawaitable(inspection):
+                    inspection = await inspection
+                confirmed = confirmed or (getattr(inspection, 'status', None) == 'STOPPED'
+                    and getattr(inspection, 'active', True) is False)
+            if not confirmed:
+                result = result.model_copy(update={'status': 'UNKNOWN',
+                    'error_code': 'SDK_STOP_WRITERS_UNCONFIRMED'})
         sdk_workspace = getattr(runner, 'workspace', sdk_workspace)
         snapshot = sdk_workspace.freeze()
         snapshot_value = snapshot.model_dump() if hasattr(snapshot, 'model_dump') else snapshot
-        snapshot_ref = engine.put(state, snapshot_value, name='执行完整快照')
-        result_ref = engine.put(state, result.model_dump(mode='json'), name='SDK执行结果')
-        execution = self._update_execution(state, execution, result.status,
-            result_ref=result_ref, sdk_session_id=result.sdk_session_id,
-            observed_usage=result.observed_usage, checkpoint_ref=snapshot_ref,
-            transcript_ref=result.transcript_ref)
+        try:
+            snapshot_ref = engine.put(state, snapshot_value, name='执行完整快照')
+            checkpoint_ref = self._checkpoint(engine, state, session, execution, sdk_workspace, result, snapshot_ref)
+            result_ref = engine.put(state, result.model_dump(mode='json'), name='SDK执行结果')
+            execution = self._update_execution(state, execution, result.status,
+                result_ref=result_ref, sdk_session_id=result.sdk_session_id,
+                observed_usage=result.observed_usage, checkpoint_ref=checkpoint_ref,
+                transcript_ref=result.transcript_ref, stop_request_id=current_job.stop_request_id,
+                event_cursor=len(self.store.outbox_events(state.harness_job_id, scope_id=state.scope_id)),
+                pending_operations=list(result.unresolved) if result.status == 'UNKNOWN' else [])
+        except BaseException as error:
+            try:
+                job = self.job(state)
+                self.store.block_job(job.job_id, 'CHECKPOINT_FLUSH_FAILED', scope_id=state.scope_id,
+                    expected_revision=job.revision)
+            except Exception:
+                pass
+            raise HarnessConflict('执行 checkpoint 或结果刷盘失败') from error
         host = self._read(state)
         host['executions'][execution.execution_id]['directory'] = str(sdk_workspace.execution_dir)
         host['executions'][execution.execution_id]['sdk_session_id'] = result.sdk_session_id
         self._write(state, host)
-        if result.status in {'UNKNOWN', 'STOPPED'}:
+        if result.status == 'STOPPED':
             job = self.job(state)
-            self.store.block_job(job.job_id, 'EXECUTOR_STATE_UNKNOWN', scope_id=state.scope_id,
-                                 expected_revision=job.revision)
+            if job.stop_request_id:
+                self.store.confirm_stopped(job.job_id, execution.checkpoint_ref, scope_id=state.scope_id,
+                    expected_revision=job.revision, session_id=session.session_id)
+            raise HarnessConflict('SDK 执行已停止，等待显式恢复')
+        if result.status == 'UNKNOWN':
+            job = self.job(state)
+            if job.status != 'BLOCKED' or job.blocker != 'EXECUTOR_STATE_UNKNOWN':
+                self.store.block_job(job.job_id, 'EXECUTOR_STATE_UNKNOWN', scope_id=state.scope_id,
+                                     expected_revision=job.revision)
             raise HarnessConflict('SDK 执行尚未确认结束，拒绝导出或接纳候选')
         return state, execution, result
 

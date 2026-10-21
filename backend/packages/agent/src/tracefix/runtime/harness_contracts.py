@@ -144,6 +144,9 @@ class SdkExecution(Contract):
     checkpoint_ref: str | None = None
     transcript_ref: str | None = None
     observed_usage: dict = Field(default_factory=dict)
+    stop_request_id: str | None = None
+    event_cursor: int = 0
+    pending_operations: list[str] = Field(default_factory=list)
 
 
 class ArtifactIdentity(Contract):
@@ -227,6 +230,8 @@ class ExecutionCheckpoint(ArtifactIdentity):
     pending_operations: list[str] = Field(default_factory=list)
     writers_alive: bool
     artifacts_consistent: bool
+    stop_request_id: str | None = None
+    stop_receipt_ref: str | None = None
 
 
 class VerificationCommand(Contract):

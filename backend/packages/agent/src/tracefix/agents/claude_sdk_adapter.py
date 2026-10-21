@@ -77,7 +77,7 @@ class StopReceipt(Contract):
     stop_request_id: str
     interrupt_sent: bool
     writers_stopped: bool = False
-    status: Literal['INTERRUPTING', 'UNKNOWN']
+    status: Literal['INTERRUPTING', 'STOPPED', 'UNKNOWN']
 
 
 class ExecutionInspection(Contract):
@@ -118,6 +118,7 @@ class ClaudeSdkAdapter:
         self._clients = {}
         self._inspections = {}
         self._results = {}
+        self._interrupts = {}
 
     def _bindings(self):
         if self._sdk is not None:
@@ -165,6 +166,7 @@ class ClaudeSdkAdapter:
         if not request.workspace.is_dir():
             raise ValueError('SDK 工作区不存在，拒绝启动')
         self._requests[request.execution_id] = request
+        self._interrupts.pop(request.execution_id, None)
         self._inspections[request.execution_id] = ExecutionInspection(
             execution_id=request.execution_id, status='STARTING', sdk_session_id=request.sdk_session_id)
         transcript = request.transcript_path or request.workspace.parent / 'transcript.jsonl'
@@ -212,7 +214,8 @@ class ClaudeSdkAdapter:
                 result.observed_usage = {'usage': terminal.usage or {},
                     'total_cost_usd': terminal.total_cost_usd, 'num_turns': terminal.num_turns}
                 reason = getattr(terminal, 'terminal_reason', None)
-                if reason in {'aborted_streaming', 'aborted_tools'}:
+                if (reason in {'aborted_streaming', 'aborted_tools'}
+                        or request.execution_id in self._interrupts):
                     result.status = 'STOPPED'
                     result.error_code = 'SDK_INTERRUPTED'
                 elif terminal.is_error or terminal.subtype != 'success':
@@ -239,10 +242,13 @@ class ClaudeSdkAdapter:
                 await client.interrupt()
             result.status, result.error_code = 'UNKNOWN', 'SDK_TIMEOUT_WRITERS_UNCONFIRMED'
         except Exception as error:
-            result.error_code = {'CLINotFoundError': 'SDK_CLI_MISSING', 'CLIConnectionError': 'SDK_CONNECTION',
-                'ProcessError': 'SDK_PROCESS', 'CLIJSONDecodeError': 'SDK_MESSAGE_INVALID'}.get(
-                    type(error).__name__, 'SDK_EXECUTION_FAILED')
-            result.unresolved = [type(error).__name__]
+            if request.execution_id in self._interrupts:
+                result.status, result.error_code = 'STOPPED', 'SDK_INTERRUPTED'
+            else:
+                result.error_code = {'CLINotFoundError': 'SDK_CLI_MISSING', 'CLIConnectionError': 'SDK_CONNECTION',
+                    'ProcessError': 'SDK_PROCESS', 'CLIJSONDecodeError': 'SDK_MESSAGE_INVALID'}.get(
+                        type(error).__name__, 'SDK_EXECUTION_FAILED')
+                result.unresolved = [type(error).__name__]
         finally:
             if client is not None:
                 try:
@@ -250,6 +256,7 @@ class ClaudeSdkAdapter:
                 except Exception:
                     result.status, result.error_code = 'UNKNOWN', 'SDK_DISCONNECT_WRITERS_UNCONFIRMED'
             self._clients.pop(request.execution_id, None)
+            self._interrupts.pop(request.execution_id, None)
             self._inspections[request.execution_id] = ExecutionInspection(execution_id=request.execution_id,
                 status=result.status, sdk_session_id=result.sdk_session_id)
         self._results[request.execution_id] = result
@@ -283,15 +290,26 @@ class ClaudeSdkAdapter:
         self._requests.pop(execution_id, None)
         return await self.start(resumed, emit)
 
-    async def interrupt(self, execution_id, stop_request_id):
+    async def interrupt(self, execution_id, stop_request_id, grace_seconds=None):
         client = self._clients.get(execution_id)
         if client is None:
             return StopReceipt(execution_id=execution_id, stop_request_id=stop_request_id,
                 interrupt_sent=False, status='UNKNOWN')
+        self._interrupts[execution_id] = stop_request_id
         await client.interrupt()
         self._inspections[execution_id].status = 'INTERRUPTING'
+        if grace_seconds is None:
+            request = self._requests.get(execution_id)
+            grace_seconds = request.config.stop_grace_seconds if request is not None else 0
+        deadline = asyncio.get_running_loop().time() + max(0, float(grace_seconds))
+        while execution_id in self._clients and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(min(0.05, max(0, deadline - asyncio.get_running_loop().time())))
+        stopped = execution_id not in self._clients
+        if stopped:
+            self._inspections[execution_id].status = 'STOPPED'
         return StopReceipt(execution_id=execution_id, stop_request_id=stop_request_id,
-            interrupt_sent=True, status='INTERRUPTING')
+            interrupt_sent=True, writers_stopped=stopped,
+            status='STOPPED' if stopped else 'INTERRUPTING')
 
     async def inspect(self, execution_id):
         inspection = self._inspections.get(execution_id)

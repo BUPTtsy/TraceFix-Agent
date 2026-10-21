@@ -340,11 +340,12 @@ class MemoryHarnessStore:
 
     def update_execution(self, execution_id, *, scope_id, expected_revision, owner, owner_epoch, status, **fields):
         current = self.get_execution(execution_id, scope_id=scope_id)
-        transitions = {'PREPARED': {'STARTING', 'FAILED'}, 'STARTING': {'RUNNING', 'FAILED', 'UNKNOWN', 'INTERRUPTING'},
-            'RUNNING': {'SUCCEEDED', 'FAILED', 'UNKNOWN', 'INTERRUPTING'}, 'INTERRUPTING': {'STOPPED', 'UNKNOWN'},
+        transitions = {'PREPARED': {'STARTING', 'FAILED'}, 'STARTING': {'RUNNING', 'FAILED', 'UNKNOWN', 'INTERRUPTING', 'STOPPED'},
+            'RUNNING': {'SUCCEEDED', 'FAILED', 'UNKNOWN', 'INTERRUPTING', 'STOPPED'}, 'INTERRUPTING': {'STOPPED', 'UNKNOWN'},
             'STOPPED': {'STARTING'}, 'SUCCEEDED': set(), 'FAILED': set(), 'UNKNOWN': set()}
         allowed = {'sdk_session_id', 'sdk_version', 'cli_version', 'model_id', 'workspace_ref', 'result_ref',
-            'checkpoint_ref', 'transcript_ref', 'observed_usage'}
+            'checkpoint_ref', 'transcript_ref', 'observed_usage', 'stop_request_id', 'event_cursor',
+            'pending_operations'}
         with self._atomic(current.job_id, scope_id):
             execution, job = self.executions[execution_id], self.jobs[current.job_id]
             self._cas(execution, expected_revision)
@@ -354,6 +355,8 @@ class MemoryHarnessStore:
                 raise HarnessConflict('执行字段或状态迁移无效')
             if job.stop_request_id and status in {'STARTING', 'RUNNING', 'SUCCEEDED'}:
                 raise HarnessConflict('停止意图已登记')
+            if status == 'STOPPED' and not job.stop_request_id:
+                raise HarnessConflict('没有已落盘的停止意图')
             updated = SdkExecution.model_validate({**execution.model_dump(), **fields,
                 'status': status, 'revision': execution.revision + 1})
             self.executions[execution_id] = updated
@@ -447,6 +450,7 @@ class MemoryHarnessStore:
             job.status, job.blocker, job.revision = 'STOPPED', None, job.revision + 1
             session.status, session.revision = 'STOPPED', session.revision + 1
             execution.status, execution.checkpoint_ref = 'STOPPED', checkpoint_ref
+            execution.stop_request_id = job.stop_request_id
             execution.revision += 1
             self._event(job, 'sdk.execution.stopped', {'execution_id': execution.execution_id})
             return job.model_copy(deep=True)
@@ -472,6 +476,8 @@ class MemoryHarnessStore:
             session.owner, session.owner_epoch, session.status = owner, job.owner_epoch, 'RUNNING'
             session.revision += 1
             execution.owner, execution.owner_epoch = owner, job.owner_epoch
+            execution.status = 'STARTING'
+            execution.stop_request_id = None
             execution.revision += 1
             if session.harness_task_id:
                 item = self.items[session.harness_task_id]
