@@ -12,6 +12,16 @@ from tracefix.model.gateway import ModelError, ModelOutputError
 from tracefix.runtime.contracts import FinishRepair, PatchProposal, Phase
 
 
+def is_sdk_coding_state(state):
+    """判断是否为原生 SDK 编码状态。
+
+    SDK 自己维护 session transcript 和 workspace checkpoint；该状态不应
+    经过 legacy repair loop 的 OpenAI 消息历史重建或宿主压缩。
+    """
+    return bool(getattr(state, 'harness_job_id', None)
+                and getattr(state, 'harness_stage', None) in {'coding', 'candidate'})
+
+
 def _session(state):
     return dict((state.loop_evidence or {}).get('repair_session') or {})
 
@@ -50,6 +60,8 @@ def _complete_history(messages):
 
 def exchange_history(engine, state, *, error=None):
     """从完整请求审计恢复原件，再补齐最后一轮响应与工具回执。"""
+    if is_sdk_coding_state(state):
+        return []
     details = getattr(error, 'details', {}) or {}
     if details.get('message_history'):
         return _complete_history(details['message_history'])
@@ -108,6 +120,8 @@ def report_summary(engine, state):
 
 
 def checkpoint_segment(engine, state, *, error=None, submitted=False, advance=True):
+    if is_sdk_coding_state(state):
+        raise RuntimeError('SDK 编码不使用 legacy repair segment checkpoint')
     history = exchange_history(engine, state, error=error)
     previous_ref = _session(state).get('history_ref')
     if not history and previous_ref:
@@ -130,6 +144,8 @@ def checkpoint_segment(engine, state, *, error=None, submitted=False, advance=Tr
 
 
 def segment_history(engine, state, context):
+    if is_sdk_coding_state(state):
+        return []
     ref = _session(state).get('history_ref')
     if not ref:
         return []
@@ -228,6 +244,8 @@ async def repair_context(engine, state):
 async def run_segment(engine, state):
     from tracefix.runtime.repair_progress import observe_repair
 
+    if is_sdk_coding_state(state):
+        raise RuntimeError('SDK 编码必须由 HarnessRuntime 执行，不能进入 legacy repair_loop')
     engine.scopes.assert_current(engine.context)
     engine.sync_guidance(state)
     engine.require_repair_rule_coverage(state)
