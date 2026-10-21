@@ -67,8 +67,7 @@ export function normalizeTask(fields: Data, projects: Data[]): Data {
     throw taskError('TASK_CONTAINS_CREDENTIALS', 'Task 不允许包含真实凭据', 400);
   const execution = fields.execution;
   if (!execution || typeof execution !== 'object' || Array.isArray(execution) ||
-      Object.keys(execution).some(key => !['executionMode', 'url', 'spec', 'repairMode', 'backend', 'coding_backend',
-        'harness_job_id', 'harness_session_id', 'harness_task_id', 'harness_stage', 'sdk_execution_id'].includes(key)))
+      Object.keys(execution).some(key => !['executionMode', 'url', 'spec', 'repairMode', 'backend', 'coding_backend'].includes(key)))
     throw taskError('INVALID_EXECUTION', '必须指定 batch 执行配置', 400);
   if (execution.executionMode !== 'batch') throw taskError('UNSUPPORTED_EXECUTION_MODE', '首版仅支持 batch 执行', 400);
   const backend = execution.backend ?? execution.coding_backend ?? 'legacy';
@@ -323,8 +322,8 @@ export class TaskLifecycle {
   checkStart(id: string, fields: Data, key?: string): void {
     this.replay('start:explicit:' + id, key, fields);
   }
-  checkResume(id: string, fields: Data, key?: string): void {
-    this.replay('resume:' + id, key, fields);
+  checkResume(id: string, fields: Data, key?: string): Data | null {
+    return this.replay('resume:' + id, key, fields);
   }
   checkCreate(fields: Data, key?: string): void {
     this.replay('create', key, fields);

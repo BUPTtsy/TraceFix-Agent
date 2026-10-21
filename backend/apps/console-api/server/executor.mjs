@@ -38,7 +38,7 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
     await bridge('task.launching', {id, runId: run.id, ownerId});
     let child;
     try {
-      child = spawn(python, [...(python === 'py' ? ['-3.12'] : []), '-m', 'tracefix.service.run', '--request-stdin'],
+      child = spawn(python, [...(python === 'py' ? ['-3.12'] : []), '-m', 'tracefix.service.run', restoring ? '--resume-stdin' : '--request-stdin'],
         {cwd: projectRoot, windowsHide: true, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'],
           env: {...process.env, TRACEFIX_CONSOLE_RUN_ID: run.id, TRACEFIX_PROCESS_CONTROL_ID: run.processControlId,
             TRACEFIX_DATA: run.dataRoot, TRACEFIX_CONSOLE_DB: run.consoleDatabasePath,
@@ -78,13 +78,27 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
           const parsed = JSON.parse(output);
           if (!overflow) result = await bridge('run.executor-result', {id: run.id, result: parsed});
         } catch {}
-        const cancelled = latest.status === 'stopping' || latest.stopRequestedAt;
+        const sdk = (latest.coding_backend || latest.execution?.backend) === 'claude_sdk';
+        const cancelled = !sdk && (latest.status === 'stopping' || latest.stopRequestedAt);
         const changes = {exitCode: code, signal, finishedAt: new Date().toISOString(), processControlId: null,
           stopRequestedAt: null, stopPreviousStatus: null,
           ...(processError ? {status: 'failed', outcome: 'INFRA_FAILURE', error: processError} :
             cancelled ? {status: 'cancelled', outcome: 'CANCELLED', error: {code: 'CANCELLED', message: '执行已取消', retryable: false}} :
               result ? result :
                 {status: 'unknown', outcome: 'UNKNOWN', error: {code: 'EXECUTOR_RESULT_MISSING', message: '执行已退出，缺少可确认的最终结果', retryable: false}})};
+        if (sdk) {
+          try {
+            const authority = await bridge('run.control', {id: run.id});
+            Object.assign(changes, {coding_backend: authority.coding_backend, control_status: authority.control_status,
+              can_stop: authority.can_stop, can_resume: authority.can_resume, resume_blockers: authority.resume_blockers,
+              harness_job_id: authority.harness_job_id, harness_session_id: authority.harness_session_id});
+            if (authority.control_status === 'STOPPED') Object.assign(changes, {status: 'stopped', outcome: 'STOPPED', error: null});
+            else if (authority.control_status === 'BLOCKED') Object.assign(changes, {status: 'blocked', outcome: 'BLOCKED'});
+          } catch {
+            Object.assign(changes, {status: 'blocked', outcome: 'BLOCKED', control_status: 'BLOCKED',
+              can_stop: false, can_resume: false, resume_blockers: ['HARNESS_AUTHORITY_UNAVAILABLE']});
+          }
+        }
         await bridge('task.finish', {id, runId: run.id, ownerId, changes});
       } catch (error) {reportError('保存执行结果失败：', error);}
       finally {owned.delete(run.id); resolveDone();}
@@ -109,6 +123,11 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
       const task = await bridge('task', {id});
       if (!task.currentRunId) return {status: 200, value: {task, run: null, replayed: true}};
       const run = await bridge('run.record', {id: task.currentRunId});
+      if ((run.coding_backend || run.execution?.backend) === 'claude_sdk') {
+        const record = await bridge('run.harness.stop', {id: run.id});
+        return {status: record.control_status === 'STOPPING' ? 202 : 200,
+          value: {task: await bridge('task', {id}), run: record, replayed: run.control_status === record.control_status}};
+      }
       if (!active.has(run.status)) return {status: 200, value: {task, run, replayed: true}};
       if (run.status === 'stopping') return {status: 202, value: {task, run, replayed: true}};
       const entry = owned.get(run.id);

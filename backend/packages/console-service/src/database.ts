@@ -23,7 +23,8 @@ export const controlProjection = (record: Record<string, any>) => {
   const backend = codingBackend(record);
   const active = ['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping'];
   const blockers = Array.isArray(record.resume_blockers) ? record.resume_blockers : [];
-  const canStop = active.includes(String(record.status).toLowerCase()) && String(record.status).toLowerCase() !== 'stopping';
+  const canStop = backend === 'claude_sdk' ? record.can_stop === true :
+    active.includes(String(record.status).toLowerCase()) && String(record.status).toLowerCase() !== 'stopping';
   const canResume = backend === 'claude_sdk' && record.control_status === 'STOPPED' && record.can_resume === true &&
     !blockers.length && record.status !== 'unknown';
   return {

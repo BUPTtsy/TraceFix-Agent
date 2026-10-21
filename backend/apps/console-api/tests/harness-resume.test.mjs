@@ -4,12 +4,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {build} from 'esbuild';
+import {EventEmitter} from 'node:events';
+import {PassThrough} from 'node:stream';
 import {createApi} from '../server/api.mjs';
+import {createExecutor} from '../server/executor.mjs';
 
 const bundle = await build({stdin: {contents: `export {ConsoleDatabase, controlProjection} from './src/database.ts';
-export {TaskLifecycle} from './src/task-lifecycle.ts';`, resolveDir: path.resolve('backend/packages/console-service')},
+export {TaskLifecycle, normalizeTask} from './src/task-lifecycle.ts';
+export {createConsoleService} from './src/dispatch.ts';`, resolveDir: path.resolve('backend/packages/console-service')},
   bundle: true, platform: 'node', format: 'esm', write: false});
-const {ConsoleDatabase, controlProjection, TaskLifecycle} = await import('data:text/javascript;base64,' + Buffer.from(bundle.outputFiles[0].text).toString('base64'));
+const {ConsoleDatabase, controlProjection, TaskLifecycle, normalizeTask, createConsoleService} = await import('data:text/javascript;base64,' + Buffer.from(bundle.outputFiles[0].text).toString('base64'));
 
 test('resume HTTP 正文严格为空对象，未知提示字段返回 400', async context => {
   const calls = [];
@@ -52,4 +56,82 @@ test('控制投影不从 cancelled/failed/UNKNOWN 猜测恢复能力', () => {
     assert.equal(controlProjection({status, coding_backend: 'claude_sdk'}).can_resume, false);
   assert.equal(controlProjection({status: 'stopped', coding_backend: 'claude_sdk', control_status: 'STOPPED', can_resume: true}).can_resume, true);
   assert.equal(controlProjection({status: 'stopped', coding_backend: 'claude_sdk', control_status: 'STOPPED', can_resume: true, resume_blockers: ['UNKNOWN_OPERATION']}).can_resume, false);
+});
+
+test('Task 定义拒绝伪造权威 Job 和 Session 字段', () => {
+  for (const field of ['harness_job_id', 'harness_session_id', 'harness_task_id', 'harness_stage', 'sdk_execution_id'])
+    assert.throws(() => normalizeTask({projectId: 'scope', mode: 'repair', goal: '修复固定缺陷问题',
+      execution: {executionMode: 'batch', backend: 'claude_sdk', [field]: 'forged'}}, [{id: 'scope', ready: true}]),
+      error => error.code === 'INVALID_EXECUTION');
+});
+
+test('控制视图刷新权威记录，恢复先核验 PG 且同键重放不再核验', context => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tf-authority-'));
+  const projectsPath = path.join(root, 'projects.yaml'), databasePath = path.join(root, 'console.sqlite3');
+  fs.writeFileSync(projectsPath, JSON.stringify({projects: []}));
+  let state = 'STOPPED';
+  const calls = [];
+  const service = createConsoleService({projectsPath, databasePath, dataRoot: root,
+    harnessControl(operation, fields) {
+      calls.push({operation, fields});
+      if (operation === 'resume.check' && state !== 'STOPPED') throw Object.assign(new Error('冲突'), {status: 409, code: 'RESUME_CONFLICT'});
+      return {coding_backend: 'claude_sdk', control_status: state, can_stop: state === 'RUNNING',
+        can_resume: state === 'STOPPED', resume_blockers: [], harness_job_id: 'authority-job', harness_session_id: 'authority-session'};
+    }});
+  const database = new ConsoleDatabase(databasePath);
+  const now = new Date().toISOString();
+  database.updateRun('run', {id: 'run', projectId: 'scope', taskId: 'task', status: 'stopped', coding_backend: 'claude_sdk',
+    control_status: 'RUNNING', can_resume: false, dataRoot: root}, true);
+  database.db.prepare('INSERT INTO console_tasks VALUES (?,?)').run('task', JSON.stringify({id: 'task',
+    definition: {execution: {backend: 'claude_sdk'}}, status: 'stopped', currentRunId: 'run', runIds: ['run'],
+    version: 1, createdAt: now, updatedAt: now}));
+  context.after(() => {database.db.close(); service.close();});
+  assert.equal(service('task', {id: 'task'}).harness_job_id, 'authority-job');
+  assert.equal(service('run', {id: 'run'}).can_resume, true);
+  const value = service('task.resume', {id: 'task', body: {}, key: 'same', ownerId: 'owner'});
+  assert.equal(value.run.id, 'run');
+  assert.equal(calls.at(-1).operation, 'resume.check');
+  assert.deepEqual(calls.at(-1).fields, {task_id: 'task', scope_id: 'scope', job_id: 'authority-job'});
+  state = 'RUNNING';
+  const count = calls.length;
+  assert.equal(service('task.resume', {id: 'task', body: {}, key: 'same', ownerId: 'owner'}).replayed, true);
+  assert.equal(calls.length, count);
+  assert.throws(() => service('task.resume', {id: 'task', body: {}, key: 'other', ownerId: 'owner'}),
+    error => error.code === 'RESUME_CONFLICT');
+});
+
+test('SDK executor 用恢复入口并通过权威桥停止，收到 STOPPED 才标记恢复能力', async () => {
+  let task = {id: 'task', currentRunId: 'run', definition: {projectId: 'scope', mode: 'repair', goal: '修复固定缺陷', execution: {backend: 'claude_sdk'}}};
+  let run = {id: 'run', projectId: 'scope', taskId: 'task', status: 'stopped', coding_backend: 'claude_sdk', control_status: 'STOPPED'};
+  const calls = [];
+  const bridge = async (operation, fields) => {
+    calls.push(operation);
+    if (operation === 'task.resume') {run = {...run, status: 'starting', control_status: 'STARTING'}; return {task, run, replayed: false};}
+    if (operation === 'task') return task;
+    if (operation === 'run' || operation === 'run.record') return run;
+    if (operation === 'run.harness.stop') {run = {...run, control_status: 'STOPPING'}; return run;}
+    if (operation === 'run.control') return {...run, control_status: 'STOPPED', can_resume: true, can_stop: false, resume_blockers: []};
+    if (operation === 'task.finish') {run = {...run, ...fields.changes}; return {task, run};}
+  };
+  let child, args, input = '', killed = false;
+  const controller = createExecutor({bridge, projectRoot: process.cwd(), pythonCommand: 'test-python',
+    spawn(command, arguments_) {
+      args = arguments_; child = new EventEmitter(); child.pid = 12345;
+      child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
+      child.stdin.on('data', chunk => {input += chunk;});
+      child.kill = () => {killed = true;};
+      process.nextTick(() => child.emit('spawn'));
+      return child;
+    }, terminate: async () => {killed = true;}, reportError: error => {throw error;}});
+  await controller.resume('task', {}, 'resume');
+  assert.ok(args.includes('--resume-stdin'));
+  assert.equal(JSON.parse(input).execution.backend, 'claude_sdk');
+  assert.equal(Object.hasOwn(JSON.parse(input), 'resume'), false);
+  assert.equal((await controller.stop('task')).status, 202);
+  assert.equal(killed, false);
+  assert.ok(calls.includes('run.harness.stop'));
+  child.emit('close', 0, null);
+  await controller.drain();
+  assert.equal(run.status, 'stopped');
+  assert.equal(run.can_resume, true);
 });

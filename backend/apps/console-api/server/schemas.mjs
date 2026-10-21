@@ -62,7 +62,6 @@ export const taskInput = {type: 'object', additionalProperties: false, required:
     execution: {type: 'object', additionalProperties: false, required: ['executionMode'], properties: {
       executionMode: {type: 'string', enum: ['batch']}, backend: {type: 'string', enum: ['legacy', 'claude_sdk']},
       coding_backend: {type: 'string', enum: ['legacy', 'claude_sdk']},
-      harness_job_id: text, harness_session_id: text, harness_task_id: text, harness_stage: text, sdk_execution_id: text,
       url: {type: 'string', format: 'uri', maxLength: 2048},
       repairMode: {type: 'string', enum: ['hybrid', 'pipeline']},
       spec: testSpec}},

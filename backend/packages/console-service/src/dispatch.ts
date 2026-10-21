@@ -9,10 +9,11 @@ import {RuleDatabase} from './rules.js';
 import {classifyGuidance, guidanceUnsafe} from './guidance.js';
 import {TaskLifecycle, normalizeTask, taskError} from './task-lifecycle.js';
 import {resultView, executorResult} from './results.js';
+import {harnessControl, type HarnessControlOptions, type HarnessControlOperation} from './harness-control.js';
 
 type Data = Record<string, any>;
 
-export interface ConsoleOptions extends RepositoryControlOptions {projectsPath?: string; databasePath?: string; displayRoot?: string}
+export interface ConsoleOptions extends RepositoryControlOptions, HarnessControlOptions {projectsPath?: string; databasePath?: string; displayRoot?: string}
 
 export function createConsoleService(options: ConsoleOptions = {}) {
   const projectsPath = path.resolve(options.projectsPath || process.env.TRACEFIX_PROJECTS || 'profiles/projects.yaml');
@@ -26,8 +27,28 @@ export function createConsoleService(options: ConsoleOptions = {}) {
   const repository = (operation: string, fields: Data = {}) => repositoryControl(projectsPath, operation, fields,
     {...options, engineRoot: options.engineRoot || options.displayRoot, dataRoot});
   const artifactRoot = (run: Data) => path.join(run.dataRoot || dataRoot, 'artifacts');
+  const refreshControl = (run: Data, operation: HarnessControlOperation = 'view') => {
+    if (codingBackend(run) !== 'claude_sdk') return run;
+    if (!run.taskId) throw taskError('HARNESS_TASK_REQUIRED', 'SDK 控制必须绑定 Task', 409);
+    let authority;
+    try {
+      authority = harnessControl(operation, {task_id: run.taskId, scope_id: run.projectId,
+        ...(run.harness_job_id ? {job_id: run.harness_job_id} : {})}, {...options,
+        engineRoot: options.engineRoot || options.displayRoot, dataRoot: run.dataRoot || dataRoot,
+        databasePath: database.filename});
+    } catch (error) {
+      if (operation !== 'view' || (error as {status?: number}).status !== 404) throw error;
+      authority = {coding_backend: 'claude_sdk', control_status: 'BLOCKED', can_resume: false,
+        can_stop: false, resume_blockers: ['HARNESS_JOB_NOT_BOUND']};
+    }
+    const {coding_backend, control_status, can_resume, can_stop, resume_blockers,
+      harness_job_id, harness_session_id, current_run_id} = authority;
+    return database.updateRun(run.id, {coding_backend, control_status, can_resume, can_stop, resume_blockers,
+      ...(harness_job_id ? {harness_job_id} : {}), ...(harness_session_id ? {harness_session_id} : {}),
+      ...(current_run_id ? {agentRunId: current_run_id} : {})});
+  };
   const taskView = (task: Data) => {
-    const run = task.currentRunId ? database.run(task.currentRunId) : null;
+    const run = task.currentRunId ? refreshControl(database.run(task.currentRunId)) : null;
     return {...task, ...(run ? controlProjection(run) : {
       coding_backend: task.definition?.execution?.backend || 'legacy', control_status: String(task.status || '').toUpperCase(),
       can_stop: false, can_resume: false, resume_blockers: [], harness_job_id: null, harness_session_id: null,
@@ -81,7 +102,7 @@ export function createConsoleService(options: ConsoleOptions = {}) {
   };
 
   function runView(id: string): Data {
-    const record = database.run(id);
+    const record = refreshControl(database.run(id));
     const index = record.agentRunId ? artifactIndex(artifactRoot(record), record.projectId, record.agentRunId) : {};
     const allowed = record.agentRunId ? evidenceClosure(artifactRoot(record), record.projectId,
       record.agentRunId, record.reportRef, index) : new Set<string>();
@@ -138,7 +159,16 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     if (operation === 'task.update') return tasks.update(fields.id, fields.body);
     if (operation === 'task.start') return tasks.start(fields.id, fields.body || {}, fields.key, fields.ownerId, fields.namespace, fields.expectedVersion);
     if (operation === 'task.start.check') return tasks.checkStart(fields.id, fields.body || {}, fields.key);
-    if (operation === 'task.resume') return tasks.resume(fields.id, fields.body || {}, fields.key, fields.ownerId);
+    if (operation === 'task.resume') {
+      const replayed = tasks.checkResume(fields.id, fields.body || {}, fields.key);
+      if (replayed) return replayed;
+      if (!fields.body || typeof fields.body !== 'object' || Array.isArray(fields.body) || Object.keys(fields.body).length)
+        throw taskError('INVALID_RESUME', 'resume 正文必须为空对象', 400);
+      const task = tasks.task(fields.id);
+      if (!task.currentRunId) throw taskError('RESUME_UNAVAILABLE', 'Task 没有可恢复的 Run', 409);
+      refreshControl(database.run(task.currentRunId), 'resume.check');
+      return tasks.resume(fields.id, fields.body, fields.key, fields.ownerId);
+    }
     if (operation === 'task.resume.check') return tasks.checkResume(fields.id, fields.body || {}, fields.key);
     if (operation === 'task.launching') return tasks.launchIntent(fields.id, fields.runId, fields.ownerId);
     if (operation === 'task.spawned') return tasks.spawned(fields.id, fields.runId, fields.ownerId, fields.pid);
@@ -194,10 +224,12 @@ export function createConsoleService(options: ConsoleOptions = {}) {
         runCount: runs.filter(run => run.projectId === project.id).length,
         documentCount: documents.filter(document => document.projectId === null || document.projectId === project.id).length}));
     }
-    if (operation === 'runs') return database.runs(fields.projectId).map(({logs, ...run}) =>
+    if (operation === 'runs') return database.runs(fields.projectId).map(run => refreshControl(run)).map(({logs, ...run}) =>
       ({...run, ...controlProjection(run), canContinue: canContinue(run.status, run.outcome)}));
     if (operation === 'run') return runView(fields.id);
     if (operation === 'run.record') return database.run(fields.id);
+    if (operation === 'run.control') return refreshControl(database.run(fields.id));
+    if (operation === 'run.harness.stop') return refreshControl(database.run(fields.id), 'stop');
     if (operation === 'run.executor-result') {
       const record = database.run(fields.id);
       const view = fields.result?.report_ref ? runView(fields.id) : undefined;
@@ -305,10 +337,6 @@ export function createConsoleService(options: ConsoleOptions = {}) {
       const record = {id: runId, projectId: project.id, mode: fields.mode,
         ...(fields.execution ? {execution: {...fields.execution}, executionMode: fields.execution.executionMode} : {}),
         coding_backend: backend,
-        ...(fields.execution?.harness_job_id ? {harness_job_id: fields.execution.harness_job_id} : {}),
-        ...(fields.execution?.harness_session_id ? {harness_session_id: fields.execution.harness_session_id} : {}),
-        ...(fields.execution?.harness_task_id ? {harness_task_id: fields.execution.harness_task_id} : {}),
-        ...(fields.execution?.harness_stage ? {harness_stage: fields.execution.harness_stage} : {}),
         ...(fields.execution?.sdk_execution_id ? {sdk_execution_id: fields.execution.sdk_execution_id} : {}),
         profile: frozen?.profile_path || project.profile, registry: frozen?.projects_path || project.registry,
         repositorySnapshot: frozen,
