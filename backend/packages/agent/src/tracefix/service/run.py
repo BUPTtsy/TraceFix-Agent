@@ -36,7 +36,7 @@ from tracefix.storage.artifacts import redact
 MAX_REQUEST_BYTES = 2_097_152
 
 
-async def watch_service_stop(documents, request, process_control_id, task, *, interval=0.2):
+async def watch_service_stop(documents, request, process_control_id, task, *, interval=0.2, session=None):
     while True:
         try:
             record = await asyncio.to_thread(documents.run, request.run_id)
@@ -46,7 +46,10 @@ async def watch_service_stop(documents, request, process_control_id, task, *, in
                 and record.get('projectId') == request.repo_id
                 and record.get('processControlId') == process_control_id
                 and record.get('status') == 'stopping' and record.get('stopRequestedAt')):
-            task.cancel()
+            if session is not None and session.engine is not None and session.state().harness_job_id:
+                await session.stop()
+            else:
+                task.cancel()
             return
         await asyncio.sleep(interval)
 
@@ -164,6 +167,7 @@ async def execute_request(request, settings, *, session_factory=Session,
             profile=snapshot['profile_path'], plain=True, goal=request.goal, mode=request.mode,
             execution_mode='batch', data=str(settings.data_root), console_db=str(settings.console_db),
             repair_mode=request.execution.repair_mode,
+            coding_backend=request.execution.backend,
             database_url=settings.database_url, run=True, url=url, spec=None,
             parent_run=None, rule=request.additional_rule_ids, skills='skills')
         stage = 'configuration_missing'
@@ -179,7 +183,7 @@ async def execute_request(request, settings, *, session_factory=Session,
         process_control_id = os.getenv('TRACEFIX_PROCESS_CONTROL_ID')
         if process_control_id:
             stop_watcher = asyncio.create_task(watch_service_stop(DocumentLibrary(settings.console_db), request,
-                process_control_id, asyncio.current_task()))
+                process_control_id, asyncio.current_task(), session=session))
         stage = 'infrastructure_error'
         await session.ensure_runtime()
         require_new_internal_run(session.store, request.run_id)
@@ -233,12 +237,16 @@ async def execute_request(request, settings, *, session_factory=Session,
         session.task = asyncio.create_task(session.drive(state))
         await session.task
         latest = session.state()
-        if latest.run_id != request.run_id or latest.run_status not in TERMINAL_STATUSES:
+        if latest.harness_job_id:
+            job = session.engine.harness.job(latest)
+            result = sdk_result(request, session, latest, job)
+        elif latest.run_id != request.run_id or latest.run_status not in TERMINAL_STATUSES:
             raise ServiceError('nonterminal_run', '服务 batch 未到达绑定 Run 的终态')
-        services.require_context_consumed()
-        latest = preserve_report_diff(latest, session.artifacts, session.engine.workspace)
-        session.store.save(latest)
-        result = serialize_result(latest, session.artifacts, task_id=request.task_id, repo_id=request.repo_id)
+        else:
+            services.require_context_consumed()
+            latest = preserve_report_diff(latest, session.artifacts, session.engine.workspace)
+            session.store.save(latest)
+            result = serialize_result(latest, session.artifacts, task_id=request.task_id, repo_id=request.repo_id)
     except BaseException as error:
         if not isinstance(error, (Exception, asyncio.CancelledError)):
             raise
@@ -251,7 +259,20 @@ async def execute_request(request, settings, *, session_factory=Session,
                 documents, _ = claim_console(request, settings)
             except Exception:
                 pass
-        if session is not None and state is not None and code != 'run_identity_conflict':
+        if session is not None and state is not None and session.engine is not None and session.state().harness_job_id:
+            latest = session.state()
+            if cancelled:
+                try:
+                    await session.stop()
+                    result = harness_result(request, latest, session.engine.harness.job(latest))
+                except Exception:
+                    result = block_sdk_result(request, session, 'STOP_UNCONFIRMED')
+            else:
+                job = session.engine.harness.job(latest)
+                result = (harness_result(request, latest, job)
+                    if job.status in {'STOPPING', 'STOPPED', 'BLOCKED'}
+                    else block_sdk_result(request, session, 'SERVICE_EXECUTION_FAILED'))
+        elif session is not None and state is not None and code != 'run_identity_conflict':
             try:
                 failed = await terminal_failure(session, state, code, cancelled=cancelled)
                 if failed is not None:
@@ -266,10 +287,16 @@ async def execute_request(request, settings, *, session_factory=Session,
                 await stop_watcher
             except asyncio.CancelledError:
                 pass
-        await services.aclose()
+        try:
+            await services.aclose()
+        except Exception:
+            services.cleanup_errors.append({'code': 'service_close_failed'})
         if services.cleanup_errors:
-            result = failure_result(**identity, code='cleanup_failed')
-            if session is not None and state is not None:
+            if result.get('coding_backend') == 'claude_sdk':
+                result = block_sdk_result(request, session, 'CLEANUP_FAILED')
+            else:
+                result = failure_result(**identity, code='cleanup_failed')
+            if session is not None and state is not None and result.get('coding_backend') != 'claude_sdk':
                 try:
                     failed = await terminal_failure(session, state, 'cleanup_failed')
                     failed = preserve_report_diff(failed, session.artifacts, session.engine.workspace)
@@ -279,7 +306,8 @@ async def execute_request(request, settings, *, session_factory=Session,
                 except Exception:
                     pass
             result['cleanup_errors'] = services.cleanup_errors
-        if (session is not None and result.get('outcome') == 'FIX_VERIFIED'
+        if (session is not None and result.get('coding_backend') != 'claude_sdk'
+                and result.get('outcome') == 'FIX_VERIFIED'
                 and result.get('run_status') == 'COMPLETED' and result.get('patch_verification') == 'verified'):
             from tracefix.runtime.test_edit_approval import verified_test_edit_files
             try:
@@ -307,26 +335,182 @@ async def execute_request(request, settings, *, session_factory=Session,
         try:
             await resources.aclose()
         except Exception:
-            if result.get('publication') is not None:
+            if result.get('coding_backend') == 'claude_sdk':
+                result = block_sdk_result(request, session, 'RUNTIME_CLOSE_FAILED')
+            elif result.get('publication') is not None:
                 result.setdefault('cleanup_errors', []).append({'code': 'runtime_close_failed'})
             else:
                 result = failure_result(**identity, code='runtime_close_failed')
         if documents is not None:
             try:
-                documents.update_run(request.run_id, {'status': result['run_status'].lower(),
+                documents.update_run(request.run_id, {'status': result.get('control_status', result['run_status']).lower(),
+                    **{key: result[key] for key in ('coding_backend', 'control_status', 'can_resume',
+                        'resume_blockers', 'harness_job_id', 'harness_session_id') if key in result},
                     'repairMode': result.get('repair_mode'),
                     'repairModeRequested': result.get('repair_mode_requested'),
                     'repairModeReason': result.get('repair_mode_reason'),
-                    'outcome': result['outcome'], 'phase': 'FINALIZE', 'reportRef': result['report_ref'],
-                    'error': result['error'], 'finishedAt': timestamp(), 'pid': None,
+                    'outcome': result['outcome'], 'phase': ('FINALIZE' if result.get('terminal')
+                        else str(session.state().phase)), 'reportRef': result['report_ref'],
+                    'error': result['error'], 'finishedAt': timestamp() if result.get('terminal') else None,
+                    'pid': None,
                     'publication': result.get('publication')})
             except Exception:
-                result.update(run_status='FAILED', outcome='INFRA_FAILURE', error={'code': 'run_index_failed'})
+                if result.get('coding_backend') == 'claude_sdk':
+                    result = block_sdk_result(request, session, 'RUN_INDEX_FAILED')
+                else:
+                    result.update(run_status='FAILED', outcome='INFRA_FAILURE', error={'code': 'run_index_failed'})
     return safe_result(result, settings)
 
 
-async def run_with_signals(request, settings):
-    task = asyncio.create_task(execute_request(request, settings))
+def harness_result(request, state, job):
+    result = failure_result(task_id=request.task_id, run_id=request.run_id, repo_id=request.repo_id,
+        code='harness_' + job.status.lower())
+    result.update(run_status='PAUSED', outcome=None, terminal=False, coding_backend='claude_sdk',
+        control_status=job.status, can_resume=False, resume_blockers=[job.blocker] if job.blocker else [],
+        harness_job_id=job.job_id, harness_session_id=state.harness_session_id, current_run_id=state.run_id)
+    return result
+
+
+def sdk_result(request, session, state, job):
+    if job.status != 'COMPLETED' or state.run_status not in TERMINAL_STATUSES:
+        return harness_result(request, state, job)
+    state = preserve_report_diff(state, session.artifacts, session.engine.workspace)
+    session.store.save(state)
+    result = serialize_result(state, session.artifacts, task_id=request.task_id, repo_id=request.repo_id)
+    result.update(run_id=request.run_id, current_run_id=state.run_id, coding_backend='claude_sdk',
+        harness_job_id=job.job_id, harness_session_id=state.harness_session_id,
+        control_status=job.status, can_resume=False, resume_blockers=[])
+    return result
+
+
+def block_sdk_result(request, session, blocker):
+    state = session.state()
+    runtime = session.engine.harness
+    job = runtime.job(state)
+    try:
+        job = runtime.store.block_job(job.job_id, blocker, scope_id=state.scope_id,
+            expected_revision=job.revision)
+    except Exception:
+        result = harness_result(request, state, job)
+        result.update(control_status='BLOCKED', resume_blockers=[blocker, 'BLOCK_PERSIST_FAILED'])
+        return result
+    return harness_result(request, state, job)
+
+
+async def restore_run_services(request, settings, session, state, *, services_factory=RunServices):
+    services = services_factory(request, settings)
+    if state.repair_source:
+        from tracefix.runtime.finding_acceptance import FrozenFindingAcceptance
+        from tracefix.runtime.harness_finding import _child_service
+        if not state.finding_acceptance_ref:
+            raise ServiceError('finding_acceptance_invalid', 'SDK 恢复缺少冻结 Finding 验收')
+        frozen = FrozenFindingAcceptance(**session.artifacts.json(state.scope_id,
+            state.run_id, state.finding_acceptance_ref))
+        if frozen.acceptance_hash != state.finding_acceptance_hash:
+            raise ServiceError('finding_acceptance_invalid', 'SDK 恢复 Finding 验收摘要不匹配')
+        source = session.artifacts.json(state.scope_id, state.run_id, state.repo_snapshot_ref)
+        services = _child_service(SimpleNamespace(artifacts=session.artifacts), services, state, source, frozen)
+        services.finding_acceptance.reproduction_ref = state.finding_reproduction_ref
+        services.finding_acceptance.verification_ref = state.finding_verification_ref
+    else:
+        services.run_id = state.run_id
+        services.bind_session(session)
+    try:
+        await services.prepare()
+    except BaseException:
+        try:
+            await services.aclose()
+        except Exception:
+            pass
+        raise
+    return services
+
+
+async def execute_resume_request(request, settings):
+    from tracefix.harness_control import ControlIdentity, HarnessControl
+    from tracefix.storage.harness import PostgresHarnessStore
+    resources = AsyncExitStack()
+    session, services, state = None, None, None
+    result = failure_result(task_id=request.task_id, run_id=request.run_id, repo_id=request.repo_id,
+        code='harness_resume_conflict')
+    try:
+        snapshot = validate_snapshot(request, settings)
+        args = SimpleNamespace(project=request.repo_id, projects=snapshot['projects_path'],
+            profile=snapshot['profile_path'], plain=True, goal=request.goal, mode=request.mode,
+            execution_mode='batch', data=str(settings.data_root), console_db=str(settings.console_db),
+            database_url=settings.database_url, repair_mode=request.execution.repair_mode,
+            run=True, url=None, spec=None, parent_run=None, rule=request.additional_rule_ids)
+        session = Session(args, None, None)
+        session.runtime_stack = resources
+        await session.ensure_runtime()
+        authority = PostgresHarnessStore(session.store, session.artifacts)
+        control = HarnessControl(session.store, session.artifacts, settings.data_root, authority=authority)
+        job = control.job(ControlIdentity(task_id=request.task_id, scope_id=request.repo_id,
+            run_id=request.run_id))
+        state = control.state(job)
+        initializer = next((item for item in authority.list_sessions(job.job_id, scope_id=request.repo_id)
+            if item.kind == 'initializer'), None)
+        if (state.goal != request.goal or state.scope_id != request.repo_id
+                or state.mode != request.mode or job.console_task_id != request.task_id
+                or state.job_id != request.task_id or initializer is None
+                or initializer.run_id != request.run_id):
+            raise ServiceError('run_identity_conflict', '恢复请求与冻结目标不一致')
+        session.console_run_id = request.run_id
+        services = await restore_run_services(request, settings, session, state)
+        session.runtime_services = services
+        await session.restore_harness(state)
+        session.engine.runtime_services = services
+        if services.session is not session:
+            services.session.engine = session.engine
+        library = session.engine.rule_library
+        session.engine.rule_library = RunBoundFindings(
+            library.library if isinstance(library, RunBoundFindings) else library, services)
+        watcher = asyncio.create_task(watch_service_stop(session.documents, request,
+            os.environ.get('TRACEFIX_PROCESS_CONTROL_ID'), session.task, session=session))
+        try:
+            await session.task
+        finally:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+        latest = session.state()
+        job = session.engine.harness.job(latest)
+        result = sdk_result(request, session, latest, job)
+    except (Exception, asyncio.CancelledError) as error:
+        if session is not None and session.engine is not None and state is not None:
+            if isinstance(error, asyncio.CancelledError):
+                try:
+                    await session.stop()
+                    result = harness_result(request, session.state(), session.engine.harness.job(session.state()))
+                except Exception:
+                    result = block_sdk_result(request, session, 'STOP_UNCONFIRMED')
+            else:
+                result = block_sdk_result(request, session, 'SERVICE_RESUME_FAILED')
+        else:
+            result = failure_result(task_id=request.task_id, run_id=request.run_id,
+                repo_id=request.repo_id, code=getattr(error, 'code', 'harness_resume_conflict'))
+    finally:
+        closers = [services.aclose] if services is not None else []
+        if session is not None and session.engine is not None:
+            closers.extend([session.engine.browser.close, session.engine.runner.close])
+        closers.append(resources.aclose)
+        cleanup_failed = False
+        for close in closers:
+            try:
+                await close()
+            except Exception:
+                cleanup_failed = True
+        if cleanup_failed or services is not None and services.cleanup_errors:
+            if session is not None and session.engine is not None and state is not None:
+                result = block_sdk_result(request, session, 'RUNTIME_CLOSE_FAILED')
+            else:
+                result = failure_result(task_id=request.task_id, run_id=request.run_id,
+                    repo_id=request.repo_id, code='runtime_close_failed')
+    return safe_result(result, settings)
+
+
+async def run_with_signals(request, settings, *, restoring=False):
+    task = asyncio.create_task(execute_resume_request(request, settings) if restoring
+        else execute_request(request, settings))
     loop = asyncio.get_running_loop()
     previous = {}
     for name in ('SIGTERM', 'SIGINT'):
@@ -349,8 +533,10 @@ def main(argv=None):
         with redirect_stdout(discarded), redirect_stderr(discarded):
             try:
                 parser = argparse.ArgumentParser()
-                parser.add_argument('--request-stdin', action='store_true', required=True)
-                parser.parse_args(argv)
+                inputs = parser.add_mutually_exclusive_group(required=True)
+                inputs.add_argument('--request-stdin', action='store_true')
+                inputs.add_argument('--resume-stdin', action='store_true')
+                options = parser.parse_args(argv)
                 payload = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
                 if len(payload) > MAX_REQUEST_BYTES:
                     raise ValueError
@@ -358,7 +544,9 @@ def main(argv=None):
                 result = failure_result(task_id=request.task_id, run_id=request.run_id,
                                         repo_id=request.repo_id, code='configuration_missing')
                 settings = ServiceSettings.from_environment()
-                result = asyncio.run(run_with_signals(request, settings))
+                operation = (run_with_signals(request, settings, restoring=True) if options.resume_stdin
+                    else run_with_signals(request, settings))
+                result = asyncio.run(operation)
             except (ValidationError, ValueError, SystemExit):
                 pass
             except ServiceError as error:
