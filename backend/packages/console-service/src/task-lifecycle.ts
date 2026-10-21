@@ -1,9 +1,10 @@
 import {createHash, randomUUID} from 'node:crypto';
-import {ConsoleDatabase, DataError, timestamp} from './database.js';
+import {ConsoleDatabase, DataError, codingBackend, timestamp} from './database.js';
 import findingAcceptanceSchema from '../../agent/src/tracefix/service/finding_acceptance.schema.json';
 
 type Data = Record<string, any>;
 const active = new Set(['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping']);
+const resumable = new Set(['cancelled', 'abnormal', 'failed', 'stopped']);
 export const taskError = (code: string, message: string, status = 409, retryable = false) =>
   Object.assign(new DataError(message, status), {code, retryable});
 
@@ -66,9 +67,14 @@ export function normalizeTask(fields: Data, projects: Data[]): Data {
     throw taskError('TASK_CONTAINS_CREDENTIALS', 'Task 不允许包含真实凭据', 400);
   const execution = fields.execution;
   if (!execution || typeof execution !== 'object' || Array.isArray(execution) ||
-      Object.keys(execution).some(key => !['executionMode', 'url', 'spec', 'repairMode'].includes(key)))
+      Object.keys(execution).some(key => !['executionMode', 'url', 'spec', 'repairMode', 'backend', 'coding_backend',
+        'harness_job_id', 'harness_session_id', 'harness_task_id', 'harness_stage', 'sdk_execution_id'].includes(key)))
     throw taskError('INVALID_EXECUTION', '必须指定 batch 执行配置', 400);
   if (execution.executionMode !== 'batch') throw taskError('UNSUPPORTED_EXECUTION_MODE', '首版仅支持 batch 执行', 400);
+  const backend = execution.backend ?? execution.coding_backend ?? 'legacy';
+  if (!['legacy', 'claude_sdk'].includes(backend)) throw taskError('INVALID_CODING_BACKEND', 'coding backend 必须是 legacy 或 claude_sdk', 400);
+  if (execution.backend !== undefined && execution.coding_backend !== undefined && execution.backend !== execution.coding_backend)
+    throw taskError('INVALID_CODING_BACKEND', 'backend 与 coding_backend 不一致', 400);
   if (execution.repairMode !== undefined && !['hybrid', 'pipeline'].includes(execution.repairMode))
     throw taskError('INVALID_REPAIR_MODE', 'repairMode 必须是 hybrid 或 pipeline', 400);
   if (execution.url !== undefined) {
@@ -152,7 +158,10 @@ export function normalizeTask(fields: Data, projects: Data[]): Data {
   }
   if (fields.create_and_start !== undefined && typeof fields.create_and_start !== 'boolean')
     throw taskError('INVALID_TASK', 'create_and_start 必须是布尔值', 400);
-  return {projectId: project.id, mode: fields.mode, goal: fields.goal.trim(), execution: {...execution},
+  const normalizedExecution = {...execution};
+  if (execution.backend !== undefined || execution.coding_backend !== undefined) normalizedExecution.backend = backend;
+  delete normalizedExecution.coding_backend;
+  return {projectId: project.id, mode: fields.mode, goal: fields.goal.trim(), execution: normalizedExecution,
     additionalRuleIds, source_run_id: fields.source_run_id ?? null, source_finding_ids: sourceFindingIds,
     github_reads: reads, ...(fields.finding_acceptance !== undefined ? {finding_acceptance: fields.finding_acceptance} : {})};
 }
@@ -279,8 +288,43 @@ export class TaskLifecycle {
       return value;
     });
   }
+  resume(id: string, fields: Data, key: string | undefined, ownerId: string): Data {
+    return this.store.transaction(() => {
+      const scope = 'resume:' + id;
+      const previous = this.replay(scope, key, fields);
+      if (previous) return previous;
+      if (!fields || Object.keys(fields).length) throw taskError('INVALID_RESUME', 'resume 正文必须为空对象', 400);
+      const task = this.task(id);
+      if (active.has(task.status)) throw taskError('TASK_ACTIVE', 'Task 当前仍在执行，不能重复恢复', 409);
+      const runId = task.currentRunId;
+      if (!runId) throw taskError('RESUME_UNAVAILABLE', 'Task 没有可恢复的 Run', 409);
+      const previousRun = this.store.run(runId);
+      if (codingBackend(previousRun) !== 'claude_sdk' && task.definition.execution?.backend !== 'claude_sdk')
+        throw taskError('RESUME_UNAVAILABLE', '仅 SDK Job 支持无提示恢复', 409);
+      if (!resumable.has(String(previousRun.status).toLowerCase()) || previousRun.status === 'unknown' ||
+          previousRun.control_status !== 'STOPPED' || previousRun.can_resume !== true ||
+          Array.isArray(previousRun.resume_blockers) && previousRun.resume_blockers.length)
+        throw taskError('RESUME_CONFLICT', '当前 Run 状态不允许恢复', 409);
+      if (this.lease()) throw taskError('EXECUTOR_BUSY', '单执行器正在运行其他 Run', 409);
+      const now = timestamp();
+      const run = {...previousRun, status: 'starting', control_status: 'STARTING', outcome: null,
+        error: null, finishedAt: null, processEndedAt: null, pid: null, stopRequestedAt: null,
+        stopPreviousStatus: null, stopError: null, processControlId: randomUUID(),
+        resumeCount: (previousRun.resumeCount || 0) + 1, resumedAt: now, updatedAt: now};
+      this.writeRun(run);
+      const updated = {...task, status: 'starting', updatedAt: now};
+      this.writeTask(updated);
+      this.store.db.prepare('INSERT INTO console_executor VALUES (1,?,?,?,?,NULL,?)').run(id, runId, process.pid, ownerId, 'reserved');
+      const value = {task: updated, run, replayed: false};
+      this.remember(scope, key, fields, value);
+      return value;
+    });
+  }
   checkStart(id: string, fields: Data, key?: string): void {
     this.replay('start:explicit:' + id, key, fields);
+  }
+  checkResume(id: string, fields: Data, key?: string): void {
+    this.replay('resume:' + id, key, fields);
   }
   checkCreate(fields: Data, key?: string): void {
     this.replay('create', key, fields);

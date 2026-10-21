@@ -16,6 +16,27 @@ export const canContinue = (status: string, outcome?: string | null) => {
     !(normalized === 'completed' && ['FIX_VERIFIED', 'NO_BUG_FOUND'].includes(outcome || ''));
 };
 
+export const codingBackend = (record: Record<string, any>): string =>
+  record.coding_backend || record.codingBackend || record.execution?.backend || 'legacy';
+
+export const controlProjection = (record: Record<string, any>) => {
+  const backend = codingBackend(record);
+  const active = ['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping'];
+  const blockers = Array.isArray(record.resume_blockers) ? record.resume_blockers : [];
+  const canStop = active.includes(String(record.status).toLowerCase()) && String(record.status).toLowerCase() !== 'stopping';
+  const canResume = backend === 'claude_sdk' && record.control_status === 'STOPPED' && record.can_resume === true &&
+    !blockers.length && record.status !== 'unknown';
+  return {
+    coding_backend: backend,
+    control_status: record.status === 'stopping' ? 'STOPPING' : record.control_status || String(record.status || '').toUpperCase(),
+    can_stop: canStop,
+    can_resume: canResume,
+    resume_blockers: blockers,
+    harness_job_id: record.harness_job_id ?? record.harnessJobId ?? null,
+    harness_session_id: record.harness_session_id ?? record.harnessSessionId ?? null,
+  };
+};
+
 function redact(value: any): any {
   if (Array.isArray(value)) return value.map(redact);
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) =>
@@ -135,7 +156,7 @@ export class ConsoleDatabase {
       if (!['running', 'paused', 'waiting_input', 'waiting_approval', 'stopping'].includes(record.status)) return record;
       if (record.processControlId !== processControlId) throw new DataError('任务进程已改变，请刷新后重试', 409);
       if (record.status === 'stopping') return record;
-      const updated = {...record, status: 'stopping', stopRequestedAt: timestamp(),
+      const updated = {...record, status: 'stopping', control_status: 'STOPPING', stopRequestedAt: timestamp(),
         stopPreviousStatus: record.status, stopError: null, updatedAt: timestamp()};
       this.db.prepare('UPDATE console_runs SET data=? WHERE id=?').run(JSON.stringify(updated), id);
       return updated;
@@ -146,7 +167,7 @@ export class ConsoleDatabase {
       const record = this.run(id);
       if (record.status !== 'stopping' || record.processControlId !== fields.processControlId ||
           record.stopRequestedAt !== fields.stopRequestedAt) return record;
-      const updated = {...record, status: record.stopPreviousStatus || 'running', stopRequestedAt: null,
+      const updated = {...record, status: record.stopPreviousStatus || 'running', control_status: record.stopPreviousStatus || 'RUNNING', stopRequestedAt: null,
         stopPreviousStatus: null, stopError: fields.error, updatedAt: timestamp()};
       this.db.prepare('UPDATE console_runs SET data=? WHERE id=?').run(JSON.stringify(updated), id);
       return updated;

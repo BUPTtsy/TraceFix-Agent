@@ -9,7 +9,7 @@ export interface RunResult {runId: string; ready: boolean; outcome: string | nul
 export interface Source {id: string; title: string; version: number}
 export interface KnowledgeUse {phase: string; queries: string[]; documents: Source[]; artifact_ref: string}
 export interface Run {id: string; projectId: string; agentRunId?: string; goal: string; mode: Service | 'unknown'; status: string; phase: string; outcome?: string; startedAt: string; finishedAt?: string; timeSource?: string; exitCode?: number; error?: string; branch?: string; continuationCount?: number; abnormalTermination?: boolean; continuationMarkers?: {instruction: string; previous_status: string; previous_error?: string; at: string}[]; knowledge: KnowledgeUse[]; logs?: string[]; artifacts?: {ref: string; label: string; bytes: number}[]}
-export interface AgentStatus extends Partial<Run> {running: boolean; canStop?: boolean; stopUnavailableReason?: string; stopError?: string | null}
+export interface AgentStatus extends Partial<Run> {running: boolean; canStop?: boolean; canResume?: boolean; can_stop?: boolean; can_resume?: boolean; control_status?: string; resume_blockers?: string[]; coding_backend?: string; stopUnavailableReason?: string; stopError?: string | null}
 export interface Run {taskId?: string | null}
 // 引导状态来自持久化账本；retarget 排队后仍需 confirmed_at 才能在运行时替换目标。
 export interface Guidance {id: string; run_id: string; level: 'hint' | 'constraint' | 'retarget'; text: string; status: 'queued' | 'applied' | 'acknowledged' | 'rejected' | 'superseded'; created_at: number; applied_step?: number; how_applied?: string; rejection_reason?: string; confirmed_at?: number; child_run_id?: string}
@@ -118,7 +118,7 @@ export function aggregateWorkers(events: TraceEvent[]): WorkerAggregate {
   const active = workers.filter(worker => worker.active && workerActiveStatuses.has(worker.status)).length;
   return {workers, active, maxConcurrency};
 }
-export interface Run {canContinue?: boolean}
+export interface Run {canContinue?: boolean; coding_backend?: string; control_status?: string; can_stop?: boolean; can_resume?: boolean; resume_blockers?: string[]; harness_job_id?: string | null; harness_session_id?: string | null}
 export interface ReportIssue {id: string; title: string; source: string; status: string; location: string; expected: string; actual: string; steps: string[]; verification: string; evidence_refs: string[]}
 export interface CheckItem {id: string; name: string; criteria: string; severity: 'blocker' | 'critical' | 'major' | 'minor'; source: 'rule' | 'user_goal'; detector: string; rule_version?: number | null}
 export interface CheckResult extends CheckItem {status: 'pass' | 'fail' | 'error' | 'inconclusive'; actual: string; evidence_refs: string[]; error?: string | null; fallback?: {source?: string; reason?: string; status?: string; error?: string} | null; stage?: 'explore' | 'verify'}
@@ -178,7 +178,7 @@ export async function loadAgentStatus(): Promise<AgentStatus> {
   if (!task?.currentRunId) return legacy;
   const run = await loadRun(task.currentRunId);
   if (!active.has(task.status) && legacy.startedAt && run.startedAt && legacy.startedAt > run.startedAt) return legacy;
-  return {...run, taskId: task.id, running: active.has(run.status), canStop: active.has(run.status)};
+  return {...run, taskId: task.id, running: active.has(run.status), canStop: run.can_stop ?? active.has(run.status), canResume: run.can_resume ?? false};
 }
 export async function startAgent(goal: string, mode: Exclude<Service, 'chat'>, projectId: string, additionalRuleIds: string[] = []): Promise<AgentStatus> {
   const created = await request<{run: Run | null}>('/api/v1/tasks', {method: 'POST', body: JSON.stringify({goal, mode, projectId, execution: {executionMode: 'batch'}, additionalRuleIds, create_and_start: true})});
@@ -189,7 +189,14 @@ export async function stopAgent(taskId?: string | null): Promise<AgentStatus> {
   if (!taskId) return request<AgentStatus>('/api/agent/stop', {method: 'POST'});
   const stopped = await request<{run: Run | null}>(`/api/v1/tasks/${encodeURIComponent(taskId)}/stop`, {method: 'POST', body: '{}'});
   if (!stopped.run) return {running: false, taskId};
-  return {...stopped.run, running: ['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping'].includes(stopped.run.status), canStop: stopped.run.status !== 'stopping'};
+  return {...stopped.run, running: ['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping'].includes(stopped.run.status), canStop: stopped.run.status !== 'stopping', canResume: stopped.run.can_resume ?? false};
+}
+export async function resumeAgent(taskId: string, idempotencyKey = globalThis.crypto?.randomUUID?.() || `resume-${Date.now()}`): Promise<AgentStatus> {
+  const resumed = await request<{task: Record<string, unknown>; run: Run | null}>(`/api/v1/tasks/${encodeURIComponent(taskId)}/resume`, {
+    method: 'POST', body: '{}', headers: {'Idempotency-Key': idempotencyKey},
+  });
+  if (!resumed.run) return {running: false, taskId, canResume: false};
+  return {...resumed.run, taskId, running: ['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping'].includes(String(resumed.run.status)), canStop: true, canResume: false};
 }
 export const continueRun = (id: string, instruction: string) => request<AgentStatus>(`/api/runs/${encodeURIComponent(id)}/continue`, {method: 'POST', body: JSON.stringify({instruction})});
 export const deriveRun = (id: string, additionalRuleIds: string[], goal = '') => request<AgentStatus>(`/api/runs/${encodeURIComponent(id)}/derive`, {method: 'POST', body: JSON.stringify({additionalRuleIds, goal})});

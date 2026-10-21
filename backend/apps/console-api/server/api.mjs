@@ -84,6 +84,10 @@ export async function createApi({bridge, controller, token, legacyHandler, logge
     async (request, reply) => reply.code(202).send(await controller.start(request.params.id, request.body || {}, request.headers['idempotency-key'])),
     async request => {if (request.headers['idempotency-key']) await bridge('task.start.check', {
       id: request.params.id, body: request.body || {}, key: request.headers['idempotency-key']});});
+  route('POST', '/api/v1/tasks/:id/resume', {params: schemas.params, body: schemas.empty, headers: schemas.idempotency, response: response(202, schemas.mutation)},
+    async (request, reply) => reply.code(202).send(await controller.resume(request.params.id, request.body || {}, request.headers['idempotency-key'])),
+    async request => {if (request.headers['idempotency-key']) await bridge('task.resume.check', {
+      id: request.params.id, body: request.body || {}, key: request.headers['idempotency-key']});});
   route('POST', '/api/v1/tasks/:id/stop', {params: schemas.params, body: schemas.empty,
     response: {...response(200, schemas.mutation), 202: schemas.mutation}},
     async (request, reply) => {const stopped = await controller.stop(request.params.id); return reply.code(stopped.status).send(stopped.value);});

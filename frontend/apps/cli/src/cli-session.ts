@@ -10,6 +10,11 @@ export class CliSession {
     this.binding = {scopeId, recordId};
   }
 
+  bindJob(scopeId: string, jobId: string): void {
+    if (!scopeId || !jobId || /\s/.test(jobId)) throw new Error('恢复 Job 需要明确的 JOB_ID，不接受补充指令');
+    this.bindRun(scopeId, jobId);
+  }
+
   currentRunId(scopeId: string): string | null {
     return this.binding?.scopeId === scopeId ? this.binding.recordId : null;
   }

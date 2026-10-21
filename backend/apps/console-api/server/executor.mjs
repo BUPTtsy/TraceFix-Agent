@@ -27,9 +27,9 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
       if (process.env[name]) text = text.replaceAll(process.env[name], '[REDACTED]');
     return text;
   };
-  async function start(id, body = {}, key, namespace = 'explicit', expectedVersion) {
+  async function start(id, body = {}, key, namespace = 'explicit', expectedVersion, restoring = false) {
     await bridge('task.recover', {isAlive});
-    const value = await bridge('task.start', {id, body, key, namespace, ownerId, expectedVersion});
+    const value = await bridge(restoring ? 'task.resume' : 'task.start', {id, body, key, namespace, ownerId, expectedVersion});
     if (value.replayed) {
       const run = await bridge('run.record', {id: value.run.id});
       return {task: {...value.task, status: run.status, updatedAt: run.updatedAt || value.task.updatedAt}, run, replayed: true};
@@ -135,7 +135,8 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
     stopping.set(id, pending);
     try {return await pending;} finally {stopping.delete(id);}
   }
-  return {start, stop, recover: () => bridge('task.recover', {isAlive}),
+  const resume = (id, body = {}, key) => start(id, body, key, 'resume', undefined, true);
+  return {start, resume, stop, recover: () => bridge('task.recover', {isAlive}),
     async drain() {await Promise.all([...owned.values()].map(entry => entry.done));},
     async close() {for (const entry of owned.values()) await terminate(entry.child, {isAlive}); await this.drain();}};
 }

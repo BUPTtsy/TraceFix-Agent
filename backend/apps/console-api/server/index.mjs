@@ -259,6 +259,7 @@ const legacyHandler = async (req,res) => {
       const fields = await body(req); const instruction = typeof fields.instruction === 'string' ? fields.instruction.trim() : '';
       if (!instruction || instruction.length > 4000) return send(res, 400, {error: '请输入 1-4000 字的继续指令'});
       const record = await bridge('run', {id: continuationMatch[1]});
+      if (record.coding_backend === 'claude_sdk') return send(res, 409, {code: 'SDK_RESUME_REQUIRES_EMPTY_BODY', error: 'SDK Job 只能通过空请求 resume 恢复'});
       if (!record.canContinue) return send(res, 409, {error: '只有非成功结束的任务可以继续'});
       await startAgent(record.goal, record.mode, record.projectId, {runId: record.id, instruction});
       return send(res, 202, await agentView());

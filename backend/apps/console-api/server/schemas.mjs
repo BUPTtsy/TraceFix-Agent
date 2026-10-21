@@ -60,7 +60,10 @@ export const taskInput = {type: 'object', additionalProperties: false, required:
     projectId: {...text, maxLength: 128}, repo_id: {...text, maxLength: 128}, repositoryId: {...text, maxLength: 128},
     mode: {type: 'string', enum: ['test', 'repair']}, goal: {type: 'string', minLength: 5, maxLength: 4000},
     execution: {type: 'object', additionalProperties: false, required: ['executionMode'], properties: {
-      executionMode: {type: 'string', enum: ['batch']}, url: {type: 'string', format: 'uri', maxLength: 2048},
+      executionMode: {type: 'string', enum: ['batch']}, backend: {type: 'string', enum: ['legacy', 'claude_sdk']},
+      coding_backend: {type: 'string', enum: ['legacy', 'claude_sdk']},
+      harness_job_id: text, harness_session_id: text, harness_task_id: text, harness_stage: text, sdk_execution_id: text,
+      url: {type: 'string', format: 'uri', maxLength: 2048},
       repairMode: {type: 'string', enum: ['hybrid', 'pipeline']},
       spec: testSpec}},
     additionalRuleIds: {...ids, maxItems: 50}, rule_ids: {...ids, maxItems: 50}, source_run_id: text,
@@ -71,13 +74,17 @@ export const task = {type: 'object', additionalProperties: false,
   required: ['id', 'definition', 'status', 'version', 'currentRunId', 'runIds', 'createdAt', 'updatedAt'], properties: {
     id: text, definition: object, status: {type: 'string'}, version: {type: 'integer', minimum: 1},
     currentRunId: {type: ['string', 'null']}, runIds: {type: 'array', items: text},
-    createdAt: {type: 'string', format: 'date-time'}, updatedAt: {type: 'string', format: 'date-time'}}};
+    createdAt: {type: 'string', format: 'date-time'}, updatedAt: {type: 'string', format: 'date-time'},
+    coding_backend: {type: 'string'}, control_status: {type: 'string'}, can_stop: {type: 'boolean'}, can_resume: {type: 'boolean'},
+    resume_blockers: {type: 'array', items: {type: 'string'}}, harness_job_id: {type: ['string', 'null']}, harness_session_id: {type: ['string', 'null']}}};
 export const run = {type: 'object', additionalProperties: false, required: ['id', 'projectId', 'status'], properties: {
   id: text, taskId: {type: ['string', 'null']}, projectId: text, agentRunId: {type: ['string', 'null']},
   mode: {type: 'string'}, goal: {type: 'string'}, status: {type: 'string'}, phase: {type: ['string', 'null']},
   outcome: {type: ['string', 'null']}, startedAt: {type: 'string'}, updatedAt: {type: 'string'},
   finishedAt: {type: ['string', 'null']}, processEndedAt: {type: ['string', 'null']},
-  error: {anyOf: [object, {type: 'string'}, {type: 'null'}]}, artifacts: {type: 'array', items: object}}};
+  error: {anyOf: [object, {type: 'string'}, {type: 'null'}]}, artifacts: {type: 'array', items: object},
+  coding_backend: {type: 'string'}, control_status: {type: 'string'}, can_stop: {type: 'boolean'}, can_resume: {type: 'boolean'},
+  resume_blockers: {type: 'array', items: {type: 'string'}}, harness_job_id: {type: ['string', 'null']}, harness_session_id: {type: ['string', 'null']}}};
 export const error = {type: 'object', additionalProperties: false, required: ['code', 'message', 'retryable', 'requestId'], properties: {
   code: text, message: {type: 'string'}, retryable: {type: 'boolean'}, requestId: text,
   taskId: text, taskUrl: {type: 'string'}, runId: text}};
@@ -89,7 +96,9 @@ export const result = {type: 'object', additionalProperties: false,
     runId: text, taskId: {type: ['string', 'null']}, outcome: {type: ['string', 'null']}, settled: {type: 'boolean'}, ready: {type: 'boolean'},
     ruleCoverage: object, findings: {type: 'array', items: object}, patch: nullableObject, verification: nullableObject,
     summary: {type: ['string', 'null']}, branch: {type: ['string', 'null']}, commit: {type: ['string', 'null']}, publication: nullableObject,
-    repair_mode: {type: ['string', 'null'], enum: ['hybrid', 'pipeline', null]},
+    repair_mode: {type: ['string', 'null'], enum: ['hybrid', 'pipeline', null]}, coding_backend: {type: 'string'}, control_status: {type: 'string'},
+    can_stop: {type: 'boolean'}, can_resume: {type: 'boolean'}, resume_blockers: {type: 'array', items: {type: 'string'}},
+    harness_job_id: {type: ['string', 'null']}, harness_session_id: {type: ['string', 'null']},
     repair_mode_requested: {type: ['string', 'null']}, repair_mode_reason: {type: ['string', 'null']},
     error: nullableObject, provenance: object}};
 const commandArgv = {type: 'array', minItems: 1, maxItems: 200, items: {type: 'string', minLength: 1, maxLength: 8000}};

@@ -150,8 +150,12 @@ export const COMMANDS: CommandSpec[] = [
     ],
   },
   {
-    name: 'resume', hint: 'RUN_ID', group: '运行控制',
-    summary: '校验检查点后继续指定 Run',
+    name: 'resume', hint: 'JOB_ID', group: '运行控制',
+    summary: '使用空请求恢复指定 SDK Job（不接受补充指令）',
+  },
+  {
+    name: 'stop', hint: '[JOB_ID]', group: '运行控制',
+    summary: '停止当前或指定 Job；SDK Job 可稍后恢复',
   },
   {
     name: 'approve', hint: 'ACTION_ID [RUN_ID]', group: '运行控制',

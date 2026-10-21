@@ -1,3 +1,4 @@
+import {controlProjection} from './database.js';
 import {taskError} from './task-lifecycle.js';
 import {isDeepStrictEqual} from 'node:util';
 
@@ -75,7 +76,7 @@ export function resultView(run: Data, findings: Data[]): Data {
   const repairMode = repairModeMetadata(recorded, report, run);
   for (const key of ['summary', 'branch', 'commit', 'publication'])
     if (recorded && Object.hasOwn(recorded, key)) metadata[key] = recorded[key];
-  return {runId: run.id, taskId: run.taskId ?? null, outcome: normalized, settled, ready,
+  return {runId: run.id, taskId: run.taskId ?? null, ...controlProjection(run), outcome: normalized, settled, ready,
     ...metadata,
     ...repairMode,
     ruleCoverage: recorded?.ruleCoverage ?? recorded?.rule_coverage ?? {

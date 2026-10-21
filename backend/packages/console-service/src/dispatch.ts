@@ -4,7 +4,7 @@ import {randomUUID} from 'node:crypto';
 import {DatabaseSync} from 'node:sqlite';
 import {artifactIndex, evidenceClosure, readArtifact, readArtifactBytes} from './artifacts.js';
 import {loadConfig, projectCatalog, repositoryControl, type RepositoryControlOptions} from './config.js';
-import {canContinue, ConsoleDatabase, DataError, timestamp} from './database.js';
+import {canContinue, codingBackend, controlProjection, ConsoleDatabase, DataError, timestamp} from './database.js';
 import {RuleDatabase} from './rules.js';
 import {classifyGuidance, guidanceUnsafe} from './guidance.js';
 import {TaskLifecycle, normalizeTask, taskError} from './task-lifecycle.js';
@@ -26,6 +26,13 @@ export function createConsoleService(options: ConsoleOptions = {}) {
   const repository = (operation: string, fields: Data = {}) => repositoryControl(projectsPath, operation, fields,
     {...options, engineRoot: options.engineRoot || options.displayRoot, dataRoot});
   const artifactRoot = (run: Data) => path.join(run.dataRoot || dataRoot, 'artifacts');
+  const taskView = (task: Data) => {
+    const run = task.currentRunId ? database.run(task.currentRunId) : null;
+    return {...task, ...(run ? controlProjection(run) : {
+      coding_backend: task.definition?.execution?.backend || 'legacy', control_status: String(task.status || '').toUpperCase(),
+      can_stop: false, can_resume: false, resume_blockers: [], harness_job_id: null, harness_session_id: null,
+    })};
+  };
   // 与 Python 运行时共用 guidance.sqlite3，Web 写入先排队，执行层在安全边界读取并应用。
   const guidanceDb = (run: Data) => {
     const filename = path.join(run.dataRoot || dataRoot, 'guidance.sqlite3');
@@ -85,7 +92,7 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     const checkReport = Object.fromEntries(['check_plan', 'check_results', 'check_summary', 'overall_status', 'images',
       'initial_check_results', 'initial_check_summary']
       .filter(key => issueReport && key in issueReport).map(key => [key, issueReport[key]]));
-    return {...record, canContinue: canContinue(record.status, record.outcome), artifacts,
+    return {...record, ...controlProjection(record), canContinue: canContinue(record.status, record.outcome), artifacts,
       issueReport, ...checkReport,
       ruleSnapshot: record.agentRunId ? rules.snapshot(record.agentRunId) : null};
   }
@@ -124,13 +131,15 @@ export function createConsoleService(options: ConsoleOptions = {}) {
   }
 
   function dispatch(operation: string, fields: Data = {}): any {
-    if (operation === 'tasks') return tasks.tasks(fields.projectId);
-    if (operation === 'task') return tasks.task(fields.id);
+    if (operation === 'tasks') return tasks.tasks(fields.projectId).map(taskView);
+    if (operation === 'task') return taskView(tasks.task(fields.id));
     if (operation === 'task.create') return tasks.create(fields.body, fields.key);
     if (operation === 'task.create.check') return tasks.checkCreate(fields.body, fields.key);
     if (operation === 'task.update') return tasks.update(fields.id, fields.body);
     if (operation === 'task.start') return tasks.start(fields.id, fields.body || {}, fields.key, fields.ownerId, fields.namespace, fields.expectedVersion);
     if (operation === 'task.start.check') return tasks.checkStart(fields.id, fields.body || {}, fields.key);
+    if (operation === 'task.resume') return tasks.resume(fields.id, fields.body || {}, fields.key, fields.ownerId);
+    if (operation === 'task.resume.check') return tasks.checkResume(fields.id, fields.body || {}, fields.key);
     if (operation === 'task.launching') return tasks.launchIntent(fields.id, fields.runId, fields.ownerId);
     if (operation === 'task.spawned') return tasks.spawned(fields.id, fields.runId, fields.ownerId, fields.pid);
     if (operation === 'task.finish') return tasks.finish(fields.id, fields.runId, fields.ownerId, fields.changes);
@@ -186,7 +195,7 @@ export function createConsoleService(options: ConsoleOptions = {}) {
         documentCount: documents.filter(document => document.projectId === null || document.projectId === project.id).length}));
     }
     if (operation === 'runs') return database.runs(fields.projectId).map(({logs, ...run}) =>
-      ({...run, canContinue: canContinue(run.status, run.outcome)}));
+      ({...run, ...controlProjection(run), canContinue: canContinue(run.status, run.outcome)}));
     if (operation === 'run') return runView(fields.id);
     if (operation === 'run.record') return database.run(fields.id);
     if (operation === 'run.executor-result') {
@@ -218,12 +227,16 @@ export function createConsoleService(options: ConsoleOptions = {}) {
       // 使用实际 Agent Run 和项目双重定位，避免将控制台记录 ID 当成运行时引导作用域。
       const record = database.run(fields.id);
       if (!record.agentRunId) throw new DataError('Agent 尚未建立 Run，暂时不能接收引导');
+      if (codingBackend(record) === 'claude_sdk' && operation !== 'run.guidance')
+        throw Object.assign(new DataError('SDK Job 不接受运行中引导或改目标请求', 409), {code: 'SDK_GUIDANCE_UNSUPPORTED'});
       if (operation === 'run.guidance') return guidanceRead(record);
       if (!['running', 'paused', 'waiting_input'].includes(record.status)) throw new DataError('只有运行中或已暂停的 Run 可以接收引导');
       return operation.endsWith('confirm') ? guidanceConfirm(record, fields.guidanceId) : guidanceWrite(record, fields);
     }
     if (operation === 'run.continue') {
       const previous = database.run(fields.id);
+      if (codingBackend(previous) === 'claude_sdk')
+        throw Object.assign(new DataError('SDK Job 不接受带指令 continue，请使用空请求 resume', 409), {code: 'SDK_RESUME_REQUIRES_EMPTY_BODY'});
       if (previous.taskId) throw taskError('TASK_RESTART_REQUIRED', 'Task 的重新执行必须使用 start 新建 Run', 409);
       const project = catalog().find(item => item.id === previous.projectId);
       if (project?.enabled === false) throw new DataError('仓库已禁用', 409);
@@ -288,8 +301,15 @@ export function createConsoleService(options: ConsoleOptions = {}) {
       if (fields.execution?.url && frozen &&
           !(frozen.repository_config?.allowed_urls || []).some((origin: string) => new URL(fields.execution.url).origin === origin))
         throw taskError('EXECUTION_URL_NOT_ALLOWED', '执行 URL 超出仓库冻结白名单', 403);
+      const backend = fields.execution?.backend || fields.execution?.coding_backend || 'legacy';
       const record = {id: runId, projectId: project.id, mode: fields.mode,
         ...(fields.execution ? {execution: {...fields.execution}, executionMode: fields.execution.executionMode} : {}),
+        coding_backend: backend,
+        ...(fields.execution?.harness_job_id ? {harness_job_id: fields.execution.harness_job_id} : {}),
+        ...(fields.execution?.harness_session_id ? {harness_session_id: fields.execution.harness_session_id} : {}),
+        ...(fields.execution?.harness_task_id ? {harness_task_id: fields.execution.harness_task_id} : {}),
+        ...(fields.execution?.harness_stage ? {harness_stage: fields.execution.harness_stage} : {}),
+        ...(fields.execution?.sdk_execution_id ? {sdk_execution_id: fields.execution.sdk_execution_id} : {}),
         profile: frozen?.profile_path || project.profile, registry: frozen?.projects_path || project.registry,
         repositorySnapshot: frozen,
         goal: fields.goal.trim(), ...(parentRunId ? {parentRunId} : {}), additionalRuleIds,
@@ -303,7 +323,8 @@ export function createConsoleService(options: ConsoleOptions = {}) {
       if (previous.repositorySnapshot && ['agentRunId', 'reportRef', 'artifacts', 'repositorySnapshot', 'profile',
         'registry', 'projectId', 'dataRoot', 'id', 'consoleRunId', 'repoSnapshotRef', 'memorySnapshotRef',
         'sourceManifest', 'evidenceRefs', 'inheritedEvidenceRefs', 'scopeId', 'parentRunId', 'taskId', 'execution',
-        'executionMode', 'source_run_id', 'source_finding_ids', 'github_reads', 'consoleDatabasePath']
+        'executionMode', 'coding_backend', 'harness_job_id', 'harness_session_id', 'harness_task_id', 'harness_stage',
+        'sdk_execution_id', 'source_run_id', 'source_finding_ids', 'github_reads', 'consoleDatabasePath']
           .some(key => Object.hasOwn(fields.changes || {}, key))) throw new DataError('运行身份、证据归属和仓库快照不可修改', 409);
       return database.updateRun(fields.id, fields.changes);
     }
