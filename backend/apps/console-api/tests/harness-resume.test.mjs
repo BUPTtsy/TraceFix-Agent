@@ -21,7 +21,10 @@ test('resume HTTP 正文严格为空对象，未知提示字段返回 400', asyn
   const app = await createApi({token: 'resume-test', bridge: async () => undefined,
     controller: {resume: async (id, body, key) => {calls.push({id, body, key});
       return {task: {id, definition: {}, status: 'running', version: 1, currentRunId: 'run', runIds: ['run'],
-        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()}, run: {id: 'run', projectId: 'scope', status: 'running'}, replayed: false};}}});
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), current_run_id: 'increment',
+        accepted_commit: 'head', quality: 'RECOVERABLE', owner_epoch: 0, harness_revision: 2},
+      run: {id: 'run', projectId: 'scope', status: 'running', current_run_id: 'increment', accepted_commit: 'head',
+        quality: 'RECOVERABLE', owner_epoch: 0, harness_revision: 2}, replayed: false};}}});
   context.after(() => app.close());
   const headers = {authorization: 'Bearer resume-test', 'idempotency-key': 'same'};
   for (const field of ['prompt', 'instruction', 'goal', 'anything']) {
@@ -30,6 +33,13 @@ test('resume HTTP 正文严格为空对象，未知提示字段返回 400', asyn
   }
   const accepted = await app.inject({method: 'POST', url: '/api/v1/tasks/task/resume', headers, payload: {}});
   assert.equal(accepted.statusCode, 202, accepted.body);
+  for (const view of [accepted.json().task, accepted.json().run]) {
+    assert.equal(view.current_run_id, 'increment');
+    assert.equal(view.accepted_commit, 'head');
+    assert.equal(view.quality, 'RECOVERABLE');
+    assert.equal(view.owner_epoch, 0);
+    assert.equal(view.harness_revision, 2);
+  }
   assert.deepEqual(calls, [{id: 'task', body: {}, key: 'same'}]);
 });
 
@@ -77,12 +87,14 @@ test('控制视图刷新权威记录，恢复先核验 PG 且同键重放不再�
       calls.push({operation, fields});
       if (operation === 'resume.check' && state !== 'STOPPED') throw Object.assign(new Error('冲突'), {status: 409, code: 'RESUME_CONFLICT'});
       return {coding_backend: 'claude_sdk', control_status: state, can_stop: state === 'RUNNING',
-        can_resume: state === 'STOPPED', resume_blockers: [], harness_job_id: 'authority-job', harness_session_id: 'authority-session'};
+        can_resume: state === 'STOPPED', resume_blockers: [], harness_job_id: 'authority-job', harness_session_id: 'authority-session',
+        current_run_id: 'current-increment', accepted_commit: 'accepted-head', quality: 'INCREMENT_VERIFIED', owner_epoch: 3, revision: 9};
     }});
   const database = new ConsoleDatabase(databasePath);
   const now = new Date().toISOString();
   database.updateRun('run', {id: 'run', projectId: 'scope', taskId: 'task', status: 'stopped', coding_backend: 'claude_sdk',
-    control_status: 'RUNNING', can_resume: false, dataRoot: root,
+    control_status: 'RUNNING', can_resume: false, dataRoot: root, revision: 40,
+    accepted_commit: 'old-head', quality: 'RECOVERABLE', owner_epoch: 1, harness_revision: 1,
     frozenDefinition: {execution: {backend: 'claude_sdk'}}}, true);
   database.db.prepare('INSERT INTO console_tasks VALUES (?,?)').run('task', JSON.stringify({id: 'task',
     definition: {execution: {backend: 'claude_sdk'}}, status: 'stopped', currentRunId: 'run', runIds: ['run'],
@@ -90,6 +102,14 @@ test('控制视图刷新权威记录，恢复先核验 PG 且同键重放不再�
   context.after(() => {database.db.close(); service.close();});
   assert.equal(service('task', {id: 'task'}).harness_job_id, 'authority-job');
   assert.equal(service('run', {id: 'run'}).can_resume, true);
+  for (const view of [service('task', {id: 'task'}), service('run', {id: 'run'}), service('run.result', {id: 'run'})]) {
+    assert.equal(view.current_run_id, 'current-increment');
+    assert.equal(view.accepted_commit, 'accepted-head');
+    assert.equal(view.quality, 'INCREMENT_VERIFIED');
+    assert.equal(view.owner_epoch, 3);
+    assert.equal(view.harness_revision, 9);
+  }
+  assert.equal(service('run.record', {id: 'run'}).revision, 40);
   const value = service('task.resume', {id: 'task', body: {}, key: 'same', ownerId: 'owner'});
   assert.equal(value.run.id, 'run');
   assert.equal(calls.at(-1).operation, 'resume.check');
@@ -136,6 +156,29 @@ test('SDK executor 用恢复入口并通过权威桥停止，收到 STOPPED 才�
   await controller.drain();
   assert.equal(run.status, 'stopped');
   assert.equal(run.can_resume, true);
+});
+
+test('首次 initializer 绑定前 404 仅禁用控制能力，不改变执行预留或启动状态', context => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tf-prebind-'));
+  const projectsPath = path.join(root, 'projects.yaml'), databasePath = path.join(root, 'console.sqlite3');
+  fs.writeFileSync(projectsPath, JSON.stringify({projects: []}));
+  const service = createConsoleService({projectsPath, databasePath, dataRoot: root,
+    harnessControl() {throw Object.assign(new Error('尚未绑定'), {status: 404});}});
+  const database = new ConsoleDatabase(databasePath);
+  context.after(() => {database.db.close(); service.close();});
+  const lifecycle = new TaskLifecycle(database, fields => fields, (fields, id) => ({id, projectId: 'scope', status: 'running',
+    coding_backend: 'claude_sdk'}));
+  const created = lifecycle.create({execution: {backend: 'claude_sdk'}});
+  const started = lifecycle.start(created.task.id, {}, 'start', 'owner');
+  const view = service('task', {id: created.task.id});
+  assert.equal(view.control_status, 'BLOCKED');
+  assert.deepEqual(view.resume_blockers, ['HARNESS_JOB_NOT_BOUND']);
+  assert.equal(view.status, 'starting');
+  assert.equal(database.run(started.run.id).status, 'running');
+  service('task.launching', {id: created.task.id, runId: started.run.id, ownerId: 'owner'});
+  service('task.spawned', {id: created.task.id, runId: started.run.id, ownerId: 'owner', pid: 12345});
+  assert.equal(lifecycle.lease().phase, 'spawned');
+  assert.equal(service('task', {id: created.task.id}).status, 'running');
 });
 
 test('SDK 恢复重放首次冻结定义，Task 后续编辑不能注入新目标或指令', context => {

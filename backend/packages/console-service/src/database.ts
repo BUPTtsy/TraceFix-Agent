@@ -35,6 +35,11 @@ export const controlProjection = (record: Record<string, any>) => {
     resume_blockers: blockers,
     harness_job_id: record.harness_job_id ?? record.harnessJobId ?? null,
     harness_session_id: record.harness_session_id ?? record.harnessSessionId ?? null,
+    current_run_id: record.current_run_id ?? record.agentRunId ?? null,
+    accepted_commit: record.accepted_commit ?? null,
+    quality: record.quality ?? null,
+    owner_epoch: record.owner_epoch ?? null,
+    harness_revision: record.harness_revision ?? null,
   };
 };
 

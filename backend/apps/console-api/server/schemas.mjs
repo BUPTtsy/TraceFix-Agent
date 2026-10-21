@@ -7,6 +7,9 @@ const text = {type: 'string', minLength: 1, maxLength: 200};
 const object = {type: 'object', additionalProperties: true};
 const nullableObject = {anyOf: [object, {type: 'null'}]};
 const ids = {type: 'array', maxItems: 100, uniqueItems: true, items: text};
+const harnessMetadata = {current_run_id: {type: ['string', 'null']}, accepted_commit: {type: ['string', 'null']},
+  quality: {type: ['string', 'null']}, owner_epoch: {type: ['integer', 'null'], minimum: 0},
+  harness_revision: {type: ['integer', 'null'], minimum: 0}};
 const locator = {type: 'object', additionalProperties: false, required: ['role', 'name'], properties: {
   role: {type: 'string', maxLength: 200}, name: {type: 'string', maxLength: 2000}}};
 const assertion = {type: 'object', additionalProperties: false, required: ['locator'], properties: {
@@ -74,7 +77,7 @@ export const task = {type: 'object', additionalProperties: false,
     id: text, definition: object, status: {type: 'string'}, version: {type: 'integer', minimum: 1},
     currentRunId: {type: ['string', 'null']}, runIds: {type: 'array', items: text},
     createdAt: {type: 'string', format: 'date-time'}, updatedAt: {type: 'string', format: 'date-time'},
-    coding_backend: {type: 'string'}, control_status: {type: 'string'}, can_stop: {type: 'boolean'}, can_resume: {type: 'boolean'},
+    ...harnessMetadata, coding_backend: {type: 'string'}, control_status: {type: 'string'}, can_stop: {type: 'boolean'}, can_resume: {type: 'boolean'},
     resume_blockers: {type: 'array', items: {type: 'string'}}, harness_job_id: {type: ['string', 'null']}, harness_session_id: {type: ['string', 'null']}}};
 export const run = {type: 'object', additionalProperties: false, required: ['id', 'projectId', 'status'], properties: {
   id: text, taskId: {type: ['string', 'null']}, projectId: text, agentRunId: {type: ['string', 'null']},
@@ -82,7 +85,7 @@ export const run = {type: 'object', additionalProperties: false, required: ['id'
   outcome: {type: ['string', 'null']}, startedAt: {type: 'string'}, updatedAt: {type: 'string'},
   finishedAt: {type: ['string', 'null']}, processEndedAt: {type: ['string', 'null']},
   error: {anyOf: [object, {type: 'string'}, {type: 'null'}]}, artifacts: {type: 'array', items: object},
-  coding_backend: {type: 'string'}, control_status: {type: 'string'}, can_stop: {type: 'boolean'}, can_resume: {type: 'boolean'},
+  ...harnessMetadata, coding_backend: {type: 'string'}, control_status: {type: 'string'}, can_stop: {type: 'boolean'}, can_resume: {type: 'boolean'},
   resume_blockers: {type: 'array', items: {type: 'string'}}, harness_job_id: {type: ['string', 'null']}, harness_session_id: {type: ['string', 'null']}}};
 export const error = {type: 'object', additionalProperties: false, required: ['code', 'message', 'retryable', 'requestId'], properties: {
   code: text, message: {type: 'string'}, retryable: {type: 'boolean'}, requestId: text,
@@ -97,7 +100,7 @@ export const result = {type: 'object', additionalProperties: false,
     summary: {type: ['string', 'null']}, branch: {type: ['string', 'null']}, commit: {type: ['string', 'null']}, publication: nullableObject,
     repair_mode: {type: ['string', 'null'], enum: ['hybrid', 'pipeline', null]}, coding_backend: {type: 'string'}, control_status: {type: 'string'},
     can_stop: {type: 'boolean'}, can_resume: {type: 'boolean'}, resume_blockers: {type: 'array', items: {type: 'string'}},
-    harness_job_id: {type: ['string', 'null']}, harness_session_id: {type: ['string', 'null']},
+    ...harnessMetadata, harness_job_id: {type: ['string', 'null']}, harness_session_id: {type: ['string', 'null']},
     repair_mode_requested: {type: ['string', 'null']}, repair_mode_reason: {type: ['string', 'null']},
     error: nullableObject, provenance: object}};
 const commandArgv = {type: 'array', minItems: 1, maxItems: 200, items: {type: 'string', minLength: 1, maxLength: 8000}};

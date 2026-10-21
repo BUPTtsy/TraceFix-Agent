@@ -42,10 +42,12 @@ export function createConsoleService(options: ConsoleOptions = {}) {
         can_stop: false, resume_blockers: ['HARNESS_JOB_NOT_BOUND']};
     }
     const {coding_backend, control_status, can_resume, can_stop, resume_blockers,
-      harness_job_id, harness_session_id, current_run_id} = authority;
+      harness_job_id, harness_session_id, current_run_id, accepted_commit, quality, owner_epoch, revision} = authority;
     return database.updateRun(run.id, {coding_backend, control_status, can_resume, can_stop, resume_blockers,
       ...(harness_job_id ? {harness_job_id} : {}), ...(harness_session_id ? {harness_session_id} : {}),
-      ...(current_run_id ? {agentRunId: current_run_id} : {})});
+      ...(current_run_id ? {agentRunId: current_run_id, current_run_id} : {}),
+      ...(accepted_commit !== undefined ? {accepted_commit} : {}), ...(quality !== undefined ? {quality} : {}),
+      ...(owner_epoch !== undefined ? {owner_epoch} : {}), ...(revision !== undefined ? {harness_revision: revision} : {})});
   };
   const taskView = (task: Data) => {
     const run = task.currentRunId ? refreshControl(database.run(task.currentRunId)) : null;
