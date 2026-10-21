@@ -3732,6 +3732,8 @@ class Engine:
                 s = self.changed(s, local_branch=receipt['branch'])
                 repair_commit = receipt['commit']
             except Exception as error:
+                if s.harness_job_id:
+                    self.harness._check(self, s)
                 verified = False
                 patch_verification = 'unverified' if patch_available else 'none'
                 s = self.changed(s, outcome=Outcome.INFRA_FAILURE,

@@ -53,7 +53,8 @@ async def test_sdk_preparation_rejects_guidance_before_job_is_attached():
     assert not store.load(state.run_id, state.scope_id).guidance
 
 
-async def test_stop_during_final_verification_prevents_local_commit(tmp_path, monkeypatch):
+@pytest.mark.parametrize('boundary', ['verification', 'commit'])
+async def test_stop_during_final_verification_prevents_local_commit(tmp_path, monkeypatch, boundary):
     engine, state = make_engine(tmp_path)
     state.harness_job_id = 'job'
     state.outcome = Outcome.FIX_VERIFIED
@@ -68,8 +69,13 @@ async def test_stop_during_final_verification_prevents_local_commit(tmp_path, mo
 
     async def verify(current):
         nonlocal stopped
-        stopped = True
+        stopped = boundary == 'verification'
         return True
+
+    async def operation(current, kind, action, execute):
+        nonlocal stopped
+        stopped = True
+        return await execute()
 
     engine.harness = SimpleNamespace(_check=check)
     monkeypatch.setattr(engine.workspace, 'diff', lambda *args: patch)
@@ -80,6 +86,8 @@ async def test_stop_during_final_verification_prevents_local_commit(tmp_path, mo
     monkeypatch.setattr(engine, 'source_acceptance_ready', lambda *args: True)
     monkeypatch.setattr(engine, 'source_rule_trials_passed', lambda *args: True)
     monkeypatch.setattr(engine, 'runtime_verification_passed', verify)
+    monkeypatch.setattr(engine, 'finish_source_findings', lambda *args, **kwargs: [])
+    monkeypatch.setattr(engine, 'operation', operation)
     with pytest.raises(HarnessConflict, match='验收期间'):
         await engine.finalize(state, None)
     branch.assert_not_called()
