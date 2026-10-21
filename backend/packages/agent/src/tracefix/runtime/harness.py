@@ -74,6 +74,11 @@ def command_suggestions(suggestions, profile):
     return result
 
 
+def local_repository_config(config):
+    return (not config or isinstance(config, dict) and type(config.get('version')) is int
+        and config['version'] == 1 and config.get('publish_branch') is False)
+
+
 class HarnessRuntime:
     def __init__(self, store, runner, config: ClaudeSdkConfig, root: Path, *,
                  owner=None, final_verifier=None, rebind=None, projector=None):
@@ -137,7 +142,7 @@ class HarnessRuntime:
                    and job.blocker in {'FINAL_ACCEPTANCE_FAILED', 'TARGET_BASE_CHANGED'})
         if not allowed or job.stop_request_id:
             raise HarnessConflict('SDK Job 当前不允许启动节点')
-        if state.remote_config:
+        if not local_repository_config(state.remote_config):
             raise PermissionError('SDK Job 禁止远端 publication')
         engine.scopes.assert_current(engine.context)
         return job
@@ -147,7 +152,7 @@ class HarnessRuntime:
         if state.harness_job_id:
             self._check(engine, state)
             return state
-        if state.mode != 'repair' or not local_commit_authorized or state.remote_config:
+        if state.mode != 'repair' or not local_commit_authorized or not local_repository_config(state.remote_config):
             raise PermissionError('SDK 首版只接受预授权本地提交的 repair 任务')
         if not state.test_spec_ref or not state.test_spec_hash:
             raise ValueError('创建 SDK Job 前必须冻结 TestSpec')
