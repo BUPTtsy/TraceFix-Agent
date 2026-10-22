@@ -10,6 +10,31 @@ from tracefix.execution.candidate_export import _snapshot
 
 # 容器退出码区分结果类别；FAILED 与未捕获异常同为 1，权威结果仍以 result.json 为准。
 EXIT_CODES = {'SUCCEEDED': 0, 'FAILED': 1, 'STOPPED': 3, 'UNKNOWN': 4}
+# 宿主可能挂载到 /workspace 下的工具链路径（依赖只读卷、dist tmpfs）。
+HOST_MOUNTPOINTS = ('node_modules', 'dist')
+# 宿主 asyncio readline 默认上限 64KiB；兼容旧消费者时内联清单的上限，留足余量。
+INLINE_ENTRIES_LIMIT = 32 * 1024
+
+
+def snapshot_skip(workspace):
+    """只跳过宿主挂载点；coder 自建的同名普通目录仍完整扫描。"""
+    root = Path(workspace)
+    return tuple(name for name in HOST_MOUNTPOINTS if os.path.ismount(root / name))
+
+
+def write_snapshot(workspace, path):
+    """完整清单写入 path，返回摘要事件负载，避免超长 stdout 行。
+
+    兼容 sdk_live 检查脚本读取事件 entries：仅在未跳过且清单足够小时内联 entries。
+    """
+    skip = snapshot_skip(workspace)
+    snapshot = _snapshot(Path(workspace), skip=skip)
+    Path(path).write_text(json.dumps(snapshot.model_dump(), ensure_ascii=False), encoding='utf-8')
+    summary = {'content_hash': snapshot.content_hash, 'entries_count': len(snapshot.entries),
+               'skipped': list(skip)}
+    if not skip and len(json.dumps(snapshot.entries, ensure_ascii=False)) <= INLINE_ENTRIES_LIMIT:
+        summary['entries'] = snapshot.entries
+    return summary
 
 
 async def run_worker(request_path, result_path):
@@ -31,8 +56,7 @@ async def run_worker(request_path, result_path):
     target.parent.mkdir(parents=True, exist_ok=True)
 
     def snapshot(name):
-        value = _snapshot(request.workspace).model_dump()
-        (target.parent / name).write_text(json.dumps(value, ensure_ascii=False), encoding='utf-8')
+        value = write_snapshot(request.workspace, target.parent / name)
         emit('sdk.workspace.input' if name == 'linux_input_manifest.json' else 'sdk.workspace.output', value)
 
     def emit(event, payload):

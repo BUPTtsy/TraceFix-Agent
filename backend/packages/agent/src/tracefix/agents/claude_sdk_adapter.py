@@ -4,6 +4,7 @@ import importlib.metadata
 import inspect
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -36,6 +37,8 @@ class SdkExecutionRequest(Contract):
     feedback_ref: str | None = None
     mcp_servers: dict[str, dict[str, Any]] = Field(default_factory=dict)
     output_schema: dict[str, Any] = Field(default_factory=lambda: OUTPUT_SCHEMA.copy())
+    # 宿主已冻结的项目应用镜像 ID，worker 只读挂载其工具链与依赖供自测；空值不进入序列化。
+    toolchain_image: str = Field(default='', exclude_if=lambda value: not value)
 
     @model_validator(mode='after')
     def validate_request(self):
@@ -45,6 +48,8 @@ class SdkExecutionRequest(Contract):
             raise ValueError('SDK 原生工具必须使用明确且受限的工具集合')
         if self.role == 'initializer' and not set(self.tools) <= {*READONLY_TOOLS, 'Agent'}:
             raise ValueError('initializer 不得直接修改源码或执行 Bash')
+        if self.toolchain_image and not re.fullmatch(r'sha256:[0-9a-f]{64}', self.toolchain_image):
+            raise ValueError('项目工具链镜像必须冻结为完整 image ID')
         if self.output_schema.get('type') != 'object':
             raise ValueError('SDK 结构化结果必须为 object schema')
         import jsonschema

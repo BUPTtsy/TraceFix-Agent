@@ -17,6 +17,14 @@ from tracefix.storage.harness import PostgresHarnessStore
 from tracefix.storage.harness_projection import project_pending
 
 
+def default_worker_capabilities(runner_factory):
+    """仅默认 AgentExecutionRunner 才探测 worker 能力；自定义 runner 不保证同一协议，按无能力处理。"""
+    if runner_factory is not None:
+        return None
+    from tracefix.execution import agent_runner
+    return getattr(agent_runner, 'worker_capabilities', None)
+
+
 def restore_harness_runtime(engine, state, *, store=None, runner_factory=None):
     authority = store or PostgresHarnessStore(engine.store, engine.artifacts)
     job = authority.get_job(state.harness_job_id, scope_id=state.scope_id)
@@ -38,7 +46,8 @@ def restore_harness_runtime(engine, state, *, store=None, runner_factory=None):
     def project(current, job_id, scope_id):
         return project_pending(current, root / 'harness-projection.sqlite3', job_id, scope_id)
 
-    return HarnessRuntime(authority, runner, config, root / 'harness', projector=project)
+    return HarnessRuntime(authority, runner, config, root / 'harness', projector=project,
+                          worker_capabilities=default_worker_capabilities(runner_factory))
 
 
 def create_harness_job(engine, state, *, console_task_id, local_commit_authorized,
@@ -85,7 +94,8 @@ def create_harness_job(engine, state, *, console_task_id, local_commit_authorize
         return factory(workspace, network=network, egress_proxy=egress_proxy)
 
     runtime = HarnessRuntime(store, runner, config, root / 'harness', projector=project,
-                             final_verifier=final_verifier, rebind=rebind)
+                             final_verifier=final_verifier, rebind=rebind,
+                             worker_capabilities=default_worker_capabilities(runner_factory))
     state = runtime.attach(engine, state, console_task_id=console_task_id,
                            local_commit_authorized=local_commit_authorized)
     runtime.project(state)

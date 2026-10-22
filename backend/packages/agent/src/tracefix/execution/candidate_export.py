@@ -31,14 +31,18 @@ class WorkspaceSnapshot:
         return {'entries': self.entries, 'content_hash': self.content_hash}
 
 
-def _snapshot(root: Path) -> WorkspaceSnapshot:
+def _snapshot(root: Path, *, skip=()) -> WorkspaceSnapshot:
+    """完整快照 root；skip 为需整体跳过的顶层相对名（含子树），默认不跳过。"""
     if is_link(root) or not root.is_dir():
         raise SDKCandidateRejected('源码根目录不是普通目录')
     entries = {}
+    skipped = frozenset(skip)
 
     def visit(directory: Path):
         with os.scandir(directory) as children:
             for child in sorted(children, key=lambda entry: entry.name):
+                if skipped and directory == root and child.name in skipped:
+                    continue
                 path = Path(child.path)
                 relative = path.relative_to(root).as_posix()
                 metadata = path.lstat()
@@ -204,7 +208,9 @@ class SDKWorkspace:
 
 
 def export_candidate(sdk_workspace: SDKWorkspace, authority: Workspace, *, summary: str,
-                     evidence_refs: list[str], rule_refs=()) -> PatchProposal:
+                     evidence_refs: list[str], rule_refs=(), forbidden_values=()) -> PatchProposal:
+    # 凭据兜底：过短的值误报率高且无保护意义，直接忽略。
+    secrets = tuple(value for value in forbidden_values if isinstance(value, str) and len(value) >= 8)
     sdk_workspace.check_input()
     sdk_workspace.check_linux_boundary()
     _check_authority(authority, sdk_workspace.authority_snapshot)
@@ -247,6 +253,9 @@ def export_candidate(sdk_workspace: SDKWorkspace, authority: Workspace, *, summa
             text = data.decode('utf-8')
         except UnicodeDecodeError as error:
             raise SDKCandidateRejected('只允许 UTF-8 普通文本', relative) from error
+        if any(secret in text for secret in secrets):
+            # 异常信息只含路径，不得回显凭据值。
+            raise SDKCandidateRejected('候选包含受保护凭据', relative)
         if not text.strip():
             raise SDKCandidateRejected('现有补丁契约不允许空内容', relative)
         if old:
