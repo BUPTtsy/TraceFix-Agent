@@ -170,7 +170,8 @@ def verify_evidence(state, artifacts, frozen_spec: Path, *, case: str) -> set[st
 def agent_command(registry: Path, data_root: Path, spec: Path) -> list:
     return [str(PYTHON), "scripts/bootstrap/launch.py", "--plain", "--project", "bugboard",
             "--projects", registry, "--profile", ROOT / "profiles/bugboard.yaml",
-            "--data", data_root, "--spec", spec, "--run", "--goal",
+            "--data", data_root, "--console-db", data_root / "console.sqlite3",
+            "--spec", spec, "--run", "--goal",
             "把 Write project brief 标记为完成，刷新页面并验证状态持久化；失败则修复。",
             "--mode", "repair", "--execution-mode", "batch"]
 

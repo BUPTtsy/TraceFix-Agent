@@ -63,6 +63,7 @@ def test_agent_command_uses_frozen_spec_without_oracle_feedback(workspace):
     frozen = workspace / "frozen-spec.json"
     command = checker.agent_command(workspace / "projects.json", workspace / "data", frozen)
     assert command[command.index("--spec") + 1] == frozen
+    assert command[command.index("--console-db") + 1] == workspace / "data/console.sqlite3"
     assert command[command.index("--execution-mode") + 1] == "batch"
     assert not any("oracle" in str(argument).lower() for argument in command)
 
