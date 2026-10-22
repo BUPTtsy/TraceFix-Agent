@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from tracefix.runtime.contracts import digest, new_id
 from tracefix.storage.artifacts import sanitize
 
-ELEMENT = re.compile(r'^\s*- (?P<role>[\w-]+)(?: "(?P<name>(?:[^"\\]|\\.)*)")?(?P<attrs>[^\n]*?)(?:\s*:\s*.*)?$', re.MULTILINE)
+# 冒号后的空白只能在当前行内匹配，否则会吞掉首个子元素。
+ELEMENT = re.compile(r'^[ \t]*- (?P<role>[\w-]+)(?: "(?P<name>(?:[^"\\]|\\.)*)")?(?P<attrs>[^\n]*?)(?:[ \t]*:[ \t]*.*)?$', re.MULTILINE)
 UPSTREAM_TRUNCATION = re.compile(
     r'(?im)^\s*(?:\.{3}|…)?\s*(?:\[[^\n]*(?:truncat(?:ed|ion)|内容已省略)[^\n]*\]'
     r'|(?:snapshot|output|content|response)\s+(?:is\s+|was\s+)?truncated\b)')

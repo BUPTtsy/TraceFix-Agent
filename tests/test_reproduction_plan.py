@@ -1,10 +1,35 @@
 import pytest
 
-from tracefix.execution.browser import resolve_locator
+from tracefix.execution.browser import elements, resolve_locator
 from tracefix.model.gateway import Gateway, ModelOutputError, ModelResult
 from tracefix.runtime.contracts import (BrowserAction, Decision, FileEdit, Locator, Outcome,
     PatchProposal, Phase, ReproductionPlan, RunState, RunStatus, Validation, digest)
 from tracefix.runtime.smoke import PNG, FakeBrowser, make_engine
+
+
+@pytest.mark.parametrize('newline', ['\n', '\r\n'])
+def test_snapshot_parser_preserves_first_child_after_empty_container(newline):
+    snapshot = newline.join([
+        '- generic [ref=e73]:',
+        '  - button "上一页" [ref=e74] [cursor=pointer]',
+        '  - button "下一页" [disabled] [ref=e75]',
+        '- generic [ref=e76]: ',
+        '',
+        '  - button "刷新" [ref=e77]',
+    ])
+    parsed = elements(snapshot)
+    assert [item['ref'] for item in parsed] == ['e73', 'e74', 'e75', 'e76', 'e77']
+    assert resolve_locator(snapshot, Locator(role='button', name='上一页')) == 'e74'
+    assert resolve_locator(snapshot, Locator(role='button', name='刷新')) == 'e77'
+    assert '[disabled]' in parsed[2]['attrs']
+
+
+def test_snapshot_parser_counts_duplicate_first_child_locators():
+    snapshot = ('- generic [ref=e1]:\n'
+                '  - button "保存" [ref=e2]\n'
+                '- button "保存" [ref=e3]')
+    with pytest.raises(ValueError, match='无法唯一匹配'):
+        resolve_locator(snapshot, Locator(role='button', name='保存'))
 
 
 def exploration_actions():
