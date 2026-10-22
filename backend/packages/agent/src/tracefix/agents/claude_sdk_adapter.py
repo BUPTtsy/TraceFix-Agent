@@ -99,6 +99,27 @@ def _message_value(message):
     return {name: value for name, value in vars(message).items() if not name.startswith('_')}
 
 
+def _cli_environment(config):
+    # setting_sources=[] 不控制 auto memory；否则可写配置目录中的 MEMORY.md 会被当作指令跨尝试加载。
+    environment = {'CLAUDE_CONFIG_DIR': os.environ.get('CLAUDE_CONFIG_DIR', '/state/claude'),
+        'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1'}
+    if config.base_url:
+        model = config.model_id
+        # 自定义网关通常没有 haiku/sonnet 等内置别名模型；后台调用与内置子 Agent 统一使用冻结模型。
+        # 密钥仍由 worker 环境中的 ANTHROPIC_API_KEY 提供，CLI 以 x-api-key 发送。
+        environment.update(ANTHROPIC_BASE_URL=config.base_url, ANTHROPIC_DEFAULT_HAIKU_MODEL=model,
+            ANTHROPIC_DEFAULT_SONNET_MODEL=model, ANTHROPIC_DEFAULT_OPUS_MODEL=model,
+            ANTHROPIC_SMALL_FAST_MODEL=model, CLAUDE_CODE_SUBAGENT_MODEL=model,
+            CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1')
+    return environment
+
+
+def _unavailable_mcp(request, data):
+    status = {item.get('name'): item.get('status') for item in (data or {}).get('mcp_servers') or []
+              if isinstance(item, dict)}
+    return sorted(name for name in request.mcp_servers if status.get(name) != 'connected')
+
+
 def _redact(value):
     encoded = json.dumps(value, ensure_ascii=False, default=str)
     secret = os.environ.get('ANTHROPIC_API_KEY', '')
@@ -147,8 +168,8 @@ class ClaudeSdkAdapter:
                 model=request.config.model_id, mcpServers=[])},
             system_prompt={'type': 'preset', 'preset': 'claude_code', 'append': request.system_prompt},
             output_format={'type': 'json_schema', 'schema': request.output_schema},
-            enable_file_checkpointing=True, resume=request.sdk_session_id,
-            env={'CLAUDE_CONFIG_DIR': os.environ.get('CLAUDE_CONFIG_DIR', '/state/claude')})
+            resume=request.sdk_session_id,
+            env=_cli_environment(request.config))
 
     async def _emit(self, emit, event, payload):
         if emit:
@@ -186,6 +207,8 @@ class ClaudeSdkAdapter:
             await self._emit(emit, 'sdk.execution.started', {'execution_id': request.execution_id})
             await client.query(request.prompt)
 
+            unavailable = []
+
             async def consume():
                 terminal = None
                 async for message in client.receive_response():
@@ -199,14 +222,21 @@ class ClaudeSdkAdapter:
                         self._inspections[request.execution_id].sdk_session_id = result.sdk_session_id
                         await self._emit(emit, 'sdk.session.bound', {'execution_id': request.execution_id,
                             'sdk_session_id': result.sdk_session_id})
+                        unavailable.extend(_unavailable_mcp(request, message.data))
                     await self._emit(emit, 'sdk.message', envelope)
+                    if unavailable:
+                        # 冻结的 MCP 未连接时不能让模型在缺少工具的情况下继续执行。
+                        break
                     if type(message).__name__ == 'ResultMessage':
                         terminal = message
                 return terminal
 
             timeout = request.config.session_timeout_seconds
             terminal = await asyncio.wait_for(consume(), timeout) if timeout else await consume()
-            if terminal is None:
+            if unavailable:
+                result.error_code = 'SDK_MCP_UNAVAILABLE'
+                result.unresolved = _redact(unavailable)
+            elif terminal is None:
                 result.error_code = 'SDK_RESULT_MISSING'
                 result.status = 'UNKNOWN'
             else:

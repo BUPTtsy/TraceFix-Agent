@@ -21,6 +21,13 @@ from tracefix.storage.harness import HarnessConflict
 
 HARNESS_VERSION = 'harness/1'
 POLICY_VERSION = 'repair/1'
+# 候选导出首版只接纳 create/modify，删除或改名会使整个候选被拒，需在执行前告知模型。
+SDK_SYSTEM_PROMPT = ('按冻结目标执行。无法继续时报告 blocker；不得提问或更改验收。'
+    '不得删除、移动或重命名已有文件（含 Bash 的 rm/mv/git mv），否则整个候选会被拒绝；'
+    '只修改已有文件内容或新增文件。'
+    '调查与审查只委派 readonly 子 Agent。除非已有确凿证据（复现结果、失败的验收或测试输出、精确的源码定位）'
+    '证明需要修改且修改范围明确，不得委派可写子 Agent（如 general-purpose）；'
+    '确需委派时，在委派说明中列出所依据的证据与允许修改的文件。')
 
 
 def environment_key(engine, state, config):
@@ -430,7 +437,7 @@ class HarnessRuntime:
             'workspace': sdk_workspace.source, 'config': self.config,
             'tools': ['Read', 'Glob', 'Grep', 'Agent'] if role == 'initializer'
                 else ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash', 'Agent'],
-            'system_prompt': '按冻结目标执行。无法继续时报告 blocker；不得提问或更改验收。',
+            'system_prompt': SDK_SYSTEM_PROMPT,
             'sdk_session_id': prior_sdk_session, 'feedback_ref': session.feedback_ref,
             'transcript_path': sdk_workspace.execution_dir / 'transcript' / (execution.execution_id + '.jsonl')}
         if output_schema is not None:

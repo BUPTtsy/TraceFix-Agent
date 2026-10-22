@@ -134,7 +134,7 @@ async function startAgent(goal, mode, projectId, continuation = null, derived = 
   const flush = () => bridge('run.update', {id: runId, changes: {logs: [...logs]}});
   const capture = chunk => {
     let text = String(chunk).replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/\bsk-[A-Za-z0-9_-]{20,}\b/g, '[REDACTED]');
-    for (const key of ['TRACEFIX_API_KEY', 'TRACEFIX_DATABASE_URL', 'TRACEFIX_GITHUB_TOKEN']) if (process.env[key]) text = text.replaceAll(process.env[key], '[REDACTED]');
+    for (const key of ['TRACEFIX_API_KEY', 'TRACEFIX_CLAUDE_API_KEY', 'TRACEFIX_DATABASE_URL', 'TRACEFIX_GITHUB_TOKEN']) if (process.env[key]) text = text.replaceAll(process.env[key], '[REDACTED]');
     logs.push(text.slice(-8000)); logs = logs.slice(-120);
     if (!flushTimer) flushTimer = setTimeout(() => {flushTimer = null; flush().catch(error => console.error('后台写入 Agent 日志失败：', error));}, 500);
   };

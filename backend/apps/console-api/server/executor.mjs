@@ -24,7 +24,7 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
     path.join(projectRoot, '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python') : process.platform === 'win32' ? 'py' : 'python3');
   const redact = value => {
     let text = String(value).replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/\bsk-[A-Za-z0-9_-]{20,}\b/g, '[REDACTED]');
-    for (const name of ['TRACEFIX_API_KEY', 'TRACEFIX_DATABASE_URL', 'TRACEFIX_SERVICE_DATABASE_URL', 'TRACEFIX_GITHUB_TOKEN', 'TRACEFIX_CONTROL_TOKEN'])
+    for (const name of ['TRACEFIX_API_KEY', 'TRACEFIX_CLAUDE_API_KEY', 'TRACEFIX_DATABASE_URL', 'TRACEFIX_SERVICE_DATABASE_URL', 'TRACEFIX_GITHUB_TOKEN', 'TRACEFIX_CONTROL_TOKEN'])
       if (process.env[name]) text = text.replaceAll(process.env[name], '[REDACTED]');
     return text;
   };

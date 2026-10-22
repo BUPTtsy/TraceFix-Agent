@@ -119,7 +119,7 @@ class AgentExecutionRunner:
         state = record.get('State') or {}
         if state.get('Running') is not True:
             return StopReceipt(execution_id=execution_id, stop_request_id=stop_request_id,
-                interrupt_sent=False, writers_stopped=True, status='INTERRUPTING')
+                interrupt_sent=False, writers_stopped=True, status='STOPPED')
         name = 'tf-sdk-' + execution_id.lower()
         try:
             await self._docker('kill', '--signal', 'SIGUSR1', name)
@@ -136,7 +136,7 @@ class AgentExecutionRunner:
         stopped = record is None or (record.get('State') or {}).get('Running') is False
         receipt = StopReceipt(execution_id=execution_id, stop_request_id=stop_request_id,
             interrupt_sent=sent, writers_stopped=stopped,
-            status='INTERRUPTING' if sent else 'UNKNOWN')
+            status='STOPPED' if stopped else 'INTERRUPTING' if sent else 'UNKNOWN')
         if stopped:
             path = self.workspace.execution_dir / 'control' / 'stop_receipt.json'
             if path.parent.is_dir():

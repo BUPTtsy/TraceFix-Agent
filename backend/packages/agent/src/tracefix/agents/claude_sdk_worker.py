@@ -8,6 +8,9 @@ from pathlib import Path
 from tracefix.agents.claude_sdk_adapter import ClaudeSdkAdapter, ExecutionResult, SdkExecutionRequest
 from tracefix.execution.candidate_export import _snapshot
 
+# 容器退出码区分结果类别；FAILED 与未捕获异常同为 1，权威结果仍以 result.json 为准。
+EXIT_CODES = {'SUCCEEDED': 0, 'FAILED': 1, 'STOPPED': 3, 'UNKNOWN': 4}
+
 
 async def run_worker(request_path, result_path):
     if os.environ.get('TRACEFIX_SDK_WORKER') != '1':
@@ -88,7 +91,7 @@ async def run_worker(request_path, result_path):
     temporary = target.with_suffix(target.suffix + '.tmp')
     temporary.write_text(result.model_dump_json(indent=2), encoding='utf-8')
     os.replace(temporary, target)
-    return 0 if result.status == 'SUCCEEDED' else 1
+    return EXIT_CODES[result.status]
 
 
 def main():

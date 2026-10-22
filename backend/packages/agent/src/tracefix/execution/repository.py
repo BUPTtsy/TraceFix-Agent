@@ -105,7 +105,7 @@ def run_git(root: Path | None, *args: str, input_data: bytes | None = None,
                 or parsed.query or parsed.fragment or '\n' in target
                 or not re.fullmatch(r'/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git', parsed.path)):
             raise PermissionError('GitHub 发布只允许 HTTPS origin')
-        if run_git(root, 'config', '--local', '--get-regexp', '^url\..*\.(insteadof|pushinsteadof)$', check=False).strip():
+        if run_git(root, 'config', '--local', '--get-regexp', r'^url\..*\.(insteadof|pushinsteadof)$', check=False).strip():
             raise PermissionError('GitHub 发布禁止仓库 URL 重写')
         authorization = 'AUTHORIZATION: basic ' + base64.b64encode(
             ('x-access-token:' + github_token).encode()).decode()

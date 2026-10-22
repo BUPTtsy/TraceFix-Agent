@@ -87,7 +87,7 @@ def claim_console(request, settings):
 
 def safe_result(value, settings):
     secrets = [os.getenv(key) for key in settings.credential_env.values()]
-    secrets.extend(os.getenv(key) for key in ('TRACEFIX_API_KEY', 'TRACEFIX_WORKER_API_KEY'))
+    secrets.extend(os.getenv(key) for key in ('TRACEFIX_API_KEY', 'TRACEFIX_WORKER_API_KEY', 'TRACEFIX_CLAUDE_API_KEY'))
 
     def scrub(item):
         if isinstance(item, dict):

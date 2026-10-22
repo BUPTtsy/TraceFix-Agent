@@ -36,7 +36,20 @@ async def test_interrupt_waits_for_container_writer_to_stop(tmp_path):
     value._docker = docker
     receipt = await value.interrupt('exec-1', 'stop-1', grace_seconds=1)
     assert receipt.interrupt_sent and receipt.writers_stopped
+    assert receipt.status == 'STOPPED'
     assert commands == [('kill', '--signal', 'SIGUSR1', 'tf-sdk-exec-1')]
+
+
+@pytest.mark.asyncio
+async def test_interrupt_of_already_exited_container_reports_stopped(tmp_path):
+    value = runner(tmp_path)
+
+    async def inspect(_execution):
+        return {'Config': {'Labels': {'tracefix.execution': 'exec-1'}}, 'State': {'Running': False}}
+
+    value._inspect_container = inspect
+    receipt = await value.interrupt('exec-1', 'stop-1', grace_seconds=1)
+    assert not receipt.interrupt_sent and receipt.writers_stopped and receipt.status == 'STOPPED'
 
 
 @pytest.mark.asyncio
