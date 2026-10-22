@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'backend/packages/agent/src'))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from tracefix.agents.claude_sdk_adapter import SdkExecutionRequest
 from tracefix.agents.claude_sdk_config import CLI_VERSION, SDK_VERSION, load_claude_sdk_config
@@ -40,7 +41,8 @@ def successful_tools(value):
         if isinstance(item, dict):
             if 'id' in item and 'input' in item and 'name' in item:
                 calls[item['id']] = item['name']
-            if item.get('tool_use_id') and item.get('is_error') is False:
+            # CLI 对 Read/Edit 成功结果返回 is_error=None，仅 Bash 显式返回 False；只有 True 表示失败。
+            if item.get('tool_use_id') and item.get('is_error') is not True:
                 completed.add(item['tool_use_id'])
             for nested in item.values():
                 walk(nested)
@@ -52,18 +54,41 @@ def successful_tools(value):
     return {calls[identity] for identity in completed if identity in calls}
 
 
-async def live_probe(args, report):
+CORE_PROMPT = ('这是一次能力探针。依次完成：1) 用 Read 读取 src/app.py；'
+    '2) 用 Edit 把 `value = 1` 改为 `value = 2`；'
+    '3) 用 Bash 执行 `cat src/app.py && python -c "import sys; print(sys.version)"`；'
+    '4) 在结构化结果的 summary 中写明 Bash 输出的 Python 版本，unresolved 为空数组。')
+SCENARIOS = CAPABILITIES[5:]
+
+
+def live_context(args):
+    from sdk_live.common import LiveContext
+    root = Path(args.work_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return LiveContext(config=load_claude_sdk_config(), network=args.network,
+        egress_proxy=args.egress_proxy, root=root)
+
+
+async def core_probe(args, report):
     from tracefix.execution.agent_runner import AgentExecutionRunner
     from tracefix.execution.candidate_export import SDKWorkspace, WorkspaceSnapshot
-    if not args.request or not args.execution_dir:
-        raise ValueError('--live 必须提供宿主冻结的 --request 和 --execution-dir')
-    request = SdkExecutionRequest.model_validate_json(Path(args.request).read_text(encoding='utf-8'))
-    root = Path(args.execution_dir).resolve()
-    metadata = json.loads((root / 'input_manifest.json').read_text(encoding='utf-8'))
-    snapshot = WorkspaceSnapshot(**metadata['input_snapshot'])
-    workspace = SDKWorkspace(root, root / 'source', root / 'input', snapshot,
-        metadata['authority_snapshot'], metadata['allowed_files'], metadata['protected_paths'],
-        tuple(metadata.get('exclusions', [])))
+    if args.request or args.execution_dir:
+        if not args.request or not args.execution_dir:
+            raise ValueError('--request 与 --execution-dir 必须同时提供')
+        request = SdkExecutionRequest.model_validate_json(Path(args.request).read_text(encoding='utf-8'))
+        root = Path(args.execution_dir).resolve()
+        metadata = json.loads((root / 'input_manifest.json').read_text(encoding='utf-8'))
+        snapshot = WorkspaceSnapshot(**metadata['input_snapshot'])
+        workspace = SDKWorkspace(root, root / 'source', root / 'input', snapshot,
+            metadata['authority_snapshot'], metadata['allowed_files'], metadata['protected_paths'],
+            tuple(metadata.get('exclusions', [])))
+    else:
+        # 未提供宿主冻结请求时，用一次性冻结源码夹具走同一生产 Runner。
+        from sdk_live.common import build_request, sdk_workspace
+        ctx = live_context(args).child('core')
+        execution_id, workspace = sdk_workspace(ctx)
+        request = build_request(ctx, execution_id, workspace, CORE_PROMPT)
+        root = workspace.execution_dir
     events = []
     runner = AgentExecutionRunner(workspace, network=args.network, egress_proxy=args.egress_proxy)
     result = await runner.start(request, lambda event, data: events.append({'type': event, 'data': data}))
@@ -81,16 +106,36 @@ async def live_probe(args, report):
             'successful_tool_receipt': name in succeeded}
     checks['structured_output'] = {'status': 'passed' if result.structured_output is not None else 'failed'}
     report['observed_tool_names'] = sorted(observed)
-    report['remaining_live_scenarios'] = {
-        'explicit_tool_restriction': '须单独请求未暴露的 Write/AskUserQuestion 并确认工具不存在或被拒绝',
-        'readonly_subagent': '须验证子 Agent 无 Bash/Edit/Write，并由宿主检查哨兵文件不变',
-        'interrupt': '须在真实工具执行中发送 SDK interrupt，并另由 Runner 确认所有写入者停止',
-        'cross_process_resume': '须退出首个 worker 后加载同一配置目录与 SDK session，再验证实际文件连续',
-        'controlled_mcp': '须部署允许/拒绝两个 MCP 并校验宿主端策略与操作回执',
-        'settings_isolation': '须放置带哨兵的用户/项目配置，证明 setting_sources=[] 未加载',
-        'checkpoint_scope': '须对主 Agent Edit、Bash、子 Agent 修改执行 rewind，检查完整快照恢复范围'}
-    for name, reason in report['remaining_live_scenarios'].items():
-        checks[name] = {'status': 'not_run', 'reason': reason}
+
+
+async def scenario_probe(args, report, name):
+    """运行 sdk_live/<name>.py 的 run(ctx)；单个场景异常不影响其他场景，并如实记为 failed。"""
+    import importlib
+    try:
+        module = importlib.import_module('sdk_live.' + name)
+    except ModuleNotFoundError as error:
+        if error.name != 'sdk_live.' + name:
+            raise
+        report['capabilities'][name] = {'status': 'not_run', 'reason': '场景模块未实现'}
+        return
+    from sdk_live.common import redact
+    ctx = live_context(args).child(name)
+    try:
+        outcome = await module.run(ctx)
+    except Exception as error:
+        outcome = {'status': 'failed', 'error_type': type(error).__name__, 'error': str(error)[:500]}
+    if outcome.get('status') not in {'passed', 'failed', 'not_run'}:
+        outcome = {'status': 'failed', 'reason': '场景返回的状态无效', 'raw': outcome}
+    report['capabilities'][name] = redact(outcome, ctx.config)
+
+
+async def live_probe(args, report):
+    selected = args.scenario or ['core', *SCENARIOS]
+    for name in selected:
+        if name == 'core':
+            await core_probe(args, report)
+        else:
+            await scenario_probe(args, report, name)
 
 
 def main():
@@ -101,6 +146,10 @@ def main():
     parser.add_argument('--execution-dir')
     parser.add_argument('--network', default='')
     parser.add_argument('--egress-proxy', default='')
+    parser.add_argument('--work-dir', default='.tmp-sdk-live/probe',
+        help='未提供 --request 时冻结源码夹具与 execution 目录的根（应位于仓库 gitignore 范围内）')
+    parser.add_argument('--scenario', action='append', choices=['core', *SCENARIOS],
+        help='只运行指定场景，可重复；默认运行 core 与全部能力场景')
     args = parser.parse_args()
     report = {'schema_version': 'tracefix.sdk-capabilities/1',
         'checked_at': datetime.now(timezone.utc).isoformat(), 'platform': platform.platform(),
