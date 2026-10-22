@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT / 'bugboard/scripts'))
 from prepare_target import target_cache
 PYTHON = Path(sys.executable)
 REQUIRED_VALIDATIONS = {"static", "unit", "build", "health", "original", "regression"}
+E2E_RULE_IDS = ("builtin_console_no_error", "builtin_api_no_5xx", "builtin_input_label")
 DEFAULT_POSTGRES_PASSWORD = "tracefix"
 
 
@@ -176,6 +177,21 @@ def agent_command(registry: Path, data_root: Path, spec: Path) -> list:
             "--mode", "repair", "--execution-mode", "batch"]
 
 
+def prepare_console(data_root: Path) -> Path:
+    """在修补前固定本用例的规则；完整业务验收仍来自 frozen-spec。"""
+    from tracefix.rules.store import RuleLibrary
+
+    path = data_root / "console.sqlite3"
+    library = RuleLibrary(path)
+    # 默认演示规则还包含提交、空列表等独立场景，不属于持久化用例。
+    # 使用仓库规则配置收窄本次 Run，不改规则正文、启用状态或运行中的快照。
+    with library.connect() as connection:
+        connection.execute(
+            'INSERT INTO repository_rule_settings (project_id, rule_ids, version, updated_at) VALUES (?, ?, ?, ?)',
+            ('bugboard', json.dumps(E2E_RULE_IDS), 1, datetime.now(timezone.utc).isoformat()))
+    return path
+
+
 def load_state(data_root: Path, dsn: str, run_id: str):
     sys.path.insert(0, str(ROOT / "backend/packages/agent/src"))
     from tracefix.storage.store import PostgresStore
@@ -217,6 +233,8 @@ def run_flow(args, output_path: Path) -> int:
         frozen_spec, spec_hash = freeze_spec(run_root, args.spec, case=args.case)
         result.update({"frozen_spec": str(frozen_spec.relative_to(ROOT)),
                        "frozen_spec_sha256": spec_hash})
+        console_db = prepare_console(data_root)
+        result.update({"console_db": str(console_db.relative_to(ROOT)), "rule_ids": list(E2E_RULE_IDS)})
         command([python, "bugboard/scripts/init_demo.py", "--case", args.case,
                  "--destination", demo_root], env=env)
         registry.write_text(json.dumps({"projects": [{

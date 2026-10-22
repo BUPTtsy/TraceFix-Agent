@@ -68,6 +68,22 @@ def test_agent_command_uses_frozen_spec_without_oracle_feedback(workspace):
     assert not any("oracle" in str(argument).lower() for argument in command)
 
 
+def test_real_e2e_rule_configuration_is_isolated_and_keeps_builtin_definitions(workspace, monkeypatch):
+    from tracefix.rules.resolver import RuleResolver
+    from tracefix.rules.store import RuleLibrary
+
+    inherited = workspace / 'personal-console.sqlite3'
+    monkeypatch.setenv('TRACEFIX_CONSOLE_DB', str(inherited))
+    path = checker.prepare_console(workspace / 'data')
+    assert not inherited.exists()
+    library = RuleLibrary(path)
+    rules = RuleResolver(library).resolve(project_id='bugboard', phase='*')
+    assert {rule.id for rule in rules} == set(checker.E2E_RULE_IDS)
+    assert len(library.rules(status='enabled')) == 5
+    assert all(rule.version == 1 for rule in library.rules())
+    assert library.repository_rule_ids('another-project') is None
+
+
 def test_run_freezes_spec_before_initializing_source(workspace, monkeypatch, specification):
     source = workspace / "source.json"
     contents = json.dumps(specification).encode()
