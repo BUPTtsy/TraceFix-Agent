@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tracefix.runtime.contracts import Phase
+from tracefix.runtime.contracts import CheckJudgement, FinishRepair, Phase, ReproductionPlan
 from tracefix.runtime.recovery import RecoveryCause, RecoveryController
 from tracefix.runtime.repair_progress import (
     WINDOW, advance_repair, assess_repair, calibrate_repair_traces, normalize_source, normalized_diff_fingerprint,
@@ -14,6 +14,7 @@ from tracefix.runtime.repair_progress import (
 from tracefix.runtime.smoke import make_engine
 from tracefix.tools.core import ToolPipeline, ToolRegistry, ToolSpec
 from tracefix.tools.test_runner import RunTestsInput
+from tracefix.tools.handlers import build_runtime_tools
 
 
 FIXTURES = Path(__file__).parent / 'fixtures' / 'repair_progress'
@@ -185,6 +186,42 @@ def test_pipeline_does_not_observe_and_cross_run_refs_are_not_whitelisted(tmp_pa
     engine.store.save(state)
     observe_repair(engine, state, 'run_tests', **test_payload(result_ref='foreign', run_id='another'))
     assert 'foreign' not in state.loop_evidence['repair'].get('self_test_refs', [])
+
+
+@pytest.mark.parametrize(('schema', 'phase'), [
+    (CheckJudgement, Phase.EXPLORE),
+    (CheckJudgement, Phase.VERIFY),
+    (CheckJudgement, Phase.DIAGNOSE),
+    (ReproductionPlan, Phase.EXPLORE),
+])
+async def test_readonly_inspection_does_not_change_repair_progress(tmp_path, schema, phase):
+    engine, state = make_engine(tmp_path)
+    state.repair_mode, state.phase = 'hybrid', phase
+    engine.store.save(state)
+    tools = build_runtime_tools(engine, state, schema)
+    pipeline = tools.pipeline()
+    before = state.model_dump(mode='json')
+    for index in range(engine.LOOP_NO_PROGRESS_LIMIT + 1):
+        result = await pipeline.execute('Read', {
+            'file_path': str(engine.workspace.root / 'src/value.ts')}, f'inspect-{index}')
+        assert not result.is_error
+    assert state.model_dump(mode='json') == before
+    assert engine.store.load(state.run_id, state.scope_id).loop_evidence == state.loop_evidence
+
+
+async def test_repair_session_reads_still_record_new_information_and_repetition(tmp_path):
+    engine, state = make_engine(tmp_path)
+    state.repair_mode, state.phase = 'hybrid', Phase.DIAGNOSE
+    engine.store.save(state)
+    pipeline = build_runtime_tools(engine, state, FinishRepair, {'repair_mode': 'hybrid'}).pipeline()
+    for index in range(3):
+        result = await pipeline.execute('Read', {
+            'file_path': str(engine.workspace.root / 'src/value.ts')}, f'repair-{index}')
+        assert not result.is_error
+    repair = state.loop_evidence['repair']
+    assert repair['read_files'] == ['src/value.ts']
+    assert [item['semantic_progress'] for item in repair['history']] == [True, False, False]
+    assert state.loop_no_progress_steps == 2
 
 
 @pytest.mark.asyncio

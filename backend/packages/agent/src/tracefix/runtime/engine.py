@@ -3014,7 +3014,9 @@ class Engine:
             'test_spec': self.spec(s).model_dump(), 'goal': s.goal,
             'exploration_actions': plan,
             'exploration_observations': self.phase_observations(s, Phase.EXPLORE),
-            'instruction': '只选择已有动作的递增索引，保留交互及随后刷新，排除无关重试。'})
+            'instruction': '只选择已有动作的递增索引，保留交互及随后刷新，排除无关重试。'
+                           '重放仅保留输入动作，不复用探索时的状态断言和等待条件；'
+                           '成功标准由冻结 TestSpec 的断言及业务场景确定。'})
         indices = selection.action_indices
         if indices != sorted(set(indices)) or any(index < 0 or index >= len(plan) for index in indices):
             raise ModelOutputError('复现计划索引必须唯一、递增且在探索记录范围内')
@@ -3022,7 +3024,8 @@ class Engine:
         for index in indices:
             action = BrowserAction(**plan[index])
             selected.append(action.model_copy(update={
-                'observation_id': None, 'element_ref': None, 'page_generation': None}).model_dump(mode='json'))
+                'observation_id': None, 'element_ref': None, 'page_generation': None,
+                'preconditions': [], 'postconditions': [], 'wait': None}).model_dump(mode='json'))
         interactions = [index for index, action in enumerate(selected) if action['kind'] in {'click', 'type', 'select', 'press'}]
         original_interactions = [index for index, action in enumerate(plan) if action['kind'] in {'click', 'type', 'select', 'press'}]
         needs_reload = bool(original_interactions) and any(

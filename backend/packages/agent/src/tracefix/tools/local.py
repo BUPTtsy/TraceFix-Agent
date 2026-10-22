@@ -694,7 +694,7 @@ class LocalTools:
             return {**result, 'files_changed': list(changes), 'cwd': '/workspace', 'staged': True}
 
 
-def register_local_tools(engine, state, context, bind):
+def register_local_tools(engine, state, context, bind, *, track_repair_progress=False):
     tools = LocalTools(engine, context, state)
     definitions = [
         ('Read', ReadInput, tools.read, False,
@@ -725,7 +725,7 @@ def register_local_tools(engine, state, context, bind):
                     record_tool_action(engine, state, name, arguments, result)
                     return result
                 result = await asyncio.to_thread(callback, arguments)
-                if name == 'Read' and state.repair_mode == 'hybrid':
+                if name == 'Read' and track_repair_progress and state.repair_mode == 'hybrid':
                     from tracefix.runtime.repair_progress import observe_repair
                     observe_repair(engine, state, 'read', path=result['relative_path'])
                 return result

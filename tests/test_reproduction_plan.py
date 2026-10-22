@@ -2,7 +2,7 @@ import pytest
 
 from tracefix.execution.browser import elements, resolve_locator
 from tracefix.model.gateway import Gateway, ModelOutputError, ModelResult
-from tracefix.runtime.contracts import (BrowserAction, Decision, FileEdit, Locator, Outcome,
+from tracefix.runtime.contracts import (Assertion, BrowserAction, Decision, FileEdit, Locator, ObservableWait, Outcome,
     PatchProposal, Phase, ReproductionPlan, RunState, RunStatus, Validation, digest)
 from tracefix.runtime.smoke import PNG, FakeBrowser, make_engine
 
@@ -218,8 +218,28 @@ async def test_verification_preserves_reload_and_checks_final_state(tmp_path, lo
     state = RunState(**output['data'])
     assert engine.runner.started and not engine.runner.closed
     assert state.source_aligned and state.environment_digest == engine.runner.environment_digest
-    state.reproduction_plan_frozen = True
-    state.replay_plan_ref = engine.put(state, [action.model_dump() for action in exploration_actions()[:3]])
+    actions = exploration_actions()[:3]
+    error_state = Assertion(locator=Locator(role='alert', name=''), condition='visible')
+    actions[0].preconditions = [Assertion(locator=actions[0].locator, condition='unchecked')]
+    actions[0].postconditions = [error_state]
+    actions[0].wait = ObservableWait(assertions=[error_state], max_observations=1)
+    actions[2].wait = ObservableWait(assertions=[
+        Assertion(locator=actions[0].locator, condition='unchecked')], max_observations=1)
+    original_plan = [action.model_dump() for action in actions]
+    state.replay_plan_ref = engine.put(state, original_plan)
+    state.phase = Phase.REPRODUCE
+    spec = engine.spec(state).model_dump()
+    spec_hash = state.test_spec_hash
+
+    async def select_plan(schema, context, **options):
+        assert schema is ReproductionPlan
+        return ModelResult(ReproductionPlan(action_indices=[0, 1, 2], summary='勾选并刷新'), {}, 'fake', 'stop')
+
+    engine.model.generate = select_plan
+    state = await engine.freeze_reproduction_plan(state)
+    assert engine.get(state, state.exploration_plan_ref) == original_plan
+    assert engine.spec(state).model_dump() == spec
+    assert state.test_spec_hash == spec_hash
     proposal = PatchProposal(summary='修复接口', evidence_refs=['baseline.json'], edits=[FileEdit(
         path='src/value.ts', before_hash=digest(engine.workspace.read('src/value.ts').encode()),
         content='export const persisted = true;\n')])

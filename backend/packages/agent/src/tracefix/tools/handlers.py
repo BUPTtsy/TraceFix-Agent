@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 from pydantic import ConfigDict, Field
 
-from tracefix.runtime.contracts import (BrowserAction, CheckJudgement, Contract, Decision, PatchProposal,
+from tracefix.runtime.contracts import (BrowserAction, CheckJudgement, Contract, Decision, FinishRepair, PatchProposal,
                                        Phase, TestSpec, digest)
 from tracefix.tools.core import ToolPipeline, ToolRegistry, ToolRejected, build_tool
 from tracefix.tools.effects import file_resource, make_operation_executor, run_effect
@@ -131,7 +131,8 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
         registry.register(definition.spec)
         handlers[name] = definition.handler
 
-    register_local_tools(engine, state, context, bind)
+    register_local_tools(engine, state, context, bind,
+                         track_repair_progress=schema is FinishRepair and phase == Phase.DIAGNOSE)
 
     from tracefix.tools.test_runner import register_test_runner
     register_test_runner(engine, state, context, bind)
