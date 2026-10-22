@@ -17,6 +17,7 @@ from pydantic_core import to_json
 
 from tracefix.model.contracts import ModelError, ModelResult
 from tracefix.runtime.contracts import digest
+from tracefix.storage.artifacts import sanitize
 
 if TYPE_CHECKING:
     from tracefix.tools.core import ToolSpec
@@ -127,6 +128,7 @@ class PydanticAIAdapter:
             raise trace.failure('configuration', '输出 schema 必须为现有 Pydantic 模型')
         tools = tuple(tools)
         tool_pipeline = runtime_options.get('tool_pipeline')
+        feedback_rejections = getattr(tool_pipeline, 'feedback_rejections', False)
         tool_registry = runtime_options.get('tool_registry') or getattr(tool_pipeline, 'registry', None)
         context_provider = runtime_options.get('context_provider')
         validate_output = runtime_options.get('validate_output')
@@ -371,10 +373,16 @@ class PydanticAIAdapter:
                 failure = None
                 if failed and not business_counterexample:
                     error_details = receipt.get('error') or {}
+                    if not isinstance(error_details, dict):
+                        error_details = {'message': str(error_details)}
                     rejected_submission = (spec.submission and receipt.get('executed') is False
                                            and error_details.get('status', 'FAILED') == 'FAILED')
+                    reason = sanitize(str(error_details.get('message') or error_details.get('type')
+                                          or '未提供错误原因'))
+                    message = ('提交被拒绝，需要补充诊断上下文' if rejected_submission
+                               else '工具返回失败回执')
                     failure = trace.failure('output_validation' if rejected_submission else 'tool_execution',
-                        '提交被拒绝，需要补充诊断上下文' if rejected_submission else '工具返回失败回执',
+                        f'{message}：{spec.name}（tool_call_id={call_id}）：{reason}',
                         tool_call_id=call_id, tool_name=spec.name, result=result, **{
                             key: value for key, value in error_details.items()
                             if key not in {'tool_call_id', 'tool_name', 'result',
@@ -416,11 +424,19 @@ class PydanticAIAdapter:
                             tool_name=spec.name, result=copy.deepcopy(result)) from error
                 if failed and not business_counterexample:
                     await emit_failure(record, failure)
-                    if (hybrid_repair and failure.status == 'FAILED'
-                            and not failure.details.get('requires_manual_review')):
+                    # CandidateRejected 等确定性拒绝的 status 为 rejected，与 FAILED 同属确定未生效。
+                    deterministic = (failure.status in {'FAILED', 'rejected'}
+                                     and not failure.details.get('requires_manual_review'))
+                    if hybrid_repair and deterministic:
                         # overlay 的确定性拒绝回灌当前会话，仍受单段工具轮次约束。
                         if spec.submission:
                             raise exceptions.ModelRetry(json.dumps(receipt, ensure_ascii=False, default=str))
+                        completed_results[call_id] = {'identity': identity, 'result': copy.deepcopy(result)}
+                        return receipt
+                    if (feedback_rejections and deterministic and not spec.submission
+                            and receipt.get('executed') is False):
+                        # Run 内确定未执行的拒绝交还模型纠正；重复调用由工具轮次与死循环检测兜底。
+                        completed_results[call_id] = {'identity': identity, 'result': copy.deepcopy(result)}
                         return receipt
                     raise failure
                 await emit('tool.completed', record)

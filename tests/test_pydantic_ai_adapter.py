@@ -666,12 +666,55 @@ async def test_error_tool_result_preserves_receipt_and_operation_id(fake_pydanti
     assert raised.value.category == 'tool_execution'
     assert raised.value.status == status
     assert raised.value.details['operation_id'] == operation_id
+    assert 'repo.read' in str(raised.value)
+    assert 'tool_call_id=read-1' in str(raised.value)
+    assert '读取证据失败' in str(raised.value)
     recorded = raised.value.details['tool_calls'][0]['result']
     if isinstance(recorded, BaseModel):
         recorded = recorded.model_dump(mode='json', by_alias=True)
     assert recorded == receipt.model_dump(mode='json', by_alias=True)
     assert calls == ['read-1']
     assert fake_pydantic_ai.instances[0].run_count == 1
+
+
+async def test_feedback_rejection_is_cached_and_call_identity_is_enforced(fake_pydantic_ai):
+    from tracefix.tools.core import ToolPipeline, ToolRegistry
+
+    calls, results = [], []
+    receipt = {'isError': True, 'executed': False,
+               'error': {'type': 'ToolRejected', 'message': '路径不可读'}}
+
+    def port(name, arguments, call_id):
+        calls.append(call_id)
+        return copy.deepcopy(receipt)
+
+    async def model(agent, prompt, history, handler):
+        assert await execute_tool(agent) == receipt
+        assert await execute_tool(agent) == receipt
+        await execute_tool(agent, arguments={'path': 'src/other.py'})
+        pytest.fail('同一 tool_call_id 不得改参数重用')
+
+    pipeline = ToolPipeline(ToolRegistry(), {}, 'DIAGNOSE', feedback_rejections=True)
+    with pytest.raises(PydanticAIAdapterError) as raised:
+        await PydanticAIAdapter(model).generate(BrowserAction, {}, tools=(readonly_tool(),),
+            tool_executor=port, tool_pipeline=pipeline,
+            on_tool_result=lambda _, payload: results.append(payload['reused']))
+    assert raised.value.category == 'tool_protocol'
+    assert calls == ['read-1']
+    assert results == [False, True]
+
+
+@pytest.mark.parametrize('error', ['读取失败', {'message': 'api_key=secret123 读取失败'}])
+async def test_error_receipt_message_is_visible_and_redacted(fake_pydantic_ai, error):
+    async def model(agent, prompt, history, handler):
+        await execute_tool(agent)
+
+    with pytest.raises(PydanticAIAdapterError) as raised:
+        await PydanticAIAdapter(model).generate(BrowserAction, {}, tools=(readonly_tool(),),
+            tool_executor=lambda *args: {'isError': True, 'error': error})
+    assert 'repo.read' in str(raised.value)
+    assert '读取失败' in str(raised.value)
+    assert 'secret123' not in str(raised.value)
 
 
 @pytest.mark.parametrize('check', ['postconditions', 'wait'])

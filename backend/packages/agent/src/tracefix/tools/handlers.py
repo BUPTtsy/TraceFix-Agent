@@ -60,6 +60,8 @@ class RuntimeTools:
 
     def pipeline(self, **callbacks):
         callbacks['submission_resolver'] = lambda name: self.submissions.get(name)
+        # Run 内策略拦截与锚点拒绝不结束 Run，反馈模型后由死循环检测兜底。
+        callbacks.setdefault('feedback_rejections', True)
         if self.operation_executor is not None:
             callbacks['operation'] = self.operation_executor
         if self.resource_resolver is not None:

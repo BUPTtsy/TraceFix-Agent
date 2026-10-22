@@ -17,7 +17,7 @@ from tracefix.model import protocol
 from tracefix.model.chat import stream_tool_chat
 from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
 from tracefix.runtime.contracts import BrowserAction, Decision
-from tracefix.tools.core import ToolPipeline, ToolRegistry, ToolResult, ToolSpec
+from tracefix.tools.core import ToolPipeline, ToolRegistry, ToolRejected, ToolResult, ToolSpec
 
 
 class Output(BaseModel):
@@ -147,6 +147,70 @@ async def test_real_agent_typed_output_and_bounded_correction():
     assert any(part.part_kind == 'retry-prompt' for message in requests[1]
                for part in message.parts)
     assert result.usage['requests'] == 2
+
+
+@pytest.mark.parametrize('feedback', [True, False])
+@pytest.mark.parametrize('error_type', [ValueError, ToolRejected])
+async def test_pipeline_rejection_feedback_allows_model_to_correct_expand(monkeypatch, feedback, error_type):
+    executed = []
+
+    def expand(arguments, call_id):
+        executed.append(call_id)
+        if arguments['ref'] == 'missing-channel':
+            raise error_type('原件没有请求的通道')
+        return {'evidence': 'corrected'}
+
+    spec = ToolSpec('context.expand', '展开证据原件', {'type': 'object', 'properties': {
+        'ref': {'type': 'string'}}, 'required': ['ref'], 'additionalProperties': False})
+    pipeline = ToolPipeline(ToolRegistry([spec]), {spec.name: expand}, 'DIAGNOSE',
+                            feedback_rejections=feedback)
+    requests = transport(monkeypatch, [
+        response(None, calls=[call('ContextExpand', 'bad-expand', {'ref': 'missing-channel'})],
+                 finish='tool_calls'),
+        response(None, calls=[call('ContextExpand', 'corrected-expand', {'ref': 'valid-channel'})],
+                 finish='tool_calls'),
+        response()])
+    gateway = Gateway(key='offline', stream=False)
+    if feedback:
+        result = await gateway.generate(Output, {}, tool_pipeline=pipeline)
+        assert result.value.answer == 42
+        receipt = json.loads(requests[1]['messages'][-1]['content'])
+        assert receipt['isError'] is True and receipt['executed'] is False
+        assert receipt['error']['message'] == '原件没有请求的通道'
+        assert executed == ['bad-expand', 'corrected-expand']
+    else:
+        with pytest.raises(ModelError, match='context.expand.*bad-expand.*原件没有请求的通道'):
+            await gateway.generate(Output, {}, tool_pipeline=pipeline)
+        assert executed == ['bad-expand']
+        assert len(requests) == 1
+
+
+@pytest.mark.parametrize('status,executed,manual_review', [
+    ('UNKNOWN_OPERATION', False, False), ('FAILED', True, False), ('FAILED', False, True)])
+async def test_pipeline_rejection_feedback_keeps_uncertain_failures_terminal(
+        monkeypatch, status, executed, manual_review):
+    def read(arguments, call_id):
+        return ToolResult(call_id=call_id, name='repo.read', isError=True, executed=executed,
+            error={'status': status, 'requires_manual_review': manual_review,
+                   'message': '读取失败', 'operation_id': 'op-1'})
+
+    spec = tool_spec()
+    pipeline = ToolPipeline(ToolRegistry([spec]), {spec.name: read}, 'DIAGNOSE',
+                            feedback_rejections=True)
+    requests = transport(monkeypatch, [response(None, calls=[call()], finish='tool_calls')])
+    with pytest.raises(ModelError) as raised:
+        await Gateway(key='offline', stream=False).generate(Output, {}, tool_pipeline=pipeline)
+    assert raised.value.status == status
+    assert raised.value.details['operation_id'] == 'op-1'
+    assert len(requests) == 1
+
+
+def test_runtime_pipeline_enables_rejection_feedback():
+    from tracefix.tools.handlers import RuntimeTools
+
+    runtime = RuntimeTools(ToolRegistry(), {}, 'EXPLORE')
+    assert runtime.pipeline().feedback_rejections is True
+    assert runtime.pipeline(feedback_rejections=False).feedback_rejections is False
 
 
 async def test_real_agent_tool_schema_id_and_read_concurrency_bound():

@@ -336,8 +336,11 @@ async def _resolve(value):
 class ToolPipeline:
     def __init__(self, registry, handlers: Mapping[str, Callable], phase, *, operation=None,
                  emit=None, store_artifact=None, count_tokens=None, scope_check=None,
-                 approve=None, resource_resolver=None, submission_resolver=None):
+                 approve=None, resource_resolver=None, submission_resolver=None,
+                 feedback_rejections=False):
         self.registry, self.handlers, self.phase = registry, dict(handlers), Phase(phase)
+        # 为真时，确定未执行的工具拒绝回传模型而不是终止本次模型调用。
+        self.feedback_rejections = feedback_rejections
         self.operation, self.emit, self.store_artifact = operation, emit, store_artifact
         self.count_tokens = count_tokens or estimate_tokens
         self.scope_check, self.approve = scope_check, approve
