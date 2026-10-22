@@ -213,6 +213,37 @@ def test_runtime_pipeline_enables_rejection_feedback():
     assert runtime.pipeline(feedback_rejections=False).feedback_rejections is False
 
 
+async def test_browser_policy_rejection_reaches_model_without_dispatch(tmp_path, monkeypatch):
+    from tracefix.runtime.contracts import Phase
+    from tracefix.runtime.smoke import make_engine
+    from tracefix.tools.browser import execute_browser_tool
+
+    engine, state = make_engine(tmp_path)
+    state.phase = Phase.EXPLORE
+    observation = {'id': 'before', 'snapshot': '- button "Next" [ref=e1]'}
+    state.observation_ref = engine.put(state, observation)
+    engine.store.save(state)
+    before = state.model_dump()
+    requests = transport(monkeypatch, [response(None, calls=[call('BrowserClick', 'bad-locator', {
+        'observation_id': 'before', 'element_ref': 'e1',
+        'locator': {'role': 'button', 'name': 'Missing'}})], finish='tool_calls'),
+        response('{"kind":"finish"}')])
+
+    async def port(name, arguments, call_id):
+        receipt, _ = await execute_browser_tool(engine, state, {}, name, arguments, call_id, 1)
+        return receipt
+
+    monkeypatch.setattr(engine, 'act', lambda *args, **kwargs: pytest.fail('拒绝的动作不得派发'))
+    pipeline = ToolPipeline(ToolRegistry(), {}, 'EXPLORE', feedback_rejections=True)
+    result = await Gateway(key='offline', stream=False).generate(BrowserAction, {'phase': 'EXPLORE'},
+        tool_pipeline=pipeline, tool_executor=port)
+    assert result.value.kind == 'finish'
+    receipt = json.loads(requests[1]['messages'][-1]['content'])
+    assert receipt['isError'] is True and receipt['executed'] is False
+    assert receipt['error']['type'] == 'ModelOutputError'
+    assert state.model_dump() == before
+
+
 async def test_real_agent_tool_schema_id_and_read_concurrency_bound():
     active = peak = 0
     executed = []

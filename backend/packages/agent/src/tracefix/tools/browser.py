@@ -75,7 +75,7 @@ async def execute_browser_tool(engine, state, context, name, arguments, call_id,
             raise
         engine.event(state, 'tool.rejected', {'tool_call_id': call_id,
             'action': action.model_dump(), 'error': sanitize(str(error))})
-        return {'isError': True, 'error': {'type': type(error).__name__,
+        return {'isError': True, 'executed': False, 'error': {'type': type(error).__name__,
             'message': sanitize(str(error)), 'executed': False},
             'observation_ref': state.observation_ref, 'observation': observation}, context
     business_failure = None
