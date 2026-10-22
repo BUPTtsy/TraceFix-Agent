@@ -5,6 +5,7 @@ import signal
 import socket
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,6 +22,36 @@ def load_tool(name):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_cli_launcher_allows_spawn_worker_without_reentering_cli(tmp_path):
+    launcher = tmp_path / 'scripts/bootstrap/launch.py'
+    launcher.parent.mkdir(parents=True)
+    shutil.copyfile(Path(__file__).resolve().parents[1] / 'scripts/bootstrap/launch.py', launcher)
+    package = tmp_path / 'tracefix/cli'
+    package.mkdir(parents=True)
+    (package.parent / '__init__.py').touch()
+    (package / '__init__.py').touch()
+    (package / 'main.py').write_text(
+        'import multiprocessing\n'
+        'from pathlib import Path\n'
+        'def worker():\n'
+        '    Path("worker-ready").write_text("ready", encoding="utf-8")\n'
+        'def main():\n'
+        '    child = multiprocessing.get_context("spawn").Process(target=worker)\n'
+        '    child.start()\n'
+        '    child.join(timeout=10)\n'
+        '    if child.is_alive():\n'
+        '        child.terminate()\n'
+        '        child.join(timeout=5)\n'
+        '        raise RuntimeError("worker did not exit")\n'
+        '    if child.exitcode != 0:\n'
+        '        raise RuntimeError("worker failed")\n', encoding='utf-8')
+    environment = {**os.environ, 'PYTHONPATH': str(tmp_path), 'PYTHONUTF8': '1'}
+    result = subprocess.run([sys.executable, str(launcher)], cwd=tmp_path, env=environment,
+                            capture_output=True, text=True, encoding='utf-8', timeout=25)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / 'worker-ready').read_text(encoding='utf-8') == 'ready'
 
 
 def tracked_powershell_scripts(root):

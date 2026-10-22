@@ -5,4 +5,6 @@ os.chdir(Path(__file__).resolve().parents[2])
 from dotenv import load_dotenv
 load_dotenv('.env', override=False, encoding='utf-8-sig')
 from tracefix.cli.main import main
-main()
+
+if __name__ == '__main__':
+    main()
