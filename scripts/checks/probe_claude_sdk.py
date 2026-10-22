@@ -59,6 +59,16 @@ CORE_PROMPT = ('这是一次能力探针。依次完成：1) 用 Read 读取 src
     '3) 用 Bash 执行 `cat src/app.py && python -c "import sys; print(sys.version)"`；'
     '4) 在结构化结果的 summary 中写明 Bash 输出的 Python 版本，unresolved 为空数组。')
 SCENARIOS = CAPABILITIES[5:]
+SOURCE_ROOT = Path(__file__).resolve().parents[2] / 'backend/packages/agent/src/tracefix'
+# 生产 SDK 请求不绑定 MCP 时，允许侧不适用；拒绝侧仍须真实通过，否则保持 failed。
+NOT_APPLICABLE = {'controlled_mcp': '生产 SDK 路径不绑定 MCP（仅 adapter 定义 mcp_servers 字段），'
+    '受控 MCP 允许侧不属于当前门禁；拒绝侧越界绑定与出口预检仍真实验证。'}
+
+
+def production_binds_mcp():
+    """除 adapter 契约外，任何生产源码出现 mcp_servers 即视为已接入 SDK MCP，不再适用 not_applicable。"""
+    return any('mcp_servers' in path.read_text(encoding='utf-8', errors='ignore')
+               for path in SOURCE_ROOT.rglob('*.py') if path.name != 'claude_sdk_adapter.py')
 
 
 def live_context(args):
@@ -126,6 +136,9 @@ async def scenario_probe(args, report, name):
         outcome = {'status': 'failed', 'error_type': type(error).__name__, 'error': str(error)[:500]}
     if outcome.get('status') not in {'passed', 'failed', 'not_run'}:
         outcome = {'status': 'failed', 'reason': '场景返回的状态无效', 'raw': outcome}
+    if name in NOT_APPLICABLE and outcome['status'] == 'not_run' and not production_binds_mcp():
+        outcome = {**outcome, 'status': 'not_applicable', 'measured_status': 'not_run',
+                   'not_applicable_reason': NOT_APPLICABLE[name]}
     report['capabilities'][name] = redact(outcome, ctx.config)
 
 
@@ -183,7 +196,8 @@ def main():
     else:
         for item in report['capabilities'].values():
             item['reason'] = '未启用 --live；离线测试不能代替真实 SDK 能力门禁'
-    report['gate_passed'] = all(item['status'] == 'passed' for item in report['capabilities'].values())
+    report['gate_passed'] = all(item['status'] in {'passed', 'not_applicable'}
+                                for item in report['capabilities'].values())
     target = Path(args.output)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
