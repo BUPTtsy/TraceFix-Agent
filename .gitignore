@@ -65,3 +65,13 @@ pytest_*.txt
 /tracefix.tmp-*/
 /.cleanup-manifest.txt
 /.tracefix-collect.txt
+.tq-session-continuation/
+.tq-session-first-failure/
+.tq-session-migration/
+.tqE/
+.tqM/
+.tqN/
+.tqS1b/
+.tqW/
+.tqX/
+.tqY/
