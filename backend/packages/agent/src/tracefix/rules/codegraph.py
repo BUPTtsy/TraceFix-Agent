@@ -6,6 +6,7 @@ import os
 import platform
 import shutil
 import subprocess
+from contextlib import contextmanager
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 
@@ -108,6 +109,42 @@ def store_root(data_root: Path | None = None) -> Path:
     return plain_root(Path(configured)) if configured else plain_root(Path(data_root or os.getenv("TRACEFIX_DATA", ".tracefix"))) / "codegraph"
 
 
+class GraphSession:
+    """已同步索引上的只读查询；只在 query_session 持锁期间有效。"""
+
+    def __init__(self, root: Path, sync: dict):
+        self.root, self.sync = root, sync
+
+    def symbols(self, selected: list[str], query: str = "") -> tuple[list[dict], bool]:
+        filters = " ".join("path:" + json.dumps(path, ensure_ascii=False) for path in selected)
+        if not filters:
+            raise CodeGraphError("没有符合查询范围的授权源码")
+        entries = json_output(run_cli(["query", "--json", "--limit", "501", "--path", str(self.root),
+                                       "--", (query + " " + filters).strip()], self.root), list)
+        items = []
+        for entry in entries:
+            node = entry.get("node") if isinstance(entry, dict) else None
+            if not isinstance(node, dict) or not isinstance(node.get("filePath"), str):
+                raise CodeGraphError("CodeGraph 符号结果结构无效")
+            if node["filePath"] in selected:
+                items.append({**node, "path": node["filePath"], "line": node.get("startLine"), "source": "codegraph"})
+        return items, len(entries) >= 501
+
+    def relation(self, check: str, query: str) -> dict:
+        if check not in GRAPH_CHECKS or check == "symbols":
+            raise CodeGraphError("不支持的 CodeGraph 检查：" + check)
+        if not query or len(query) > 2000:
+            raise CodeGraphError("图关系查询需要 1 至 2000 字符的 query")
+        options = ["--format", "json", "--max-nodes", "50"] if check == "context" else ["--json"]
+        return json_output(run_cli([check, *options, "--path", str(self.root), "--", query], self.root), dict)
+
+    def callers(self, query: str) -> dict:
+        return self.relation("callers", query)
+
+    def callees(self, query: str) -> dict:
+        return self.relation("callees", query)
+
+
 class RepositoryCodeGraph:
     def __init__(self, project, data_root: Path | None = None):
         self.identity = {"repo_id": project.repo_id, "root": os.path.normcase(str(project.root.resolve()))}
@@ -175,40 +212,30 @@ class RepositoryCodeGraph:
         return {"repo_key": self.key, "database_path": str(self.database), "source_version": manifest["source_version"],
                 "binding": binding, "status": status, "version": version}
 
+    @contextmanager
+    def query_session(self, files, binding: dict | None = None):
+        """同一把索引锁内只同步一次，随后可多次查询符号与调用关系。"""
+        from tracefix.repository_registry import registry_lock
+        sources = self._sources(files)
+        with registry_lock(self.directory / "index", timeout=600):
+            yield GraphSession(self.root, self._sync(sources, dict(binding or {})))
+
     def analyze(self, files, *, selected: list[str], check: str = "symbols", query: str = "",
                 binding: dict | None = None) -> dict:
-        from tracefix.repository_registry import registry_lock
         result = {"status": "pass", "detector": check, "findings": [], "items": [], "errors": [],
                   "analyzed_files": selected, "supported_languages": [], "parser": "codegraph",
                   "codegraph_index": "repository", "fallback_required": False}
         try:
-            sources = self._sources(files)
-            with registry_lock(self.directory / "index", timeout=600):
-                result["codegraph"] = self._sync(sources, dict(binding or {}))
-                result["supported_languages"] = result["codegraph"]["status"].get("languages", [])
+            with self.query_session(files, binding) as session:
+                result["codegraph"] = session.sync
+                result["supported_languages"] = session.sync["status"].get("languages", [])
                 if check == "index":
                     return result
                 if check in {"symbols", "elements", "syntax", "a11y_name", "event_binding"}:
-                    filters = " ".join("path:" + json.dumps(path, ensure_ascii=False) for path in selected)
-                    if not filters:
-                        raise CodeGraphError("没有符合查询范围的授权源码")
-                    entries = json_output(run_cli(["query", "--json", "--limit", "501", "--path", str(self.root),
-                                                   "--", (query + " " + filters).strip()], self.root), list)
-                    for entry in entries:
-                        node = entry.get("node") if isinstance(entry, dict) else None
-                        if not isinstance(node, dict) or not isinstance(node.get("filePath"), str):
-                            raise CodeGraphError("CodeGraph 符号结果结构无效")
-                        if node["filePath"] in selected:
-                            result["items"].append({**node, "path": node["filePath"], "line": node.get("startLine"),
-                                                    "source": "codegraph"})
-                    result["truncated"] = len(entries) >= 501
-                    result["items"] = result["items"][:500]
+                    items, result["truncated"] = session.symbols(selected, query)
+                    result["items"] = items[:500]
                 elif check in GRAPH_CHECKS:
-                    if not query or len(query) > 2000:
-                        raise CodeGraphError("图关系查询需要 1 至 2000 字符的 query")
-                    options = ["--format", "json", "--max-nodes", "50"] if check == "context" else ["--json"]
-                    graph = json_output(run_cli([check, *options, "--path", str(self.root), "--", query], self.root), dict)
-                    result["graph"] = graph
+                    result["graph"] = session.relation(check, query)
                 else:
                     raise CodeGraphError("不支持的 CodeGraph 检查：" + check)
         except (CodeGraphError, OSError, ValueError, RuntimeError) as error:

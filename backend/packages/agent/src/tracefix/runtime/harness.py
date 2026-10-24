@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import inspect
 import os
@@ -84,7 +85,8 @@ def command_suggestions(suggestions, profile):
     return result
 
 
-EVIDENCE_LIMIT, EVIDENCE_TOTAL, INSTRUCTIONS_LIMIT, SKILLS_TOTAL = 4000, 20000, 8000, 12000
+EVIDENCE_LIMIT, EVIDENCE_TOTAL, INSTRUCTIONS_LIMIT, SKILLS_TOTAL = 6000, 22000, 10000, 14000
+CODE_MAP_TOTAL = 8000
 # 证据按 ref 用途标签择优；源码卡片、索引、快照与模型自身工具读取记录可由 SDK 原生 Read 获取，注入只是噪音。
 EVIDENCE_PRIORITY = ('复现', '失败', '基线', '线索', '诊断', '回退', '观察', '检查')
 EVIDENCE_SKIPPED = ('源码片段', '文件索引', '源码快照', '上下文快照', '代码工具检查证据',
@@ -261,8 +263,9 @@ def export_candidate_safely(export, *args, forbidden_values=(), **kwargs):
 
 
 def local_repository_config(config):
+    # 增量只在本地提交；publish_branch=True 的远端发布只发生在交付阶段（service.delivery）。
     return (not config or isinstance(config, dict) and type(config.get('version')) is int
-        and config['version'] == 1 and config.get('publish_branch') is False)
+        and config['version'] == 1 and type(config.get('publish_branch', False)) is bool)
 
 
 def pending_harness_operations(store, state):
@@ -347,7 +350,7 @@ class HarnessRuntime:
                 or session.owner_epoch != job.owner_epoch):
             raise HarnessConflict('SDK Session 执行者或 owner epoch 已失效')
         if not local_repository_config(state.remote_config):
-            raise PermissionError('SDK Job 禁止远端 publication')
+            raise PermissionError('SDK Job 的仓库配置不是受管的 version 1 配置')
         engine.scopes.assert_current(engine.context)
         return job
 
@@ -357,7 +360,7 @@ class HarnessRuntime:
             self._check(engine, state)
             return state
         if state.mode != 'repair' or not local_commit_authorized or not local_repository_config(state.remote_config):
-            raise PermissionError('SDK 首版只接受预授权本地提交的 repair 任务')
+            raise PermissionError('SDK 只接受预授权本地提交、受管仓库配置的 repair 任务')
         if not state.test_spec_ref or not state.test_spec_hash:
             raise ValueError('创建 SDK Job 前必须冻结 TestSpec')
         acceptance_refs = list(acceptance_refs or [state.test_spec_ref])
@@ -946,6 +949,7 @@ class HarnessRuntime:
 
     async def code(self, engine, state):
         from tracefix.execution.candidate_export import SDKWorkspace, export_candidate, materialize_candidate
+        from tracefix.runtime.code_map import build_code_map
 
         self._check(engine, state)
         self.require_current_initialization(engine, state)
@@ -974,6 +978,15 @@ class HarnessRuntime:
             values = {'goal': state.goal, 'task': item.model_dump(mode='json'),
                 'input_commit': session.input_commit, 'test_spec': engine.spec(state).model_dump(mode='json'),
                 'rule_refs': state.rule_refs, 'feedback': feedback, **coder_context(engine, state)}
+            # 图谱随 prompt 冻结，重放不再查询；ref 只供审计，不进入 evidence_refs。
+            code_map = await asyncio.to_thread(build_code_map, engine, state, item, feedback)
+            values['code_map'] = code_map
+            engine.event(state, 'harness.code_map.built', {'seeds': len(code_map['seeds']),
+                'entries': sum(len(entry['symbols']) for entry in code_map['files'].values()) + len(code_map['edges']),
+                'omitted': code_map['omitted'], 'unavailable': code_map['unavailable'],
+                'artifact_ref': engine.put(state, code_map, name='代码结构图谱')})
+            instruction += ('code_map 是宿主按本增量预先查出的符号与调用关系，只作 Read 的起点，不是证据；'
+                            '委派 readonly 子 Agent 时把相关 files 与 edges 条目抄进委派任务书。')
             if image:
                 # prepare 可能安装依赖，与只读依赖约束冲突，一并排除。
                 values['self_test_commands'] = [list(command) for kind, command
