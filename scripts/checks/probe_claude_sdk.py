@@ -59,6 +59,8 @@ CORE_PROMPT = ('这是一次能力探针。依次完成：1) 用 Read 读取 src
     '3) 用 Bash 执行 `cat src/app.py && python -c "import sys; print(sys.version)"`；'
     '4) 在结构化结果的 summary 中写明 Bash 输出的 Python 版本，unresolved 为空数组。')
 SCENARIOS = CAPABILITIES[5:]
+# 信息类场景：仅经 --scenario 显式运行，结果写入 report['informational']，不计入 gate_passed。
+INFORMATIONAL = ('parallel_subagents',)
 SOURCE_ROOT = Path(__file__).resolve().parents[2] / 'backend/packages/agent/src/tracefix'
 # 生产 SDK 请求不绑定 MCP 时，允许侧不适用；拒绝侧仍须真实通过，否则保持 failed。
 NOT_APPLICABLE = {'controlled_mcp': '生产 SDK 路径不绑定 MCP（仅 adapter 定义 mcp_servers 字段），'
@@ -135,6 +137,9 @@ async def scenario_probe(args, report, name):
         outcome = await module.run(ctx)
     except Exception as error:
         outcome = {'status': 'failed', 'error_type': type(error).__name__, 'error': str(error)[:500]}
+    if name in INFORMATIONAL:
+        report.setdefault('informational', {})[name] = redact(outcome, ctx.config)
+        return
     if outcome.get('status') not in {'passed', 'failed', 'not_run'}:
         outcome = {'status': 'failed', 'reason': '场景返回的状态无效', 'raw': outcome}
     if name in NOT_APPLICABLE and outcome['status'] == 'not_run' and not production_binds_mcp():
@@ -162,8 +167,8 @@ def main():
     parser.add_argument('--egress-proxy', default='')
     parser.add_argument('--work-dir', default='.tmp-sdk-live/probe',
         help='未提供 --request 时冻结源码夹具与 execution 目录的根（应位于仓库 gitignore 范围内）')
-    parser.add_argument('--scenario', action='append', choices=['core', *SCENARIOS],
-        help='只运行指定场景，可重复；默认运行 core 与全部能力场景')
+    parser.add_argument('--scenario', action='append', choices=['core', *SCENARIOS, *INFORMATIONAL],
+        help='只运行指定场景，可重复；默认运行 core 与全部能力场景，信息类场景须显式指定且不计入门禁')
     args = parser.parse_args()
     report = {'schema_version': 'tracefix.sdk-capabilities/1',
         'checked_at': datetime.now(timezone.utc).isoformat(), 'platform': platform.platform(),
