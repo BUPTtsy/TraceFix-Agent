@@ -2,7 +2,7 @@
 
 TraceFix 是 GUI 检测—修复平台中的 Agent 执行组件，面向受控 React/TypeScript 项目，通过接口向上层平台提供 GUI 检测、问题复现、源码定位、候选修补和回归验证能力。
 
-调用方通过接口提交任务所需的执行信息；TraceFix 按仓库粒度管理执行配置、仓库访问凭据引用、检查规则、任务和运行记录，在隔离工作区中执行 Agent，返回 Finding、结果、diff 和可回查的证据。组件不管理用户、组织或租户，不感知或判断用户身份、角色和业务权限，也不要求上层平台建设用户管理。现有 Web / CLI 用于研发调试与演示。
+调用方通过接口提交任务所需的执行信息；TraceFix 按仓库粒度管理执行配置、仓库访问凭据引用、检查规则、任务和运行记录，在隔离工作区中执行 Agent，返回 Finding、结果、diff 和可回查的证据。组件不管理用户、组织或租户，不感知或判断用户身份、角色和业务权限，也不要求上层平台建设用户管理。现有 Web 用于研发调试与演示。
 
 > 接口现状（2026-10-10，`main@b622dfd`）：`/api/v1/tasks` 提供创建、独立启动、编辑、停止与查询；创建默认不执行，可通过 `create_and_start` 合并创建和启动。Task 保存执行定义，每次启动生成新的 Run。B1 仓库注册、查询、更新 / 禁用及 Run 配置冻结已实现；B2 独立 GitHub MCP 只读 connector 已通过 Mock 验证，运行生命周期接线与真实读取验收仍待完成。稳定 result、持久化幂等等按[接口型 Beta 计划](docs/产品说明手册/00-项目进度/接口型Beta最小补足与开发计划.md)收口。
 
@@ -32,7 +32,7 @@ TraceFix 是 GUI 检测—修复平台中的 Agent 执行组件，面向受控 R
 - **仓库规则与任务**：维护仓库对应的检查规则和任务定义，创建与启动分开；运行中禁止编辑，停止后编辑并重新启动从头执行，历史 Run 保留。
 - **知识库与规则快照**：为仓库维护 Markdown 知识、规则版本，并在 Run 中记录实际使用内容。
 - **规则与 Finding 修复来源**：Test / Repair 的内部输入可追加选择规则，PREPARE 冻结完整正文与版本；逐问题 Finding 绑定规则、仓库、Run 和证据，独立 Repair 重新复现并通过确定性 gate 后才回写 `fixed`。内部契约、覆盖状态和 B4 接入边界见[规则与独立 Repair 来源链](docs/产品说明手册/03-Agent运行时/规则Finding与独立Repair来源链.md)。
-- **对外接口与研发入口**：复用 Node HTTP API 提供 Agent 调用与结果查询；Web / CLI 作为调试、演示和兼容入口，稳定外部契约按接口型 Beta 计划补齐。
+- **对外接口与研发入口**：复用 Node HTTP API 提供 Agent 调用与结果查询；Web 作为调试、演示和兼容入口，稳定外部契约按接口型 Beta 计划补齐。
 - **可替换的模型接口**：使用 OpenAI-compatible Chat Completions 接口，通过 PydanticAI 执行原生工具调用。
 
 Agent 使用的工具定义、输入输出契约、注册和执行逻辑集中在 `backend/packages/agent/src/tracefix/tools/`，与 `rules/` 同级。`core.py` 提供注册表和调用管线，`handlers.py` 按 Run 阶段与权限绑定工具；本地文件、Bash、任务、网络、Skill、浏览器、Chat 和委派工具各有独立模块，`effects.py` 负责副作用回执与资源隔离，`evidence.py` 将检查和诊断中的源码读取结果保存为证据。前端源码分析入口位于 `tools/code_analysis.py`：`CodeAnalyze` 定义调用参数，处理器读取授权源码与暂存候选、调用 `rules/analyzers.py`，返回分析位置、内容哈希和证据引用；`rules/` 继续负责规则与可复用分析服务。
@@ -59,7 +59,7 @@ Agent 使用的工具定义、输入输出契约、注册和执行逻辑集中�
                                       └──────────────────┘
 ```
 
-现有 Web / CLI 调试入口位于 `frontend/`，Node 接口层位于 `backend/apps/console-api`，共享服务位于 `backend/packages/console-service`，Python Agent 位于 `backend/packages/agent`。BugBoard 测试目标位于独立的 `BUPTtsy/Test-Bug-repo` 仓库，由 Agent 根据配置拉取，不加入产品 npm workspace。
+现有 Web 调试入口位于 `frontend/`，Node 接口层位于 `backend/apps/console-api`，共享服务位于 `backend/packages/console-service`，Python Agent 位于 `backend/packages/agent`。BugBoard 测试目标位于独立的 `BUPTtsy/Test-Bug-repo` 仓库，由 Agent 根据配置拉取，不加入产品 npm workspace。
 
 ## 接入边界
 
@@ -75,7 +75,7 @@ Agent 使用的工具定义、输入输出契约、注册和执行逻辑集中�
 
 Git checkout 负责源码物化；GitHub MCP 仅读取绑定仓库的元数据、指定 commit 文件 / 提交，以及调用方明确选择的 Issue / PR 描述。部署与 `read_context()` / `health()` / `list_read_tools()` 契约见[GitHub 只读接入边界](docs/GitHub端到端测试边界.md)。当前 connector 尚未自动进入 Test / Diagnose / Repair 上下文，真实读取验收为 **SKIPPED**；定向通过不代表完整 Beta 已验收，结果见[验收记录](docs/验收记录.md)。
 
-当前接口使用已注册仓库的 `projectId`（兼容 `repositoryId`），由该仓库的 Profile 提供启动命令、源码范围和环境配置。`goal` 为任务目标，`mode` 支持 `test` / `repair`；可传 `execution` 中的 `executionMode`、`url` 和 `spec`，以及 `additionalRuleIds`（兼容 `rule_ids`）。Task 接口首版只支持 `batch`，也是默认执行模式；交互审批仍通过原有 CLI / Run 入口处理。`url` 须属于仓库配置的来源，`spec` 为组件目录内的相对文件路径，编辑时可用 `null` 清除这两项。仓库地址、凭据引用和命令通过受控注册入口配置，Task 正文不能替换仓库绑定或注入明文凭据。
+当前接口使用已注册仓库的 `projectId`（兼容 `repositoryId`），由该仓库的 Profile 提供启动命令、源码范围和环境配置。`goal` 为任务目标，`mode` 支持 `test` / `repair`；可传 `execution` 中的 `executionMode`、`url` 和 `spec`，以及 `additionalRuleIds`（兼容 `rule_ids`）。Task 接口首版只支持 `batch`，也是默认执行模式；审批与恢复通过 Web Run 入口处理。`url` 须属于仓库配置的来源，`spec` 为组件目录内的相对文件路径，编辑时可用 `null` 清除这两项。仓库地址、凭据引用和命令通过受控注册入口配置，Task 正文不能替换仓库绑定或注入明文凭据。
 
 | 接口 | 行为 |
 | --- | --- |
@@ -142,31 +142,6 @@ bash scripts/bootstrap/start.sh --web
 
 `--dev` 模式使用 Vite 的 `5173` 端口，控制台 API 使用 `3000` 端口；默认模式由同一个 Node 服务提供前台页面和 API。
 
-### 启动交互式 CLI
-
-Windows：
-
-```powershell
-.\start-windows.cmd
-```
-
-Linux/macOS：
-
-```bash
-[ -f .env ] || cp .env.example .env
-chmod +x scripts/bootstrap/start.sh
-./scripts/bootstrap/start.sh --mode repair --spec profiles/persistence.spec.json
-```
-
-进入 CLI 后，直接输入消息即可开始 Chat；执行测试或修复前切换模式：
-
-```text
-/mode repair
-把 Write project brief 标记为完成，重新加载页面，确认完成状态仍然保留；如果失败则修复。
-```
-
-Run 到达 REVIEW 后，可以使用 `/diff`、`/evidence REF` 和 `/report` 查看产物，并使用 `/approve ACTION_ID` 或 `/reject ACTION_ID` 处理明确的本地提交请求。审批前不会创建提交。
-
 ## Web 调试工作台开发
 
 如果已经自行准备好依赖、数据库和镜像，可以直接运行产品 workspace：
@@ -228,7 +203,7 @@ TRACEFIX_TEXT_MODEL=deepseek-chat
 | --- | --- |
 | `TRACEFIX_API_KEY` | 模型服务认证；真实模型调用时必填。 |
 | `TRACEFIX_BASE_URL` | OpenAI-compatible 接口根地址，不要附加 `/chat/completions`。 |
-| `TRACEFIX_TEXT_MODEL` | CLI、Web 和 Agent 默认使用的文本模型。 |
+| `TRACEFIX_TEXT_MODEL` | Web 和 Agent 默认使用的文本模型。 |
 | `TRACEFIX_VISION_MODEL` | 可选视觉模型；留空时截图只保存为证据，不发送给模型。 |
 | `TRACEFIX_THINKING` | 是否启用模型 reasoning：`enabled` 或 `disabled`。 |
 | `TRACEFIX_STREAM` | 是否流式接收模型输出；模板默认关闭。 |
@@ -236,7 +211,7 @@ TRACEFIX_TEXT_MODEL=deepseek-chat
 | `TRACEFIX_MODEL_MAX_ATTEMPTS` | 结构化输出校正的总尝试次数，不是网络重试次数。 |
 | `TRACEFIX_DATABASE_URL` | Agent 的 PostgreSQL 地址，用于 Test / Repair 的状态和 checkpoint。 |
 | `POSTGRES_PASSWORD` | Compose PostgreSQL 密码，应与数据库 URL 一致。 |
-| `TRACEFIX_CONSOLE_DB` | Web/CLI 控制台 SQLite 文件位置。 |
+| `TRACEFIX_CONSOLE_DB` | Web 控制台 SQLite 文件位置。 |
 | `TRACEFIX_WORKER_*` | 为 Worker 覆盖模型网关；未填写的字段继承主配置。 |
 | `TRACEFIX_WEB_SEARCH_API_KEY` | 配置后启用 WebSearch；留空则不注册搜索工具。 |
 | `TRACEFIX_EMBEDDING_URL` / `TRACEFIX_EMBEDDING_REVISION` | 配置可选的 dense RAG 服务及固定版本。 |
@@ -264,7 +239,6 @@ python -m pytest -q tests/test_pydantic_model_execution.py tests/test_pydantic_a
 tracefix/
 ├── frontend/
 │   ├── apps/web/             React Web 调试工作台
-│   ├── apps/cli/             TypeScript CLI
 │   └── packages/             API、展示层、Agent UI、知识库、规则和 Run UI
 ├── backend/
 │   ├── apps/console-api/     Node HTTP/SSE 接口层
@@ -290,10 +264,9 @@ npm test
 npm run typecheck
 npm run build
 python -m pytest -q
-python scripts/bootstrap/launch.py --smoke --plain
 ```
 
-`--smoke` 使用 Fake 模型、工具和内存数据库，适合验证状态机、证据门、审批和报告链路；它不会启动真实浏览器，也不代表完整修复验收。完整真实 E2E 需要模型 API、Docker Linux、Compose、PostgreSQL 和 Playwright MCP，入口及前置条件见 [完成度评估](docs/产品说明手册/00-项目进度/完成度评估.md)。
+引擎单元测试使用 Fake 模型、工具和内存数据库，验证状态机、证据门、审批和报告链路；这些测试不会启动真实浏览器，也不代表完整修复验收。完整真实 E2E 需要模型 API、Docker Linux、Compose、PostgreSQL 和 Playwright MCP，入口及前置条件见 [完成度评估](docs/产品说明手册/00-项目进度/完成度评估.md)。
 
 ## 文档导航
 
@@ -305,7 +278,6 @@ python scripts/bootstrap/launch.py --smoke --plain
 | [规则与独立 Repair 来源链](docs/产品说明手册/03-Agent运行时/规则Finding与独立Repair来源链.md) | B3 内部规则快照、逐 Finding 来源、独立修复、覆盖与 B4 接线 |
 | [WINDOWS_START.md](WINDOWS_START.md) | Windows 环境准备与常见问题 |
 | [配置与边界](docs/项目配置与操作边界.md) | 项目 Profile、操作范围和运行时约束 |
-| [命令行工作区](docs/命令行工作区.md) | CLI 项目、知识、Run 和续执行 |
 | [Web 工作台与知识库](docs/Web工作台与知识库.md) | 控制台页面、共享数据和浏览器验收 |
 | [框架接入说明](docs/agent-framework-migration.md) | PydanticAI、LangGraph、DeepAgents 的执行边界 |
 | [统一检查套件与前端代码分析](docs/统一检查套件与前端代码分析.md) | CheckPlan、逐项检查、Test/Repair 复用、CodeAnalyze 和报告契约 |

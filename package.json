@@ -11,7 +11,7 @@
     "backend/packages/console-service"
   ],
   "scripts": {
-    "build": "npm run build --workspace @tracefix/console-service && npm run build --workspace @tracefix/cli && npm run build --workspace @tracefix/web",
+    "build": "npm run build --workspace @tracefix/console-service && npm run build --workspace @tracefix/web",
     "typecheck": "npm run typecheck --workspace @tracefix/web",
     "test": "npm test --workspace @tracefix/console-service && npm test --workspace @tracefix/console-api",
     "dev": "npm run dev --workspace @tracefix/web",

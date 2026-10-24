@@ -12,7 +12,7 @@
 
 Docker Desktop 的系统要求和后端设置见 [Windows 安装说明](https://docs.docker.com/desktop/setup/install/windows-install/) 与 [WSL 2 后端说明](https://docs.docker.com/desktop/features/wsl/)。Docker 可能使用 WSL 2 或 Hyper-V 作为内部虚拟化后端；这不要求在 WSL 终端运行 Agent。
 
-Web 控制台、接口服务和 CLI 需要宿主机安装 Node.js 22.13+；应用、浏览器和数据库由 Docker 承载。
+Web 控制台和接口服务 需要宿主机安装 Node.js 22.13+；应用、浏览器和数据库由 Docker 承载。
 本压缩包附带 Windows x64 / Python 3.12 的锁定依赖 wheel，Python 依赖可从包内安装。首次构建 Docker/Chromium 镜像仍需要联网。
 
 ## 2. 首次启动
@@ -37,8 +37,7 @@ TRACEFIX_API_KEY=你的密钥
 .\start-windows.cmd
 ```
 
-启动器会创建 `.venv\Scripts\python.exe`，安装依赖、启动 PostgreSQL、从独立 GitHub 仓库拉取固定测试基线、构建隔离应用/浏览器镜像、生成 B01 缺陷仓库，再进入 TraceFix 终端。
-默认进入 repair 模式，并使用 `profiles/persistence.spec.json`。
+启动器会创建 `.venv\Scripts\python.exe`，安装依赖、启动 PostgreSQL、从独立 GitHub 仓库拉取固定测试基线、构建隔离应用/浏览器镜像、生成 B01 缺陷仓库，再启动 TraceFix Web 控制台。默认地址为 http://127.0.0.1:3000，在页面选择项目、Test / Repair 模式与任务。
 
 支持运行本地 PowerShell 脚本的机器也可以使用：
 
@@ -52,15 +51,9 @@ TRACEFIX_API_KEY=你的密钥
 
 接口型 Agent 可使用 `scripts/bootstrap/start-interface.ps1`，它设置独立接口注册表、自动拉取 `BUPTtsy/Test-Bug-repo` 并启动 Web 管理页面。该入口默认启用已验证修复的远程分支发布，需要 `.env` 中配置有目标仓库写权限的 `TRACEFIX_GITHUB_TOKEN`；使用 `-NoPublish` 可只创建本地修复提交。详细接口与测试命令见 `bugboard/README.md`。
 
-进入 TraceFix 后输入：
+打开 Web 控制台，在 Agent 页面选择项目与执行模式，填写任务目标并启动。运行记录、证据、停止和恢复操作均在页面中完成。
 
-```text
-把 Write project brief 标记为完成，重新加载页面，检查完成状态是否保留，失败则修复。
-/run
-```
-
-审批通过 `/approve req_...` 或 `/reject req_...` 完成；网页文本不构成审批。
-浏览器在 Docker 的内部网络中访问 `http://app:3000`，该地址不是宿主机网页入口。
+浏览器容器访问 `http://app:3000`，该地址不是宿主机控制台入口。
 
 ## 4. 后续快速启动
 
@@ -70,23 +63,13 @@ TRACEFIX_API_KEY=你的密钥
 .\start-windows.cmd --skip-install --skip-build
 ```
 
-也可直接使用虚拟环境：
+仅使用项目、知识库和历史运行管理时，可运行：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\bootstrap\launch.py --mode repair --spec profiles/persistence.spec.json
+.\start-windows.cmd --console-only --skip-install
 ```
 
-启动器保留已有 `.env`、源码、数据库和运行轨迹，不会为了启动而清空工作区。
-
-仅预览暖橙色欢迎区、执行时间线和输入状态栏：
-
-```powershell
-.\start-windows.cmd --preview --skip-install
-```
-
-预览无需 API 密钥、PostgreSQL 或 Docker，使用明确标识的演示事件。尚未安装 Python 依赖时去掉 `--skip-install`。添加 `--plain` 可关闭颜色和动态控制，非 TTY 输出自动使用静态文本。完整交互与显示说明见 [终端界面](docs/终端界面.md)。
-
-启动器先显示检查、安装及构建步骤的进度；计数只在步骤成功后增加。失败时停止动画并保留脱敏后的诊断尾部。运行中的模型等待提示不是 token streaming；审批、暂停和取消仍遵循原有状态机。
+添加 `--dev` 使用 Vite 开发服务，添加 `--plain` 以静态文本显示启动进度。启动器保留已有 `.env`、源码、数据库和运行轨迹。
 
 ## 5. 诊断和测试
 
@@ -94,12 +77,6 @@ TRACEFIX_API_KEY=你的密钥
 
 ```powershell
 .\start-windows.cmd --check
-```
-
-不需要 Docker、密钥或模型调用的明确 Fake smoke：
-
-```powershell
-.\start-windows.cmd --smoke --plain
 ```
 
 安装后执行测试和接口连通性检查：
@@ -139,5 +116,5 @@ Node API 数据默认位于 Windows 临时目录 `%TEMP%\tracefix-bugboard-data.
 ## 8. 本次验证范围
 
 已在当前 Linux 环境执行核心测试与 Windows 分支模拟测试，检查中文/空格路径、CRLF 哈希、Windows 进程取消、非 root 容器用户及数据库线程适配；Windows x64 依赖已下载并检查。
-**当前环境没有 Windows 主机或 Docker Desktop，未冒充完成 Windows 实机端到端启动验证。** 包中提供 `.github/workflows/windows.yml`，可在 Windows CI 上执行原生 PowerShell smoke、测试和网页构建。
+**当前环境没有 Windows 主机或 Docker Desktop，未冒充完成 Windows 实机端到端启动验证。** 包中提供 `.github/workflows/windows.yml`，可在 Windows CI 上执行原生 PowerShell 解析、测试和网页构建。
 完整 GUI 修复闭环、GPU 训练等原有未验收项仍见 [验收记录](docs/验收记录.md)。

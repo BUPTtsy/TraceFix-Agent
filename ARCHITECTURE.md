@@ -7,7 +7,6 @@
 | 目录 | 软件包 | 职责 |
 | --- | --- | --- |
 | `frontend/apps/web` | `@tracefix/web` | React 应用装配、导航、全局样式与 Web 构建 |
-| `frontend/apps/cli` | `@tracefix/cli` | 交互终端、命令解析、Agent 进程启动 |
 | `frontend/packages/api-client` | `@tracefix/api-client` | HTTP/SSE 客户端、接口类型、错误包装 |
 | `frontend/packages/presentation` | `@tracefix/presentation` | 状态、阶段和事件展示文案 |
 | `frontend/packages/agent` | `@tracefix/agent-ui` | Agent 对话与运行控制界面 |
@@ -26,9 +25,9 @@
 | `backend/packages/agent/src/tracefix` | `tracefix-agent` | Python Agent 发行包，导入名维持 `tracefix.*` |
 | `backend/skills` | Agent 流程资源 | 13 个分阶段 Skill 目录；索引只读 `name`/`description`，正文按触发器加载；由 `--skills` 配置资源根 |
 
-Python 发行包中的 `runtime`、`agents`、`connectors`、`execution`、`model`、`knowledge`、`rules`、`storage` 是功能子包；`cli` 保留引擎会话及旧命令入口。`agents` 保存框架适配器：Gateway 的模型执行接入 PydanticAI，只读 Worker 的调查接入 DeepAgents。`connectors/github_mcp.py` 提供独立的 GitHub MCP 只读 stdio 契约。它们共享运行契约，因此保持统一发行与安装，不将其声明为独立部署服务。根 `pyproject.toml` 指向源码目录，SQL schema 仍随 `tracefix.storage` 打包。
+Python 发行包中的 `runtime`、`agents`、`connectors`、`execution`、`model`、`knowledge`、`rules`、`storage` 是功能子包；`service/session.py` 保存 Web 所需的运行会话，`service/web_run.py` 通过 JSON stdin 承接旧版 Web 运行接口，Python CLI 已移除。`agents` 保存框架适配器：Gateway 的模型执行接入 PydanticAI，只读 Worker 的调查接入 DeepAgents。`connectors/github_mcp.py` 提供独立的 GitHub MCP 只读 stdio 契约。它们共享运行契约，因此保持统一发行与安装，不将其声明为独立部署服务。根 `pyproject.toml` 指向源码目录，SQL schema 仍随 `tracefix.storage` 打包。
 
-Web 通过 HTTP 访问 console-api；console-api 和 TypeScript CLI 共用 console-service。CLI 在本机直接调用后台数据服务，执行任务时启动 Python Agent。Python 与 Node 继续使用同一 SQLite 数据契约。HTTP 服务从 `frontend/apps/web/dist` 提供构建后的页面，并保留原有所有路由。
+Web 通过 HTTP 访问 console-api；console-api 使用 console-service 管理数据，并通过内部服务入口启动 Python Agent。Python 与 Node 继续使用同一 SQLite 数据契约。HTTP 服务从 `frontend/apps/web/dist` 提供构建后的页面，并保留原有所有路由。
 
 ### 仓库注册、冻结与外部上下文
 
@@ -75,9 +74,9 @@ npm test
 npm run dev
 ```
 
-生产方式本地预览：先 `npm run build`，再 `npm start`。CLI 为 `node frontend/apps/cli/dist/cli.mjs`。单独构建可使用 `npm run build --workspace @tracefix/cli` 或 `--workspace @tracefix/web`。
+生产方式本地预览：先 `npm run build`，再 `npm start`。单独构建前台可使用 `npm run build --workspace @tracefix/web`。
 
-Python 3.12 环境安装依赖后执行 `python -m pip install --no-deps -e .`，迁移前已有 editable install 也需要重装一次。现有测试从根目录执行 `python -m pytest`。离线引擎检查使用 `scripts/bootstrap/start.ps1 --smoke --plain` 或对应 Unix 入口。
+Python 3.12 环境安装依赖后执行 `python -m pip install --no-deps -e .`，迁移前已有 editable install 也需要重装一次。现有测试从根目录执行 `python -m pytest`。离线引擎检查使用 pytest 中的 Fake 测试；bootstrap 默认启动 Web 控制台。
 
 ```bash
 docker build -f bugboard/docker/Dockerfile -t tracefix-bugboard:1.0 bugboard/target
