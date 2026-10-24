@@ -4,12 +4,14 @@ import socket
 import subprocess
 import time
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 import yaml
 
 from tracefix.console import dispatch
+from tracefix.agents.claude_sdk_adapter import ExecutionInspection
 from tracefix.service.session import Session
 from tracefix.storage.store import MemoryStore
 from tracefix.execution.workspace import Workspace
@@ -18,6 +20,9 @@ from tracefix.runtime.continuation import continuation_state
 from tracefix.runtime.smoke import FakeBrowser, FakeRunner, make_engine
 from tracefix.knowledge.documents import ConflictError, DocumentLibrary
 from tracefix.rules import Rule, RuleLibrary, RuleResolver
+
+from test_harness_graph import create_harness_engine
+from support_harness_continuation import continuation_workspace
 
 
 def web(session, operation, fields=None):
@@ -29,6 +34,7 @@ def web(session, operation, fields=None):
 def engine_session(service_session, tmp_path, monkeypatch):
     session = service_session
     engine, state = make_engine(tmp_path / 'engine', bugfree=True)
+    state.mode = 'test'
     rule = Rule(id='ci_source_guard', name='模拟源码不得包含 debugger', status='enabled', pinned=True,
         scope={'level': 'project', 'project_ids': ['b'], 'path_globs': ['src/value.ts']},
         phases=['EXPLORE', 'DIAGNOSE', 'PATCH', 'VERIFY'],
@@ -148,71 +154,115 @@ def test_shared_continuation_gate_and_duplicate_requests(service_session, status
             web(session, 'run.continue', {'id': record['id'], 'instruction': '继续检查'})
 
 
-async def test_continuation_revalidates_existing_patch(engine_session):
-    session, engine, state = engine_session
-    engine.browser.bugfree = False
-    await session.drive(state)
-    pending = session.state()
-    assert pending.run_status == RunStatus.WAITING_APPROVAL
-    patch = engine.workspace.diff()
-    engine.workspace.branch('tracefix/' + pending.run_id)
-    pending.run_status = RunStatus.FAILED
-    pending.outcome = Outcome.INFRA_FAILURE
-    engine.store.save(pending)
-    session.publish_console()
-    previous_trace = engine.store.trace(state.run_id, state.scope_id)
-    await session.continue_task(session.console_run_id, '重试环境并重新验证补丁')
-    await session.task
-    resumed = session.state()
-    assert resumed.run_status == RunStatus.WAITING_APPROVAL
-    assert resumed.outcome == Outcome.FIX_VERIFIED
-    assert resumed.patch_hash == pending.patch_hash and engine.workspace.diff(pending.patch_base_commit) == patch
-    assert resumed.test_spec_ref == pending.test_spec_ref
-    assert resumed.approval_ref != pending.approval_ref
-    assert resumed.budget.model_calls > pending.budget.model_calls
-    assert len(resumed.validation_refs) == 6
-    browser_validations = [reference for reference in resumed.validation_refs
-        if engine.get(resumed, reference)['kind'] in {'original', 'regression'}]
-    assert set(browser_validations).isdisjoint(pending.validation_refs)
-    assert set(resumed.check_result_refs).isdisjoint(pending.check_result_refs)
-    assert resumed.initial_check_result_refs == pending.initial_check_result_refs
-    assert any(item['rule_id'] == 'ci_source_guard' and item['status'] == 'checked_pass'
-               and item['phase'] == 'VERIFY' for item in resumed.rule_coverage)
-    trace = engine.store.trace(state.run_id, state.scope_id)
+async def stopped_candidate(tmp_path, monkeypatch, *, after_accepted=False):
+    engine, state, harness, executor = await create_harness_engine(tmp_path)
+    verify = engine.verify
+    executor.inspect = AsyncMock(return_value=ExecutionInspection(
+        execution_id='checked', status='STOPPED', active=False))
+
+    async def stop_before_verification(current, node):
+        accepted = harness.job(current).accepted_commit != harness.job(current).origin_base_commit
+        if accepted != after_accepted:
+            return await verify(current, node)
+        job = await harness.stop(engine, current)
+        assert job.status == 'STOPPED'
+        return engine.output(engine.changed(current, run_status=RunStatus.PAUSED), 'end')
+
+    monkeypatch.setattr(engine, 'verify', stop_before_verification)
+    await engine.run(state)
+    pending = engine.store.load(engine.current_run, state.scope_id)
+    assert pending.run_status == RunStatus.PAUSED and pending.patch_hash, pending.error
+    execution = harness.store.get_execution(pending.sdk_execution_id, scope_id=pending.scope_id)
+    checkpoint = engine.get(pending, execution.checkpoint_ref)
+    assert checkpoint['status'] == 'STOPPED' and checkpoint['writers_alive'] is False
+    assert checkpoint['artifacts_consistent'] is True
+    monkeypatch.setattr(engine, 'verify', verify)
+    return engine, pending, harness, executor, execution
+
+
+async def test_continuation_revalidates_existing_patch(continuation_workspace, monkeypatch):
+    engine, pending, harness, executor, execution = await stopped_candidate(
+        continuation_workspace, monkeypatch)
+    patch = engine.workspace.diff(pending.patch_base_commit)
+    job = harness.job(pending)
+    frozen_acceptance = list(job.acceptance_refs)
+    previous_trace = engine.store.trace(pending.run_id, pending.scope_id)
+    invocations = len(executor.requests)
+
+    resumed = harness.resume(engine, pending, execution.checkpoint_ref)
+    assert harness.job(resumed).owner_epoch == job.owner_epoch + 1
+    await engine.run(resumed, resume='harness')
+
+    completed = engine.store.load(pending.run_id, pending.scope_id)
+    session = harness.store.get_session(pending.harness_session_id, scope_id=pending.scope_id)
+    record = engine.get(completed, session.verification_ref)
+    assert session.status == 'COMPLETED' and completed.outcome == Outcome.FIX_VERIFIED
+    assert completed.run_id == pending.run_id and completed.harness_job_id == pending.harness_job_id
+    assert completed.patch_hash == pending.patch_hash
+    assert completed.test_spec_ref == pending.test_spec_ref
+    assert completed.test_spec_hash == pending.test_spec_hash
+    assert completed.initial_check_result_refs == pending.initial_check_result_refs
+    assert completed.replay_plan_ref == pending.replay_plan_ref
+    assert record['passed'] and record['patch_hash'] == pending.patch_hash
+    assert record['acceptance_refs'] == frozen_acceptance
+    assert record['candidate_commit'] == session.candidate_commit
+    assert len(completed.validation_refs) == 6
+    assert all(engine.get(completed, ref)['passed'] for ref in completed.validation_refs)
+    assert record['regression_refs'] == completed.validation_refs
+    assert harness.job(completed).status == 'COMPLETED'
+    # 恢复已封存的 SDK 结果只重新跑宿主验收，不再次编码当前候选。
+    assert len([request for request in executor.requests[:invocations]
+                if request.execution_id == execution.execution_id]) == 1
+    assert not any(request.session_id == pending.harness_session_id
+                   for request in executor.requests[invocations:])
+    receipt = engine.get(completed, harness._read(completed)['lineage'][0]['ref'])
+    assert receipt['patch_hash'] == digest(patch.encode())
+    trace = engine.store.trace(pending.run_id, pending.scope_id)
     verification_operations = [event['payload']['operation_id'] for event in trace[len(previous_trace):]
         if event['type'] == 'tool.started' and ':verify.' in event['payload']['operation_id']]
     assert {operation.split(':')[-2] for operation in verification_operations} == {
         'verify.static', 'verify.unit', 'verify.build', 'verify.health'}
     assert set(verification_operations).isdisjoint({
         event['payload']['operation_id'] for event in previous_trace if event['type'] == 'tool.started'})
-    completed = {event['payload']['operation_id'] for event in trace[len(previous_trace):]
-                 if event['type'] == 'tool.completed'}
-    assert set(verification_operations) <= completed
+    completed_operations = {event['payload']['operation_id'] for event in trace[len(previous_trace):]
+                            if event['type'] == 'tool.completed'}
+    assert set(verification_operations) <= completed_operations
 
 
-async def test_continuation_failed_revalidation_cannot_reuse_old_approval(engine_session, monkeypatch):
-    session, engine, state = engine_session
-    engine.browser.bugfree = False
-    await session.drive(state)
-    pending = session.state()
-    assert pending.run_status == RunStatus.WAITING_APPROVAL
-    engine.workspace.branch('tracefix/' + pending.run_id)
-    pending.run_status = RunStatus.FAILED
-    pending.outcome = Outcome.INFRA_FAILURE
-    engine.store.save(pending)
-    session.publish_console()
-    monkeypatch.setattr('tracefix.service.session.DockerRunner',
-                        lambda *args: FakeRunner(state.source_manifest, fail='static'))
-    await session.continue_task(session.console_run_id, '重新检查失败的静态验证')
-    await session.task
-    resumed = session.state()
-    static_validation = session.engine.get(resumed, resumed.validation_refs[0])
+async def test_continuation_failed_revalidation_cannot_reuse_old_approval(continuation_workspace, monkeypatch):
+    engine, pending, harness, _executor, execution = await stopped_candidate(
+        continuation_workspace, monkeypatch, after_accepted=True)
+    job = harness.job(pending)
+    predecessor = next(session for session in harness.store.list_sessions(job.job_id,
+        scope_id=pending.scope_id) if session.kind == 'coder' and session.status == 'COMPLETED')
+    old_record = engine.artifacts.json(pending.scope_id, predecessor.run_id, predecessor.verification_ref)
+    assert old_record['passed'] and old_record['candidate_commit'] == job.accepted_commit
+
+    resumed = harness.resume(engine, pending, execution.checkpoint_ref)
+    engine.runner.fail = 'static'
+    output = await engine.verify(resumed, 'verify')
+    failed = RunState.model_validate(output['data'])
+    static_validation = engine.get(failed, failed.validation_refs[0])
     assert static_validation['kind'] == 'static' and not static_validation['passed']
-    assert resumed.run_status != RunStatus.WAITING_APPROVAL
-    assert resumed.outcome != Outcome.FIX_VERIFIED
-    assert resumed.approval_ref is None and resumed.patch_hash == pending.patch_hash
-    assert resumed.replay_plan_ref == pending.replay_plan_ref
-    assert resumed.initial_check_result_refs == pending.initial_check_result_refs
+    assert failed.outcome != Outcome.FIX_VERIFIED and failed.approval_ref is None
+    assert failed.patch_hash == pending.patch_hash
+    assert failed.replay_plan_ref == pending.replay_plan_ref
+    assert failed.initial_check_result_refs == pending.initial_check_result_refs
+    assert harness.job(failed).accepted_commit == job.accepted_commit
+    session = harness.store.get_session(failed.harness_session_id, scope_id=failed.scope_id)
+    assert session.verification_ref is None and session.invocation_no == 2
+    feedback = engine.get(failed, session.feedback_ref)
+    record = engine.get(failed, feedback['verification_ref'])
+    assert not record['passed'] and record['patch_hash'] == failed.patch_hash
+    assert record['patch_hash'] != old_record['patch_hash']
+    assert record['run_id'] == pending.run_id != old_record['run_id']
+    assert any(command['exit_code'] == 1 for command in record['commands'])
+    # 即使复用旧流程的成功状态，当前失败的实际验收证据也不能接纳候选。
+    forged = engine.changed(failed, outcome=Outcome.FIX_VERIFIED,
+                            local_branch='tracefix/' + failed.run_id)
+    with pytest.raises(PermissionError, match='独立验收'):
+        await harness.accept(engine, forged)
+    assert harness.job(failed).accepted_commit == job.accepted_commit
 
 
 @pytest.mark.parametrize('has_initial_failures', [False, True])

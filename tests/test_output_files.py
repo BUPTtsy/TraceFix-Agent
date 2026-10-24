@@ -4,8 +4,10 @@ from urllib.parse import quote
 
 import pytest
 
+from support_harness_reports import report_workspace
+from test_harness_graph import create_harness_engine
+
 from tracefix.runtime.contracts import digest
-from tracefix.runtime.smoke import make_engine
 from tracefix.storage.artifacts import Artifacts
 from tracefix.storage.presentation import report_page
 
@@ -99,13 +101,21 @@ def test_report_provenance_links_only_intact_current_run_artifacts(tmp_path):
     assert reference in unidentified
 
 
-async def test_complete_run_outputs_linked_chinese_report_and_logs(tmp_path):
-    engine, state = make_engine(tmp_path)
-    await engine.run(state)
-    state = engine.store.load(state.run_id, 'b')
-    engine.store.decide_approval(state.approval_ref, state, 'reject')
-    await engine.run(resume='reject')
-    state = engine.store.load(state.run_id, 'b')
+async def test_complete_run_outputs_linked_chinese_report_and_logs(report_workspace):
+    engine, parent, harness, executor = await create_harness_engine(report_workspace)
+    output = await engine.run(parent)
+    job = harness.job(parent)
+    assert job.status == 'COMPLETED' and job.quality == 'MERGE_READY', output['data'].get('error')
+    assert job.final_verification_ref and job.accepted_commit != job.origin_base_commit
+    sessions = harness.store.list_sessions(job.job_id, scope_id=parent.scope_id)
+    coder = next(session for session in sessions if session.kind == 'coder')
+    state = engine.store.load(coder.run_id, parent.scope_id)
+    assert state.run_id != parent.run_id and state.outcome.value == 'FIX_VERIFIED'
+    assert state.run_status.value == 'COMPLETED' and state.approval_ref is None
+    report = engine.get(state, state.report_ref)
+    assert report['patch_available'] and report['patch_verification'] == 'verified'
+    assert state.model_exchange_refs and state.validation_refs and state.evidence_refs
+    assert [request.role for request in executor.requests] == ['initializer', 'coder', 'coder']
     assert state.report_ref.endswith('_收尾_修复报告数据.json')
     events = engine.store.trace(state.run_id, 'b')
     finished = next(event for event in events if event['type'] == 'run.finished')

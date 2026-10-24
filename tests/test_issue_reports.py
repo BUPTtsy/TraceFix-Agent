@@ -3,6 +3,9 @@ from urllib.parse import quote
 
 import pytest
 
+from support_harness_reports import report_workspace
+from test_harness_graph import create_harness_engine
+
 from tracefix.console import dispatch
 from tracefix.knowledge.documents import DocumentLibrary
 from tracefix.rules import Rule, RuleLibrary, RuleResolver
@@ -14,14 +17,24 @@ from tracefix.storage.reporting import collect_issues, report_text
 
 
 @pytest.mark.parametrize('mode,expected_status', [('test', 'suspected'), ('repair', 'fixed')])
-async def test_run_explains_actual_bug_in_web_and_html(tmp_path, mode, expected_status):
-    engine, state = make_engine(tmp_path)
-    state.mode = mode
-    await engine.run(state)
-    current = engine.store.load(state.run_id, state.scope_id)
-    if current.approval_ref:
-        engine.store.decide_approval(current.approval_ref, current, 'reject')
-        await engine.run(resume='reject')
+async def test_run_explains_actual_bug_in_web_and_html(tmp_path, report_workspace, mode, expected_status):
+    if mode == 'repair':
+        # Harness 的首个 coder 子 Run 保留原缺陷与对应修复验证；初始化 Run 不产出修复报告。
+        tmp_path = report_workspace
+        engine, parent, harness, executor = await create_harness_engine(tmp_path)
+        output = await engine.run(parent)
+        job = harness.job(parent)
+        assert job.status == 'COMPLETED', output['data'].get('error')
+        sessions = harness.store.list_sessions(job.job_id, scope_id=parent.scope_id)
+        coder = next(session for session in sessions if session.kind == 'coder')
+        state = engine.store.load(coder.run_id, parent.scope_id)
+        assert state.run_id != parent.run_id and state.harness_job_id == job.job_id
+        assert state.outcome.value == 'FIX_VERIFIED' and state.approval_ref is None
+        assert any(request.role == 'coder' for request in executor.requests)
+    else:
+        engine, state = make_engine(tmp_path)
+        state.mode = mode
+        await engine.run(state)
     current = engine.store.load(state.run_id, state.scope_id)
     report = engine.get(current, current.report_ref)
     assert len(report['issues']) == 1
@@ -31,6 +44,10 @@ async def test_run_explains_actual_bug_in_web_and_html(tmp_path, mode, expected_
         assert report['overall_status'] == 'FAILED'
         assert any(result['status'] == 'fail' for result in report['check_results'])
         assert current.reproduced is False and current.trial == 0
+    else:
+        assert report['patch_available'] and report['patch_verification'] == 'verified'
+        assert any(result['status'] == 'fail' for result in report['initial_check_results'])
+        assert all(result['status'] == 'pass' for result in report['check_results'])
     assert issue['location'] == 'http://app:3000'
     assert 'Complete task' in issue['actual'] and '未选中' in issue['actual']
     assert '保持选中' in issue['expected']
@@ -44,7 +61,7 @@ async def test_run_explains_actual_bug_in_web_and_html(tmp_path, mode, expected_
     library = DocumentLibrary(tmp_path / 'console.sqlite3')
     library.update_run('console_run', {'projectId': state.scope_id, 'agentRunId': state.run_id,
         'reportRef': current.report_ref, 'goal': state.goal, 'mode': mode, 'status': 'completed'}, create=True)
-    detail = dispatch('run', {'id': 'console_run'}, library=library, data_root=tmp_path)
+    detail = dispatch('run', {'id': 'console_run'}, library=library, data_root=engine.artifacts.root.parent)
     assert detail['issueReport']['issues'] == report['issues']
     assert set(issue['evidence_refs']) <= {entry['ref'] for entry in detail['artifacts']}
     segments = [engine.get(current, entry['ref']) for entry in detail['artifacts'] if entry['label'].endswith('_阶段轨迹')]
