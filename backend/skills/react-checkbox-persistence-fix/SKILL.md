@@ -1,33 +1,45 @@
 ---
 name: react-checkbox-persistence-fix
-description: 针对 React 复选框勾选后刷新丢失这一小问题，定位状态归属并实施最小持久化修复。
-version: "1.0.0"
-phases: [DIAGNOSE, PATCH, VERIFY]
+description: React 复选框勾选后刷新丢失：判定状态归属与读写时机，做最小持久化修复。
+version: "1.1.0"
+phases: [DIAGNOSE, PATCH]
 triggers:
   frameworks: [react]
   rule_categories: [functional]
   file_globs: ["**/*.tsx", "**/*.jsx"]
-tools_hint: [code.read, code.references, browser.console, browser.navigate]
+tools_hint: [Read, Grep, Edit]
 owner: tracefix
 ---
 
 # react-checkbox-persistence-fix
 
-适用场景：用户勾选任务复选框后页面立即显示完成，但刷新或重新进入同一路由后状态回到未完成。该 Skill 只处理这个持久性问题，不扩展到通用状态管理重构。
+适用：勾选后界面立即变化，刷新或重新进入同一路由后回到旧值。
+不适用：点击无反应（先查事件与受控绑定）、加载报错、多端同步冲突、需要新增后端接口。
 
-## 诊断
+## 根因判定
 
-先沿 `checked`、`onChange`、任务 id 和数据加载函数追踪状态的唯一来源，确认组件是受控还是非受控。再查找现有 API、localStorage 或缓存适配层，确认写入是否使用稳定的任务 id，读取是否发生在首次渲染前后。检查 `useEffect` 依赖，排除以下常见但不同的原因：写入只更新内存、异步写入被卸载取消、读取结果被默认值覆盖、列表 key 改变导致状态错配。
+| 症状 | 候选原因 | 区分证据 |
+|-|-|-|
+| 刷新必丢 | 只更新内存 state | onChange 链上无 API、storage 或 store 写入 |
+| 刷新偶发丢 | 写入未 await、卸载被取消、失败被吞 | 空 catch、无 await、abort |
+| 存储有新值仍显示旧值 | 默认值或旧数据覆盖读取结果 | useState 初值与 effect 写回顺序、依赖数组 |
+| 错勾其他任务 | key 用 index 或 id 不稳定 | 列表 key、存储键 |
+| 写了但读不到 | 读写键名或 JSON 形状不一致 | 对比读写两处 |
 
-必须提供一条证据链：勾选后的 observation、刷新后的 observation、相关状态声明和读写调用的源码卡片。没有证据时不要把问题归因于 React 渲染。
+用 Grep 追 `checked`、`onChange`、任务 id 和加载函数，结论要有源码行号；没有证据不要归因于 React 渲染。
 
-## 实施
+## 修复优先级
 
-1. 优先复用项目现有的持久化接口；没有接口时才在允许文件内增加最小的按任务 id 读写适配。
-2. 让加载结果成为受控 `checked` 的唯一来源，避免同时保留 DOM 本地状态和服务端状态。
-3. 对写入失败保留可观测错误，不用静默 fallback 伪造已保存状态；对首次加载使用明确的 loading 状态避免默认值覆盖真实值。
-4. 不修改测试断言、权限、路由授权或其他任务的状态语义。
+1. 复用已有持久化接口（API 客户端、storage 封装、store action）。
+2. 修正读写键与时机：加载结果作为受控 `checked` 的唯一来源，加载完成前不让默认值回写。
+3. 前两者都不存在时，才在允许文件内加最小的按 id 读写适配。
 
-## 验证
+## 反模式
 
-验证勾选、等待保存、硬刷新、重新进入同一路由和切换另一任务五个步骤。确认当前任务保持原状态、其他任务不被误改、网络或存储失败能被观察到，并运行原始场景与独立回归场景。
+- 写入失败静默 fallback 成已保存，或吞掉错误。
+- 改测试断言、fixture 或冻结的 test_spec。
+- 顺手重构状态管理、组件结构或其他任务语义；用 setTimeout 掩盖时序。
+
+## 宿主将验证
+
+勾选后刷新仍勾选；取消后刷新仍未勾选；其他任务不变；重新进入路由一致。副本内无法确认后端持久化时写入 unresolved。
