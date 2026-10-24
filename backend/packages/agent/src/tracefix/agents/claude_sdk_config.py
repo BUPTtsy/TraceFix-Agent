@@ -6,6 +6,7 @@ from urllib.parse import urlsplit
 from pydantic import Field, model_validator
 
 from tracefix.runtime.contracts import Contract, digest
+from tracefix.connectors.context7_mcp import CONTEXT7_ORIGIN, context7_enabled
 
 
 SDK_VERSION = '0.2.168'
@@ -60,6 +61,10 @@ class ClaudeSdkConfig(Contract):
         return self
 
     @property
+    def context7_enabled(self):
+        return CONTEXT7_ORIGIN in self.egress_allowlist
+
+    @property
     def config_hash(self):
         return digest(self)
 
@@ -88,11 +93,20 @@ def load_claude_sdk_config(environment=None):
     if not credential_ref and reuse and setting('TRACEFIX_API_KEY'):
         credential_ref = 'env:TRACEFIX_API_KEY'
     allowlist = [item.strip() for item in setting('TRACEFIX_SDK_EGRESS_ALLOWLIST').split(',') if item.strip()]
+    enabled = context7_enabled(source)
+    if not allowlist:
+        allowlist = [_origin(base_url) if base_url else ANTHROPIC_ORIGIN]
+        if enabled:
+            allowlist.append(CONTEXT7_ORIGIN)
+    elif enabled and CONTEXT7_ORIGIN not in allowlist:
+        raise ValueError('Context7 MCP 需要在 TRACEFIX_SDK_EGRESS_ALLOWLIST 中放行 ' + CONTEXT7_ORIGIN)
+    if not enabled:
+        allowlist = [origin for origin in allowlist if origin != CONTEXT7_ORIGIN]
     return ClaudeSdkConfig(backend=setting('TRACEFIX_CODING_BACKEND') or 'legacy',
         model_id=setting('TRACEFIX_CLAUDE_MODEL') or (setting('TRACEFIX_TEXT_MODEL') if reuse else ''),
         credential_ref=credential_ref, base_url=base_url,
         worker_image=setting('TRACEFIX_SDK_WORKER_IMAGE'),
         # 未显式配置白名单时只放行实际模型接口的 origin。
-        egress_allowlist=allowlist or [_origin(base_url) if base_url else ANTHROPIC_ORIGIN],
+        egress_allowlist=allowlist,
         stop_grace_seconds=setting('TRACEFIX_SDK_STOP_GRACE_SECONDS') or 15,
         session_timeout_seconds=setting('TRACEFIX_SDK_SESSION_TIMEOUT_SECONDS') or None)

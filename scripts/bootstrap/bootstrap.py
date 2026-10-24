@@ -215,7 +215,7 @@ def main(argv=None):
     if options.console_only:
         total += 1 + int(not options.skip_install)
     else:
-        total += 4 + (2 if not options.skip_build else 1)
+        total += 5 + (2 if not options.skip_build else 1)
         total += 1 + int(not options.skip_install)
         total += 1
     progress = StartupProgress(total, plain=options.plain)
@@ -269,6 +269,7 @@ def main(argv=None):
         run([python, 'scripts/bootstrap/services.py', *(['--dev'] if options.dev else [])])
         return 0
     progress.run('检查 CodeGraph 运行依赖', [python, 'scripts/codegraph/deploy_codegraph.py', '--check'])
+    progress.run('部署并检查 Context7 MCP', [python, 'scripts/context7/deploy_context7_mcp.py', '--prepare'])
     progress.run('检查模型配置', [python, '-c', "from dotenv import load_dotenv; import os; load_dotenv('.env', encoding='utf-8-sig'); assert os.getenv('TRACEFIX_API_KEY'), '请先在 .env 中填写 TRACEFIX_API_KEY'"])
     progress.run('启动 PostgreSQL', ['docker', 'compose', '--env-file', '.env', 'up', '-d', '--wait', 'postgres'])
     progress.run('拉取并验证独立测试仓库', [python, 'bugboard/scripts/prepare_target.py', '--verify-cases'])

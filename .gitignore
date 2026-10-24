@@ -26,6 +26,7 @@ tests/*
 !tests/test_gateway_streaming.py
 !tests/test_architecture_repairs.py
 !tests/test_web_startup.py
+!tests/test_context7_mcp.py
 !tests/test_issue_reports.py
 !tests/test_reproduction_plan.py
 !tests/test_skills.py

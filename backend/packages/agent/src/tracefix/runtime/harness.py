@@ -9,6 +9,7 @@ from pathlib import Path
 
 from tracefix.agents.claude_sdk_adapter import ExecutionResult, SdkExecutionRequest
 from tracefix.agents.claude_sdk_config import ClaudeSdkConfig
+from tracefix.connectors.context7_mcp import SDK_CONTEXT7_INSTRUCTIONS, sdk_context7_servers
 from tracefix.execution.harness_revision import (RevisionReceipt, cumulative_diff,
     materialize_revision, tracked_files, validate_receipt)
 from tracefix.execution.repository import plain_root, run_git
@@ -628,7 +629,9 @@ class HarnessRuntime:
             'workspace': sdk_workspace.source, 'config': self.config,
             'tools': ['Read', 'Glob', 'Grep', 'Agent'] if role == 'initializer'
                 else ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash', 'Agent'],
-            'system_prompt': SDK_SYSTEM_PROMPT,
+            'system_prompt': SDK_SYSTEM_PROMPT + (
+                SDK_CONTEXT7_INSTRUCTIONS if self.config.context7_enabled else ''),
+            'mcp_servers': sdk_context7_servers(self.config),
             'sdk_session_id': prior_sdk_session, 'feedback_ref': session.feedback_ref,
             'transcript_path': sdk_workspace.execution_dir / 'transcript' / (execution.execution_id + '.jsonl')}
         if output_schema is not None:

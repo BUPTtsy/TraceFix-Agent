@@ -142,10 +142,12 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
                           submissions=submissions, validate_output=validate_output)
 
     from tracefix.tools.code_analysis import register_code_analysis_tool
+    from tracefix.tools.context7 import register_context7_tools
     from tracefix.tools.task import register_task_tools
     from tracefix.tools.web import register_web_tools
 
     register_code_analysis_tool(engine, state, context, bind)
+    register_context7_tools(engine, state, context, bind)
     register_task_tools(engine, state, context, bind)
     register_web_tools(engine, state, context, bind)
 
