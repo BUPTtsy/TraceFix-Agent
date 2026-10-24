@@ -7,7 +7,7 @@ import {loadConfig, projectCatalog, repositoryControl, type RepositoryControlOpt
 import {canContinue, codingBackend, controlProjection, ConsoleDatabase, DataError, timestamp} from './database.js';
 import {RuleDatabase} from './rules.js';
 import {classifyGuidance, guidanceUnsafe} from './guidance.js';
-import {TaskLifecycle, normalizeTask, taskError} from './task-lifecycle.js';
+import {TaskLifecycle, approvalInput, executionDefinition, normalizeTask, taskError} from './task-lifecycle.js';
 import {resultView, executorResult} from './results.js';
 import {harnessControl, type HarnessControlOptions, type HarnessControlOperation} from './harness-control.js';
 
@@ -29,7 +29,11 @@ export function createConsoleService(options: ConsoleOptions = {}) {
   const artifactRoot = (run: Data) => path.join(run.dataRoot || dataRoot, 'artifacts');
   const refreshControl = (run: Data, operation: HarnessControlOperation = 'view') => {
     if (codingBackend(run) !== 'claude_sdk') return run;
-    if (!run.taskId) throw taskError('HARNESS_TASK_REQUIRED', 'SDK 控制必须绑定 Task', 409);
+    // CLI 直接发起的 SDK Run 没有 Task 绑定：只读视图跳过权威刷新原样返回，控制操作仍要求 Task。
+    if (!run.taskId) {
+      if (operation === 'view') return run;
+      throw taskError('HARNESS_TASK_REQUIRED', 'SDK 控制必须绑定 Task', 409);
+    }
     let authority;
     try {
       authority = harnessControl(operation, {task_id: run.taskId, scope_id: run.projectId, run_id: run.id,
@@ -42,18 +46,25 @@ export function createConsoleService(options: ConsoleOptions = {}) {
         can_stop: false, resume_blockers: ['HARNESS_JOB_NOT_BOUND']};
     }
     const {coding_backend, control_status, can_resume, can_stop, resume_blockers,
-      harness_job_id, harness_session_id, current_run_id, accepted_commit, quality, owner_epoch, revision} = authority;
+      harness_job_id, harness_session_id, current_run_id, accepted_commit, quality, owner_epoch, revision, approval} = authority;
+    // 权威交付记录只补充审批子集；不改写 Run status（waiting_approval 由执行结果维护，不能被刷新改回 completed）。
+    const local = run.approval && typeof run.approval === 'object' ? run.approval : null;
+    const merged = approval && typeof approval === 'object' && !Array.isArray(approval) ?
+      (!local || local.id === approval.id ? {...(local || {}), ...Object.fromEntries(Object.entries(approval)
+        .filter(([, value]) => value !== null && value !== undefined))} : approval) : undefined;
     return database.updateRun(run.id, {coding_backend, control_status, can_resume, can_stop, resume_blockers,
       ...(harness_job_id ? {harness_job_id} : {}), ...(harness_session_id ? {harness_session_id} : {}),
       ...(current_run_id ? {agentRunId: current_run_id, current_run_id} : {}),
       ...(accepted_commit !== undefined ? {accepted_commit} : {}), ...(quality !== undefined ? {quality} : {}),
-      ...(owner_epoch !== undefined ? {owner_epoch} : {}), ...(revision !== undefined ? {harness_revision: revision} : {})});
+      ...(owner_epoch !== undefined ? {owner_epoch} : {}), ...(revision !== undefined ? {harness_revision: revision} : {}),
+      ...(merged ? {approval: merged} : {})});
   };
   const taskView = (task: Data) => {
     const run = task.currentRunId ? refreshControl(database.run(task.currentRunId)) : null;
     return {...task, ...(run ? controlProjection(run) : {
-      coding_backend: task.definition?.execution?.backend || 'legacy', control_status: String(task.status || '').toUpperCase(),
-      can_stop: false, can_resume: false, resume_blockers: [], harness_job_id: null, harness_session_id: null,
+      coding_backend: task.definition?.mode === 'repair' ? 'claude_sdk' : null, control_status: String(task.status || '').toUpperCase(),
+      can_stop: false, can_resume: false, can_approve: false, approval: null, resume_blockers: [],
+      harness_job_id: null, harness_session_id: null,
     })};
   };
   // 与 Python 运行时共用 guidance.sqlite3，Web 写入先排队，执行层在安全边界读取并应用。
@@ -172,6 +183,16 @@ export function createConsoleService(options: ConsoleOptions = {}) {
       return tasks.resume(fields.id, fields.body, fields.key, fields.ownerId);
     }
     if (operation === 'task.resume.check') return tasks.checkResume(fields.id, fields.body || {}, fields.key);
+    if (operation === 'task.approval') {
+      const replayed = tasks.checkApproval(fields.id, fields.body ?? {}, fields.key);
+      if (replayed) return replayed;
+      approvalInput(fields.body);
+      const task = tasks.task(fields.id);
+      // 先同步权威交付记录：CLI 已审批或 Job 已交付时，下面的前置条件会拒绝重复交付。
+      if (task.currentRunId) refreshControl(database.run(task.currentRunId));
+      return tasks.approve(fields.id, fields.body, fields.key, fields.ownerId);
+    }
+    if (operation === 'task.approval.check') return tasks.checkApproval(fields.id, fields.body ?? {}, fields.key);
     if (operation === 'task.launching') return tasks.launchIntent(fields.id, fields.runId, fields.ownerId);
     if (operation === 'task.spawned') return tasks.spawned(fields.id, fields.runId, fields.ownerId, fields.pid);
     if (operation === 'task.finish') return tasks.finish(fields.id, fields.runId, fields.ownerId, fields.changes);
@@ -213,7 +234,8 @@ export function createConsoleService(options: ConsoleOptions = {}) {
         url: project.url, executionProfile: profile,
         repository: configuration ? {defaultRef: configuration.default_ref, commit: configuration.commit,
           configDigest: configuration.config_digest, checkoutMode: configuration.checkout_mode,
-          publishBranch: configuration.publish_branch, allowedUrls: configuration.allowed_urls} : null,
+          publishBranch: configuration.publish_branch, requireApproval: configuration.require_approval === true,
+          allowedUrls: configuration.allowed_urls} : null,
         detectionRules: rules.rules({status: 'enabled'}).filter(rule => selectedRuleIds.has(rule.id)).map(rule => ({
           id: rule.id, version: rule.version, name: rule.name, severity: rule.severity,
           detection: rule.detection, fix_guidance: rule.fix_guidance})),
@@ -233,7 +255,8 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     if (operation === 'run.control') return refreshControl(database.run(fields.id));
     if (operation === 'run.harness.stop') return refreshControl(database.run(fields.id), 'stop');
     if (operation === 'run.executor-result') {
-      const view = fields.result?.report_ref ? runView(fields.id) : undefined;
+      // 待审批（非终态）结果没有权威终态报告，不做报告/补丁校验，只刷新权威控制状态。
+      const view = fields.result?.terminal !== false && fields.result?.report_ref ? runView(fields.id) : undefined;
       const record = view || refreshControl(database.run(fields.id));
       const ref = view?.issueReport?.patch_diff_ref;
       const bytes = ref ? Buffer.from(dispatch('artifact', {id: fields.id, ref}).content, 'base64') : undefined;
@@ -335,10 +358,11 @@ export function createConsoleService(options: ConsoleOptions = {}) {
       if (fields.execution?.url && frozen &&
           !(frozen.repository_config?.allowed_urls || []).some((origin: string) => new URL(fields.execution.url).origin === origin))
         throw taskError('EXECUTION_URL_NOT_ALLOWED', '执行 URL 超出仓库冻结白名单', 403);
-      const backend = fields.execution?.backend || fields.execution?.coding_backend || 'legacy';
+      // repair 一律由 SDK 编码；test 检测流程没有编码后端。历史定义中的 legacy/repairMode 不再写入 Run。
+      const backend = fields.mode === 'repair' ? 'claude_sdk' : null;
       const record = {id: runId, projectId: project.id, mode: fields.mode,
-        ...(fields.execution ? {execution: {...fields.execution}, executionMode: fields.execution.executionMode} : {}),
-        coding_backend: backend,
+        ...(fields.execution ? {execution: executionDefinition(fields), executionMode: fields.execution.executionMode} : {}),
+        ...(backend ? {coding_backend: backend} : {}),
         ...(fields.execution?.sdk_execution_id ? {sdk_execution_id: fields.execution.sdk_execution_id} : {}),
         profile: frozen?.profile_path || project.profile, registry: frozen?.projects_path || project.registry,
         repositorySnapshot: frozen,
@@ -354,7 +378,8 @@ export function createConsoleService(options: ConsoleOptions = {}) {
         'registry', 'projectId', 'dataRoot', 'id', 'consoleRunId', 'repoSnapshotRef', 'memorySnapshotRef',
         'sourceManifest', 'evidenceRefs', 'inheritedEvidenceRefs', 'scopeId', 'parentRunId', 'taskId', 'execution',
         'executionMode', 'coding_backend', 'harness_job_id', 'harness_session_id', 'harness_task_id', 'harness_stage',
-        'sdk_execution_id', 'source_run_id', 'source_finding_ids', 'github_reads', 'consoleDatabasePath']
+        'sdk_execution_id', 'source_run_id', 'source_finding_ids', 'github_reads', 'consoleDatabasePath',
+        'approval', 'publication', 'delivery_diff']
           .some(key => Object.hasOwn(fields.changes || {}, key))) throw new DataError('运行身份、证据归属和仓库快照不可修改', 409);
       return database.updateRun(fields.id, fields.changes);
     }

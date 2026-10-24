@@ -1,12 +1,33 @@
 import {createHash, randomUUID} from 'node:crypto';
-import {ConsoleDatabase, DataError, codingBackend, timestamp} from './database.js';
+import {ConsoleDatabase, DataError, codingBackend, executorBusy, timestamp} from './database.js';
 import findingAcceptanceSchema from '../../agent/src/tracefix/service/finding_acceptance.schema.json';
 
 type Data = Record<string, any>;
+// Task 级锁：这些状态下不能 start/update/resume；waiting_approval 只锁 Task，不占用执行器。
 const active = new Set(['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping']);
 const resumable = new Set(['cancelled', 'abnormal', 'failed', 'stopped']);
 export const taskError = (code: string, message: string, status = 409, retryable = false) =>
   Object.assign(new DataError(message, status), {code, retryable});
+
+// 规范化执行定义：repair 一律交给 SDK，test 检测流程不带编码后端；
+// 历史定义残留的 repairMode / backend:'legacy' 等字段只读保留在旧记录中，构造新 Run 与请求时一律剔除。
+export function executionDefinition(definition: Data): Data {
+  const execution = definition?.execution && typeof definition.execution === 'object' ? definition.execution : {};
+  const normalized: Data = Object.fromEntries(['executionMode', 'url', 'spec']
+    .filter(key => execution[key] !== undefined).map(key => [key, execution[key]]));
+  const sdk = definition?.mode === 'repair' ||
+    definition?.mode !== 'test' && [execution.backend, execution.coding_backend].includes('claude_sdk');
+  return sdk ? {...normalized, backend: 'claude_sdk'} : normalized;
+}
+
+export function approvalInput(fields: Data): Data {
+  if (!fields || typeof fields !== 'object' || Array.isArray(fields) ||
+      Object.keys(fields).sort().join(',') !== 'approval_id,decision' ||
+      typeof fields.approval_id !== 'string' || !fields.approval_id || fields.approval_id.length > 200 ||
+      !['approve', 'reject'].includes(fields.decision))
+    throw taskError('INVALID_APPROVAL', '审批正文必须恰为 approval_id 与 approve/reject 决定', 400);
+  return {approval_id: fields.approval_id, decision: fields.decision};
+}
 
 function canonical(value: any): string {
   if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
@@ -67,15 +88,14 @@ export function normalizeTask(fields: Data, projects: Data[]): Data {
     throw taskError('TASK_CONTAINS_CREDENTIALS', 'Task 不允许包含真实凭据', 400);
   const execution = fields.execution;
   if (!execution || typeof execution !== 'object' || Array.isArray(execution) ||
-      Object.keys(execution).some(key => !['executionMode', 'url', 'spec', 'repairMode', 'backend', 'coding_backend'].includes(key)))
+      Object.keys(execution).some(key => !['executionMode', 'url', 'spec', 'backend', 'coding_backend'].includes(key)))
     throw taskError('INVALID_EXECUTION', '必须指定 batch 执行配置', 400);
   if (execution.executionMode !== 'batch') throw taskError('UNSUPPORTED_EXECUTION_MODE', '首版仅支持 batch 执行', 400);
-  const backend = execution.backend ?? execution.coding_backend ?? 'legacy';
-  if (!['legacy', 'claude_sdk'].includes(backend)) throw taskError('INVALID_CODING_BACKEND', 'coding backend 必须是 legacy 或 claude_sdk', 400);
-  if (execution.backend !== undefined && execution.coding_backend !== undefined && execution.backend !== execution.coding_backend)
-    throw taskError('INVALID_CODING_BACKEND', 'backend 与 coding_backend 不一致', 400);
-  if (execution.repairMode !== undefined && !['hybrid', 'pipeline'].includes(execution.repairMode))
-    throw taskError('INVALID_REPAIR_MODE', 'repairMode 必须是 hybrid 或 pipeline', 400);
+  for (const key of ['backend', 'coding_backend'])
+    if (execution[key] !== undefined && execution[key] !== 'claude_sdk')
+      throw taskError('INVALID_CODING_BACKEND', 'coding backend 只能是 claude_sdk', 400);
+  if (fields.mode === 'test' && (execution.backend !== undefined || execution.coding_backend !== undefined))
+    throw taskError('INVALID_CODING_BACKEND', 'test 任务不使用编码后端', 400);
   if (execution.url !== undefined) {
     let url;
     try {url = new URL(execution.url);} catch {throw taskError('INVALID_URL', '执行 URL 无效', 400);}
@@ -157,10 +177,7 @@ export function normalizeTask(fields: Data, projects: Data[]): Data {
   }
   if (fields.create_and_start !== undefined && typeof fields.create_and_start !== 'boolean')
     throw taskError('INVALID_TASK', 'create_and_start 必须是布尔值', 400);
-  const normalizedExecution = {...execution};
-  if (execution.backend !== undefined || execution.coding_backend !== undefined) normalizedExecution.backend = backend;
-  delete normalizedExecution.coding_backend;
-  return {projectId: project.id, mode: fields.mode, goal: fields.goal.trim(), execution: normalizedExecution,
+  return {projectId: project.id, mode: fields.mode, goal: fields.goal.trim(), execution: executionDefinition(fields),
     additionalRuleIds, source_run_id: fields.source_run_id ?? null, source_finding_ids: sourceFindingIds,
     github_reads: reads, ...(fields.finding_acceptance !== undefined ? {finding_acceptance: fields.finding_acceptance} : {})};
 }
@@ -243,7 +260,7 @@ export class TaskLifecycle {
   }
   assertIdle(): void {
     const lease = this.lease();
-    if (lease || this.store.runs().some(run => active.has(run.status) || run.pid))
+    if (lease || this.store.runs().some(executorBusy))
       throw taskError('EXECUTOR_BUSY', '单执行器正在运行其他 Run', 409,
         !lease || this.store.run(lease.run_id).outcome !== 'UNKNOWN');
   }
@@ -263,10 +280,11 @@ export class TaskLifecycle {
         return codingBackend(previousRun) === 'claude_sdk' && previousRun.harness_job_id;
       })) throw taskError('SDK_NEW_TASK_REQUIRED', '已有 SDK Job 的 Task 请使用 resume；新目标须创建新 Task', 409);
       const runId = randomUUID(), now = timestamp();
-      const template = task.definition.finding_acceptance;
+      const definition = {...task.definition, execution: executionDefinition(task.definition)};
+      const template = definition.finding_acceptance;
       if (template?.run_id && template.run_id !== runId)
         throw taskError('INVALID_FINDING_ACCEPTANCE', '验收模板不能绑定其他或历史 Repair Run', 409);
-      const prepared = this.prepareRun(task.definition, runId);
+      const prepared = this.prepareRun(definition, runId);
       if (template) {
         const source = this.store.runs().filter(record => record.projectId === task.definition.projectId &&
           [record.id, record.agentRunId].includes(task.definition.source_run_id));
@@ -276,8 +294,8 @@ export class TaskLifecycle {
             template.source_repo_id !== config?.owner + '/' + config?.repo)
           throw taskError('INVALID_FINDING_ACCEPTANCE', '验收模板与唯一来源 Run、仓库或开始 revision 不一致', 409);
       }
-      const run = {...prepared, taskId: task.id, execution: task.definition.execution,
-        frozenDefinition: JSON.parse(JSON.stringify(task.definition)),
+      const run = {...prepared, taskId: task.id, execution: definition.execution,
+        frozenDefinition: JSON.parse(JSON.stringify(definition)),
         source_run_id: prepared.source_run_id ?? task.definition.source_run_id, source_finding_ids: task.definition.source_finding_ids,
         github_reads: task.definition.github_reads,
         ...(template ? {finding_acceptance: {...template, run_id: runId}} : {}),
@@ -331,6 +349,40 @@ export class TaskLifecycle {
   }
   checkResume(id: string, fields: Data, key?: string): Data | null {
     return this.replay('resume:' + id, key, fields);
+  }
+  checkApproval(id: string, fields: Data, key?: string): Data | null {
+    return this.replay('approval:' + id, key, fields);
+  }
+  // 交付审批：SDK Job 最终累计验收后的待审批 Run 重新占用执行器，由 --deliver-stdin 完成交付。
+  approve(id: string, fields: Data, key: string | undefined, ownerId: string): Data {
+    return this.store.transaction(() => {
+      const scope = 'approval:' + id;
+      const previous = this.replay(scope, key, fields);
+      if (previous) return previous;
+      const input = approvalInput(fields);
+      const task = this.task(id);
+      const runId = task.currentRunId;
+      if (!runId) throw taskError('APPROVAL_UNAVAILABLE', 'Task 没有待审批的 Run', 409);
+      const previousRun = this.store.run(runId);
+      const approval = previousRun.approval;
+      if (previousRun.status !== 'waiting_approval' || !approval || typeof approval !== 'object' ||
+          approval.status !== 'pending' || codingBackend(previousRun) !== 'claude_sdk' || !previousRun.frozenDefinition)
+        throw taskError('APPROVAL_UNAVAILABLE', '当前 Run 不在待交付审批状态', 409);
+      if (approval.id !== input.approval_id) throw taskError('APPROVAL_MISMATCH', '审批标识与当前待审批交付不一致', 409);
+      this.assertIdle();
+      const now = timestamp();
+      const run = {...previousRun, status: 'starting',
+        approval: {...approval, decision: input.decision, decided_by: 'web', decided_at: now},
+        error: null, finishedAt: null, processEndedAt: null, pid: null, stopRequestedAt: null,
+        stopPreviousStatus: null, stopError: null, processControlId: randomUUID(), approvedAt: now, updatedAt: now};
+      this.writeRun(run);
+      const updated = {...task, status: 'starting', updatedAt: now};
+      this.writeTask(updated);
+      this.store.db.prepare('INSERT INTO console_executor VALUES (1,?,?,?,?,NULL,?)').run(id, runId, process.pid, ownerId, 'reserved');
+      const value = {task: updated, run, replayed: false};
+      this.remember(scope, key, fields, value);
+      return value;
+    });
   }
   checkCreate(fields: Data, key?: string): void {
     this.replay('create', key, fields);

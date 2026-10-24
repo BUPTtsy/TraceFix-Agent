@@ -8,14 +8,36 @@ const active = new Set(['starting', 'running', 'paused', 'waiting_input', 'waiti
 const alive = pid => {try {process.kill(pid, 0); return true;} catch {return false;}};
 const failure = (code, message, status = 409, retryable = false) => Object.assign(new Error(message), {code, status, retryable});
 
+// repair 一律由 SDK 编码，test 检测流程不带编码后端；历史 Task 定义中残留的 repairMode/repair_mode、
+// backend:'legacy' 等字段在构造执行请求时剔除（只保留 executionMode/url/spec）。
+export function executionFor(definition) {
+  const source = definition.execution && typeof definition.execution === 'object' ? definition.execution : {};
+  const execution = Object.fromEntries(['executionMode', 'url', 'spec'].filter(key => source[key] !== undefined).map(key => [key, source[key]]));
+  const sdk = definition.mode === 'repair' ||
+    definition.mode !== 'test' && [source.backend, source.coding_backend].includes('claude_sdk');
+  return sdk ? {...execution, backend: 'claude_sdk'} : execution;
+}
+
 export function executionRequest(task, run) {
   const definition = run.frozenDefinition || task.definition;
   return {schema_version: 1, task_id: task.id, run_id: run.id, repo_id: definition.projectId,
-    mode: definition.mode, goal: definition.goal, execution: definition.execution,
+    mode: definition.mode, goal: definition.goal, execution: executionFor(definition),
     additional_rule_ids: definition.additionalRuleIds, repository_snapshot: run.repositorySnapshot,
     source_run_id: run.source_run_id ?? null, source_finding_ids: definition.source_finding_ids,
     github_reads: definition.github_reads, finding_acceptance: run.finding_acceptance ?? null};
 }
+
+// --deliver-stdin 专用：与 start 相同的执行请求，额外带 Web 的审批决定（取自已落库的 run.approval）。
+export function deliveryRequest(task, run) {
+  const approval = run.approval;
+  if (!approval || typeof approval.id !== 'string' || !['approve', 'reject'].includes(approval.decision))
+    throw failure('APPROVAL_UNAVAILABLE', '缺少已记录的审批决定', 409);
+  return {...executionRequest(task, run), approval_decision: {approval_id: approval.id, decision: approval.decision,
+    decided_by: approval.decided_by || 'web'}};
+}
+
+const entrypoints = {start: '--request-stdin', resume: '--resume-stdin', approve: '--deliver-stdin'};
+const bridgeOperations = {start: 'task.start', resume: 'task.resume', approve: 'task.approval'};
 
 export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAlive = alive,
   terminate = terminateChildTree, graceMs = 15000, reportError = console.error, pythonCommand}) {
@@ -28,9 +50,9 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
       if (process.env[name]) text = text.replaceAll(process.env[name], '[REDACTED]');
     return text;
   };
-  async function start(id, body = {}, key, namespace = 'explicit', expectedVersion, restoring = false) {
+  async function start(id, body = {}, key, namespace = 'explicit', expectedVersion, kind = 'start') {
     await bridge('task.recover', {isAlive});
-    const value = await bridge(restoring ? 'task.resume' : 'task.start', {id, body, key, namespace, ownerId, expectedVersion});
+    const value = await bridge(bridgeOperations[kind], {id, body, key, namespace, ownerId, expectedVersion});
     if (value.replayed) {
       const run = await bridge('run.record', {id: value.run.id});
       return {task: {...value.task, status: run.status, updatedAt: run.updatedAt || value.task.updatedAt}, run, replayed: true};
@@ -39,7 +61,7 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
     await bridge('task.launching', {id, runId: run.id, ownerId});
     let child;
     try {
-      child = spawn(python, [...(python === 'py' ? ['-3.12'] : []), '-m', 'tracefix.service.run', restoring ? '--resume-stdin' : '--request-stdin'],
+      child = spawn(python, [...(python === 'py' ? ['-3.12'] : []), '-m', 'tracefix.service.run', entrypoints[kind]],
         {cwd: projectRoot, windowsHide: true, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'],
           env: {...process.env, TRACEFIX_CONSOLE_RUN_ID: run.id, TRACEFIX_PROCESS_CONTROL_ID: run.processControlId,
             TRACEFIX_DATA: run.dataRoot, TRACEFIX_CONSOLE_DB: run.consoleDatabasePath,
@@ -81,7 +103,9 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
         } catch {}
         const sdk = (latest.coding_backend || latest.execution?.backend) === 'claude_sdk';
         const cancelled = !sdk && (latest.status === 'stopping' || latest.stopRequestedAt);
-        const changes = {exitCode: code, signal, finishedAt: new Date().toISOString(), processControlId: null,
+        // 待审批结果是非终态：进程退出但 Run 停在 waiting_approval，不写 finishedAt，也不被控制刷新覆盖。
+        const pendingApproval = result?.status === 'waiting_approval';
+        const changes = {exitCode: code, signal, finishedAt: pendingApproval ? null : new Date().toISOString(), processControlId: null,
           stopRequestedAt: null, stopPreviousStatus: null,
           ...(processError ? {status: 'failed', outcome: 'INFRA_FAILURE', error: processError} :
             cancelled ? {status: 'cancelled', outcome: 'CANCELLED', error: {code: 'CANCELLED', message: '执行已取消', retryable: false}} :
@@ -93,11 +117,13 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
             Object.assign(changes, {coding_backend: authority.coding_backend, control_status: authority.control_status,
               can_stop: authority.can_stop, can_resume: authority.can_resume, resume_blockers: authority.resume_blockers,
               harness_job_id: authority.harness_job_id, harness_session_id: authority.harness_session_id});
-            if (authority.control_status === 'STOPPED') Object.assign(changes, {status: 'stopped', outcome: 'STOPPED', error: null});
+            // 权威交付记录只补充审批子集；待审批状态与交付结果由执行结果决定，控制刷新不得把它们改回 completed。
+            if (pendingApproval) changes.can_stop = false;
+            else if (authority.control_status === 'STOPPED') Object.assign(changes, {status: 'stopped', outcome: 'STOPPED', error: null});
             else if (authority.control_status === 'BLOCKED') Object.assign(changes, {status: 'blocked', outcome: 'BLOCKED'});
           } catch {
-            Object.assign(changes, {status: 'blocked', outcome: 'BLOCKED', control_status: 'BLOCKED',
-              can_stop: false, can_resume: false, resume_blockers: ['HARNESS_AUTHORITY_UNAVAILABLE']});
+            Object.assign(changes, {control_status: 'BLOCKED', can_stop: false, can_resume: false,
+              resume_blockers: ['HARNESS_AUTHORITY_UNAVAILABLE'], ...(pendingApproval ? {} : {status: 'blocked', outcome: 'BLOCKED'})});
           }
         }
         await bridge('task.finish', {id, runId: run.id, ownerId, changes});
@@ -110,7 +136,7 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
         child.once('error', reject);
       });
       await bridge('task.spawned', {id, runId: run.id, ownerId, pid: child.pid});
-      child.stdin.end(JSON.stringify(executionRequest(task, run)));
+      child.stdin.end(JSON.stringify(kind === 'approve' ? deliveryRequest(task, run) : executionRequest(task, run)));
     } catch {
       if (child.pid) await terminate(child, {isAlive}).catch(reportError);
       await done;
@@ -124,6 +150,9 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
       const task = await bridge('task', {id});
       if (!task.currentRunId) return {status: 200, value: {task, run: null, replayed: true}};
       const run = await bridge('run.record', {id: task.currentRunId});
+      // 待交付审批的 Run 没有执行进程可停：必须先批准或驳回，不能 stop。
+      if (run.status === 'waiting_approval' && !run.pid)
+        throw failure('STOP_UNAVAILABLE', '任务正等待交付审批，没有可停止的执行进程；请批准或驳回', 409);
       if ((run.coding_backend || run.execution?.backend) === 'claude_sdk') {
         const record = await bridge('run.harness.stop', {id: run.id});
         return {status: record.control_status === 'STOPPING' ? 202 : 200,
@@ -155,8 +184,9 @@ export function createExecutor({bridge, projectRoot, spawn = spawnProcess, isAli
     stopping.set(id, pending);
     try {return await pending;} finally {stopping.delete(id);}
   }
-  const resume = (id, body = {}, key) => start(id, body, key, 'resume', undefined, true);
-  return {start, resume, stop, recover: () => bridge('task.recover', {isAlive}),
+  const resume = (id, body = {}, key) => start(id, body, key, 'resume', undefined, 'resume');
+  const approve = (id, body, key) => start(id, body, key, 'approval', undefined, 'approve');
+  return {start, resume, approve, stop, recover: () => bridge('task.recover', {isAlive}),
     async drain() {await Promise.all([...owned.values()].map(entry => entry.done));},
     async close() {for (const entry of owned.values()) await terminate(entry.child, {isAlive}); await this.drain();}};
 }

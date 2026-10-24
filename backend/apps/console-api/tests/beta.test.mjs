@@ -11,7 +11,7 @@ import {createHash} from 'node:crypto';
 import {DatabaseSync} from 'node:sqlite';
 import {build} from 'esbuild';
 import {createApi} from '../server/api.mjs';
-import {createExecutor} from '../server/executor.mjs';
+import {createExecutor, executionRequest} from '../server/executor.mjs';
 
 const projectRoot = fileURLToPath(new URL('../../../../', import.meta.url));
 const bundle = await build({entryPoints: [path.join(projectRoot, 'backend/packages/console-service/src/dispatch.ts')],
@@ -63,7 +63,11 @@ async function fixture(context) {
   fs.mkdirSync(path.dirname(projectsPath), {recursive: true});
   fs.writeFileSync(projectsPath, JSON.stringify({projects: []}));
   const dataRoot = path.join(root, 'data'), databasePath = path.join(dataRoot, 'console.sqlite3');
-  const serviceOptions = {projectsPath, dataRoot, databasePath, engineRoot: projectRoot,
+  // repair 一律走 SDK：用桩替代 Python HarnessControl，按 Run 返回稳定的 Job/Session 权威记录。
+  const harnessControl = (operation, fields) => ({coding_backend: 'claude_sdk', control_status: 'COMPLETED', can_resume: false,
+    can_stop: false, resume_blockers: [], harness_job_id: 'job-' + fields.run_id, harness_session_id: 'session-' + fields.run_id,
+    current_run_id: fields.run_id});
+  const serviceOptions = {projectsPath, dataRoot, databasePath, engineRoot: projectRoot, harnessControl,
     pythonCommand: process.platform === 'win32' ? 'py' : 'python3', repositoryRoots: [root]};
   const service = createConsoleService(serviceOptions);
   const target = path.join(root, 'checkout');
@@ -88,8 +92,11 @@ async function fixture(context) {
     assert.equal(response.statusCode, 201, response.body);
     return response.json();
   };
-  const finish = async (started, outcome = 'FIX_VERIFIED', settled = true, repairMetadata = {}) => {
-    const call = fake.calls.find(item => item.request?.run_id === started.run.id);
+  const finish = async (started, outcome = 'FIX_VERIFIED', settled = true, repairMetadata = {}, extra = {}, callIndex) => {
+    const call = callIndex === undefined ? fake.calls.find(item => item.request?.run_id === started.run.id) : fake.calls[callIndex];
+    const sdk = service('run.record', {id: started.run.id}).coding_backend === 'claude_sdk';
+    const sdkFields = sdk ? {coding_backend: 'claude_sdk', current_run_id: started.run.id, control_status: 'COMPLETED', can_resume: false,
+      harness_job_id: 'job-' + started.run.id, harness_session_id: 'session-' + started.run.id} : {};
     const runDirectory = path.join(dataRoot, 'artifacts', 'alpha', started.run.id);
     fs.mkdirSync(runDirectory, {recursive: true});
     const index = {};
@@ -115,39 +122,111 @@ async function fixture(context) {
     call.child.finish({schema_version: 1, task_id: started.task.id, run_id: started.run.id, repo_id: 'alpha',
       run_status: runStatus, outcome, terminal: true, report_ref: '0001_report.json', report,
       patch_diff_ref: patchRef, diff: patchRef ? diff : null, patch_available: Boolean(patchRef),
-      patch_verification: patchRef ? 'verified' : 'none', error: null, ...repairMetadata});
+      patch_verification: patchRef ? 'verified' : 'none', error: null, ...sdkFields, ...repairMetadata, ...extra});
     await controller.drain();
   };
   return {root, target, dataRoot, databasePath, service, serviceOptions, bridge, app, controller, fake, request, create, finish};
 }
 
-test('H0 repairMode 在 HTTP Task 入口校验并透传到 Python 执行请求', async context => {
+test('legacy 后端与 repairMode 在 HTTP 入口被拒；repair 请求固定 claude_sdk，test 请求不带后端', async context => {
   const {request, create, fake, finish} = await fixture(context);
-  for (const repairMode of ['loop', 'HYBRID', null, 1, true]) {
-    const invalid = await request('POST', '/api/v1/tasks',
-      {...body, mode: 'repair', execution: {...body.execution, repairMode}});
+  const repair = {...body, mode: 'repair'};
+  for (const patch of [{repairMode: 'hybrid'}, {repairMode: 'pipeline'}, {backend: 'legacy'}, {coding_backend: 'legacy'}, {backend: 'other'}]) {
+    const invalid = await request('POST', '/api/v1/tasks', {...repair, execution: {...body.execution, ...patch}});
     assert.equal(invalid.statusCode, 400, invalid.body);
   }
+  const testWithBackend = await request('POST', '/api/v1/tasks', {...body, execution: {...body.execution, backend: 'claude_sdk'}});
+  assert.equal(testWithBackend.statusCode, 400, testWithBackend.body);
+  assert.equal(testWithBackend.json().code, 'INVALID_CODING_BACKEND');
   assert.equal(fake.calls.length, 0);
-  for (const repairMode of ['hybrid', 'pipeline']) {
-    const created = await create({...body, mode: 'repair', execution: {...body.execution, repairMode}});
-    assert.equal(created.task.definition.execution.repairMode, repairMode);
-    const response = await request('POST', '/api/v1/tasks/' + created.task.id + '/start', {});
-    assert.equal(response.statusCode, 202, response.body);
-    const started = response.json();
-    const call = fake.calls.find(item => item.request?.run_id === started.run.id);
-    assert.equal(call.request.execution.repairMode, repairMode);
-    const metadata = {repair_mode: 'pipeline', repair_mode_requested: repairMode,
-      repair_mode_reason: repairMode === 'hybrid' ? 'not_implemented' : null};
-    await finish(started, 'NO_BUG_FOUND', true, metadata);
-    const responseResult = await request('GET', '/api/v1/runs/' + started.run.id + '/result');
-    assert.equal(responseResult.statusCode, 200, responseResult.body);
-    const result = responseResult.json();
-    for (const [key, value] of Object.entries(metadata)) {
-      assert.equal(result[key], value);
-      assert.equal(result.provenance[key], value);
-    }
-  }
+  const created = await create(repair);
+  assert.equal(created.task.definition.execution.backend, 'claude_sdk');
+  const started = (await request('POST', '/api/v1/tasks/' + created.task.id + '/start', {})).json();
+  assert.deepEqual(fake.calls[0].args, ['-m', 'tracefix.service.run', '--request-stdin']);
+  assert.equal(fake.calls[0].request.execution.backend, 'claude_sdk');
+  for (const key of ['repairMode', 'repair_mode']) assert.equal(Object.hasOwn(fake.calls[0].request.execution, key), false);
+  assert.equal(started.run.coding_backend, 'claude_sdk');
+  await finish(started, 'NO_BUG_FOUND');
+  const testTask = await create(body);
+  assert.equal(Object.hasOwn(testTask.task.definition.execution, 'backend'), false);
+  const testStarted = (await request('POST', '/api/v1/tasks/' + testTask.task.id + '/start', {})).json();
+  assert.equal(Object.hasOwn(fake.calls[1].request.execution, 'backend'), false);
+  await finish(testStarted, 'NO_BUG_FOUND');
+});
+
+test('历史 Task 定义残留 repairMode/backend:legacy 时构造请求会剔除，repair 补 claude_sdk', () => {
+  const definition = mode => ({projectId: 'alpha', mode, goal: '历史定义目标', execution: {executionMode: 'batch', url: 'http://app:3000',
+    repairMode: 'hybrid', repair_mode: 'pipeline', backend: 'legacy', coding_backend: 'legacy'}});
+  const repair = executionRequest({id: 'task', definition: definition('repair')}, {id: 'run'});
+  assert.deepEqual(repair.execution, {executionMode: 'batch', url: 'http://app:3000', backend: 'claude_sdk'});
+  const test = executionRequest({id: 'task', definition: definition('test')}, {id: 'run'});
+  assert.deepEqual(test.execution, {executionMode: 'batch', url: 'http://app:3000'});
+});
+
+test('交付审批：待审批不阻塞执行器；approval 路由成功、不匹配、状态错误与幂等重放；--deliver-stdin 带决定', async context => {
+  const {request, create, fake, finish, service, controller} = await fixture(context);
+  const {task} = await create({...body, mode: 'repair'});
+  const started = (await request('POST', '/api/v1/tasks/' + task.id + '/start', {})).json();
+  const runId = started.run.id;
+  const decision = {approval_id: 'approval-1', decision: 'approve'};
+  assert.equal((await request('POST', '/api/v1/tasks/' + task.id + '/approval', decision)).statusCode, 409);
+  const approval = {id: 'approval-1', status: 'pending', job_id: 'job-' + runId, accepted_commit: 'a'.repeat(40), patch_hash: 'h'.repeat(8),
+    publish_branch: true, diff_ref: '0002_patch.diff', requested_at: new Date().toISOString()};
+  fake.calls[0].child.finish({schema_version: 1, task_id: task.id, run_id: runId, repo_id: 'alpha', run_status: 'WAITING_APPROVAL',
+    terminal: false, outcome: 'FIX_VERIFIED', coding_backend: 'claude_sdk', control_status: 'COMPLETED', can_resume: false,
+    harness_job_id: 'job-' + runId, harness_session_id: 'session-' + runId, current_run_id: runId, publication: null,
+    approval, delivery_diff: '--- a/src/App.tsx\n+++ b/src/App.tsx\n'});
+  await controller.drain();
+  const pending = (await request('GET', '/api/v1/runs/' + runId)).json();
+  assert.equal(pending.status, 'waiting_approval');
+  assert.equal(pending.can_approve, true);
+  assert.equal(pending.can_stop, false);
+  assert.equal(pending.finishedAt, null);
+  assert.equal(pending.approval.id, 'approval-1');
+  assert.equal(pending.publication, null);
+  assert.match(pending.delivery_diff, /src\/App\.tsx/);
+  assert.equal((await request('GET', '/api/v1/runs')).json()[0].approval.status, 'pending');
+  assert.equal((await request('GET', '/api/v1/tasks/' + task.id)).json().can_approve, true);
+  // Task 级锁：不能 start/update/stop；但不占用执行器，其他 Task 可启动。
+  assert.equal((await request('POST', '/api/v1/tasks/' + task.id + '/start', {})).statusCode, 409);
+  assert.equal((await request('PUT', '/api/v1/tasks/' + task.id, {...body, mode: 'repair'})).json().code, 'TASK_ACTIVE');
+  const stop = await request('POST', '/api/v1/tasks/' + task.id + '/stop', {});
+  assert.equal(stop.statusCode, 409); assert.equal(stop.json().code, 'STOP_UNAVAILABLE');
+  const other = await create(body);
+  const otherStarted = await request('POST', '/api/v1/tasks/' + other.task.id + '/start', {});
+  assert.equal(otherStarted.statusCode, 202, otherStarted.body);
+  assert.equal(fake.calls.length, 2);
+  // 执行器忙时审批排队失败；其他 Task 结束后可审批。
+  const busy = await request('POST', '/api/v1/tasks/' + task.id + '/approval', decision);
+  assert.equal(busy.statusCode, 409); assert.equal(busy.json().code, 'EXECUTOR_BUSY');
+  await finish(otherStarted.json(), 'NO_BUG_FOUND');
+  for (const invalid of [{}, {approval_id: 'approval-1'}, {approval_id: 'approval-1', decision: 'maybe'}, {...decision, extra: true}])
+    assert.equal((await request('POST', '/api/v1/tasks/' + task.id + '/approval', invalid)).statusCode, 400);
+  const mismatch = await request('POST', '/api/v1/tasks/' + task.id + '/approval', {...decision, approval_id: 'stale'});
+  assert.equal(mismatch.statusCode, 409); assert.equal(mismatch.json().code, 'APPROVAL_MISMATCH');
+  const accepted = await request('POST', '/api/v1/tasks/' + task.id + '/approval', {approval_id: 'approval-1', decision: 'approve'}, 'approve-1');
+  assert.equal(accepted.statusCode, 202, accepted.body);
+  assert.deepEqual(fake.calls[2].args, ['-m', 'tracefix.service.run', '--deliver-stdin']);
+  assert.deepEqual(fake.calls[2].request.approval_decision, {approval_id: 'approval-1', decision: 'approve', decided_by: 'web'});
+  assert.equal(fake.calls[2].request.run_id, runId);
+  assert.equal(fake.calls[2].request.execution.backend, 'claude_sdk');
+  for (const call of fake.calls.slice(0, 2)) assert.equal(Object.hasOwn(call.request, 'approval_decision'), false);
+  const replay = await request('POST', '/api/v1/tasks/' + task.id + '/approval', {approval_id: 'approval-1', decision: 'approve'}, 'approve-1');
+  assert.equal(replay.statusCode, 202); assert.equal(replay.json().replayed, true); assert.equal(fake.calls.length, 3);
+  assert.equal((await request('POST', '/api/v1/tasks/' + task.id + '/approval', {approval_id: 'approval-1', decision: 'reject'}, 'approve-1')).json().code, 'IDEMPOTENCY_CONFLICT');
+  const publication = {status: 'published', branch: 'tracefix/' + runId, commit: 'c'.repeat(40), error: null};
+  const delivered = {id: 'approval-1', status: 'approved', decision: 'approve', decided_by: 'web', decided_at: new Date().toISOString()};
+  await finish(started, 'FIX_VERIFIED', true, {}, {publication, branch: publication.branch, commit: publication.commit, approval: delivered}, 2);
+  const done = (await request('GET', '/api/v1/runs/' + runId)).json();
+  assert.equal(done.status, 'completed');
+  assert.equal(done.approval.status, 'approved'); assert.equal(done.approval.decided_by, 'web');
+  assert.deepEqual(done.publication, publication);
+  assert.equal(done.can_approve, false);
+  const result = (await request('GET', '/api/v1/runs/' + runId + '/result')).json();
+  assert.equal(result.branch, publication.branch); assert.equal(result.commit, publication.commit);
+  assert.deepEqual(result.publication, publication);
+  assert.equal((await request('POST', '/api/v1/tasks/' + task.id + '/approval', decision, 'late')).json().code, 'APPROVAL_UNAVAILABLE');
+  assert.equal(service('run.record', {id: runId}).approval.decision, 'approve');
 });
 
 test('Fastify Task lifecycle: 创建不执行、start、活动编辑、终态编辑、新 Run 和历史查询', async context => {

@@ -164,6 +164,7 @@ export function projectCatalog(projectsPath: string, dataRoot: string, displayRo
       checkoutMode: repository?.checkout_mode || 'existing',
       cloneUrl: repository ? `https://github.com/${repository.owner}/${repository.repo}.git` : null,
       defaultRef: repository?.default_ref || null, publishBranch: repository?.publish_branch === true,
+      requireApproval: repository?.require_approval === true,
       allowedFiles: project.allowed_files || [], commands: entry?.profile.commands || {}, remoteConfig: remote[project.id] || null,
       ready: issue === null, issue,
     };

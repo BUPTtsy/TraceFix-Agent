@@ -25,13 +25,17 @@ test('仓库管理正式路由公开 OpenAPI 并校验注册更新字段', async
   const profile = {url: 'http://app:3000', allowed_origins: ['http://app:3000'],
     commands: Object.fromEntries(['prepare', 'start', 'reset', 'static', 'unit', 'build'].map(name => [name, ['node', '--version']]))};
   const input = {repo_id: 'demo', owner: 'team', repo: 'demo', default_ref: 'main',
-    checkout_mode: 'managed', publish_branch: false, profile, allowed_files: ['src/**'], allowed_urls: ['http://app:3000']};
+    checkout_mode: 'managed', publish_branch: false, require_approval: true, profile, allowed_files: ['src/**'], allowed_urls: ['http://app:3000']};
   assert.equal((await request('POST', '/api/v1/repositories', input)).statusCode, 201);
   assert.deepEqual(calls.at(-1), {operation: 'repository.create', fields: input});
   assert.equal((await request('PATCH', '/api/v1/repositories/demo', {publish_branch: true})).statusCode, 200);
   assert.deepEqual(calls.at(-1), {operation: 'repository.update', fields: {id: 'demo', patch: {publish_branch: true}}});
+  assert.equal((await request('PATCH', '/api/v1/repositories/demo', {require_approval: false})).statusCode, 200);
+  assert.deepEqual(calls.at(-1), {operation: 'repository.update', fields: {id: 'demo', patch: {require_approval: false}}});
+  for (const invalid of [{require_approval: 'true'}, {require_approval: 1}, {repair_mode: 'hybrid'}])
+    assert.equal((await request('PATCH', '/api/v1/repositories/demo', invalid)).statusCode, 400);
   for (const invalid of [{...input, checkout_mode: 'existing'}, {...input, token: 'secret'},
-    {...input, publish_branch: 'true'}, {...input, profile: {...profile, commands: {...profile.commands, prepare: 'npm ci'}}}]) {
+    {...input, publish_branch: 'true'}, {...input, require_approval: 'yes'}, {...input, repair_mode: 'pipeline'}, {...input, profile: {...profile, commands: {...profile.commands, prepare: 'npm ci'}}}]) {
     assert.equal((await request('POST', '/api/v1/repositories', invalid)).statusCode, 400);
   }
   assert.equal((await request('PATCH', '/api/v1/repositories/demo', {unknown: true})).statusCode, 400);
@@ -81,12 +85,14 @@ test('托管仓库目录尚未拉取时项目配置可启动并展示来源', ()
     commands: Object.fromEntries(['start', 'reset', 'static', 'unit', 'build'].map(name => [name, ['node', '--version']]))};
   fs.writeFileSync(registry, JSON.stringify({projects: [{id: 'demo', repo_id: 'team/demo', root: './missing',
     allowed_files: ['src/**'], repository_config: {version: 1, checkout_mode: 'managed', owner: 'team', repo: 'demo',
-      default_ref: 'main', publish_branch: false, profile}}]}));
+      default_ref: 'main', publish_branch: false, require_approval: true, profile}}]}));
   const [record] = projectCatalog(registry, path.join(root, 'data'), root);
   assert.equal(record.ready, true);
   assert.equal(record.checkoutMode, 'managed');
   assert.equal(record.cloneUrl, 'https://github.com/team/demo.git');
   assert.equal(record.defaultRef, 'main');
+  assert.equal(record.requireApproval, true);
+  assert.equal(record.publishBranch, false);
 });
 
 test('执行器将显式服务数据库配置或部署数据库回退传给子进程', async context => {

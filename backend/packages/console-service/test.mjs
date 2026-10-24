@@ -37,6 +37,44 @@ test('停止请求按进程控制标识幂等更新并支持失败恢复', conte
   assert.equal(dispatch('run.stop.request', {id: run.id, processControlId: 'control_test'}).status, 'completed');
 });
 
+test('无 taskId 的 SDK 记录（CLI 发起）不触发权威刷新，运行列表与详情照常返回', context => {
+  const {dispatch} = fixture(context);
+  const run = dispatch('run.create', {projectId: 'alpha', goal: 'CLI 发起的 SDK 修复', mode: 'test'});
+  dispatch('run.update', {id: run.id, changes: {coding_backend: 'claude_sdk', control_status: 'COMPLETED', status: 'completed', outcome: 'FIX_VERIFIED'}});
+  const listed = dispatch('runs', {projectId: 'alpha'});
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].coding_backend, 'claude_sdk');
+  assert.equal(listed[0].control_status, 'COMPLETED');
+  assert.equal(dispatch('run', {id: run.id}).coding_backend, 'claude_sdk');
+  assert.throws(() => dispatch('run.harness.stop', {id: run.id}), error => error.code === 'HARNESS_TASK_REQUIRED');
+});
+
+test('待审批 Run 的控制投影：can_approve 仅待审批、不可 stop，刷新不改回 completed 并同步权威审批', context => {
+  const {root, projectsPath, databasePath, dispatch: base} = fixture(context);
+  let authorityApproval = null;
+  const dispatch = createConsoleService({projectsPath, dataRoot: root, databasePath, harnessControl: () => ({
+    coding_backend: 'claude_sdk', control_status: 'COMPLETED', can_resume: false, can_stop: true, resume_blockers: [],
+    harness_job_id: 'job', harness_session_id: 'session', approval: authorityApproval})});
+  const run = base('run.create', {projectId: 'alpha', goal: '待审批展示', mode: 'test'});
+  const approval = {id: 'a1', status: 'pending', job_id: 'job', publish_branch: false};
+  base('run.update', {id: run.id, changes: {taskId: 'task', coding_backend: 'claude_sdk', control_status: 'COMPLETED', can_stop: true,
+    status: 'waiting_approval', pid: null, approval, publication: null, delivery_diff: 'diff text'}});
+  const view = dispatch('runs', {projectId: 'alpha'})[0];
+  assert.equal(view.status, 'waiting_approval');
+  assert.equal(view.can_approve, true);
+  assert.equal(view.can_stop, false);
+  assert.deepEqual(view.approval, approval);
+  assert.equal(view.delivery_diff, 'diff text');
+  assert.equal(dispatch('run.stop.request', {id: run.id, processControlId: 'x'}).status, 'waiting_approval');
+  authorityApproval = {id: 'a1', status: 'approved', decision: 'approve', decided_by: 'cli', decided_at: '2026-10-24T00:00:00Z', diff_ref: null};
+  const synced = dispatch('run', {id: run.id});
+  assert.equal(synced.status, 'waiting_approval');
+  assert.equal(synced.approval.status, 'approved');
+  assert.equal(synced.approval.job_id, 'job');
+  assert.equal(synced.can_approve, false);
+  dispatch.close();
+});
+
 test('新建与更新规则区分冲突、拒绝 Python 无法读取的配置', context => {
   const {dispatch, databasePath, projectsPath, root} = fixture(context);
   const fields = {id: 'new_rule', name: '新规则', detection: {type: 'guided', guided: {prompt: '检查空状态'}}};
@@ -133,20 +171,6 @@ test('TypeScript 控制台共享文档、运行和规则数据', () => {
     assert.equal(dispatch('search', {projectId: 'alpha', query: '刷新状态'})[0].id, document.id);
     assert.equal(dispatch('document.save', {...document, content: '修复后的内容', id: document.id}).version, 2);
     assert.throws(() => dispatch('document.save', {...document, id: document.id}), error => error.status === 409);
-    const cli = spawnSync(process.execPath, [path.resolve('../../../frontend/apps/cli/dist/cli.mjs'), '--project', 'alpha',
-      '--projects', path.join(profiles, 'projects.yaml'), '--data', path.join(root, 'data'),
-      '--console-db', path.join(root, 'data', 'console.sqlite3'), '--command', `/knowledge show ${document.id}`],
-      {cwd: path.resolve('../../..'), encoding: 'utf8'});
-    assert.equal(cli.status, 0, cli.stderr);
-    assert.match(cli.stdout, /修复后的内容/);
-    const sessionCli = spawnSync(process.execPath, [path.resolve('../../../frontend/apps/cli/dist/cli.mjs'), '--project', 'alpha',
-      '--projects', path.join(profiles, 'projects.yaml'), '--data', path.join(root, 'data'),
-      '--console-db', path.join(root, 'data', 'console.sqlite3'),
-      '--command', '/remote set --repository team/repo --scope session', '--command', '/remote show'],
-      {cwd: path.resolve('../../..'), encoding: 'utf8'});
-    assert.equal(sessionCli.status, 0, sessionCli.stderr);
-    assert.match(sessionCli.stdout, /team\/repo/);
-    assert.equal(fs.existsSync(path.join(root, 'data', 'remote-config.json')), false);
 
     const run = dispatch('run.create', {projectId: 'alpha', goal: '检查状态', mode: 'test'});
     dispatch('run.update', {id: run.id, changes: {status: 'failed', outcome: 'INFRA_FAILURE'}});

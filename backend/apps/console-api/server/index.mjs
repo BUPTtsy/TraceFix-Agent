@@ -319,7 +319,10 @@ await bridge('runs.import');
 setInterval(() => bridge('runs.import').catch(error => console.error('后台导入运行记录失败：', error)), 60000).unref();
 for (const record of await bridge('runs')) {
   if (record.taskId) continue;
-  if (['running', 'stopping', 'paused', 'waiting_input', 'waiting_approval'].includes(record.status)) {
+  // waiting_approval 不占用执行进程；兼容历史记录中尚未退出的审批进程。
+  const executing = ['running', 'stopping', 'paused', 'waiting_input'].includes(record.status) ||
+    record.status === 'waiting_approval' && Boolean(record.pid);
+  if (executing) {
     if (record.pid && isAlive(record.pid)) agent = {...record, logs: []};
     else await bridge('run.ended', {id: record.id, error: 'API 重启后检测到 Agent 进程已退出'});
   }

@@ -16,22 +16,31 @@ export const canContinue = (status: string, outcome?: string | null) => {
     !(normalized === 'completed' && ['FIX_VERIFIED', 'NO_BUG_FOUND'].includes(outcome || ''));
 };
 
-export const codingBackend = (record: Record<string, any>): string =>
-  record.coding_backend || record.codingBackend || record.execution?.backend || 'legacy';
+// 编码后端只有 claude_sdk；test 检测流程没有编码后端（null），历史记录中的其他取值仅原样展示。
+export const codingBackend = (record: Record<string, any>): string | null =>
+  record.coding_backend || record.codingBackend || record.execution?.backend || null;
+
+// waiting_approval 不再占用执行进程；仅当进程仍在（如交互式 CLI 等待 /approve）时视为占用执行器。
+const executingStatuses = ['starting', 'running', 'paused', 'waiting_input', 'stopping'];
+export const executorBusy = (record: Record<string, any>): boolean =>
+  executingStatuses.includes(String(record.status).toLowerCase()) || Boolean(record.pid);
 
 export const controlProjection = (record: Record<string, any>) => {
   const backend = codingBackend(record);
-  const active = ['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping'];
+  const status = String(record.status).toLowerCase();
   const blockers = Array.isArray(record.resume_blockers) ? record.resume_blockers : [];
-  const canStop = backend === 'claude_sdk' ? record.can_stop === true :
-    active.includes(String(record.status).toLowerCase()) && String(record.status).toLowerCase() !== 'stopping';
+  const canStop = backend === 'claude_sdk' ? record.can_stop === true && status !== 'waiting_approval' :
+    status !== 'stopping' && (executingStatuses.includes(status) || status === 'waiting_approval' && Boolean(record.pid));
   const canResume = backend === 'claude_sdk' && record.control_status === 'STOPPED' && record.can_resume === true &&
     !blockers.length && record.status !== 'unknown';
+  const approval = record.approval && typeof record.approval === 'object' && !Array.isArray(record.approval) ? record.approval : null;
   return {
-    coding_backend: backend,
-    control_status: record.status === 'stopping' ? 'STOPPING' : record.control_status || String(record.status || '').toUpperCase(),
+    ...(backend ? {coding_backend: backend} : {}),
+    control_status: status === 'stopping' ? 'STOPPING' : record.control_status || String(record.status || '').toUpperCase(),
     can_stop: canStop,
     can_resume: canResume,
+    can_approve: status === 'waiting_approval' && approval?.status === 'pending' && Boolean(record.taskId),
+    approval,
     resume_blockers: blockers,
     harness_job_id: record.harness_job_id ?? record.harnessJobId ?? null,
     harness_session_id: record.harness_session_id ?? record.harnessSessionId ?? null,
@@ -159,7 +168,8 @@ export class ConsoleDatabase {
   requestStop(id: string, processControlId?: string): RecordData {
     return this.transaction(() => {
       const record = this.run(id);
-      if (!['running', 'paused', 'waiting_input', 'waiting_approval', 'stopping'].includes(record.status)) return record;
+      if (!['running', 'paused', 'waiting_input', 'stopping'].includes(record.status) &&
+          !(record.status === 'waiting_approval' && record.pid)) return record;
       if (record.processControlId !== processControlId) throw new DataError('任务进程已改变，请刷新后重试', 409);
       if (record.status === 'stopping') return record;
       const updated = {...record, status: 'stopping', control_status: 'STOPPING', stopRequestedAt: timestamp(),

@@ -39,7 +39,8 @@ export function harnessControl(operation: HarnessControlOperation, fields: Recor
   const data = response.data;
   if (result.status !== 0 || !data || data.coding_backend !== 'claude_sdk' || typeof data.control_status !== 'string' ||
       typeof data.can_resume !== 'boolean' || typeof data.can_stop !== 'boolean' ||
-      !Array.isArray(data.resume_blockers) || data.resume_blockers.some((entry: any) => typeof entry !== 'string'))
+      !Array.isArray(data.resume_blockers) || data.resume_blockers.some((entry: any) => typeof entry !== 'string') ||
+      data.approval !== undefined && data.approval !== null && (typeof data.approval !== 'object' || Array.isArray(data.approval)))
     throw failure('HARNESS_CONTROL_PROTOCOL', 'SDK 控制服务响应无效');
   return data;
 }

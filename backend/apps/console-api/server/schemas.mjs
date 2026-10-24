@@ -7,6 +7,8 @@ const text = {type: 'string', minLength: 1, maxLength: 200};
 const object = {type: 'object', additionalProperties: true};
 const nullableObject = {anyOf: [object, {type: 'null'}]};
 const ids = {type: 'array', maxItems: 100, uniqueItems: true, items: text};
+// 交付审批：approval 为待审批/已决定记录（含 id、status、decision 等），publication 为发布结果，delivery_diff 为待交付累计差异。
+const deliveryMetadata = {can_approve: {type: 'boolean'}, approval: nullableObject};
 const harnessMetadata = {current_run_id: {type: ['string', 'null']}, accepted_commit: {type: ['string', 'null']},
   quality: {type: ['string', 'null']}, owner_epoch: {type: ['integer', 'null'], minimum: 0},
   harness_revision: {type: ['integer', 'null'], minimum: 0}};
@@ -63,10 +65,9 @@ export const taskInput = {type: 'object', additionalProperties: false, required:
     projectId: {...text, maxLength: 128}, repo_id: {...text, maxLength: 128}, repositoryId: {...text, maxLength: 128},
     mode: {type: 'string', enum: ['test', 'repair']}, goal: {type: 'string', minLength: 5, maxLength: 4000},
     execution: {type: 'object', additionalProperties: false, required: ['executionMode'], properties: {
-      executionMode: {type: 'string', enum: ['batch']}, backend: {type: 'string', enum: ['legacy', 'claude_sdk']},
-      coding_backend: {type: 'string', enum: ['legacy', 'claude_sdk']},
+      executionMode: {type: 'string', enum: ['batch']}, backend: {type: 'string', enum: ['claude_sdk']},
+      coding_backend: {type: 'string', enum: ['claude_sdk']},
       url: {type: 'string', format: 'uri', maxLength: 2048},
-      repairMode: {type: 'string', enum: ['hybrid', 'pipeline']},
       spec: testSpec}},
     additionalRuleIds: {...ids, maxItems: 50}, rule_ids: {...ids, maxItems: 50}, source_run_id: text,
     source_finding_ids: ids, github_reads: {type: 'array', maxItems: 50, items: githubRead},
@@ -77,7 +78,7 @@ export const task = {type: 'object', additionalProperties: false,
     id: text, definition: object, status: {type: 'string'}, version: {type: 'integer', minimum: 1},
     currentRunId: {type: ['string', 'null']}, runIds: {type: 'array', items: text},
     createdAt: {type: 'string', format: 'date-time'}, updatedAt: {type: 'string', format: 'date-time'},
-    ...harnessMetadata, coding_backend: {type: 'string'}, control_status: {type: 'string'}, can_stop: {type: 'boolean'}, can_resume: {type: 'boolean'},
+    ...harnessMetadata, ...deliveryMetadata, coding_backend: {type: 'string'}, control_status: {type: 'string'}, can_stop: {type: 'boolean'}, can_resume: {type: 'boolean'},
     resume_blockers: {type: 'array', items: {type: 'string'}}, harness_job_id: {type: ['string', 'null']}, harness_session_id: {type: ['string', 'null']}}};
 export const run = {type: 'object', additionalProperties: false, required: ['id', 'projectId', 'status'], properties: {
   id: text, taskId: {type: ['string', 'null']}, projectId: text, agentRunId: {type: ['string', 'null']},
@@ -85,7 +86,8 @@ export const run = {type: 'object', additionalProperties: false, required: ['id'
   outcome: {type: ['string', 'null']}, startedAt: {type: 'string'}, updatedAt: {type: 'string'},
   finishedAt: {type: ['string', 'null']}, processEndedAt: {type: ['string', 'null']},
   error: {anyOf: [object, {type: 'string'}, {type: 'null'}]}, artifacts: {type: 'array', items: object},
-  ...harnessMetadata, coding_backend: {type: 'string'}, control_status: {type: 'string'}, can_stop: {type: 'boolean'}, can_resume: {type: 'boolean'},
+  ...harnessMetadata, ...deliveryMetadata, publication: nullableObject, delivery_diff: {type: ['string', 'null']},
+  coding_backend: {type: 'string'}, control_status: {type: 'string'}, can_stop: {type: 'boolean'}, can_resume: {type: 'boolean'},
   resume_blockers: {type: 'array', items: {type: 'string'}}, harness_job_id: {type: ['string', 'null']}, harness_session_id: {type: ['string', 'null']}}};
 export const error = {type: 'object', additionalProperties: false, required: ['code', 'message', 'retryable', 'requestId'], properties: {
   code: text, message: {type: 'string'}, retryable: {type: 'boolean'}, requestId: text,
@@ -98,10 +100,9 @@ export const result = {type: 'object', additionalProperties: false,
     runId: text, taskId: {type: ['string', 'null']}, outcome: {type: ['string', 'null']}, settled: {type: 'boolean'}, ready: {type: 'boolean'},
     ruleCoverage: object, findings: {type: 'array', items: object}, patch: nullableObject, verification: nullableObject,
     summary: {type: ['string', 'null']}, branch: {type: ['string', 'null']}, commit: {type: ['string', 'null']}, publication: nullableObject,
-    repair_mode: {type: ['string', 'null'], enum: ['hybrid', 'pipeline', null]}, coding_backend: {type: 'string'}, control_status: {type: 'string'},
+    coding_backend: {type: 'string'}, control_status: {type: 'string'},
     can_stop: {type: 'boolean'}, can_resume: {type: 'boolean'}, resume_blockers: {type: 'array', items: {type: 'string'}},
-    ...harnessMetadata, harness_job_id: {type: ['string', 'null']}, harness_session_id: {type: ['string', 'null']},
-    repair_mode_requested: {type: ['string', 'null']}, repair_mode_reason: {type: ['string', 'null']},
+    ...harnessMetadata, ...deliveryMetadata, harness_job_id: {type: ['string', 'null']}, harness_session_id: {type: ['string', 'null']},
     error: nullableObject, provenance: object}};
 const commandArgv = {type: 'array', minItems: 1, maxItems: 200, items: {type: 'string', minLength: 1, maxLength: 8000}};
 const repositoryProfile = {type: 'object', additionalProperties: false, required: ['commands'], properties: {
@@ -121,7 +122,7 @@ const repositoryFields = {
   repo: {type: 'string', pattern: '^[A-Za-z0-9_.-]{1,100}$'},
   default_ref: {type: 'string', minLength: 1, maxLength: 255},
   checkout_mode: {type: 'string', enum: ['existing', 'managed']}, publish_branch: {type: 'boolean'},
-  repair_mode: {type: 'string', enum: ['hybrid', 'pipeline']},
+  require_approval: {type: 'boolean'},
   protected_paths: {type: 'array', maxItems: 200, uniqueItems: true, items: {type: 'string', minLength: 1, maxLength: 1024}},
   profile: repositoryProfile, profile_ref: {type: ['string', 'null'], minLength: 1, maxLength: 4096},
   allowed_files: {type: 'array', minItems: 1, maxItems: 200, uniqueItems: true, items: {type: 'string', minLength: 1, maxLength: 1024}},
@@ -135,6 +136,8 @@ export const repositoryInput = {type: 'object', additionalProperties: false,
     {if: {required: ['checkout_mode'], properties: {checkout_mode: {const: 'managed'}}}, then: {}, else: {required: ['root']}}]};
 export const repositoryPatch = {type: 'object', additionalProperties: false, minProperties: 1, properties: repositoryFields};
 export const empty = {type: 'object', additionalProperties: false, properties: {}};
+export const approvalDecision = {type: 'object', additionalProperties: false, required: ['approval_id', 'decision'], properties: {
+  approval_id: text, decision: {type: 'string', enum: ['approve', 'reject']}}};
 export const params = {type: 'object', additionalProperties: false, required: ['id'], properties: {id: text}};
 export const idempotency = {type: 'object', properties: {'idempotency-key': {type: 'string', minLength: 1, maxLength: 200, pattern: '^[!-~]+$'}}};
 export const genericObject = object;

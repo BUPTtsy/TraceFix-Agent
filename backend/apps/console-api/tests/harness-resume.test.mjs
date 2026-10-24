@@ -198,7 +198,7 @@ test('SDK 恢复重放首次冻结定义，Task 后续编辑不能注入新目�
   lifecycle.finish(created.task.id, started.run.id, 'owner', {status: 'stopped', control_status: 'STOPPED',
     can_resume: true, resume_blockers: [], harness_job_id: 'job'});
   const changed = lifecycle.update(created.task.id, {...definition, goal: '替换为其他目标', mode: 'test',
-    execution: {backend: 'legacy', spec: {goal: '注入新规范'}}, additionalRuleIds: ['injected-rule'],
+    execution: {executionMode: 'batch', spec: {goal: '注入新规范'}}, additionalRuleIds: ['injected-rule'],
     github_reads: [{source_kind: 'issue', number: 99}], source_finding_ids: ['injected-finding']});
   assert.throws(() => lifecycle.start(created.task.id, {}, 'restart', 'owner'), error => error.code === 'SDK_NEW_TASK_REQUIRED');
   const resumed = lifecycle.resume(created.task.id, {}, 'resume', 'owner');
@@ -232,4 +232,66 @@ test('SDK 终态以原控制台 Run 输出并绑定 PG 当前增量、Session �
       error => error.code === 'EXECUTOR_RESULT_INVALID', field);
   assert.throws(() => executorResult(value, run, view, Buffer.from('changed patch')),
     error => error.code === 'EXECUTOR_RESULT_INVALID');
+});
+
+test('待审批与交付后结果：校验 approval/publication 形状并映射 waiting_approval/completed', () => {
+  const run = {id: 'console', taskId: 'task', projectId: 'scope', coding_backend: 'claude_sdk', agentRunId: 'increment',
+    harness_job_id: 'job', harness_session_id: 'session', control_status: 'COMPLETED'};
+  const approval = {id: 'ap', status: 'pending', job_id: 'job', accepted_commit: 'c'.repeat(40), patch_hash: 'h',
+    publish_branch: false, diff_ref: 'd.diff', requested_at: '2026-10-24T00:00:00Z'};
+  const pending = {schema_version: 1, task_id: 'task', run_id: 'console', repo_id: 'scope', run_status: 'WAITING_APPROVAL',
+    terminal: false, outcome: 'FIX_VERIFIED', coding_backend: 'claude_sdk', control_status: 'COMPLETED', can_resume: false,
+    harness_job_id: 'job', harness_session_id: 'session', current_run_id: 'increment', publication: null, approval, delivery_diff: 'diff'};
+  const changes = executorResult(pending, run);
+  assert.equal(changes.status, 'waiting_approval');
+  assert.deepEqual(changes.approval, approval);
+  assert.equal(changes.publication, null);
+  assert.equal(changes.delivery_diff, 'diff');
+  for (const patch of [{approval: {...approval, status: 'approved'}}, {approval: {...approval, publish_branch: 'no'}},
+    {approval: {...approval, job_id: 'other'}}, {approval: null}, {delivery_diff: ''}, {publication: {status: 'local'}},
+    {outcome: 'NO_BUG_FOUND'}, {harness_job_id: 'other'}, {coding_backend: undefined}])
+    assert.throws(() => executorResult({...pending, ...patch}, run), error => error.code === 'EXECUTOR_RESULT_INVALID', JSON.stringify(patch));
+  assert.throws(() => executorResult(pending, {...run, coding_backend: undefined}), error => error.code === 'EXECUTOR_RESULT_INVALID');
+  assert.throws(() => executorResult(pending, {...run, approval: {...approval, id: 'stale'}}), error => error.code === 'EXECUTOR_RESULT_INVALID');
+  const failed = {schema_version: 1, task_id: 'task', run_id: 'console', repo_id: 'scope', terminal: true, run_status: 'FAILED',
+    outcome: 'INFRA_FAILURE', coding_backend: 'claude_sdk', control_status: 'COMPLETED', harness_job_id: 'job',
+    harness_session_id: 'session', current_run_id: 'increment'};
+  for (const publication of [{status: 'unknown'}, {status: 'local', branch: 3}, 'local'])
+    assert.throws(() => executorResult({...failed, publication}, run), error => error.code === 'EXECUTOR_RESULT_INVALID');
+  for (const decided of [{id: 'ap', status: 'approved', decision: 'reject', decided_by: 'web', decided_at: 'now'},
+    {id: 'ap', status: 'rejected', decided_at: 'now'}])
+    assert.throws(() => executorResult({...failed, approval: decided}, run), error => error.code === 'EXECUTOR_RESULT_INVALID');
+  const rejected = executorResult({...failed, publication: {status: 'rejected', branch: null, commit: null, error: null},
+    approval: {id: 'ap', status: 'rejected', decided_by: 'web', decided_at: 'now'}}, {...run, approval: {...approval, decision: 'reject'}});
+  assert.equal(rejected.approval.decision, 'reject');
+  assert.equal(rejected.publication.status, 'rejected');
+  assert.equal(Object.hasOwn(rejected.executionResult, 'repair_mode'), false);
+});
+
+test('executor close：待审批结果不写 finishedAt，权威控制刷新不得把 waiting_approval 改成 completed/stopped', async () => {
+  const task = {id: 'task', currentRunId: 'run', definition: {projectId: 'scope', mode: 'repair', goal: '修复固定缺陷', execution: {executionMode: 'batch'}}};
+  let run = {id: 'run', projectId: 'scope', taskId: 'task', status: 'starting', coding_backend: 'claude_sdk', control_status: 'STARTING'};
+  const bridge = async (operation, fields) => {
+    if (operation === 'task.start') return {task, run, replayed: false};
+    if (operation === 'task') return task;
+    if (operation === 'run' || operation === 'run.record') return run;
+    if (operation === 'run.executor-result') return {status: 'waiting_approval', outcome: 'FIX_VERIFIED', error: null,
+      approval: {id: 'ap', status: 'pending'}, publication: null, delivery_diff: 'diff'};
+    if (operation === 'run.control') return {...run, coding_backend: 'claude_sdk', control_status: 'STOPPED', can_stop: true, can_resume: true, resume_blockers: []};
+    if (operation === 'task.finish') {run = {...run, ...fields.changes}; return {task, run};}
+  };
+  let child;
+  const controller = createExecutor({bridge, projectRoot: process.cwd(), pythonCommand: 'test-python', spawn() {
+    child = new EventEmitter(); child.pid = 12345;
+    child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
+    process.nextTick(() => child.emit('spawn')); return child;
+  }, reportError: error => {throw error;}});
+  await controller.start('task');
+  child.stdout.write(JSON.stringify({schema_version: 1}));
+  child.emit('close', 0, null);
+  await controller.drain();
+  assert.equal(run.status, 'waiting_approval');
+  assert.equal(run.finishedAt, null);
+  assert.equal(run.can_stop, false);
+  assert.equal(run.approval.status, 'pending');
 });

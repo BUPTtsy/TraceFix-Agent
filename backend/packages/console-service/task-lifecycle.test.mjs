@@ -37,19 +37,26 @@ test('非 GUI TestSpec 冻结命令目标并拒绝混用浏览器计划，GUI �
   assert.equal(validate({goal: '旧 GUI 保持现有兼容', assertions: [assertion], regression_assertions: [assertion]}), true);
 });
 
-test('Task 修复模式保持可选、校验非法值并透传执行定义', context => {
+test('legacy 后端与 repairMode 被拒绝；repair 归一化为 claude_sdk，test 不带后端', context => {
   const {tasks, store} = fixture(context);
-  assert.equal(normalizeTask(input, projects).execution.repairMode, undefined);
-  for (const repairMode of ['loop', 'HYBRID', null, 1, true])
-    assert.throws(() => normalizeTask({...input, execution: {...input.execution, repairMode}}, projects),
-      error => error.code === 'INVALID_REPAIR_MODE' && error.status === 400);
-  for (const repairMode of ['hybrid', 'pipeline']) {
-    const {task} = tasks.create({...input, mode: 'repair', execution: {...input.execution, repairMode}});
-    const started = tasks.start(task.id, {}, undefined, 'owner');
-    assert.equal(started.run.execution.repairMode, repairMode);
-    assert.equal(store.run(started.run.id).execution.repairMode, repairMode);
-    tasks.finish(task.id, started.run.id, 'owner', {status: 'completed'});
-  }
+  const repair = {...input, mode: 'repair'};
+  for (const backend of ['legacy', 'other', null, 1])
+    for (const key of ['backend', 'coding_backend'])
+      assert.throws(() => normalizeTask({...repair, execution: {...input.execution, [key]: backend}}, projects),
+        error => error.code === 'INVALID_CODING_BACKEND' && error.status === 400);
+  for (const repairMode of ['hybrid', 'pipeline', 'loop', null])
+    assert.throws(() => normalizeTask({...repair, execution: {...input.execution, repairMode}}, projects),
+      error => error.code === 'INVALID_EXECUTION' && error.status === 400);
+  for (const key of ['backend', 'coding_backend'])
+    assert.throws(() => normalizeTask({...input, execution: {...input.execution, [key]: 'claude_sdk'}}, projects),
+      error => error.code === 'INVALID_CODING_BACKEND' && error.status === 400);
+  assert.equal(normalizeTask(repair, projects).execution.backend, 'claude_sdk');
+  assert.equal(normalizeTask({...repair, execution: {...input.execution, coding_backend: 'claude_sdk'}}, projects).execution.coding_backend, undefined);
+  assert.equal(Object.hasOwn(normalizeTask(input, projects).execution, 'backend'), false);
+  const {task} = tasks.create(repair);
+  const started = tasks.start(task.id, {}, undefined, 'owner');
+  assert.equal(started.run.execution.backend, 'claude_sdk');
+  assert.equal(Object.hasOwn(store.run(started.run.id).execution, 'repairMode'), false);
 });
 
 function fixture(context) {
@@ -185,4 +192,46 @@ test('项目缺失为 404；格式错误、别名冲突与歧义保持 400', () 
   assert.throws(() => normalizeTask(input, [{...projects[0], ready: false}]),
     error => error.code === 'PROJECT_NOT_READY' && error.status === 409);
   assert.equal(normalizeTask({...input, projectId: 'alpha', repositoryId: 'repo'}, catalog).projectId, 'alpha');
+});
+
+test('交付审批：校验前置条件、写入决定、幂等重放；waiting_approval 不阻塞执行器', context => {
+  const {tasks, store} = fixture(context);
+  const {task} = tasks.create({...input, mode: 'repair'});
+  const first = tasks.start(task.id, {}, undefined, 'owner');
+  store.updateRun(first.run.id, {coding_backend: 'claude_sdk', harness_job_id: 'job', harness_session_id: 'session'});
+  const approval = {id: 'approval_1', status: 'pending', job_id: 'job', accepted_commit: 'a'.repeat(40), patch_hash: 'h',
+    publish_branch: false, diff_ref: 'd.diff', requested_at: new Date().toISOString()};
+  assert.throws(() => tasks.approve(task.id, {approval_id: 'approval_1', decision: 'approve'}, 'k', 'owner'),
+    error => error.code === 'APPROVAL_UNAVAILABLE' && error.status === 409);
+  tasks.finish(task.id, first.run.id, 'owner', {status: 'waiting_approval', outcome: 'FIX_VERIFIED', approval, delivery_diff: 'diff'});
+  assert.equal(tasks.lease(), null);
+  assert.equal(tasks.task(task.id).status, 'waiting_approval');
+  assert.throws(() => tasks.start(task.id, {}, undefined, 'owner'), error => error.code === 'TASK_ACTIVE');
+  assert.throws(() => tasks.update(task.id, {...input, mode: 'repair'}), error => error.code === 'TASK_ACTIVE');
+  // waiting_approval 且无进程：其他 Task 仍可使用执行器；有进程时才占用。
+  tasks.assertIdle();
+  store.updateRun(first.run.id, {pid: 4321});
+  assert.throws(() => tasks.assertIdle(), error => error.code === 'EXECUTOR_BUSY');
+  store.updateRun(first.run.id, {pid: null});
+  const other = tasks.create(input).task;
+  const otherStarted = tasks.start(other.id, {}, undefined, 'owner');
+  tasks.finish(other.id, otherStarted.run.id, 'owner', {status: 'completed'});
+  for (const body of [{}, {approval_id: 'approval_1'}, {approval_id: 'approval_1', decision: 'maybe'},
+    {approval_id: 'approval_1', decision: 'approve', extra: 1}, {approval_id: 7, decision: 'approve'}])
+    assert.throws(() => tasks.approve(task.id, body, undefined, 'owner'), error => error.code === 'INVALID_APPROVAL' && error.status === 400);
+  assert.throws(() => tasks.approve(task.id, {approval_id: 'other', decision: 'approve'}, undefined, 'owner'),
+    error => error.code === 'APPROVAL_MISMATCH' && error.status === 409);
+  const body = {approval_id: 'approval_1', decision: 'reject'};
+  const approved = tasks.approve(task.id, body, 'approve-key', 'owner');
+  assert.equal(approved.run.status, 'starting');
+  assert.equal(approved.task.status, 'starting');
+  assert.equal(approved.run.approval.decision, 'reject');
+  assert.equal(approved.run.approval.decided_by, 'web');
+  assert.equal(approved.run.approval.status, 'pending');
+  assert.ok(approved.run.approval.decided_at);
+  assert.equal(tasks.lease().run_id, first.run.id);
+  assert.equal(tasks.approve(task.id, body, 'approve-key', 'owner').replayed, true);
+  assert.equal(tasks.checkApproval(task.id, body, 'approve-key').run.id, first.run.id);
+  assert.throws(() => tasks.approve(task.id, {...body, decision: 'approve'}, 'approve-key', 'owner'), error => error.code === 'IDEMPOTENCY_CONFLICT');
+  assert.throws(() => tasks.approve(task.id, body, 'second-key', 'owner'), error => error.code === 'APPROVAL_UNAVAILABLE');
 });

@@ -88,6 +88,11 @@ export async function createApi({bridge, controller, token, legacyHandler, logge
     async (request, reply) => reply.code(202).send(await controller.resume(request.params.id, request.body || {}, request.headers['idempotency-key'])),
     async request => {if (request.headers['idempotency-key']) await bridge('task.resume.check', {
       id: request.params.id, body: request.body || {}, key: request.headers['idempotency-key']});});
+  // 修复交付前人工审批：正文恰为 {approval_id, decision}；决定写入后由 --deliver-stdin 完成交付，幂等与 resume 一致。
+  route('POST', '/api/v1/tasks/:id/approval', {params: schemas.params, body: schemas.approvalDecision, headers: schemas.idempotency, response: response(202, schemas.mutation)},
+    async (request, reply) => reply.code(202).send(await controller.approve(request.params.id, request.body, request.headers['idempotency-key'])),
+    async request => {if (request.headers['idempotency-key']) await bridge('task.approval.check', {
+      id: request.params.id, body: request.body || {}, key: request.headers['idempotency-key']});});
   route('POST', '/api/v1/tasks/:id/stop', {params: schemas.params, body: schemas.empty,
     response: {...response(200, schemas.mutation), 202: schemas.mutation}},
     async (request, reply) => {const stopped = await controller.stop(request.params.id); return reply.code(stopped.status).send(stopped.value);});
