@@ -11,8 +11,6 @@ dependencies = [
   "claude-agent-sdk==0.2.168",
   "pydantic==2.12.5", "pydantic-ai-slim[openai]==1.107.7",
   "langgraph==1.1.0", "langgraph-checkpoint-postgres==3.0.4",
-  "deepagents==0.4.12", "langchain==1.2.11", "langchain-openai==1.1.7",
-  "langchain-anthropic==1.3.4", "langchain-google-genai==4.2.0",
   "psycopg[binary,pool]==3.3.3", "mcp==1.26.0", "jsonschema==4.26.0",
   "httpx[socks]==0.28.1", "PyYAML==6.0.3",
   "tree-sitter==0.25.2", "tree-sitter-typescript==0.23.2",
