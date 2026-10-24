@@ -46,3 +46,9 @@ export const eventLabel = (event: string) => events[event] || event;
 export const serviceLabel = (service: string) => services[service] || service;
 export const workerStatusLabel = (status: string) => workerStatuses[status.toUpperCase()] || status;
 export const workerRoleLabel = (role: string) => workerRoles[role] || role;
+// 交付发布状态：published 为已推送远端修复分支（不建 PR），rejected 为人工审批拒绝交付。
+const publications: Record<string, string> = {
+  published: '已发布', local: '已生成本地提交', succeeded: '已发布', failed: '发布失败', rejected: '已拒绝交付',
+  disabled: '未启用发布', skipped: '已跳过', pending: '等待发布',
+};
+export const publicationLabel = (status: string) => publications[status] || status;

@@ -2,15 +2,15 @@ import {FormEvent, useCallback, useEffect, useRef, useState} from 'react';
 import {ApiError, loadRepository, Project, Repository, RepositoryDraft, RepositoryProfile, saveRepository} from '@tracefix/api-client';
 
 interface Props {projects: Project[]; editId: string; onSaved: (id: string) => Promise<void>; onDirty: (dirty: boolean) => void; onNavigate: (hash: string, message?: string) => void; report: (error: unknown) => void}
-interface Draft {id: string; url: string; ref: string; root: string; mode: RepositoryDraft['checkout_mode']; commands: string; allowedFiles: string; allowedUrls: string; appUrl: string; credential: string; enabled: boolean; publish: boolean; profile: RepositoryProfile | null}
+interface Draft {id: string; url: string; ref: string; root: string; mode: RepositoryDraft['checkout_mode']; commands: string; allowedFiles: string; allowedUrls: string; appUrl: string; credential: string; enabled: boolean; publish: boolean; approval: boolean; profile: RepositoryProfile | null}
 const defaultCommands = {prepare: ['node', '--version'], start: ['node', 'scripts/serve.mjs'], reset: ['node', 'scripts/reset.mjs'], static: ['node', 'node_modules/typescript/bin/tsc', '--noEmit'], unit: ['node', '--test', 'tests/tasks.test.mjs'], build: ['node', 'scripts/build.mjs']};
 function blank(projects: Project[]): Draft {
   let id = 'test-bug-repo', suffix = 2;
   while (projects.some(project => project.id.toLowerCase() === id)) id = 'test-bug-repo-' + suffix++;
-  return {id, url: 'https://github.com/BUPTtsy/Test-Bug-repo', ref: 'main', root: '', mode: 'managed', commands: JSON.stringify(defaultCommands, null, 2), allowedFiles: 'src/**\nserver/**', allowedUrls: 'http://app:3000', appUrl: 'http://app:3000', credential: '', enabled: true, publish: false, profile: null};
+  return {id, url: 'https://github.com/BUPTtsy/Test-Bug-repo', ref: 'main', root: '', mode: 'managed', commands: JSON.stringify(defaultCommands, null, 2), allowedFiles: 'src/**\nserver/**', allowedUrls: 'http://app:3000', appUrl: 'http://app:3000', credential: '', enabled: true, publish: false, approval: false, profile: null};
 }
 function fromRecord(record: Repository): Draft {
-  return {id: record.repo_id, url: `https://github.com/${record.owner}/${record.repo}`, ref: record.default_ref, root: record.root || '', mode: record.checkout_mode || 'existing', commands: JSON.stringify(record.profile.commands, null, 2), allowedFiles: record.allowed_files.join('\n'), allowedUrls: record.allowed_urls.join('\n'), appUrl: record.profile.url, credential: record.credential_ref || '', enabled: record.enabled, publish: record.publish_branch === true, profile: record.profile};
+  return {id: record.repo_id, url: `https://github.com/${record.owner}/${record.repo}`, ref: record.default_ref, root: record.root || '', mode: record.checkout_mode || 'existing', commands: JSON.stringify(record.profile.commands, null, 2), allowedFiles: record.allowed_files.join('\n'), allowedUrls: record.allowed_urls.join('\n'), appUrl: record.profile.url, credential: record.credential_ref || '', enabled: record.enabled, publish: record.publish_branch === true, approval: record.require_approval === true, profile: record.profile};
 }
 function lines(text: string): string[] {return [...new Set(text.split(/\r?\n/).map(value => value.trim()).filter(Boolean))];}
 function commandsFrom(text: string): Record<string, string[]> {
@@ -69,7 +69,7 @@ export function RepositoryPage({projects, editId, onSaved, onDirty, onNavigate, 
       }
       const appUrl = new URL(draft.appUrl);
       if (!allowedUrls.some(origin => new URL(origin).origin === appUrl.origin)) throw new Error('测试地址必须属于允许访问的来源');
-      const repository: RepositoryDraft = {repo_id: draft.id.trim(), owner: match[1], repo: match[2], default_ref: draft.ref.trim(), checkout_mode: draft.mode, publish_branch: draft.publish, allowed_files: lines(draft.allowedFiles), allowed_urls: allowedUrls, credential_ref: draft.credential.trim() || null, enabled: draft.enabled, profile: {...draft.profile, project: draft.id.trim(), url: draft.appUrl.trim(), allowed_origins: allowedUrls, commands: commandsFrom(draft.commands)}};
+      const repository: RepositoryDraft = {repo_id: draft.id.trim(), owner: match[1], repo: match[2], default_ref: draft.ref.trim(), checkout_mode: draft.mode, publish_branch: draft.publish, require_approval: draft.approval, allowed_files: lines(draft.allowedFiles), allowed_urls: allowedUrls, credential_ref: draft.credential.trim() || null, enabled: draft.enabled, profile: {...draft.profile, project: draft.id.trim(), url: draft.appUrl.trim(), allowed_origins: allowedUrls, commands: commandsFrom(draft.commands)}};
       if (draft.root.trim()) repository.root = draft.root.trim();
       if (draft.mode === 'existing' && !repository.root) throw new Error('使用已有 checkout 时必须填写目标目录');
       const saved = await saveRepository(repository, editId || undefined);
@@ -97,6 +97,8 @@ export function RepositoryPage({projects, editId, onSaved, onDirty, onNavigate, 
       <label className="knowledge-toggle"><input type="checkbox" checked={draft.enabled} onChange={event => update({enabled: event.target.checked})}/>启用仓库</label>
       <label className="knowledge-toggle"><input type="checkbox" checked={draft.publish} onChange={event => update({publish: event.target.checked})}/>验证通过后发布修复分支到目标仓库</label>
       <p className="muted">发布默认关闭；开启后需要服务端部署的 GitHub 写入凭据。</p>
+      <label className="knowledge-toggle"><input type="checkbox" checked={draft.approval} onChange={event => update({approval: event.target.checked})}/>修复交付前需人工审批</label>
+      <p className="muted">审批默认关闭；开启后修复通过最终验收会停在“等待审批”，需在运行详情或 CLI 中批准后才交付（推送分支或保留本地提交）。</p>
       {failure && <div className="notice failure" role="alert">{failure}</div>}
       <div className="editor-footer"><span className="muted">保存后可在项目空间进入“配置规则”页面勾选检测规则，再启动 Test 或 Repair。</span><button className="primary" disabled={Boolean(duplicate)}>{busy ? '保存中…' : '保存仓库配置'}</button></div>
     </fieldset>

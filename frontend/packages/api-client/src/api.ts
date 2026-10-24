@@ -1,11 +1,15 @@
 import {errorWithContext} from './errors';
 
 export type Service = 'test' | 'repair' | 'chat';
-export interface Project {id: string; repoId: string; root: string; profile: string | null; url: string | null; ready: boolean; issue: string | null; allowedFiles: string[]; commands: Record<string, string[]>; runCount: number; documentCount: number; checkoutMode?: 'existing' | 'managed'; cloneUrl?: string | null; defaultRef?: string | null; publishBranch?: boolean; repositoryConfigVersion?: number | null}
+export interface Project {id: string; repoId: string; root: string; profile: string | null; url: string | null; ready: boolean; issue: string | null; allowedFiles: string[]; commands: Record<string, string[]>; runCount: number; documentCount: number; checkoutMode?: 'existing' | 'managed'; cloneUrl?: string | null; defaultRef?: string | null; publishBranch?: boolean; requireApproval?: boolean; repositoryConfigVersion?: number | null}
 export interface RepositoryProfile {project: string; source_commit?: string; url: string; allowed_origins: string[]; commands: Record<string, string[]>; [key: string]: unknown}
-export interface RepositoryDraft {repo_id: string; root?: string; owner: string; repo: string; default_ref: string; checkout_mode: 'existing' | 'managed'; publish_branch: boolean; profile: RepositoryProfile; allowed_files: string[]; allowed_urls: string[]; credential_ref: string | null; enabled: boolean}
+export interface RepositoryDraft {repo_id: string; root?: string; owner: string; repo: string; default_ref: string; checkout_mode: 'existing' | 'managed'; publish_branch: boolean; require_approval: boolean; profile: RepositoryProfile; allowed_files: string[]; allowed_urls: string[]; credential_ref: string | null; enabled: boolean}
 export interface Repository extends RepositoryDraft {version: number; commit: string | null; config_digest: string; profile_ref?: string | null}
-export interface RunResult {runId: string; ready: boolean; outcome: string | null; summary: string | null; branch: string | null; commit: string | null; publication: {status: string; branch: string | null; commit: string | null; error?: string | {code?: string; message?: string} | null} | null; patch: {ref: string; diff?: string; available: boolean; verification: string; branch?: string | null; commit?: string | null} | null}
+// 交付发布结果：local 仅本地提交，published 已推送远端分支（不建 PR），rejected 为人工拒绝交付。
+export interface Publication {status: string; branch: string | null; commit: string | null; error?: string | {code?: string; message?: string} | null}
+// SDK Job 最终累计验收后、交付前的人工审批记录；决定后 status 为 approved/rejected，并带 decision 等字段。
+export interface DeliveryApproval {id: string; status: 'pending' | 'approved' | 'rejected'; job_id?: string; accepted_commit?: string | null; patch_hash?: string | null; publish_branch?: boolean; diff_ref?: string | null; requested_at?: string | null; decision?: 'approve' | 'reject'; decided_by?: string; decided_at?: string}
+export interface RunResult {runId: string; ready: boolean; outcome: string | null; summary: string | null; branch: string | null; commit: string | null; publication: Publication | null; patch: {ref: string; diff?: string; available: boolean; verification: string; branch?: string | null; commit?: string | null} | null}
 export interface Source {id: string; title: string; version: number}
 export interface KnowledgeUse {phase: string; queries: string[]; documents: Source[]; artifact_ref: string}
 export interface Run {id: string; projectId: string; agentRunId?: string; goal: string; mode: Service | 'unknown'; status: string; phase: string; outcome?: string; startedAt: string; finishedAt?: string; timeSource?: string; exitCode?: number; error?: string; branch?: string; continuationCount?: number; abnormalTermination?: boolean; continuationMarkers?: {instruction: string; previous_status: string; previous_error?: string; at: string}[]; knowledge: KnowledgeUse[]; logs?: string[]; artifacts?: {ref: string; label: string; bytes: number}[]}
@@ -118,7 +122,7 @@ export function aggregateWorkers(events: TraceEvent[]): WorkerAggregate {
   const active = workers.filter(worker => worker.active && workerActiveStatuses.has(worker.status)).length;
   return {workers, active, maxConcurrency};
 }
-export interface Run {canContinue?: boolean; coding_backend?: string; control_status?: string; can_stop?: boolean; can_resume?: boolean; resume_blockers?: string[]; harness_job_id?: string | null; harness_session_id?: string | null; current_run_id?: string | null; accepted_commit?: string | null; quality?: string | null}
+export interface Run {coding_backend?: string; control_status?: string; can_stop?: boolean; can_resume?: boolean; resume_blockers?: string[]; harness_job_id?: string | null; harness_session_id?: string | null; current_run_id?: string | null; accepted_commit?: string | null; quality?: string | null; can_approve?: boolean; approval?: DeliveryApproval | null; publication?: Publication | null; delivery_diff?: string | null}
 export interface ReportIssue {id: string; title: string; source: string; status: string; location: string; expected: string; actual: string; steps: string[]; verification: string; evidence_refs: string[]}
 export interface CheckItem {id: string; name: string; criteria: string; severity: 'blocker' | 'critical' | 'major' | 'minor'; source: 'rule' | 'user_goal'; detector: string; rule_version?: number | null}
 export interface CheckResult extends CheckItem {status: 'pass' | 'fail' | 'error' | 'inconclusive'; actual: string; evidence_refs: string[]; error?: string | null; fallback?: {source?: string; reason?: string; status?: string; error?: string} | null; stage?: 'explore' | 'verify'}
@@ -169,37 +173,58 @@ export const loadRunTrace = (id: string, after = 0) => request<TraceEvent[]>(`/a
 export const loadGuidance = (id: string) => request<Guidance[]>(`/api/runs/${encodeURIComponent(id)}/guidance`);
 export const submitGuidance = (id: string, text: string, level: Guidance['level']) => request<Guidance>(`/api/runs/${encodeURIComponent(id)}/guidance`, {method: 'POST', body: JSON.stringify({text, level})});
 export const confirmGuidance = (id: string, guidanceId: string) => request<Guidance>(`/api/runs/${encodeURIComponent(id)}/guidance/${encodeURIComponent(guidanceId)}/confirm`, {method: 'POST', body: '{}'});
+// 执行状态只来自 Task：优先活动 Task，否则取最近更新的 Task，便于查看结果或恢复。
 export async function loadAgentStatus(): Promise<AgentStatus> {
-  const [legacy, tasks] = await Promise.all([request<AgentStatus>('/api/agent/status'),
-    request<{id: string; status: string; currentRunId: string | null; updatedAt: string}[]>('/api/v1/tasks')]);
+  const tasks = await request<{id: string; status: string; currentRunId: string | null; updatedAt: string}[]>('/api/v1/tasks');
   const active = new Set(['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping']);
   const ordered = tasks.filter(task => task.currentRunId).sort((first, second) => second.updatedAt.localeCompare(first.updatedAt));
-  const task = ordered.find(item => active.has(item.status)) || (!legacy.running ? ordered[0] : undefined);
-  if (!task?.currentRunId) return legacy;
+  const task = ordered.find(item => active.has(item.status)) || ordered[0];
+  if (!task?.currentRunId) return {running: false, canStop: false, canResume: false};
   const run = await loadRun(task.currentRunId);
-  if (!active.has(task.status) && legacy.startedAt && run.startedAt && legacy.startedAt > run.startedAt) return legacy;
-  return {...run, taskId: task.id, running: active.has(run.status), canStop: run.can_stop ?? active.has(run.status), canResume: run.can_resume ?? false};
+  // waiting_approval 仍锁定 Task（计入 running），但后端禁止停止，只能在运行详情中批准或拒绝交付。
+  const waiting = run.status === 'waiting_approval';
+  return {...run, taskId: task.id, running: active.has(run.status), canStop: !waiting && (run.can_stop ?? active.has(run.status)), canResume: run.can_resume ?? false,
+    ...(waiting ? {stopUnavailableReason: '等待交付审批，不能停止；请在运行详情中批准或拒绝'} : {})};
 }
-export async function startAgent(goal: string, mode: Exclude<Service, 'chat'>, projectId: string, additionalRuleIds: string[] = []): Promise<AgentStatus> {
-  const created = await request<{run: Run | null}>('/api/v1/tasks', {method: 'POST', body: JSON.stringify({goal, mode, projectId, execution: {executionMode: 'batch'}, additionalRuleIds, create_and_start: true})});
+async function createAndStartTask(goal: string, mode: Exclude<Service, 'chat'>, projectId: string, additionalRuleIds: string[], extra: Record<string, unknown> = {}): Promise<AgentStatus> {
+  const created = await request<{task?: {id?: string}; run: Run | null}>('/api/v1/tasks', {method: 'POST', body: JSON.stringify({goal, mode, projectId, execution: {executionMode: 'batch'}, additionalRuleIds, create_and_start: true, ...extra})});
   if (!created.run) throw new Error('任务已创建，但未返回运行信息');
-  return {...created.run, running: ['starting', 'running', 'queued', 'created', 'retrying'].includes(created.run.status.toLowerCase()), canStop: true};
+  // 停止只能按 taskId 发起，启动后立即带上，避免等待下一次轮询。
+  return {...created.run, taskId: created.run.taskId || created.task?.id || null, running:['starting', 'running', 'queued', 'created', 'retrying'].includes(created.run.status.toLowerCase()), canStop: true};
 }
-export async function stopAgent(taskId?: string | null): Promise<AgentStatus> {
-  if (!taskId) return request<AgentStatus>('/api/agent/stop', {method: 'POST'});
+export const startAgent = (goal: string, mode: Exclude<Service, 'chat'>, projectId: string, additionalRuleIds: string[] = []) => createAndStartTask(goal, mode, projectId, additionalRuleIds);
+// 派生 Run 走普通 Task 创建，附带 parent_run_id 由后端继承父 Run 的规则快照；目标为空时沿用父目标。
+export async function deriveRun(parent: Pick<Run, 'id' | 'agentRunId' | 'projectId' | 'mode' | 'goal'>, goal = ''): Promise<AgentStatus> {
+  try {
+    return await createAndStartTask(goal.trim() || parent.goal, parent.mode === 'repair' ? 'repair' : 'test', parent.projectId, [], {parent_run_id: parent.agentRunId || parent.id});
+  } catch (error) {
+    if (!(error instanceof ApiError)) throw error;
+    // 错误码沿用 ApiError 展示；非受管仓库补一句可操作的提示。
+    const hint = error.code === 'REPOSITORY_FREEZE_REQUIRED' ? '派生 Run 需要受管仓库，请先在仓库配置中注册并冻结。' : '';
+    throw new ApiError(`派生 Run 失败：${hint}${error.message}`, error.status, error.code, error.requestId);
+  }
+}
+export async function stopAgent(taskId: string): Promise<AgentStatus> {
   const stopped = await request<{run: Run | null}>(`/api/v1/tasks/${encodeURIComponent(taskId)}/stop`, {method: 'POST', body: '{}'});
   if (!stopped.run) return {running: false, taskId};
-  return {...stopped.run, running: ['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping'].includes(stopped.run.status), canStop: stopped.run.status !== 'stopping', canResume: stopped.run.can_resume ?? false};
+  return {...stopped.run, running: ['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping'].includes(stopped.run.status), canStop: !['stopping', 'waiting_approval'].includes(stopped.run.status), canResume: stopped.run.can_resume ?? false};
 }
 export async function resumeAgent(taskId: string, idempotencyKey = globalThis.crypto?.randomUUID?.() || `resume-${Date.now()}`): Promise<AgentStatus> {
   const resumed = await request<{task: Record<string, unknown>; run: Run | null}>(`/api/v1/tasks/${encodeURIComponent(taskId)}/resume`, {
     method: 'POST', body: '{}', headers: {'Idempotency-Key': idempotencyKey},
   });
   if (!resumed.run) return {running: false, taskId, canResume: false};
-  return {...resumed.run, taskId, running: ['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping'].includes(String(resumed.run.status)), canStop: true, canResume: false};
+  return {...resumed.run, taskId, running: ['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping'].includes(String(resumed.run.status)), canStop: resumed.run.status !== 'waiting_approval', canResume: false};
 }
-export const continueRun = (id: string, instruction: string) => request<AgentStatus>(`/api/runs/${encodeURIComponent(id)}/continue`, {method: 'POST', body: JSON.stringify({instruction})});
-export const deriveRun = (id: string, additionalRuleIds: string[], goal = '') => request<AgentStatus>(`/api/runs/${encodeURIComponent(id)}/derive`, {method: 'POST', body: JSON.stringify({additionalRuleIds, goal})});
+// 交付审批：正文恰为 {approval_id, decision}，幂等键与 resume 相同处理；决定写入后由执行器完成交付或拒绝。
+export async function decideApproval(taskId: string, approvalId: string, decision: 'approve' | 'reject', idempotencyKey = globalThis.crypto?.randomUUID?.() || `approval-${Date.now()}`): Promise<AgentStatus> {
+  const decided = await request<{task: Record<string, unknown>; run: Run | null}>(`/api/v1/tasks/${encodeURIComponent(taskId)}/approval`, {
+    method: 'POST', body: JSON.stringify({approval_id: approvalId, decision}), headers: {'Idempotency-Key': idempotencyKey},
+  });
+  if (!decided.run) return {running: false, taskId, canResume: false};
+  const status = String(decided.run.status);
+  return {...decided.run, taskId, running: ['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping'].includes(status), canStop: status !== 'waiting_approval' && decided.run.can_stop === true, canResume: false};
+}
 export const loadDocuments = (projectId: string, query = '') => request<KnowledgeDocument[]>(`/api/knowledge?${new URLSearchParams({projectId, q: query})}`);
 export const loadDocument = (id: string) => request<KnowledgeDocument>(`/api/knowledge/${encodeURIComponent(id)}`);
 export const saveDocument = (document: DocumentDraft) => request<KnowledgeDocument>(`/api/knowledge${document.id ? '/' + encodeURIComponent(document.id) : ''}`, {method: document.id ? 'PUT' : 'POST', body: JSON.stringify(document)});
