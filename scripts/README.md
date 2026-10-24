@@ -4,12 +4,12 @@
 
 | 目录 | 职责 |
 | --- | --- |
-| `bootstrap` | Windows/Unix 启动、依赖准备、Python Agent 入口 |
+| `bootstrap` | Windows/Unix Web 启动、依赖准备 |
 | `checks` | 模型连接、HTTP 集成、Web 规则/知识/续执行及跨包验收 |
 | `github` | 远程测试项目准备 |
 | `maintenance` | 保留的人工暂存辅助脚本，包含 Git 索引写入，按需手动运行 |
 
-演示初始化工具位于 `bugboard/scripts/init_demo.py`。运行 `bootstrap` 的完整模式会使用已配置模型及 Docker；`--smoke` 为离线 Fake 模型检查。
+演示初始化工具位于 `bugboard/scripts/init_demo.py`。`bootstrap` 默认准备完整 Agent 环境并启动 Web 控制台；`--console-only` 仅启动控制台，不检查模型密钥或 Docker。离线引擎检查通过 pytest 执行。
 
 ## 真实 E2E 验收
 
@@ -23,9 +23,9 @@ Windows 在项目根目录运行：
 .\.venv\Scripts\python.exe scripts/checks/verify_real_e2e.py --required --case B01 --output artifacts/real-e2e/m0-rerun.json
 ```
 
-该检查会读取本地 `.env`（不覆盖已设置的环境变量），要求真实模型配置、可访问的 Docker Linux 引擎与 Docker Compose v2。PostgreSQL 的 Compose 密码和 Agent 连接 DSN 都使用 `POSTGRES_PASSWORD`；已有数据卷的初始化密码不会因修改 Compose 环境变量而改变，若仍出现认证失败，应让 `.env` 与该数据卷的实际密码一致。它会准备 B01 缺陷仓库、PostgreSQL、应用与浏览器镜像，以 `--execution-mode batch` 执行真实修复，不创建本地提交或等待审批，并检查 `COMPLETED` / `FIX_VERIFIED`、六类验证证据和已验证的有效 diff。失败报告也包含 Run、报告及补丁引用和具体原因，方便调用方继续处理。其他缺陷虽可通过 `--case` 选择，但冻结测试规范和目标当前固定为 B01 的状态持久化场景，不能据此宣称 12 个缺陷已经验收。
+该检查会读取本地 `.env`（不覆盖已设置的环境变量），要求真实模型配置、可访问的 Docker Linux 引擎与 Docker Compose v2。repair 编码只走 Docker 内的 Claude Agent SDK worker，没有其他编码路径，因此前置检查还要求 `.env.example` 中标注为 repair 必填的 `TRACEFIX_CLAUDE_*` / `TRACEFIX_SDK_*`：模型、凭据、worker 镜像完整 ID、受控出口网络与代理。镜像与网络必须能被 `docker image inspect` / `docker network inspect` 查到；依赖已安装时，还会用 `load_claude_sdk_config` 做完整校验。PostgreSQL 的 Compose 密码和 Agent 连接 DSN 都使用 `POSTGRES_PASSWORD`；已有数据卷的初始化密码不会因修改 Compose 环境变量而改变，若仍出现认证失败，应让 `.env` 与该数据卷的实际密码一致。它会准备 B01 缺陷仓库、PostgreSQL、应用与浏览器镜像，通过内部服务执行 batch 真实修复，不创建本地提交或等待审批，并检查 `COMPLETED` / `FIX_VERIFIED`、六类验证证据和已验证的有效 diff。失败报告也包含 Run、报告及补丁引用和具体原因，方便调用方继续处理。其他缺陷虽可通过 `--case` 选择，但冻结测试规范和目标当前固定为 B01 的状态持久化场景，不能据此宣称 12 个缺陷已经验收。
 
-从非交互入口使用 `--continue-run RUN_ID` 时同样默认为 `batch`，会继续补充上下文并收尾；只有显式 `--execution-mode interactive` 或交互终端的 `/continue` 才沿用人工暂停/审批语义。
+任务通过 Web / HTTP 服务创建和恢复，执行模式由服务请求控制；Python 包不提供交互式终端入口。
 
 当前 B01 新 Run 的独立回归还会执行「完成 → 刷新 → 取消完成 → 刷新 → Todo 筛选」，要求目标任务仍可见，防止补丁停用取消完成来满足原问题断言。历史 Run 使用当时冻结的规范，新增回归不会改写历史自动结果。
 

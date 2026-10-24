@@ -2,6 +2,8 @@
 
 This checker never substitutes Fake components.  Without the required real
 environment it reports SKIPPED locally or FAILED in required CI mode.
+Repair coding always runs in the Claude Agent SDK Docker worker, so the
+TRACEFIX_CLAUDE_* / TRACEFIX_SDK_* configuration is a prerequisite as well.
 """
 from __future__ import annotations
 
@@ -69,6 +71,54 @@ def postgres_connection_config() -> tuple[str, str]:
     return dsn, compose_env
 
 
+def _origin(url: str) -> str:
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}".lower()
+
+
+def sdk_prerequisites() -> list[str]:
+    """repair 编码只走 Claude Agent SDK：与 load_claude_sdk_config / harness_bootstrap 的必填项一致。
+
+    只用标准库，CI 安装依赖前也能执行；依赖已安装时再用 load_claude_sdk_config 做完整校验。
+    """
+    def setting(name):
+        return os.getenv(name, "").strip()
+
+    missing = []
+    base_url = setting("TRACEFIX_CLAUDE_BASE_URL").rstrip("/")
+    legacy_url = setting("TRACEFIX_BASE_URL")
+    reuse = bool(base_url and legacy_url and _origin(base_url) == _origin(legacy_url))
+    if not setting("TRACEFIX_CLAUDE_MODEL") and not (reuse and setting("TRACEFIX_TEXT_MODEL")):
+        missing.append("TRACEFIX_CLAUDE_MODEL（SDK 模型 ID；网关与 TRACEFIX_BASE_URL 同源时可复用 TRACEFIX_TEXT_MODEL）")
+    reference = setting("TRACEFIX_CLAUDE_CREDENTIAL_REF")
+    if reference:
+        if not re.fullmatch(r"env:[A-Z][A-Z0-9_]*", reference) or not setting(reference.removeprefix("env:")):
+            missing.append("TRACEFIX_CLAUDE_CREDENTIAL_REF（须为 env:NAME 且被引用变量非空）")
+    elif not setting("TRACEFIX_CLAUDE_API_KEY") and not (reuse and setting("TRACEFIX_API_KEY")):
+        missing.append("TRACEFIX_CLAUDE_API_KEY（SDK 密钥；网关与 TRACEFIX_BASE_URL 同源时可复用 TRACEFIX_API_KEY）")
+    image = setting("TRACEFIX_SDK_WORKER_IMAGE")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
+        missing.append("TRACEFIX_SDK_WORKER_IMAGE（worker 镜像完整 ID，sha256:...）")
+    network = setting("TRACEFIX_SDK_NETWORK")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", network):
+        missing.append("TRACEFIX_SDK_NETWORK（带 tracefix.egress.* 标签的 internal Docker 网络）")
+    proxy = urlsplit(setting("TRACEFIX_SDK_EGRESS_PROXY"))
+    if proxy.scheme not in {"http", "https"} or not proxy.hostname or proxy.username or proxy.password:
+        missing.append("TRACEFIX_SDK_EGRESS_PROXY（无内嵌凭据的 http(s) 出口代理）")
+    if missing:
+        return missing
+    sys.path.insert(0, str(ROOT / "backend/packages/agent/src"))
+    try:
+        from tracefix.agents.claude_sdk_config import load_claude_sdk_config
+    except ImportError:
+        return missing
+    try:
+        load_claude_sdk_config().resolve_credential()
+    except ValueError as error:
+        missing.append("Claude Agent SDK 配置无效：" + safe_output(str(error)).replace("\n", " ")[:500])
+    return missing
+
+
 def prerequisites() -> list[str]:
     missing = []
     if not os.getenv("TRACEFIX_API_KEY", "").strip():
@@ -77,6 +127,8 @@ def prerequisites() -> list[str]:
         missing.append("TRACEFIX_BASE_URL")
     if not os.getenv("TRACEFIX_TEXT_MODEL"):
         missing.append("TRACEFIX_TEXT_MODEL")
+    sdk_missing = sdk_prerequisites()
+    missing.extend(sdk_missing)
     docker = shutil.which("docker")
     if not docker:
         missing.append("docker 命令")
@@ -88,6 +140,13 @@ def prerequisites() -> list[str]:
         compose = command([docker, "compose", "version", "--short"], check=False, timeout=30)
         if compose.returncode:
             missing.append("Docker Compose v2")
+        if not sdk_missing:
+            image = os.environ["TRACEFIX_SDK_WORKER_IMAGE"].strip()
+            if command([docker, "image", "inspect", image], check=False, timeout=60).returncode:
+                missing.append("SDK worker 镜像（docker image inspect 失败）")
+            network = os.environ["TRACEFIX_SDK_NETWORK"].strip()
+            if command([docker, "network", "inspect", network], check=False, timeout=30).returncode:
+                missing.append("SDK 受控出口网络（docker network inspect 失败）")
     return missing
 
 
@@ -339,6 +398,12 @@ def main(argv=None) -> int:
                 " > Actions 中添加名为 TRACEFIX_API_KEY 的 Repository secret，值为有效的模型 API 密钥。"
                 "若使用 Organization secret，请授权当前仓库；若使用 Environment secret，"
                 "请为 workflow job 配置对应 environment。本地运行请设置环境变量或项目根目录 .env。"
+            )
+        if any(item.startswith(("TRACEFIX_CLAUDE_", "TRACEFIX_SDK_", "SDK ", "Claude Agent SDK"))
+               for item in missing):
+            report["message"] += (
+                " repair 编码只走 Claude Agent SDK（Docker 内 worker），没有其他编码路径：请按 .env.example 配置"
+                " TRACEFIX_CLAUDE_* 与 TRACEFIX_SDK_*；受控出口网络与代理需由部署环境预置。"
             )
         write_json(args.output, report)
         print(f"REAL_E2E: {status.upper()} — " + "；".join(missing))

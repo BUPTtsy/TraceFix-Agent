@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import runpy
 import shutil
@@ -90,6 +91,10 @@ def test_real_e2e_required_preflight_reports_missing_secret(tmp_path, monkeypatc
     monkeypatch.setenv('TRACEFIX_API_KEY', api_key)
     monkeypatch.setenv('TRACEFIX_BASE_URL', 'https://api.deepseek.com')
     monkeypatch.setenv('TRACEFIX_TEXT_MODEL', 'deepseek-chat')
+    # SDK 配置来自宿主环境时会改变缺失项，测试内统一清空。
+    for name in list(os.environ):
+        if name.startswith(('TRACEFIX_CLAUDE_', 'TRACEFIX_SDK_')):
+            monkeypatch.delenv(name)
     monkeypatch.setitem(main.__globals__, 'load_local_env', lambda: None)
     monkeypatch.setattr(module['shutil'], 'which', lambda name: name)
     monkeypatch.setitem(main.__globals__, 'command', lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout='linux'))
@@ -99,8 +104,12 @@ def test_real_e2e_required_preflight_reports_missing_secret(tmp_path, monkeypatc
 
     report = json.loads(output.read_text(encoding='utf-8'))
     assert report['status'] == 'failed'
-    assert report['missing'] == ['TRACEFIX_API_KEY']
+    # repair 编码只走 Claude Agent SDK，未配置 SDK 时同样列为缺失。
+    assert [item.split('（', 1)[0] for item in report['missing']] == [
+        'TRACEFIX_API_KEY', 'TRACEFIX_CLAUDE_MODEL', 'TRACEFIX_CLAUDE_API_KEY',
+        'TRACEFIX_SDK_WORKER_IMAGE', 'TRACEFIX_SDK_NETWORK', 'TRACEFIX_SDK_EGRESS_PROXY']
     assert 'Repository secret' in report['message']
+    assert 'TRACEFIX_CLAUDE_*' in report['message']
     assert 'Repository secret' in capsys.readouterr().out
 
 

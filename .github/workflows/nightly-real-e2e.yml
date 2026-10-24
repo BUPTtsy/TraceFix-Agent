@@ -1,5 +1,19 @@
 name: Nightly real model E2E
 
+# repair 编码只走 Claude Agent SDK（Docker 内 worker），没有其他编码路径。除宿主模型配置外还需要：
+#   - secrets.TRACEFIX_CLAUDE_API_KEY：SDK 专属密钥；网关（TRACEFIX_CLAUDE_BASE_URL）与 TRACEFIX_BASE_URL 同源时
+#     可留空，复用 TRACEFIX_API_KEY 与 TRACEFIX_TEXT_MODEL。TRACEFIX_CLAUDE_CREDENTIAL_REF 需要同时注入被引用的
+#     变量，本 workflow 不使用。
+#   - vars.TRACEFIX_CLAUDE_BASE_URL / TRACEFIX_CLAUDE_MODEL / TRACEFIX_SDK_EGRESS_ALLOWLIST /
+#     TRACEFIX_SDK_STOP_GRACE_SECONDS / TRACEFIX_SDK_SESSION_TIMEOUT_SECONDS：含义同根目录 .env.example，留空取默认。
+#   - vars.TRACEFIX_SDK_WORKER_IMAGE：worker 镜像完整 ID（sha256:...）；留空且已配置受控出口时，
+#     下方步骤从 Dockerfile.sdk-worker 构建并导出镜像 ID。
+#   - vars.TRACEFIX_SDK_NETWORK / TRACEFIX_SDK_EGRESS_PROXY：受控出口网络与代理。
+# GitHub 托管的 ubuntu-24.04 runner 不提供受控出口：没有带 tracefix.egress.enforced / tracefix.egress.policy
+# 标签的 internal Docker 网络，也没有经过审计的出口代理。scripts/checks/sdk_live/egress.py 只用于开发机探针，
+# 不在 CI 中代替生产出口。必须在已预置出口的 runner 上配置这两个变量；否则必需模式预检会失败退出并列出
+# 缺失项，不会回退到其他编码路径。
+
 on:
   schedule:
     - cron: '17 2 * * *'
@@ -16,6 +30,14 @@ jobs:
       TRACEFIX_API_KEY: ${{ secrets.TRACEFIX_API_KEY }}
       TRACEFIX_BASE_URL: ${{ vars.TRACEFIX_BASE_URL || 'https://api.deepseek.com' }}
       TRACEFIX_TEXT_MODEL: ${{ vars.TRACEFIX_TEXT_MODEL || 'deepseek-chat' }}
+      TRACEFIX_CLAUDE_API_KEY: ${{ secrets.TRACEFIX_CLAUDE_API_KEY }}
+      TRACEFIX_CLAUDE_BASE_URL: ${{ vars.TRACEFIX_CLAUDE_BASE_URL }}
+      TRACEFIX_CLAUDE_MODEL: ${{ vars.TRACEFIX_CLAUDE_MODEL }}
+      TRACEFIX_SDK_NETWORK: ${{ vars.TRACEFIX_SDK_NETWORK }}
+      TRACEFIX_SDK_EGRESS_PROXY: ${{ vars.TRACEFIX_SDK_EGRESS_PROXY }}
+      TRACEFIX_SDK_EGRESS_ALLOWLIST: ${{ vars.TRACEFIX_SDK_EGRESS_ALLOWLIST }}
+      TRACEFIX_SDK_STOP_GRACE_SECONDS: ${{ vars.TRACEFIX_SDK_STOP_GRACE_SECONDS }}
+      TRACEFIX_SDK_SESSION_TIMEOUT_SECONDS: ${{ vars.TRACEFIX_SDK_SESSION_TIMEOUT_SECONDS }}
       PYTHONUTF8: '1'
       PYTHONIOENCODING: utf-8
     steps:
@@ -23,6 +45,19 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      - name: Resolve Claude Agent SDK worker image
+        # 通过 GITHUB_ENV 导出，避免与 job 级 env 的优先级冲突；未预置受控出口时不构建镜像。
+        env:
+          PINNED_SDK_WORKER_IMAGE: ${{ vars.TRACEFIX_SDK_WORKER_IMAGE }}
+        run: |
+          image="$PINNED_SDK_WORKER_IMAGE"
+          if [ -z "$image" ] && [ -n "$TRACEFIX_SDK_NETWORK" ]; then
+            docker build -f Dockerfile.sdk-worker -t tracefix-sdk-worker:0.2.168 .
+            image="$(docker image inspect tracefix-sdk-worker:0.2.168 --format '{{.Id}}')"
+          fi
+          if [ -n "$image" ]; then
+            echo "TRACEFIX_SDK_WORKER_IMAGE=$image" >> "$GITHUB_ENV"
+          fi
       - name: Check real E2E prerequisites
         run: python scripts/checks/verify_real_e2e.py --required --preflight-only --case B01 --output artifacts/real-e2e/report.json
       - uses: actions/setup-node@v5
@@ -35,7 +70,7 @@ jobs:
       - name: Check Python runtime dependencies
         run: |
           python -m pip check
-          python -c "import tracefix.agents.deepagents_adapter; from pydantic_ai.models.openai import OpenAIChatModel"
+          python -c "import claude_agent_sdk, tracefix.agents.claude_sdk_adapter; from pydantic_ai.models.openai import OpenAIChatModel"
       - name: Install and check Agent native runtime dependencies
         run: |
           npm ci --workspace @tracefix/agent --include=optional --omit=dev
