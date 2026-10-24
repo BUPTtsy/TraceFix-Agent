@@ -1,12 +1,10 @@
 import asyncio
 import json
-from io import StringIO
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
-from tracefix.cli.main import chat_jsonl
 from tracefix.model.chat import stream_tool_chat
 from tracefix.model import protocol
 from tracefix.agents.pydantic_ai_adapter import PydanticAIAdapterError
@@ -149,71 +147,3 @@ async def test_chat_rejects_empty_final_response(monkeypatch):
     with pytest.raises(PydanticAIAdapterError, match='未返回正文'):
         async for event in stream_tool_chat('question', [], 'scope', None, pipeline(lambda *args: {}), False):
             assert 'turn_messages' not in event
-
-
-class InputQueue:
-    def __init__(self):
-        import queue
-        self.lines = queue.Queue()
-
-    def readline(self):
-        return self.lines.get(timeout=3)
-
-    def send(self, request):
-        self.lines.put(json.dumps(request) + '\n')
-
-
-async def wait_event(output, kind, message_id=None):
-    for attempt in range(100):
-        values = [json.loads(line) for line in output.getvalue().splitlines()]
-        if any(value['type'] == kind and (message_id is None or value.get('message_id') == message_id)
-               for value in values):
-            return values
-        await asyncio.sleep(0.01)
-    raise AssertionError(f'missing {kind}: {output.getvalue()}')
-
-
-async def test_jsonl_starts_empty_preserves_whole_turn_and_cancels_without_history(tmp_path, monkeypatch):
-    histories = []
-    input_queue, output = InputQueue(), StringIO()
-    monkeypatch.setattr('tracefix.cli.main.sys.stdin', input_queue)
-    monkeypatch.setattr('tracefix.cli.main.sys.stdout', output)
-    monkeypatch.setattr('tracefix.cli.main.load_projects', lambda path: {})
-    monkeypatch.setattr('tracefix.cli.main.ScopeResolver',
-        lambda projects, path: SimpleNamespace(context=lambda scope: SimpleNamespace(active_scope=scope)))
-    monkeypatch.setattr('tracefix.tools.chat.build_chat_tools', lambda *args, **kwargs: None)
-
-    async def fake_chat(message, history, project, library, tools, use_knowledge):
-        histories.append((message, list(history)))
-        yield {'delta': '正'}
-        if message == 'cancel':
-            await asyncio.Event().wait()
-        yield {'delta': '文'}
-        yield {'turn_messages': [{'role': 'user', 'content': message},
-            {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 'fixture'}]},
-            {'role': 'tool', 'tool_call_id': 'fixture', 'content': 'result body'},
-            {'role': 'assistant', 'content': '正文'}]}
-
-    monkeypatch.setattr('tracefix.cli.main.stream_tool_chat', fake_chat)
-    args = SimpleNamespace(project='scope', projects='fixture.yaml',
-        console_db=tmp_path / 'console.sqlite3', data=str(tmp_path), chat_session='fresh-session')
-    runner = asyncio.create_task(chat_jsonl(args))
-    await wait_event(output, 'chat.ready')
-    input_queue.send({'id': 'first', 'message': 'hello'})
-    await wait_event(output, 'chat.finished', 'first')
-    input_queue.send({'id': 'abort', 'message': 'cancel'})
-    await wait_event(output, 'chat.delta', 'abort')
-    input_queue.send({'type': 'cancel', 'id': 'abort'})
-    await wait_event(output, 'chat.cancelled', 'abort')
-    input_queue.send({'id': 'next', 'message': 'next'})
-    await wait_event(output, 'chat.finished', 'next')
-    assert histories[0][1] == []
-    assert len(histories[2][1]) == 4 and histories[2][1][2]['role'] == 'tool'
-    input_queue.send({'type': 'clear'})
-    await wait_event(output, 'chat.cleared')
-    input_queue.send({'id': 'clear', 'message': 'after clear'})
-    await wait_event(output, 'chat.finished', 'clear')
-    assert histories[-1][1] == []
-    input_queue.send({'type': 'quit'})
-    await runner
-    assert not any('reasoning' in value for value in output.getvalue().splitlines())

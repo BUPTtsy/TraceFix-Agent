@@ -17,7 +17,7 @@ from tracefix.config import load_projects
 from tracefix.knowledge.scope import ScopeResolver
 from tracefix.knowledge.memory import MemoryLibrary
 from tracefix.storage.artifacts import Artifacts
-from tracefix.cli.main import Session
+from tracefix.service.session import Session
 from tracefix.storage.store import MemoryStore
 from langgraph.checkpoint.memory import InMemorySaver
 from tracefix.repository_control import dispatch
@@ -249,9 +249,9 @@ async def test_managed_session_consumes_frozen_registry_without_tty(tmp_path, mo
     session = Session(args, MemoryStore(), InMemorySaver())
     session.begin_console_run()
     calls = []
-    monkeypatch.setattr('tracefix.cli.main.DockerRunner', lambda *arguments: SimpleNamespace(browser_command=lambda: []))
-    monkeypatch.setattr('tracefix.cli.main.MCPBrowser', lambda *arguments: SimpleNamespace())
-    monkeypatch.setattr('tracefix.cli.main.Gateway', lambda: SimpleNamespace())
+    monkeypatch.setattr('tracefix.service.session.DockerRunner', lambda *arguments: SimpleNamespace(browser_command=lambda: []))
+    monkeypatch.setattr('tracefix.service.session.MCPBrowser', lambda *arguments: SimpleNamespace())
+    monkeypatch.setattr('tracefix.service.session.Gateway', lambda: SimpleNamespace())
     async def drive(state):
         calls.append(state.run_id)
     session.drive = drive

@@ -32,7 +32,7 @@ tests/*
 !tests/test_skill_runtime.py
 !tests/test_skill_prompt_cache.py
 !tests/test_workers.py
-!tests/test_batch_cli.py
+!tests/test_web_run.py
 !tests/test_batch_checker.py
 !tests/test_batch_completion.py
 !tests/test_architecture_operation_repairs.py

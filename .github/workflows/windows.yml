@@ -1,4 +1,4 @@
-name: Windows native smoke
+name: Windows Web console checks
 on:
   workflow_dispatch:
   push:
@@ -21,8 +21,14 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '22'
-      - name: Bootstrap with native PowerShell (explicit fake model)
-        run: ./scripts/bootstrap/start.ps1 --smoke --plain
+      - name: Install Python environment with native PowerShell
+        run: |
+          python -m venv .venv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./.venv/Scripts/python.exe -m pip install --disable-pip-version-check --no-index --find-links vendor/wheels-win_amd64 -r requirements.lock
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./.venv/Scripts/python.exe -m pip install --disable-pip-version-check --no-deps --no-build-isolation -e .
+          exit $LASTEXITCODE
       - name: Check Python runtime dependencies
         run: |
           ./.venv/Scripts/python.exe -m pip check

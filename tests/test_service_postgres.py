@@ -4,7 +4,7 @@ from uuid import uuid4
 
 import pytest
 
-from tracefix.cli.main import Session
+from tracefix.service.session import Session
 from tracefix.service.run import execute_request
 from tracefix.storage.checkpoints import postgres_checkpointer
 from tracefix.storage.store import PostgresStore

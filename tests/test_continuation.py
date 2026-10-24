@@ -9,17 +9,25 @@ import httpx
 import pytest
 import yaml
 
-from test_cli_workspace import session, web
+from tracefix.console import dispatch
+from tracefix.service.session import Session
+from tracefix.storage.store import MemoryStore
 from tracefix.execution.workspace import Workspace
 from tracefix.runtime.contracts import Outcome, RunState, RunStatus, digest
 from tracefix.runtime.continuation import continuation_state
 from tracefix.runtime.smoke import FakeBrowser, FakeRunner, make_engine
-from tracefix.knowledge.documents import ConflictError
+from tracefix.knowledge.documents import ConflictError, DocumentLibrary
 from tracefix.rules import Rule, RuleLibrary, RuleResolver
 
 
+def web(session, operation, fields=None):
+    return dispatch(operation, fields or {}, library=DocumentLibrary(session.args.console_db),
+                    projects_path=session.args.projects, data_root=session.args.data)
+
+
 @pytest.fixture
-def engine_session(session, tmp_path, monkeypatch):
+def engine_session(service_session, tmp_path, monkeypatch):
+    session = service_session
     engine, state = make_engine(tmp_path / 'engine', bugfree=True)
     rule = Rule(id='ci_source_guard', name='模拟源码不得包含 debugger', status='enabled', pinned=True,
         scope={'level': 'project', 'project_ids': ['b'], 'path_globs': ['src/value.ts']},
@@ -43,15 +51,14 @@ def engine_session(session, tmp_path, monkeypatch):
     state.repo_snapshot_ref = engine.artifacts.put(state.scope_id, state.run_id, source)
     engine.runner.source = state.source_manifest
     session.store, session.saver, session.artifacts = engine.store, engine.graph.checkpointer, engine.artifacts
-    session.render.artifacts = session.artifacts
     session.begin_console_run(state)
     session.run_id, session.engine = state.run_id, engine
     engine.notify = session.notify
     monkeypatch.setenv('TRACEFIX_API_KEY', 'fake-ci')
-    monkeypatch.setattr('tracefix.cli.main.DockerRunner', lambda *args: FakeRunner(state.source_manifest))
+    monkeypatch.setattr('tracefix.service.session.DockerRunner', lambda *args: FakeRunner(state.source_manifest))
     monkeypatch.setattr(FakeRunner, 'browser_command', lambda self: [], raising=False)
-    monkeypatch.setattr('tracefix.cli.main.MCPBrowser', lambda *args: FakeBrowser(engine.workspace, bugfree=True))
-    monkeypatch.setattr('tracefix.cli.main.Gateway', lambda *args, **kwargs: engine.model)
+    monkeypatch.setattr('tracefix.service.session.MCPBrowser', lambda *args: FakeBrowser(engine.workspace, bugfree=True))
+    monkeypatch.setattr('tracefix.service.session.Gateway', lambda *args, **kwargs: engine.model)
     return session, engine, state
 
 
@@ -67,13 +74,13 @@ async def test_two_continuations_keep_identity_trace_budget_and_reports(engine_s
     stopped.budget.model_calls = stopped.budget.max_model_calls
     stopped.budget.tokens = stopped.budget.max_tokens
     engine.store.save(stopped)
-    await session.dispatch('/runs continue ' + state.run_id + ' "重新检查页面"')
+    await session.continue_task(state.run_id, '重新检查页面')
     session.engine.control = 'cancel'
     await session.task
     first_continuation = session.state()
     assert first_continuation.run_status == RunStatus.CANCELLED
     assert first_continuation.budget.model_calls == stopped.budget.model_calls
-    await session.dispatch('/continue ' + original['id'] + ' "完成验证并记录状态"')
+    await session.continue_task(original['id'], '完成验证并记录状态')
     await session.task
     final = session.state()
     assert final.run_id == state.run_id and final.goal == state.goal
@@ -99,13 +106,13 @@ async def test_two_continuations_keep_identity_trace_budget_and_reports(engine_s
     shared = web(session, 'run.trace', {'id': original['id']})
     assert len([event for event in shared if event['type'] == 'run.continuation_requested']) == 2
     assert len([event for event in shared if event['type'] == 'run.continued']) == 2
-    await session.dispatch('/runs trace ' + original['id'])
-    assert '重新检查页面' in session.output.getvalue()
+    assert any(event.get('payload', {}).get('instruction') == '重新检查页面' for event in shared)
     with pytest.raises(ConflictError):
         await session.continue_task(original['id'], '已成功的任务不能继续')
 
 
-async def test_failed_launch_reuses_console_task_and_records_each_request(session):
+async def test_failed_launch_reuses_console_task_and_records_each_request(service_session):
+    session = service_session
     session.goal = '修复初始化错误'
     with pytest.raises(ValueError, match='TRACEFIX_DATABASE_URL'):
         await session.create()
@@ -126,7 +133,8 @@ async def test_failed_launch_reuses_console_task_and_records_each_request(sessio
     ('failed', 'INFRA_FAILURE', True), ('cancelled', 'INCONCLUSIVE', True),
     ('completed', 'INCONCLUSIVE', True), ('completed', 'NO_BUG_FOUND', False),
     ('completed', 'FIX_VERIFIED', False), ('paused', None, False), ('running', None, False)])
-def test_shared_continuation_gate_and_duplicate_requests(session, status, outcome, allowed):
+def test_shared_continuation_gate_and_duplicate_requests(service_session, status, outcome, allowed):
+    session = service_session
     record = session.documents.update_run('task', {'projectId': 'alpha', 'goal': '目标',
         'mode': 'repair', 'status': status, 'outcome': outcome}, create=True)
     assert web(session, 'run', {'id': record['id']})['canContinue'] is allowed
@@ -193,7 +201,7 @@ async def test_continuation_failed_revalidation_cannot_reuse_old_approval(engine
     pending.outcome = Outcome.INFRA_FAILURE
     engine.store.save(pending)
     session.publish_console()
-    monkeypatch.setattr('tracefix.cli.main.DockerRunner',
+    monkeypatch.setattr('tracefix.service.session.DockerRunner',
                         lambda *args: FakeRunner(state.source_manifest, fail='static'))
     await session.continue_task(session.console_run_id, '重新检查失败的静态验证')
     await session.task
@@ -293,7 +301,8 @@ async def test_continuation_instruction_reaches_model(engine_session, monkeypatc
     assert all(context['continuation_count'] == 1 for context in contexts)
 
 
-async def test_web_continues_failed_launch_without_creating_task(session, monkeypatch):
+async def test_web_continues_failed_launch_without_creating_task(service_session, monkeypatch):
+    session = service_session
     with socket.socket() as listener:
         listener.bind(('127.0.0.1', 0))
         port = listener.getsockname()[1]
@@ -361,7 +370,7 @@ async def test_run_input_retarget_requires_confirmation_without_changing_spec(en
     else:
         engine.store.save(state)
         monkeypatch.setattr(session, 'active', lambda: True)
-    await session.dispatch(instruction)
+    engine.submit_guidance(session.state(), instruction)
     if paused:
         assert session.task is None or session.task.done()
     else:
@@ -375,7 +384,50 @@ async def test_run_input_retarget_requires_confirmation_without_changing_spec(en
     assert all(instruction not in str(context) for context in contexts)
     assert not any(event['type'] == 'run.retargeted' for event in trace)
     assert session.state().test_spec_hash == original_spec
-    output = session.output.getvalue()
-    assert '改目标 L3' in output and '/retarget confirm' in output
     if paused:
         assert session.state().run_status == RunStatus.PAUSED
+
+
+@pytest.mark.parametrize('noninteractive,requested_mode,record_mode,previous_mode,expected_mode', [
+    (True, None, 'interactive', 'interactive', 'batch'),
+    (True, 'batch', 'interactive', 'interactive', 'batch'),
+    (True, 'interactive', 'batch', 'batch', 'interactive'),
+    (True, None, None, 'interactive', 'batch'),
+    (False, None, 'interactive', 'interactive', 'interactive'),
+    (False, None, 'batch', 'batch', 'batch'),
+    (False, None, None, 'batch', 'batch'),
+    (False, 'batch', 'interactive', 'interactive', 'batch'),
+    (False, 'interactive', 'batch', 'batch', 'interactive'),
+])
+async def test_continuation_uses_requested_or_entrypoint_execution_mode(
+        service_session, monkeypatch, noninteractive, requested_mode, record_mode,
+        previous_mode, expected_mode):
+    monkeypatch.delenv('TRACEFIX_CONTINUATION_ID', raising=False)
+    service_session.args.execution_mode = requested_mode
+    service_session.args.continue_run = 'previous_task' if noninteractive else None
+    continued_session = Session(service_session.args, MemoryStore(), None)
+    previous = RunState(scope_id=continued_session.scope, goal='继续验证状态持久化',
+                        url='http://app:3000', mode='repair', execution_mode=previous_mode,
+                        run_status=RunStatus.FAILED, outcome=Outcome.INFRA_FAILURE)
+    continued_session.store.save(previous)
+    fields = {'projectId': previous.scope_id, 'goal': previous.goal,
+              'mode': previous.mode, 'status': 'failed', 'outcome': str(previous.outcome),
+              'agentRunId': previous.run_id}
+    if record_mode is not None:
+        fields['executionMode'] = record_mode
+    record = continued_session.documents.update_run('previous_task', fields, create=True)
+    launched = []
+
+    async def capture_agent(state=None, reuse_workspace=False):
+        launched.append((state, reuse_workspace))
+
+    monkeypatch.setattr(continued_session, 'create_agent', capture_agent)
+    await continued_session.continue_task(record['id'], '检查环境后继续原任务')
+
+    assert len(launched) == 1
+    continued, reuse_workspace = launched[0]
+    assert continued.execution_mode == continued_session.execution_mode == expected_mode
+    assert continued.run_id == previous.run_id
+    assert continued.continuation_count == 1 and reuse_workspace
+    assert continued.run_status == RunStatus.RUNNING
+    assert continued_session.store.load(previous.run_id, previous.scope_id).execution_mode == previous_mode

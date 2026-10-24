@@ -8,7 +8,7 @@ import httpx
 import pytest
 import yaml
 
-from tracefix.cli.main import Session
+from tracefix.service.session import Session
 from tracefix.console import dispatch, project_catalog
 from tracefix.knowledge.documents import ConflictError, DocumentLibrary
 from tracefix.knowledge.selection import KnowledgeQueries, KnowledgeSelection, select_documents

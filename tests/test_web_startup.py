@@ -24,36 +24,6 @@ def load_tool(name):
     return module
 
 
-def test_cli_launcher_allows_spawn_worker_without_reentering_cli(tmp_path):
-    launcher = tmp_path / 'scripts/bootstrap/launch.py'
-    launcher.parent.mkdir(parents=True)
-    shutil.copyfile(Path(__file__).resolve().parents[1] / 'scripts/bootstrap/launch.py', launcher)
-    package = tmp_path / 'tracefix/cli'
-    package.mkdir(parents=True)
-    (package.parent / '__init__.py').touch()
-    (package / '__init__.py').touch()
-    (package / 'main.py').write_text(
-        'import multiprocessing\n'
-        'from pathlib import Path\n'
-        'def worker():\n'
-        '    Path("worker-ready").write_text("ready", encoding="utf-8")\n'
-        'def main():\n'
-        '    child = multiprocessing.get_context("spawn").Process(target=worker)\n'
-        '    child.start()\n'
-        '    child.join(timeout=10)\n'
-        '    if child.is_alive():\n'
-        '        child.terminate()\n'
-        '        child.join(timeout=5)\n'
-        '        raise RuntimeError("worker did not exit")\n'
-        '    if child.exitcode != 0:\n'
-        '        raise RuntimeError("worker failed")\n', encoding='utf-8')
-    environment = {**os.environ, 'PYTHONPATH': str(tmp_path), 'PYTHONUTF8': '1'}
-    result = subprocess.run([sys.executable, str(launcher)], cwd=tmp_path, env=environment,
-                            capture_output=True, text=True, encoding='utf-8', timeout=25)
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert (tmp_path / 'worker-ready').read_text(encoding='utf-8') == 'ready'
-
-
 def tracked_powershell_scripts(root):
     result = subprocess.run(
         ['git', 'ls-files', '-z', '--', '*.ps1', '*.psm1', '*.psd1'],
@@ -188,17 +158,12 @@ def test_full_web_prepares_agent_and_starts_services(tmp_path, monkeypatch):
     assert calls[check][-1] == '--check'
     assert check < prepare
     assert calls[-1] == [str(module.venv_python(tmp_path)), 'scripts/bootstrap/services.py']
-    assert not any('frontend/apps/cli/dist/cli.mjs' in command for command in calls)
 
 
-@pytest.mark.parametrize('agent_arguments', [
-    [], ['--mode', 'test'], ['--mode', 'repair', '--spec', 'profiles/persistence.spec.json'],
-    ['--run', '--goal', 'batch task'],
-])
-def test_cli_startup_uses_new_default_without_overriding_explicit_task(tmp_path, monkeypatch, agent_arguments):
+def test_default_startup_launches_web_services(tmp_path, monkeypatch):
     module, calls, _ = bootstrap_fixture(tmp_path, monkeypatch)
-    assert module.main(['--skip-install', '--skip-build', *agent_arguments]) == 0
-    assert calls[-1] == ['node', 'frontend/apps/cli/dist/cli.mjs', *agent_arguments]
+    assert module.main(['--skip-install', '--skip-build', '--plain']) == 0
+    assert calls[-1] == [str(module.venv_python(tmp_path)), 'scripts/bootstrap/services.py']
 
 
 def test_console_only_does_not_require_docker_or_key(tmp_path, monkeypatch):
@@ -245,7 +210,7 @@ def test_missing_runtime_stops_web_before_database_or_services(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize('arguments', [
-    ['--dev'], ['--web', '--smoke'], ['--web', '--preview'], ['--web', '--mode', 'repair'],
+    ['--smoke'], ['--preview'], ['--mode', 'repair'], ['--run'], ['--goal', 'old CLI task'],
 ])
 def test_incompatible_modes_fail_before_startup(arguments):
     module = load_tool('bootstrap')

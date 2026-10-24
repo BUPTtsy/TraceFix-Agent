@@ -114,12 +114,12 @@ async function startAgent(goal, mode, projectId, continuation = null, derived = 
   try {
   agent = continuation ? await bridge('run.continue', {id: continuation.runId, instruction: continuation.instruction}) : await bridge('run.create', {goal, mode, projectId, ...(derived || {})});
   const python = pythonCommand();
-  const args = [...(python === 'py' ? ['-3.12'] : []), 'scripts/bootstrap/launch.py', '--plain',
-    ...(continuation ? ['--continue-run', agent.id, '--instruction', continuation.instruction] : ['--run', '--goal', goal, '--mode', mode]),
-    ...(derived?.parentRunId ? ['--parent-run', derived.parentRunId] : []),
-    ...((derived?.additionalRuleIds || []).flatMap(ruleId => ['--rule', ruleId])),
-    '--project', projectId, '--projects', agent.registry,
-    ...(agent.profile ? ['--profile', agent.profile] : []), '--data', agent.dataRoot || process.env.TRACEFIX_DATA];
+  const args = [...(python === 'py' ? ['-3.12'] : []), '-m', 'tracefix.service.web_run'];
+  const request = {goal, mode, project: projectId, projects: agent.registry,
+    profile: agent.profile || null, data: agent.dataRoot || process.env.TRACEFIX_DATA,
+    console_db: process.env.TRACEFIX_CONSOLE_DB,
+    continue_run: continuation ? agent.id : null, instruction: continuation?.instruction || '',
+    parent_run: derived?.parentRunId || null, rule: derived?.additionalRuleIds || []};
   const runId = agent.id;
   const processControlId = crypto.randomUUID();
   agent = await bridge('run.update', {id: runId, changes: {processControlId,
@@ -139,6 +139,7 @@ async function startAgent(goal, mode, projectId, continuation = null, derived = 
     if (!flushTimer) flushTimer = setTimeout(() => {flushTimer = null; flush().catch(error => console.error('后台写入 Agent 日志失败：', error));}, 500);
   };
   child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+  child.stdin.on('error', error => {processError = `Agent 执行请求写入失败：${error.message}`; capture(processError);});
   child.stdout.on('data', capture); child.stderr.on('data', capture);
   child.on('error', error => {processError = `Agent 进程启动或控制失败：${error.message}`; capture(processError);});
   child.on('close', async code => {
@@ -150,6 +151,7 @@ async function startAgent(goal, mode, projectId, continuation = null, derived = 
     catch (error) {console.error('后台记录 Agent 结果失败：', error);}
     finally {if (agentProcess === child) agentProcess = null;}
   });
+  child.stdin.end(JSON.stringify(request));
   if (childRunning(child)) await bridge('run.update', {id: runId, changes: {pid: child.pid}});
   } finally {launching = false;}
 }

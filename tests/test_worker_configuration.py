@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from dotenv import dotenv_values
 
-from tracefix.cli.main import configured_worker_model
+from tracefix.service.session import configured_worker_model
 
 
 WORKER_ENVIRONMENT = (

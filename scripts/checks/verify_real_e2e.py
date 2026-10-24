@@ -49,10 +49,10 @@ def load_local_env():
             os.environ[key] = value.strip("'\"")
 
 
-def command(argv, *, env=None, check=True, timeout=1800):
+def command(argv, *, env=None, check=True, timeout=1800, input=None):
     result = subprocess.run(
         [str(item) for item in argv], cwd=ROOT, env=env, text=True,
-        encoding="utf-8", errors="replace", capture_output=True, timeout=timeout,
+        encoding="utf-8", errors="replace", capture_output=True, timeout=timeout, input=input,
     )
     if check and result.returncode:
         detail = safe_output((result.stdout or "") + "\n" + (result.stderr or ""))
@@ -168,13 +168,17 @@ def verify_evidence(state, artifacts, frozen_spec: Path, *, case: str) -> set[st
     return {validation.kind for validation in validations if validation.passed}
 
 
-def agent_command(registry: Path, data_root: Path, spec: Path) -> list:
-    return [str(PYTHON), "scripts/bootstrap/launch.py", "--plain", "--project", "bugboard",
-            "--projects", registry, "--profile", ROOT / "profiles/bugboard.yaml",
-            "--data", data_root, "--console-db", data_root / "console.sqlite3",
-            "--spec", spec, "--run", "--goal",
-            "把 Write project brief 标记为完成，刷新页面并验证状态持久化；失败则修复。",
-            "--mode", "repair", "--execution-mode", "batch"]
+def agent_command() -> list[str]:
+    return [str(PYTHON), "-m", "tracefix.service.web_run"]
+
+
+def agent_request(registry: Path, data_root: Path, spec: Path) -> dict:
+    """通过 Web 内部服务执行同一份冻结规范，不经过终端参数或命令解析。"""
+    return {"project": "bugboard", "projects": str(registry),
+            "profile": str(ROOT / "profiles/bugboard.yaml"), "data": str(data_root),
+            "console_db": str(data_root / "console.sqlite3"), "spec": str(spec),
+            "goal": "把 Write project brief 标记为完成，刷新页面并验证状态持久化；失败则修复。",
+            "mode": "repair"}
 
 
 def prepare_console(data_root: Path) -> Path:
@@ -225,6 +229,7 @@ def run_flow(args, output_path: Path) -> int:
         "TRACEFIX_DATABASE_URL": dsn,
         "TRACEFIX_DATA": str(data_root),
         "TRACEFIX_PROJECTS": str(registry),
+        "PYTHONPATH": os.pathsep.join(filter(None, [str(ROOT / "backend/packages/agent/src"), os.getenv("PYTHONPATH")])),
     })
     result = {"status": "failed", "started_at": stamp, "case": args.case,
               "run_root": str(run_root.relative_to(ROOT))}
@@ -257,8 +262,8 @@ def run_flow(args, output_path: Path) -> int:
             inspected = command([docker, "image", "inspect", image], check=False, timeout=60)
             if inspected.returncode:
                 command(build, env=env, timeout=3600)
-        agent_result = command(agent_command(registry, data_root, frozen_spec),
-                               env=env, check=False, timeout=3600)
+        agent_result = command(agent_command(), env=env, check=False, timeout=3600,
+                               input=json.dumps(agent_request(registry, data_root, frozen_spec), ensure_ascii=False))
         output_path.parent.mkdir(parents=True, exist_ok=True)
         for channel in ('stdout', 'stderr'):
             log_path = output_path.parent / f'agent.{channel}.log'

@@ -1,12 +1,10 @@
-import io
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import yaml
-from rich.console import Console
 
-from tracefix.cli.main import Session
+from tracefix.service.session import Session
 from tracefix.execution.workspace import Workspace
 from tracefix.runtime.contracts import digest
 from tracefix.runtime.smoke import FakeBrowser, FakeRunner, make_engine
@@ -18,7 +16,7 @@ def json_completion_transport(monkeypatch):
 
 
 @pytest.fixture
-def cli_session(tmp_path, monkeypatch):
+def service_session(tmp_path, monkeypatch):
     monkeypatch.delenv('TRACEFIX_CONSOLE_RUN_ID', raising=False)
     monkeypatch.delenv('TRACEFIX_DATABASE_URL', raising=False)
     registry = tmp_path / 'profiles'
@@ -34,16 +32,12 @@ def cli_session(tmp_path, monkeypatch):
     args = SimpleNamespace(project='alpha', projects=str(registry / 'projects.yaml'), profile=None,
                            console_db=str(tmp_path / 'console.sqlite3'), data=str(tmp_path / 'data'),
                            goal='', mode='test', plain=True, url=None, spec=None, skills='skills', run=False, command=None)
-    session = Session(args, None, None)
-    output = io.StringIO()
-    session.render.console = Console(file=output, no_color=True, markup=False, width=120)
-    session.output = output
-    return session
+    return Session(args, None, None)
 
 
 @pytest.fixture
-def engine_session(cli_session, tmp_path, monkeypatch):
-    session = cli_session
+def engine_session(service_session, tmp_path, monkeypatch):
+    session = service_session
     engine, state = make_engine(tmp_path / 'engine', bugfree=True)
     registry = Path(session.args.projects)
     registry.write_text(yaml.safe_dump({'projects': [{'id': 'b', 'repo_id': 'ci',
@@ -60,13 +54,12 @@ def engine_session(cli_session, tmp_path, monkeypatch):
     state.repo_snapshot_ref = engine.artifacts.put(state.scope_id, state.run_id, source)
     engine.runner.source = state.source_manifest
     session.store, session.saver, session.artifacts = engine.store, engine.graph.checkpointer, engine.artifacts
-    session.render.artifacts = session.artifacts
     session.begin_console_run(state)
     session.run_id, session.engine = state.run_id, engine
     engine.notify = session.notify
     monkeypatch.setenv('TRACEFIX_API_KEY', 'fake-ci')
-    monkeypatch.setattr('tracefix.cli.main.DockerRunner', lambda *args: FakeRunner(state.source_manifest))
+    monkeypatch.setattr('tracefix.service.session.DockerRunner', lambda *args: FakeRunner(state.source_manifest))
     monkeypatch.setattr(FakeRunner, 'browser_command', lambda self: [], raising=False)
-    monkeypatch.setattr('tracefix.cli.main.MCPBrowser', lambda *args: FakeBrowser(engine.workspace, bugfree=True))
-    monkeypatch.setattr('tracefix.cli.main.Gateway', lambda *args, **kwargs: engine.model)
+    monkeypatch.setattr('tracefix.service.session.MCPBrowser', lambda *args: FakeBrowser(engine.workspace, bugfree=True))
+    monkeypatch.setattr('tracefix.service.session.Gateway', lambda *args, **kwargs: engine.model)
     return session, engine, state

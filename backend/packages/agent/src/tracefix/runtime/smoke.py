@@ -126,16 +126,3 @@ def make_engine(root, bugfree=False, runner_fail=None, flaky=False):
                   Retriever(store,scopes,ctx),source,InMemorySaver())
     engine.subagent_enabled = False
     return engine,state
-
-
-async def main(root, *, plain=False):
-    from tracefix.cli.render import Renderer
-    engine,state=make_engine(root/new_id('smoke'))
-    await engine.run(state)
-    state=engine.store.load(state.run_id,'b')
-    if state.approval_ref:
-        engine.store.decide_approval(state.approval_ref,state,'reject')
-        await engine.run(resume='reject')
-    state=engine.store.load(state.run_id,'b')
-    Renderer(plain=plain).panel('FAKE CI SMOKE · 非真实 GUI/API 证据',state.model_dump_json(indent=2))
-    return state

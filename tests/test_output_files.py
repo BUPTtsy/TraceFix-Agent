@@ -4,7 +4,6 @@ from urllib.parse import quote
 
 import pytest
 
-from tracefix.cli.render import Renderer
 from tracefix.runtime.contracts import digest
 from tracefix.runtime.smoke import make_engine
 from tracefix.storage.artifacts import Artifacts
@@ -77,18 +76,6 @@ def test_report_provenance_links_nested_refs_without_linking_arbitrary_text():
     assert '<script>' not in page and '&lt;script&gt;' in page
     assert '源码&lt;片段&gt;' in page
     assert 'href=""' not in page and f'href="{quote(ordinary, safe="")}"' not in page
-
-
-def test_terminal_shortens_checksums_but_preserves_old_evidence_refs():
-    renderer = Renderer(plain=True)
-    checksum = 'a'*64
-    with renderer.console.capture() as capture:
-        renderer.event({'seq': 1, 'phase': 'VERIFY', 'type': 'gate.decided',
-                        'payload': {'passed': True, 'patch_hash': checksum, 'evidence_ref': checksum+'.json'}})
-    output = capture.get()
-    assert '验证门禁结论' in output and '是否通过' in output
-    assert checksum+'.json' in output
-    assert checksum[:12]+'…' in output
 
 
 def test_report_provenance_links_only_intact_current_run_artifacts(tmp_path):

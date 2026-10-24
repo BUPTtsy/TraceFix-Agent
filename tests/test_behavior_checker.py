@@ -59,13 +59,15 @@ def test_freezing_rejects_missing_original_assertions(workspace, payload):
     assert not (workspace / "run/frozen-spec.json").exists()
 
 
-def test_agent_command_uses_frozen_spec_without_oracle_feedback(workspace):
+def test_agent_request_uses_frozen_spec_without_oracle_feedback(workspace):
     frozen = workspace / "frozen-spec.json"
-    command = checker.agent_command(workspace / "projects.json", workspace / "data", frozen)
-    assert command[command.index("--spec") + 1] == frozen
-    assert command[command.index("--console-db") + 1] == workspace / "data/console.sqlite3"
-    assert command[command.index("--execution-mode") + 1] == "batch"
-    assert not any("oracle" in str(argument).lower() for argument in command)
+    command = checker.agent_command()
+    request = checker.agent_request(workspace / "projects.json", workspace / "data", frozen)
+    assert command[-2:] == ["-m", "tracefix.service.web_run"]
+    assert request["spec"] == str(frozen)
+    assert request["console_db"] == str(workspace / "data/console.sqlite3")
+    assert request["mode"] == "repair"
+    assert not any("oracle" in str(argument).lower() for argument in [*command, *request.values()])
 
 
 def test_real_e2e_rule_configuration_is_isolated_and_keeps_builtin_definitions(workspace, monkeypatch):

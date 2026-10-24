@@ -1,9 +1,7 @@
-.PHONY: test smoke doctor demo
+.PHONY: test web demo
 test:
 	.venv/bin/python -m pytest -q
-smoke:
-	.venv/bin/tracefix --smoke
-doctor:
-	.venv/bin/tracefix --doctor
+web:
+	./scripts/bootstrap/start.sh --console-only
 demo:
-	./scripts/bootstrap/start.sh --mode repair --spec profiles/persistence.spec.json
+	./scripts/bootstrap/start.sh

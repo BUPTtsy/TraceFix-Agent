@@ -101,7 +101,7 @@ class StartupProgress:
     def _accent(self, text):
         return f'\033[38;2;218;119;86m{text}\033[0m' if self.animated else text
 
-    def welcome(self, mode='Agent'):
+    def welcome(self, mode='Web 控制台'):
         mark = '✻' if self.unicode else '*'
         self._write('\n' + self._accent(f'  {mark}  TraceFix') + f'  /  {mode}\n')
         self._write('  准备工作环境 · 进度按已完成步骤计算\n\n')
@@ -195,28 +195,18 @@ def prerequisites(require_docker=True):
 
 
 def main(argv=None):
-    parser = ChineseArgumentParser(description='TraceFix 启动器（其余参数将传给 tracefix）')
+    parser = ChineseArgumentParser(description='准备并启动 TraceFix Web 控制台')
     parser.add_argument('--check', action='store_true', help='只检查主机前置条件，不安装依赖')
-    parser.add_argument('--smoke', action='store_true', help='运行离线假数据 Smoke，不需要 Docker 或 API')
-    parser.add_argument('--preview', action='store_true', help='预览终端界面，不需要 Docker 或 API')
-    parser.add_argument('--web', action='store_true', help='准备完整 Agent 环境并启动 Web 控制台与 HTTP 服务')
+    parser.add_argument('--web', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--console-only', action='store_true', help='仅准备并启动 Web 控制台，不启动 Docker 或检查模型配置')
     parser.add_argument('--dev', action='store_true', help='Web 模式使用 Vite 开发服务（5173），默认提供构建后的页面（3000）')
     parser.add_argument('--skip-install', action='store_true', help='复用已安装的环境')
     parser.add_argument('--skip-build', action='store_true', help='复用现有沙箱镜像')
-    parser.add_argument('--default-mode', choices=['chat', 'test', 'repair'], default='chat', help=argparse.SUPPRESS)
-    options, agent_args = parser.parse_known_args(argv)
-    web = options.web or options.console_only
-    if options.dev and not web:
-        parser.error('--dev 需要 --web 或 --console-only')
-    if web and (options.smoke or options.preview):
-        parser.error('Web 模式不能与 --smoke 或 --preview 同时使用')
-    if web and any(argument != '--plain' for argument in agent_args):
-        parser.error('Web 模式不接收 CLI 任务参数，请在网页中选择项目并启动任务')
+    parser.add_argument('--plain', action='store_true', help='使用普通文本显示启动进度')
+    options = parser.parse_args(argv)
     os.chdir(ROOT)
     os.environ['PYTHONUTF8'] = '1'
     os.environ['PYTHONIOENCODING'] = 'utf-8'
-    offline = options.smoke or options.preview
     python = venv_python(ROOT)
     create_venv = not options.skip_install and not python.is_file()
     total = 2
@@ -224,40 +214,39 @@ def main(argv=None):
         total += 2 + int(create_venv)
     if options.console_only:
         total += 1 + int(not options.skip_install)
-    elif not offline:
+    else:
         total += 4 + (2 if not options.skip_build else 1)
         total += 1 + int(not options.skip_install)
         total += 1
-    progress = StartupProgress(total, plain='--plain' in agent_args)
+    progress = StartupProgress(total, plain=options.plain)
 
     def check_prerequisites():
-        result, okay = prerequisites(require_docker=not (offline or options.console_only))
+        result, okay = prerequisites(require_docker=not options.console_only)
         if options.check:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         if not okay:
             detail = '' if options.check else json.dumps(result, ensure_ascii=False, indent=2) + '\n'
-            raise RuntimeError(detail + '请安装 Python 3.12 x64 和 Git。真实运行前请启动使用 Linux 容器引擎和 Compose v2 的 Docker。离线使用请加 --smoke 或 --preview。')
+            raise RuntimeError(detail + '请安装 Python 3.12 x64 和 Git。完整运行前请启动使用 Linux 容器引擎和 Compose v2 的 Docker；仅使用控制台可加 --console-only。')
         return result
 
     if options.check:
         check_prerequisites()
         return 0
-    progress.welcome('Web 控制台' if web else '界面预览' if options.preview else '离线 Smoke' if options.smoke else 'Agent')
+    progress.welcome('Web 控制台')
     progress.perform('检查启动环境', check_prerequisites)
-    if not offline and not (ROOT / '.env').exists():
+    if not (ROOT / '.env').exists():
         shutil.copyfile(ROOT / '.env.example', ROOT / '.env')
         if not options.console_only and not os.getenv('TRACEFIX_API_KEY'):
             print('已创建 .env。请填入 TRACEFIX_API_KEY，然后重新执行刚才的命令。')
             return 2
-    if not offline:
-        npm = shutil.which('npm')
-        node = shutil.which('node')
-        if not npm or not node:
-            raise RuntimeError('TypeScript CLI 需要 Node.js 22.13+ 和 npm')
-        version = run([node, '--version'], capture=True)
-        match = re.fullmatch(r'v(\d+)\.(\d+)\.(\d+)', version)
-        if not match or (int(match[1]), int(match[2])) < (22, 13):
-            raise RuntimeError('TypeScript CLI 需要 Node.js 22.13+ 和 npm')
+    npm = shutil.which('npm')
+    node = shutil.which('node')
+    if not npm or not node:
+        raise RuntimeError('Web 控制台需要 Node.js 22.13+ 和 npm')
+    version = run([node, '--version'], capture=True)
+    match = re.fullmatch(r'v(\d+)\.(\d+)\.(\d+)', version)
+    if not match or (int(match[1]), int(match[2])) < (22, 13):
+        raise RuntimeError('Web 控制台需要 Node.js 22.13+ 和 npm')
     if options.skip_install and not python.is_file():
         raise RuntimeError('找不到已安装的 .venv。请先不带 --skip-install 执行一次。')
     if not options.skip_install:
@@ -272,10 +261,6 @@ def main(argv=None):
         progress.run('安装 TraceFix', [python, '-m', 'pip', 'install', '--disable-pip-version-check',
             '--no-deps', '--no-build-isolation', '-e', '.'])
     progress.run('检查 Python 环境', [python, '-c', "import sys; assert sys.version_info[:2] == (3, 12), '现有虚拟环境必须使用 Python 3.12'"])
-    if offline:
-        progress.finish('正在进入界面预览。' if options.preview else '正在运行离线 Smoke。')
-        run([python, 'scripts/bootstrap/launch.py', '--preview' if options.preview else '--smoke', *agent_args])
-        return 0
     if not options.skip_install:
         progress.run('安装 workspace 与 Agent 运行依赖', [npm, 'ci', '--include=optional'])
     if options.console_only:
@@ -294,15 +279,9 @@ def main(argv=None):
     else:
         progress.run('检查沙箱镜像', ['docker', 'image', 'inspect', '--format', '{{.Id}}', 'tracefix-bugboard:1.0', 'tracefix-browser:1.0'])
     progress.run('初始化演示项目', [python, 'bugboard/scripts/init_demo.py', '--case', 'B01'])
-    progress.run('构建控制台软件包', [npm, 'run', 'build', *([] if web else ['--workspace', '@tracefix/cli'])])
-    if web:
-        progress.finish('正在启动 Web 控制台；请在页面选择项目并启动 Agent Run。')
-        run([python, 'scripts/bootstrap/services.py', *(['--dev'] if options.dev else [])])
-        return 0
-    if not [argument for argument in agent_args if argument != '--plain'] and options.default_mode == 'repair':
-        agent_args = ['--mode', 'repair', '--spec', 'profiles/persistence.spec.json', *agent_args]
-    progress.finish('正在进入 TraceFix Agent。')
-    run([node, 'frontend/apps/cli/dist/cli.mjs', *agent_args])
+    progress.run('构建控制台软件包', [npm, 'run', 'build'])
+    progress.finish('正在启动 Web 控制台；请在页面选择项目并启动 Agent Run。')
+    run([python, 'scripts/bootstrap/services.py', *(['--dev'] if options.dev else [])])
     return 0
 
 

@@ -12,7 +12,7 @@ import pytest
 from pydantic import ValidationError
 from langgraph.checkpoint.memory import InMemorySaver
 
-from tracefix.cli.main import Session
+from tracefix.service.session import Session
 from tracefix.connectors import GitHubMCPError
 from tracefix.execution.workspace import commit_workspace, git
 from tracefix.knowledge.documents import DocumentLibrary
@@ -102,9 +102,9 @@ def service_fixture(tmp_path, monkeypatch):
     monkeypatch.setenv('TRACEFIX_API_KEY', 'fake-service-model-key')
     monkeypatch.delenv('TRACEFIX_CONSOLE_RUN_ID', raising=False)
     monkeypatch.delenv('TRACEFIX_SESSION_REMOTE', raising=False)
-    monkeypatch.setattr('tracefix.cli.main.DockerRunner', runner)
-    monkeypatch.setattr('tracefix.cli.main.MCPBrowser', browser)
-    monkeypatch.setattr('tracefix.cli.main.Gateway', lambda: FakeModel(runners[-1].workspace))
+    monkeypatch.setattr('tracefix.service.session.DockerRunner', runner)
+    monkeypatch.setattr('tracefix.service.session.MCPBrowser', browser)
+    monkeypatch.setattr('tracefix.service.session.Gateway', lambda: FakeModel(runners[-1].workspace))
     # 新 Run 冻结先于 runner 创建，能力探测与绑定后的 FakeModel 保持一致。
     model_capabilities = SimpleNamespace(supports_tool_executor=False)
     monkeypatch.setattr('tracefix.service.run.Gateway', lambda: model_capabilities)
@@ -196,7 +196,7 @@ async def test_partial_factory_initialization_closes_browser_and_runner(service_
     def fail():
         raise RuntimeError('secret startup details')
 
-    monkeypatch.setattr('tracefix.cli.main.Gateway', fail)
+    monkeypatch.setattr('tracefix.service.session.Gateway', fail)
     result = await execute_request(fixture.request(), fixture.settings, session_factory=fixture.factory)
     assert result['run_status'] == 'FAILED' and result['report_ref']
     assert fixture.runners[0].closed and fixture.browsers[0].closed

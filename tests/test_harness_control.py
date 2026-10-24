@@ -1,13 +1,12 @@
 """Python 控制桥的字段、归属和冻结配置边界回归。"""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import ValidationError
 
 from tracefix.agents.claude_sdk_config import ClaudeSdkConfig
-from tracefix.cli.main import Session
 from tracefix.harness_control import ControlIdentity, ControlRequest, HarnessControl, HarnessNotFound, ResumeRequest
 from tracefix.agents.claude_sdk_adapter import ExecutionInspection
 from tracefix.execution.candidate_export import _snapshot
@@ -83,26 +82,6 @@ def test_control_state_rejects_session_run_identity_mismatch(control):
     control.store.save(state)
     with pytest.raises(PermissionError, match='身份'):
         control.state(job)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('text', ['普通补充文字', '/continue run-sdk 新的指令',
-    '/hint 额外建议', '/retarget 新目标', '/constrain 额外条件'])
-async def test_sdk_text_and_continue_cannot_persist_guidance(control, text):
-    state = RunState(scope_id='scope', run_id='run-sdk', goal='冻结目标',
-        url='http://app.test', harness_job_id='job', run_status='PAUSED')
-    control.store.save(state)
-    submit = Mock(side_effect=AssertionError('SDK guidance 不应写入'))
-    session = object.__new__(Session)
-    session.run_id, session.scope, session.store = state.run_id, state.scope_id, control.store
-    session.engine = SimpleNamespace(submit_guidance=submit, notes=[])
-    session.task = None
-    with pytest.raises(ValueError, match='不接收补充指令'):
-        await session.dispatch(text)
-    submit.assert_not_called()
-    assert session.engine.notes == []
-    assert control.store.load(state.run_id, state.scope_id).continuation_instruction is None
-    assert control.store.events == {}
 
 
 def configured_runtime(control, monkeypatch):

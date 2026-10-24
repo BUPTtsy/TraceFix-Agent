@@ -3,7 +3,6 @@ from urllib.parse import quote
 
 import pytest
 
-from tracefix.cli.render import Renderer
 from tracefix.console import dispatch
 from tracefix.knowledge.documents import DocumentLibrary
 from tracefix.rules import Rule, RuleLibrary, RuleResolver
@@ -15,19 +14,14 @@ from tracefix.storage.reporting import collect_issues, report_text
 
 
 @pytest.mark.parametrize('mode,expected_status', [('test', 'suspected'), ('repair', 'fixed')])
-async def test_run_explains_actual_bug_in_terminal_web_and_html(tmp_path, mode, expected_status):
+async def test_run_explains_actual_bug_in_web_and_html(tmp_path, mode, expected_status):
     engine, state = make_engine(tmp_path)
     state.mode = mode
-    renderer = Renderer(plain=True)
-    renderer.artifacts = engine.artifacts
-    renderer.scope, renderer.run_id = state.scope_id, state.run_id
-    engine.notify = renderer.event
-    with renderer.console.capture() as capture:
-        await engine.run(state)
-        current = engine.store.load(state.run_id, state.scope_id)
-        if current.approval_ref:
-            engine.store.decide_approval(current.approval_ref, current, 'reject')
-            await engine.run(resume='reject')
+    await engine.run(state)
+    current = engine.store.load(state.run_id, state.scope_id)
+    if current.approval_ref:
+        engine.store.decide_approval(current.approval_ref, current, 'reject')
+        await engine.run(resume='reject')
     current = engine.store.load(state.run_id, state.scope_id)
     report = engine.get(current, current.report_ref)
     assert len(report['issues']) == 1
@@ -42,9 +36,6 @@ async def test_run_explains_actual_bug_in_terminal_web_and_html(tmp_path, mode, 
     assert '保持选中' in issue['expected']
     assert issue['steps'] == ['打开页面 http://app:3000']
     assert len(issue['evidence_refs']) >= (1 if mode == 'test' else 2)
-    output = capture.get()
-    assert '问题报告' in output and '未选中' in output and '保持选中' in output
-    assert '"action"' not in output
     finished = next(event for event in engine.store.trace(state.run_id, state.scope_id) if event['type'] == 'run.finished')
     page = engine.artifacts.read(state.scope_id, state.run_id, finished['payload']['html_ref']).decode()
     assert '问题清单' in page and '未选中' in page and '复现步骤' in page

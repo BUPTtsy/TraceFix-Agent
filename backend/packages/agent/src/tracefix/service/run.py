@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 from pydantic import ValidationError
 
-from tracefix.cli.main import Session
+from tracefix.service.session import Session
 from tracefix.connectors import GitHubMCPError
 from tracefix.execution.policy import Policy
 from tracefix.knowledge.documents import DocumentLibrary, timestamp

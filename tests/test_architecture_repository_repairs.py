@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from tracefix.config import Profile, Project
-from tracefix.cli.main import Session
+from tracefix.service.session import Session
+from tracefix.console import dispatch
 from tracefix.execution.repository import run_git, safe_commit, safe_index_files
 from tracefix.execution.platforms import bind_mount, container_user
 from tracefix.execution.runner import DockerRunner
@@ -244,7 +245,7 @@ def test_bind_rejects_tampered_workspace_before_runner(tmp_path, monkeypatch):
     session.validate_workspace = lambda *args: Session.validate_workspace(session, *args)
     state = RunState(scope_id='app', source_manifest=digest(snapshot), run_id='run_fixture',
                      goal='拒绝被篡改的工作区', url='http://localhost')
-    monkeypatch.setattr('tracefix.cli.main.DockerRunner', lambda *_: pytest.fail('runner must not be constructed'))
+    monkeypatch.setattr('tracefix.service.session.DockerRunner', lambda *_: pytest.fail('runner must not be constructed'))
     with pytest.raises(PermissionError):
         Session.bind(session, state, None, workspace, snapshot)
 
@@ -424,7 +425,9 @@ def test_executable_export_is_explicitly_unsupported(tmp_path):
 
 async def test_missing_workspace_rejects_before_continuation_marker(engine_session):
     session, engine, state = engine_session
-    web = session.workspace_commands.call
+    def web(operation, fields):
+        return dispatch(operation, fields, library=session.documents,
+                        projects_path=session.args.projects, data_root=session.args.data)
     engine.store.save(state)
     session.publish_console()
     web('run.ended', {'id': session.console_run_id, 'exitCode': 1})
