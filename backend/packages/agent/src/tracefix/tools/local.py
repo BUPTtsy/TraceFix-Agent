@@ -27,6 +27,9 @@ from tracefix.tools.fingerprints import diff_fingerprint, record_tool_action
 from tracefix.workers.locks import WorkspaceMutex
 
 
+CONTAINER_WORKSPACE = '/workspace'
+
+
 class ReadInput(Contract):
     file_path: str = Field(min_length=1)
     offset: int = Field(default=1, ge=1)
@@ -188,8 +191,21 @@ class LocalTools:
         with apply_effect_receipt():
             return self.workspace.stage(path.relative_to(self.root).as_posix(), content)
 
+    def container_path(self, value):
+        """把沙箱内的 /workspace/... 映射到宿主工作区根。
+
+        模型在容器里看到的是 /workspace，Windows 上 Path('/workspace/x') 不是绝对路径，
+        直接拒绝会让合法的容器路径被误判。映射后的路径仍须通过后续的工作区边界校验。"""
+        text = str(value).replace('\\', '/')
+        if text == CONTAINER_WORKSPACE or text.startswith(CONTAINER_WORKSPACE + '/'):
+            parts = [part for part in text[len(CONTAINER_WORKSPACE):].split('/') if part]
+            if '..' in parts:
+                raise ToolRejected('路径必须位于当前授权工作区')
+            return self.root.joinpath(*parts)
+        return Path(value)
+
     def path(self, value, *, write=False):
-        candidate = Path(value)
+        candidate = self.container_path(value)
         if not candidate.is_absolute():
             raise ToolRejected('文件工具必须使用绝对路径')
         try:
@@ -207,7 +223,7 @@ class LocalTools:
         return self.workspace.path(relative, write=True) if write else self.workspace.path(relative)
 
     def files(self, directory=None):
-        base = Path(directory) if directory else self.root
+        base = self.container_path(directory) if directory else self.root
         if not base.is_absolute() or not base.resolve().is_relative_to(self.root):
             raise ToolRejected('检索目录必须是工作区内的绝对路径')
         candidates = [base] if base.is_file() else base.rglob('*')

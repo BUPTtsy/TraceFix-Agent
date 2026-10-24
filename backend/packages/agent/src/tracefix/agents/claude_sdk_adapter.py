@@ -20,6 +20,9 @@ READONLY_TOOLS = ('Read', 'Glob', 'Grep')
 OUTPUT_SCHEMA = {'type': 'object', 'properties': {
     'summary': {'type': 'string'}, 'unresolved': {'type': 'array', 'items': {'type': 'string'}}},
     'required': ['summary', 'unresolved'], 'additionalProperties': False}
+# CLI 在模型思考时逐 token 发出进度消息；不含诊断信息，转发会把事件流放大上万倍并拖慢宿主。
+PROGRESS_SUBTYPES = frozenset({'thinking_tokens'})
+INTERRUPT_TIMEOUT_SECONDS = 10
 
 
 class SdkExecutionRequest(Contract):
@@ -94,6 +97,14 @@ class ExecutionInspection(Contract):
 
 async def _await(value):
     return await value if inspect.isawaitable(value) else value
+
+
+async def _interrupt_quietly(client):
+    """超时/取消路径上的 interrupt 控制请求本身可能超时；吞掉异常，保证仍能写出 UNKNOWN 结果。"""
+    try:
+        await asyncio.wait_for(client.interrupt(), INTERRUPT_TIMEOUT_SECONDS)
+    except Exception:
+        pass
 
 
 def _message_value(message):
@@ -217,6 +228,9 @@ class ClaudeSdkAdapter:
             async def consume():
                 terminal = None
                 async for message in client.receive_response():
+                    if (type(message).__name__ == 'SystemMessage'
+                            and getattr(message, 'subtype', '') in PROGRESS_SUBTYPES):
+                        continue
                     payload = _redact(_message_value(message))
                     envelope = {'type': type(message).__name__, 'payload': payload}
                     with transcript.open('a', encoding='utf-8') as stream:
@@ -269,12 +283,12 @@ class ClaudeSdkAdapter:
                         result.unresolved = result.structured_output.get('unresolved', [])
         except asyncio.CancelledError:
             if client is not None:
-                await client.interrupt()
+                await _interrupt_quietly(client)
             result.status, result.error_code = 'UNKNOWN', 'SDK_CANCELLED_WRITERS_UNCONFIRMED'
             raise
         except (TimeoutError, asyncio.TimeoutError):
             if client is not None:
-                await client.interrupt()
+                await _interrupt_quietly(client)
             result.status, result.error_code = 'UNKNOWN', 'SDK_TIMEOUT_WRITERS_UNCONFIRMED'
         except Exception as error:
             if request.execution_id in self._interrupts:

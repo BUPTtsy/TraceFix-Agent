@@ -51,3 +51,9 @@ status: completed
 按后续要求删除阶段二的两项遗留测试：使用 TRACEFIX_WORKER 开关的 fake 诊断不可用测试，以及通过 engine.model_call/tool_pipeline 直接执行只读调查的旧测试；同时删除其无用导入。保留已改为真实 DeepAgents Agent loop 的 Worker 行为测试、单 Agent 宿主授权检查与主诊断校验。DeepAgents 测试中的旧入口禁止调用断言及旧 checkpoint 不被读取断言验证的是当前迁移边界，继续保留。生产代码没有新增改动。
 
 清理后定向验证：`python -m pytest -q tests/test_phase2_diagnosis.py` 为 5 passed（15.50 秒）；`python -m pytest -q tests/test_deepagents_adapter.py -k 'direct_deepagents or scope_rejection'` 为 6 passed、70 deselected（14.20 秒）。旧开关和直接 executor 测试已无引用；`git diff 93149f2 --check` 通过。没有运行全项目基线，没有 push。
+
+## 合并到 main 后的说明（2026-10-07）
+
+合并提交 `618a473` 将本 worktree 成果纳入 main；修改/删除冲突按 main 的旧测试删除决定处理，`7e80dce` 删除整个 `tests/test_phase2_diagnosis.py`。上文该文件的测试结果属于历史 worktree 验证，不再作为 main 的测试命令。
+
+在 main 提交 `7e80dce` 上使用本独立虚拟环境从 main 目录加载代码，`python -m pytest -q tests/test_deepagents_adapter.py` 为 76 passed（66.67 秒），仅有 pytest cache 写入权限 warning。main 自有 .venv 当时未安装 DeepAgents，第一次收集失败。后续 PydanticAI 合并不计入这次测试结论。当前工作树已开始补充框架依赖声明，但锁未同步，候选版本与独立验证环境不同；安装集成仍待验收。本轮说明同步未新增代码或测试结果，文档仅保留本地修改，由用户手动提交，不 push。

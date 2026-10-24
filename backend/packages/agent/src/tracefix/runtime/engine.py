@@ -3279,10 +3279,12 @@ class Engine:
         if worker_enabled:
             from tracefix.runtime.worker import ReadOnlyWorker, SubtaskSpec
             specs = [SubtaskSpec(s.goal, 'code-explorer', s.revision,
-                tuple(card['path'] for card in cards[:3]), tuple(s.evidence_refs[-2:])),
-                SubtaskSpec(s.goal, 'evidence-reviewer', s.revision, (),
-                    tuple(dict.fromkeys([s.observation_ref] +
-                                        [item['observation_ref'] for item in action_observations])))]
+                tuple(card['path'] for card in cards[:3]), tuple(s.evidence_refs[-2:]))]
+            # 非 GUI 目标没有页面观测；只委派实际存在的观测，不能把空引用当作证据授权。
+            observed = tuple(ref for ref in dict.fromkeys([s.observation_ref] +
+                [item['observation_ref'] for item in action_observations]) if ref)
+            if observed:
+                specs.append(SubtaskSpec(s.goal, 'evidence-reviewer', s.revision, (), observed))
             results = await ReadOnlyWorker(self).group(s, specs)
             accepted = []
             for result in results:

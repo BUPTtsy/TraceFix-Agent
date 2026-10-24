@@ -12,7 +12,7 @@
 
 Docker Desktop 的系统要求和后端设置见 [Windows 安装说明](https://docs.docker.com/desktop/setup/install/windows-install/) 与 [WSL 2 后端说明](https://docs.docker.com/desktop/features/wsl/)。Docker 可能使用 WSL 2 或 Hyper-V 作为内部虚拟化后端；这不要求在 WSL 终端运行 Agent。
 
-正式 Agent 不要求宿主机安装 Node.js；只有想单独运行/开发 BugBoard 网页时需要 Node.js 22+。
+Web 控制台、接口服务和 CLI 需要宿主机安装 Node.js 22.13+；应用、浏览器和数据库由 Docker 承载。
 本压缩包附带 Windows x64 / Python 3.12 的锁定依赖 wheel，Python 依赖可从包内安装。首次构建 Docker/Chromium 镜像仍需要联网。
 
 ## 2. 首次启动
@@ -37,18 +37,20 @@ TRACEFIX_API_KEY=你的密钥
 .\start-windows.cmd
 ```
 
-启动器会创建 `.venv\Scripts\python.exe`，安装依赖、启动 PostgreSQL、构建隔离应用/浏览器镜像、生成 B01 缺陷仓库，再进入 TraceFix 终端。
+启动器会创建 `.venv\Scripts\python.exe`，安装依赖、启动 PostgreSQL、从独立 GitHub 仓库拉取固定测试基线、构建隔离应用/浏览器镜像、生成 B01 缺陷仓库，再进入 TraceFix 终端。
 默认进入 repair 模式，并使用 `profiles/persistence.spec.json`。
 
 支持运行本地 PowerShell 脚本的机器也可以使用：
 
 ```powershell
-.\scripts\start.ps1
+.\scripts\bootstrap\start.ps1
 ```
 
-若 PowerShell 的执行策略禁止 `.ps1`，直接使用 `start-windows.cmd`，或运行 `py -3.12 scripts\bootstrap.py`。不需要修改系统执行策略。
+若 PowerShell 的执行策略禁止 `.ps1`，直接使用 `start-windows.cmd`，或运行 `py -3.12 scripts\bootstrap\bootstrap.py`。不需要修改系统执行策略。
 
 ## 3. 运行任务
+
+接口型 Agent 可使用 `scripts/bootstrap/start-interface.ps1`，它设置独立接口注册表、自动拉取 `BUPTtsy/Test-Bug-repo` 并启动 Web 管理页面。该入口默认启用已验证修复的远程分支发布，需要 `.env` 中配置有目标仓库写权限的 `TRACEFIX_GITHUB_TOKEN`；使用 `-NoPublish` 可只创建本地修复提交。详细接口与测试命令见 `bugboard/README.md`。
 
 进入 TraceFix 后输入：
 
@@ -71,7 +73,7 @@ TRACEFIX_API_KEY=你的密钥
 也可直接使用虚拟环境：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\launch.py --mode repair --spec profiles/persistence.spec.json
+.\.venv\Scripts\python.exe scripts\bootstrap\launch.py --mode repair --spec profiles/persistence.spec.json
 ```
 
 启动器保留已有 `.env`、源码、数据库和运行轨迹，不会为了启动而清空工作区。
@@ -104,7 +106,7 @@ TRACEFIX_API_KEY=你的密钥
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\python.exe scripts\check_api.py
+.\.venv\Scripts\python.exe scripts\checks\check_api.py
 ```
 
 未配置 `TRACEFIX_TEST_DATABASE_URL` 会跳过真实 PostgreSQL 测试。Windows 未启用符号链接创建权限时，相关 symlink 创建测试也会明确跳过；运行 Agent 不要求管理员权限或开发者模式。

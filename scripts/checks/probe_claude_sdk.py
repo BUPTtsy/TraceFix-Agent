@@ -100,7 +100,8 @@ async def core_probe(args, report):
         request = build_request(ctx, execution_id, workspace, CORE_PROMPT)
         root = workspace.execution_dir
     events = []
-    runner = AgentExecutionRunner(workspace, network=args.network, egress_proxy=args.egress_proxy)
+    runner = AgentExecutionRunner(workspace, network=args.network, egress_proxy=args.egress_proxy,
+                                  stream_messages=True)
     result = await runner.start(request, lambda event, data: events.append({'type': event, 'data': data}))
     report['execution'] = {'execution_id': result.execution_id, 'status': result.status,
         'error_code': result.error_code, 'sdk_session_id': result.sdk_session_id,

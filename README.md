@@ -4,7 +4,7 @@ TraceFix 是 GUI 检测—修复平台中的 Agent 执行组件，面向受控 R
 
 调用方通过接口提交任务所需的执行信息；TraceFix 按仓库粒度管理执行配置、仓库访问凭据引用、检查规则、任务和运行记录，在隔离工作区中执行 Agent，返回 Finding、结果、diff 和可回查的证据。组件不管理用户、组织或租户，不感知或判断用户身份、角色和业务权限，也不要求上层平台建设用户管理。现有 Web / CLI 用于研发调试与演示。
 
-> 接口现状：`/api/v1/tasks` 提供创建、独立启动、编辑、停止与查询；创建默认不执行，可通过 `create_and_start` 合并创建和启动。Task 保存执行定义，每次启动生成新的 Run。稳定 result、持久化幂等和仓库注册接口仍按[接口型 Beta 计划](docs/产品说明手册/00-项目进度/接口型Beta最小补足与开发计划.md)补齐。
+> 接口现状（2026-10-10，`main@b622dfd`）：`/api/v1/tasks` 提供创建、独立启动、编辑、停止与查询；创建默认不执行，可通过 `create_and_start` 合并创建和启动。Task 保存执行定义，每次启动生成新的 Run。B1 仓库注册、查询、更新 / 禁用及 Run 配置冻结已实现；B2 独立 GitHub MCP 只读 connector 已通过 Mock 验证，运行生命周期接线与真实读取验收仍待完成。稳定 result、持久化幂等等按[接口型 Beta 计划](docs/产品说明手册/00-项目进度/接口型Beta最小补足与开发计划.md)收口。
 
 > 存储方向：规则、Task / Run 索引和知识文档当前使用 SQLite，后续迁移至 MySQL；仓库配置当前仍包含 YAML / JSON，运行时的 PostgreSQL checkpoint 保持现有实现。
 
@@ -31,6 +31,7 @@ TraceFix 是 GUI 检测—修复平台中的 Agent 执行组件，面向受控 R
 - **仓库与运行隔离**：通过 Profile 描述启动命令、工作区、文件与网络范围和测试规范，每个 Run 保留独立产物。
 - **仓库规则与任务**：维护仓库对应的检查规则和任务定义，创建与启动分开；运行中禁止编辑，停止后编辑并重新启动从头执行，历史 Run 保留。
 - **知识库与规则快照**：为仓库维护 Markdown 知识、规则版本，并在 Run 中记录实际使用内容。
+- **规则与 Finding 修复来源**：Test / Repair 的内部输入可追加选择规则，PREPARE 冻结完整正文与版本；逐问题 Finding 绑定规则、仓库、Run 和证据，独立 Repair 重新复现并通过确定性 gate 后才回写 `fixed`。内部契约、覆盖状态和 B4 接入边界见[规则与独立 Repair 来源链](docs/产品说明手册/03-Agent运行时/规则Finding与独立Repair来源链.md)。
 - **对外接口与研发入口**：复用 Node HTTP API 提供 Agent 调用与结果查询；Web / CLI 作为调试、演示和兼容入口，稳定外部契约按接口型 Beta 计划补齐。
 - **可替换的模型接口**：使用 OpenAI-compatible Chat Completions 接口，通过 PydanticAI 执行原生工具调用。
 
@@ -58,18 +59,23 @@ Agent 使用的工具定义、输入输出契约、注册和执行逻辑集中�
                                       └──────────────────┘
 ```
 
-现有 Web / CLI 调试入口位于 `frontend/`，Node 接口层位于 `backend/apps/console-api`，共享服务位于 `backend/packages/console-service`，Python Agent 位于 `backend/packages/agent`。独立的 BugBoard 演示目标位于 `bugboard/target`，不会加入产品 npm workspace。
+现有 Web / CLI 调试入口位于 `frontend/`，Node 接口层位于 `backend/apps/console-api`，共享服务位于 `backend/packages/console-service`，Python Agent 位于 `backend/packages/agent`。BugBoard 测试目标位于独立的 `BUPTtsy/Test-Bug-repo` 仓库，由 Agent 根据配置拉取，不加入产品 npm workspace。
 
 ## 接入边界
 
 - 输入绑定仓库 / 项目、具体源码 revision、受审 Profile、规则快照、目标与 TestSpec；Repair 还需绑定来源 Finding 和 Run。
+- Finding Repair 内部 helper 已实现；外部来源 Run ID 必须经显式 adapter 解析为唯一内部 Run / scope，再导出独立工作区。来源输入和结果查询的 HTTP 接线仍由 B4 集成；缺少逐问题可执行验收的 guided / 自由 GUI Finding 返回 `INCONCLUSIVE`。
 - 输出包含 Run 状态、`outcome`、规则覆盖、Finding、补丁验证状态与证据引用；HTTP 成功或任务结束不能单独作为修复成功依据。
 - TraceFix 校验仓库 / Run 归属、仓库凭据配置、工具执行范围和验证门；这些是执行正确性边界，不是对用户权限的判断。
 - 用户管理、身份映射、角色权限、后台用户数据、计费和独立管理平台均不进入组件范围；调用方自行决定如何消费结果、应用补丁或发布。
 
 ## 任务接口
 
-当前接口使用已注册仓库的 `projectId`（兼容 `repositoryId`），由该仓库的 Profile 提供启动命令、源码范围和环境配置。`goal` 为任务目标，`mode` 支持 `test` / `repair`；可传 `execution` 中的 `executionMode`、`url` 和 `spec`，以及 `additionalRuleIds`（兼容 `rule_ids`）。Task 接口首版只支持 `batch`，也是默认执行模式；交互审批仍通过原有 CLI / Run 入口处理。`url` 须属于仓库配置的来源，`spec` 为组件目录内的相对文件路径，编辑时可用 `null` 清除这两项。直接传入仓库地址、凭据、任意命令、内联 TestSpec 或 Finding 来源的统一注册 / 提交契约仍待补齐。
+先通过受保护的 `POST /api/v1/repositories` 注册预置 Git checkout、Profile、允许范围和部署凭据引用；`GET` 查询，`PATCH /api/v1/repositories/{id}` 更新或禁用。外部 `repo_id` 与 `projectId` 映射同一个规范化小写项目 ID。注册表由 Python 权威入口加锁并原子保存，每个新 Run 固定具体 commit 与独立配置 / Profile 文件；注册更新不改变已冻结 Run。完整字段、部署 roots 和无 TTY service bridge 见[配置与边界](docs/项目配置与操作边界.md)。
+
+Git checkout 负责源码物化；GitHub MCP 仅读取绑定仓库的元数据、指定 commit 文件 / 提交，以及调用方明确选择的 Issue / PR 描述。部署与 `read_context()` / `health()` / `list_read_tools()` 契约见[GitHub 只读接入边界](docs/GitHub端到端测试边界.md)。当前 connector 尚未自动进入 Test / Diagnose / Repair 上下文，真实读取验收为 **SKIPPED**；定向通过不代表完整 Beta 已验收，结果见[验收记录](docs/验收记录.md)。
+
+当前接口使用已注册仓库的 `projectId`（兼容 `repositoryId`），由该仓库的 Profile 提供启动命令、源码范围和环境配置。`goal` 为任务目标，`mode` 支持 `test` / `repair`；可传 `execution` 中的 `executionMode`、`url` 和 `spec`，以及 `additionalRuleIds`（兼容 `rule_ids`）。Task 接口首版只支持 `batch`，也是默认执行模式；交互审批仍通过原有 CLI / Run 入口处理。`url` 须属于仓库配置的来源，`spec` 为组件目录内的相对文件路径，编辑时可用 `null` 清除这两项。仓库地址、凭据引用和命令通过受控注册入口配置，Task 正文不能替换仓库绑定或注入明文凭据。
 
 | 接口 | 行为 |
 | --- | --- |
@@ -185,19 +191,17 @@ npm start
 
 ## BugBoard 演示
 
-BugBoard 是 TraceFix 使用的独立演示目标，包含自己的依赖、测试和 Git 历史。单独运行目标应用：
+BugBoard 的依赖、测试和 Git 历史保存在独立仓库。注册自动拉取的接口测试项目：
 
 ```bash
-cd bugboard/target
-npm ci
-npm run dev
+python scripts/github/configure_test_repository.py
 ```
 
-目标页面默认位于 `http://127.0.0.1:5174`，API 位于 `http://127.0.0.1:3001`。回到仓库根目录后，可以初始化 B01 缺陷工作区并构建镜像：
+通过项目空间配置检测规则、命令与修复分支发布。固定版本故障回归则先拉取评测基线，再初始化隔离的 B01 工作区：
 
 ```bash
+python bugboard/scripts/prepare_target.py --verify-cases
 python bugboard/scripts/init_demo.py --case B01
-docker build -f bugboard/docker/Dockerfile -t tracefix-bugboard:1.0 bugboard/target
 ```
 
 更多目标说明见 [bugboard/README.md](bugboard/README.md)。
@@ -298,6 +302,7 @@ python scripts/bootstrap/launch.py --smoke --plain
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 软件包职责、依赖方向和工程边界 |
 | [总体架构](docs/产品说明手册/01-系统架构/总体架构.md) | 上层平台与 Agent 组件的职责划分 |
 | [接口型 Beta 计划](docs/产品说明手册/00-项目进度/接口型Beta最小补足与开发计划.md) | 外部接口契约、待补齐能力和真实验收门槛 |
+| [规则与独立 Repair 来源链](docs/产品说明手册/03-Agent运行时/规则Finding与独立Repair来源链.md) | B3 内部规则快照、逐 Finding 来源、独立修复、覆盖与 B4 接线 |
 | [WINDOWS_START.md](WINDOWS_START.md) | Windows 环境准备与常见问题 |
 | [配置与边界](docs/项目配置与操作边界.md) | 项目 Profile、操作范围和运行时约束 |
 | [命令行工作区](docs/命令行工作区.md) | CLI 项目、知识、Run 和续执行 |

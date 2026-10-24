@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
 
 import yaml
@@ -105,12 +105,14 @@ class DockerSessionAdapter:
         inputs.mkdir(exist_ok=False)
         public_paths = {'profile': config.profile, 'spec': config.spec, 'public_protocol': config.public_protocol,
                         'initial_experience': config.initial_experience}
-        replacements = {'source_root': Path('/agent-run/source'), 'skills_root': Path('/agent-run/inputs/skills')}
+        # 容器内路径必须保持 POSIX 形式；Windows 宿主上 Path 会序列化成反斜杠相对路径。
+        replacements = {'source_root': PurePosixPath('/agent-run/source'),
+                        'skills_root': PurePosixPath('/agent-run/inputs/skills')}
         for name, path in public_paths.items():
             path = plain_path(path)
             destination = inputs / (name + path.suffix)
             shutil.copyfile(path, destination)
-            replacements[name] = Path('/agent-run/inputs') / destination.name
+            replacements[name] = PurePosixPath('/agent-run/inputs') / destination.name
         skill_source = plain_path(config.skills_root)
         for item in skill_source.rglob('*'):
             plain_path(item)

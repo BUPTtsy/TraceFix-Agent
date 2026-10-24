@@ -1,6 +1,6 @@
 # Windows Python 依赖
 
-`wheels-win_amd64/` 包含 CPython 3.12、Windows x64 的 71 个锁定依赖 wheel，其中包括 `pypdf==6.1.1`。
+`wheels-win_amd64/` 包含 CPython 3.12、Windows x64 的依赖 wheel，其中包括 `deepagents==0.4.12`、`pydantic-ai-slim[openai]==1.107.7` 和 `pypdf==6.1.1`。
 启动器在 Windows 自动使用 `--no-index --find-links` 从该目录安装，随后从本地源码安装 TraceFix。
 不包含 Python、Git、Docker Desktop、容器镜像或训练模型；这些仍需单独准备。
 

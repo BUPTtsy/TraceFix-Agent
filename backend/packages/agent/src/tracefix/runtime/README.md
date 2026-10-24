@@ -1,4 +1,16 @@
-# Tool 定义与注册
+# Agent runtime 与工具契约
+
+## B3：规则、Finding 与独立 Repair
+
+`contracts.py` 的 RunState 支持 `rule_ids` / `additional_rule_ids`、逐阶段 `rule_coverage` 和结构化 `repair_source`。`GUIIssue.rule_refs` 默认空且最多一个本次注入的规则 ID，`Decision.rule_refs` 不向各问题自动传播。`engine.py` 在 PREPARE 冻结规则快照，按阶段保护规则 / 来源上下文，保存逐问题证据，并在确定性验证 gate 通过后回写 Finding 的 fixed 与修复来源。
+
+`finding_source.py` 提供 `SourceRunIdentity`、`resolve_source_run()`、`create_finding_repair_run()`、`validate_finding_repair_source()` 和 `rebind_finding_repair_revision()`。调用方须显式解析控制面 ID 为内部 Run / scope；同仓库不同 Run、归属不明、源码或证据不一致均拒绝。创建 helper 返回未绑定工作区的新 Repair，运行工厂必须导出来源提交并绑定快照；旧 FIX_VERIFIED、TestSpec 与验证结果不继承。
+
+最终报告包含完整规则快照、coverage、findings、source_findings、repair_source 与 provenance，供 B4 直接序列化。guided / 自由 GUI 来源缺少可执行验收时保持 `INCONCLUSIVE`；检查套件已有失败的相关分支记录 `finding_executable_acceptance_missing`，模型自报不能标 fixed。详细字段、工厂接线顺序与验证边界见[规则与独立 Repair 来源链](../../../../../../docs/产品说明手册/03-Agent运行时/规则Finding与独立Repair来源链.md)。
+
+## Tool 定义与注册
+
+Agent 工具实现已集中迁入同级 `../tools/` 包：`core.py` 为通用定义与管线，`handlers.py` 为运行时注册入口，`local.py`、`task.py`、`web.py`、`discovery.py`、`chat.py`、`supervisor.py` 保存各类工具的定义及执行，`browser.py` 保存浏览器 schema、动作转换和工具执行，`code_analysis.py` 保存 `CodeAnalyze` 与授权源码分析入口，`effects.py`、`evidence.py` 处理副作用与源码证据。`runtime/` 保留状态机、阶段契约和运行协调；规则及底层分析器仍在 `rules/`。
 
 TraceFix 的模型工具采用同一条路径：`build_tool` → `ToolDefinition[InputT, OutputT]` → `ToolRegistry` → `ToolPipeline`。定义将输入模型、处理器、输出模型及能力元数据放在一起，借鉴 Claude Code `src/Tool.ts` 中 `Tool<Input, Output>`、`ToolDef`、`buildTool` 的关联类型与集中默认值思想。执行仍遵循 TraceFix 的 Run scope、阶段授权、overlay、幂等回执和 UNKNOWN resource fence。
 
@@ -6,7 +18,7 @@ TraceFix 的模型工具采用同一条路径：`build_tool` → `ToolDefinition
 
 ```python
 from tracefix.runtime.contracts import Contract, Phase
-from tracefix.runtime.tools import build_tool
+from tracefix.tools.core import build_tool
 
 class CountInput(Contract):
     text: str

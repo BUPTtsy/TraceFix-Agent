@@ -54,7 +54,7 @@ class ChatWorkspace(Workspace):
 
 class ChatLocalTools(LocalTools):
     def files(self, directory=None):
-        base = Path(directory) if directory else self.root
+        base = self.container_path(directory) if directory else self.root
         if not base.is_absolute() or not base.resolve().is_relative_to(self.root):
             raise ToolRejected('检索目录必须是工作区内的绝对路径')
         if base != self.root:

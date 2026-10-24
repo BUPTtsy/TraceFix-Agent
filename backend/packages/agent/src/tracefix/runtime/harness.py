@@ -794,20 +794,24 @@ class HarnessRuntime:
             except PermissionError:
                 continue
             writable.append(path)
+        # 与 validate_plan 对齐：每个增量必须声明非空文件范围；验收由宿主独立执行，不能单列为增量。
+        files = {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1}
         schema = {'type': 'object', 'properties': {'commands': {'type': 'array', 'items': {
-            'type': 'array', 'items': {'type': 'string'}}}, 'work_items': {'type': 'array',
+            'type': 'array', 'items': {'type': 'string'}}}, 'work_items': {'type': 'array', 'minItems': 1,
             'items': {'type': 'object', 'properties': {'id': {'type': 'string'},
                 'title': {'type': 'string'}, 'depends_on': {'type': 'array', 'items': {'type': 'string'}},
                 'acceptance_refs': {'type': 'array', 'items': {'type': 'string'}},
-                'allowed_files': {'type': 'array', 'items': {'type': 'string'}},
-                'writable_files': {'type': 'array', 'items': {'type': 'string'}}},
+                'allowed_files': files, 'writable_files': files},
                 'required': ['id', 'title', 'depends_on', 'acceptance_refs', 'allowed_files', 'writable_files'],
                 'additionalProperties': False}}}, 'required': ['commands', 'work_items'],
             'additionalProperties': False}
         prompt = json.dumps({'goal': state.goal, 'input_commit': job.accepted_commit,
             'acceptance_refs': job.acceptance_refs, 'allowed_files': list(engine.source['files']),
             'writable_files': writable, 'approved_commands': engine.profile.commands,
-            'instruction': '只读检查环境，提出依赖无环的最小增量计划；不得改变冻结验收项。'}, ensure_ascii=False)
+            'instruction': ('只读检查环境，提出依赖无环的最小增量计划；不得改变冻结验收项。'
+                '每个增量都必须修改源码，writable_files 至少一个且取自 writable_files；'
+                '验证、复现与回归由宿主在每个增量后独立执行，不要单列只做验证的增量。')},
+            ensure_ascii=False)
         state, execution, result = await self._execute(engine, state, 'initializer', prompt,
                                                      output_schema=schema)
         from tracefix.execution.candidate_export import SDKWorkspace
@@ -979,9 +983,10 @@ class HarnessRuntime:
         host = self._read(state)
         info = host['executions'][execution.execution_id]
         sdk_workspace = SDKWorkspace.load(Path(info['directory']), engine.workspace)
+        # state.rule_refs 是规则快照引用对象；SDK 候选由宿主按实际差异生成，不声明引用了哪些规则。
         proposal = export_candidate_safely(export_candidate, sdk_workspace, engine.workspace,
             summary=result.summary or 'SDK 实际文件候选', evidence_refs=state.evidence_refs,
-            rule_refs=state.rule_refs, forbidden_values=credential_values(self.config))
+            rule_refs=(), forbidden_values=credential_values(self.config))
         if not {edit.path for edit in proposal.edits} <= set(item.writable_files):
             raise PermissionError('SDK 候选越过当前增量文件授权')
         current = host['candidates'].get(session.session_id)

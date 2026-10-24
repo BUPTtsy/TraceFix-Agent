@@ -458,6 +458,26 @@ def test_mode_phase_and_worker_path_permissions_remain_restrictive(engine):
     assert engine.workspace.staged_content('app.py') is None
 
 
+def test_container_workspace_paths_map_to_host_root_and_keep_boundaries(engine):
+    engine, state = engine
+    tools = LocalTools(engine, worker_context(), state)
+    root = engine.workspace.root.resolve()
+    # 沙箱内的 /workspace/... 与宿主绝对路径指向同一文件（Windows 上 /workspace 并非绝对路径）。
+    assert tools.container_path('/workspace/app.py') == root / 'app.py'
+    assert tools.container_path('\\workspace\\app.py') == root / 'app.py'
+    assert tools.container_path('/workspace') == root
+    assert tools.read(ReadInput(file_path='/workspace/app.py', offset=2, limit=1))['content'] == '2\tvalue = 1'
+    # 目录检索同样接受容器路径。
+    assert tools.files('/workspace') is not None
+    # 映射不放宽边界：相对路径、逃逸、工作区外路径、同前缀的兄弟目录仍被拒绝。
+    for value in ['app.py', '/workspace/../escape.py', '/workspace/src/../../escape.py',
+                  '/workspace-other/app.py', '/workspaceapp.py']:
+        with pytest.raises(ToolRejected):
+            tools.read(ReadInput(file_path=value))
+    with pytest.raises(ToolRejected):
+        tools.write(WriteInput(file_path='/workspace/app.py', content='forbidden\n'))
+
+
 @pytest.mark.asyncio
 async def test_local_side_effects_without_operation_guard_fail_before_execution(engine, monkeypatch):
     from tracefix.tools import local as local_tools

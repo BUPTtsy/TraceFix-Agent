@@ -91,7 +91,9 @@ def build_request(ctx: LiveContext, execution_id: str, workspace: SDKWorkspace, 
 
 
 def runner_for(ctx: LiveContext, workspace: SDKWorkspace):
-    return AgentExecutionRunner(workspace, network=ctx.network, egress_proxy=ctx.egress_proxy)
+    # 探针需逐条观察工具调用与实时停止时机，显式开启消息流。
+    return AgentExecutionRunner(workspace, network=ctx.network, egress_proxy=ctx.egress_proxy,
+                                stream_messages=True)
 
 
 async def run_execution(ctx: LiveContext, workspace: SDKWorkspace, request, *, on_event=None, runner=None):

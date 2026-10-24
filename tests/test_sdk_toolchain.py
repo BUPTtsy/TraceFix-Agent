@@ -79,6 +79,8 @@ def test_build_command_without_toolchain_is_unchanged(tmp_path):
     del runner._worker_path
     assert runner.build_command(SimpleNamespace(execution_id='exec-1',
         config=make_request().config)) == expected
+    runner.stream_messages = True
+    assert runner.build_command(make_request('')) == expected + ['--stream-messages']
 
 
 def test_existing_snapshot_paths_are_not_shadowed(tmp_path):

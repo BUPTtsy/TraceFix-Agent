@@ -76,6 +76,24 @@ def test_load_and_new_invocation_preserve_source_and_session_config(sdk_workspac
     assert invocation.execution_dir != loaded.execution_dir
 
 
+def test_feedback_invocations_stay_flat_and_old_nested_layout_still_loads(sdk_workspace):
+    authority, sdk = sdk_workspace
+    second = SDKWorkspace.load(sdk.execution_dir, authority).fork_execution('execution-2')
+    third = SDKWorkspace.load(second.execution_dir, authority).fork_execution('execution-3')
+    assert sdk.execution_dir.parent == second.execution_dir.parent == third.execution_dir.parent
+    restored = SDKWorkspace.load(third.execution_dir, authority)
+    assert restored.source == sdk.source and restored.config_dir == sdk.execution_dir / 'sdk-config'
+    with pytest.raises(SDKCandidateRejected, match='已存在'):
+        restored.fork_execution('execution-2')
+    # 旧版本把 fork 嵌套在首个 execution 下并以其为 session_root；已持久化的记录仍须可恢复。
+    nested = sdk.execution_dir / 'executions' / 'legacy-execution'
+    nested.mkdir(parents=True)
+    metadata = json.loads((second.execution_dir / 'input_manifest.json').read_text(encoding='utf-8'))
+    metadata['session_root'] = str(sdk.execution_dir)
+    (nested / 'input_manifest.json').write_text(json.dumps(metadata, ensure_ascii=False), encoding='utf-8')
+    assert SDKWorkspace.load(nested, authority).source == sdk.source
+
+
 def test_runner_fails_closed_without_network(sdk_workspace):
     import asyncio
     from types import SimpleNamespace

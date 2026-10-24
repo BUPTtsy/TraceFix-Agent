@@ -232,6 +232,44 @@ async def test_real_langgraph_runs_two_dependent_increments_with_independent_fin
         assert sum(call == {'kind': kind, 'stage': 'final_acceptance'} for call in executor.host_commands) == 2
 
 
+async def test_sdk_candidate_export_accepts_runs_with_rule_snapshot_refs(tmp_path, monkeypatch):
+    # 真实 Run 的 rule_refs 是规则快照引用对象，不能原样作为 PatchProposal 的规则 ID 列表。
+    original = HarnessRuntime.code
+    exported = []
+
+    async def code(self, engine, state):
+        # 只在编码节点内注入快照引用对象；节点返回后恢复，避免 fake engine 缺少规则快照触发后续门禁。
+        refs = state.rule_refs
+        output = await original(self, engine, engine.changed(state,
+            rule_refs=[{'id': 'builtin_api_no_5xx', 'version': 1}]))
+        current = RunState.model_validate(output['data'])
+        exported.append(engine.get(current, current.patch_ref)['rule_refs'])
+        return {**output, 'data': engine.changed(current, rule_refs=refs).model_dump(mode='json')}
+
+    monkeypatch.setattr(HarnessRuntime, 'code', code)
+    engine, state, harness, executor = await create_harness_engine(tmp_path)
+    output = await engine.run(state)
+    job = harness.job(state)
+    assert job.status == 'COMPLETED', output['data'].get('error')
+    assert exported == [[], []]
+
+
+async def test_initializer_schema_requires_file_scope_matching_plan_validation(tmp_path):
+    import jsonschema
+
+    engine, state, harness, executor = await create_harness_engine(tmp_path)
+    await engine.run(state)
+    request = executor.requests[0]
+    assert request.role == 'initializer'
+    item = {'id': 'verify-only', 'title': '只做验证', 'depends_on': [], 'acceptance_refs': [],
+            'allowed_files': [], 'writable_files': []}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({'commands': [], 'work_items': [item]}, request.output_schema)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({'commands': [], 'work_items': []}, request.output_schema)
+    assert '不要单列只做验证的增量' in json.loads(request.prompt)['instruction']
+
+
 async def test_completed_logical_invocation_reentry_reuses_result_and_frozen_input(tmp_path):
     engine, state, harness, executor = await create_harness_engine(tmp_path)
     payload = {'approved_commands': engine.profile.commands, 'acceptance_refs': [state.test_spec_ref]}

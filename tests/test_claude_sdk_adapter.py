@@ -1,4 +1,5 @@
 import asyncio
+import json
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
@@ -355,3 +356,69 @@ async def test_worker_exit_code_distinguishes_stopped_from_failed(tmp_path, monk
     request_file = tmp_path / 'request.json'
     request_file.write_text(original.model_dump_json(), encoding='utf-8')
     assert await claude_sdk_worker.run_worker(request_file, tmp_path / 'state/result.json') == code
+
+
+async def test_thinking_progress_messages_are_not_recorded_or_emitted(tmp_path):
+    progress = [SystemMessage(subtype='thinking_tokens', data={'estimated_tokens_delta': 1})] * 50
+    instance, _clients = adapter([SystemMessage(), *progress, ResultMessage()])
+    events = []
+    result = await instance.start(request(tmp_path, transcript_path=tmp_path / 'transcript.jsonl'),
+                                  lambda event, payload: events.append(event))
+    assert result.status == 'SUCCEEDED'
+    assert (tmp_path / 'transcript.jsonl').read_text(encoding='utf-8').count('\n') == 2
+    assert events.count('sdk.message') == 2
+
+
+class HangingClient(FakeClient):
+    async def receive_response(self):
+        await asyncio.sleep(30)
+        yield ResultMessage()
+
+
+@pytest.mark.parametrize('failure', ['raise', 'hang'])
+async def test_session_timeout_still_returns_unknown_when_interrupt_fails(tmp_path, monkeypatch, failure):
+    from tracefix.agents import claude_sdk_adapter
+
+    monkeypatch.setattr(claude_sdk_adapter, 'INTERRUPT_TIMEOUT_SECONDS', 0.05)
+
+    class Client(HangingClient):
+        async def interrupt(self):
+            if failure == 'raise':
+                raise Exception('Control request timeout: interrupt')
+            await asyncio.sleep(30)
+
+    sdk = SimpleNamespace(ClaudeAgentOptions=lambda **values: SimpleNamespace(**values),
+        AgentDefinition=lambda **values: SimpleNamespace(**values))
+    instance = ClaudeSdkAdapter(sdk=sdk, client_factory=lambda options: Client(options, []))
+    original = request(tmp_path)
+    original = original.model_copy(update={'config': original.config.model_copy(
+        update={'session_timeout_seconds': 0.05})})
+    result = await asyncio.wait_for(instance.start(original), 5)
+    assert result.status == 'UNKNOWN' and result.error_code == 'SDK_TIMEOUT_WRITERS_UNCONFIRMED'
+
+
+@pytest.mark.parametrize('stream', [False, True])
+async def test_worker_forwards_messages_only_when_streaming_and_always_writes_result(
+        tmp_path, monkeypatch, capsys, stream):
+    from tracefix.agents import claude_sdk_worker
+
+    monkeypatch.setattr(claude_sdk_worker.os, 'environ', {'TRACEFIX_SDK_WORKER': '1',
+        'ANTHROPIC_API_KEY': 'restricted-key', 'CLAUDE_CONFIG_DIR': str(tmp_path / 'config')})
+
+    class WorkerAdapter:
+        async def start(self, execution, emit):
+            emit('sdk.session.bound', {'execution_id': execution.execution_id})
+            emit('sdk.message', {'type': 'AssistantMessage', 'payload': {}})
+            raise RuntimeError('adapter 意外异常')
+
+    monkeypatch.setattr(claude_sdk_worker, 'ClaudeSdkAdapter', WorkerAdapter)
+    original = request(tmp_path / 'source')
+    original.workspace.mkdir()
+    request_file = tmp_path / 'request.json'
+    request_file.write_text(original.model_dump_json(), encoding='utf-8')
+    result_file = tmp_path / 'state/result.json'
+    assert await claude_sdk_worker.run_worker(request_file, result_file, stream_messages=stream) == 4
+    printed = [json.loads(line)['type'] for line in capsys.readouterr().out.splitlines()]
+    assert 'sdk.session.bound' in printed
+    assert ('sdk.message' in printed) is stream
+    assert json.loads(result_file.read_text(encoding='utf-8'))['error_code'] == 'SDK_WORKER_EXCEPTION'

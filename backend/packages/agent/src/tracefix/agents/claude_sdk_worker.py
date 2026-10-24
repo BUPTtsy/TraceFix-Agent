@@ -37,7 +37,7 @@ def write_snapshot(workspace, path):
     return summary
 
 
-async def run_worker(request_path, result_path):
+async def run_worker(request_path, result_path, *, stream_messages=False):
     if os.environ.get('TRACEFIX_SDK_WORKER') != '1':
         raise RuntimeError('SDK worker 必须由专用容器入口启动')
     allowed = {'PATH', 'HOME', 'CLAUDE_CONFIG_DIR', 'TRACEFIX_SDK_WORKER',
@@ -60,6 +60,9 @@ async def run_worker(request_path, result_path):
         emit('sdk.workspace.input' if name == 'linux_input_manifest.json' else 'sdk.workspace.output', value)
 
     def emit(event, payload):
+        # 完整消息已由 adapter 写入 /state transcript；默认只向宿主发生命周期事件，避免逐条落库拖慢宿主。
+        if event == 'sdk.message' and not stream_messages:
+            return
         print(json.dumps({'type': event, 'data': payload}, ensure_ascii=False, default=str), flush=True)
 
     snapshot('linux_input_manifest.json')
@@ -102,6 +105,10 @@ async def run_worker(request_path, result_path):
             result = await task
         stop_task.cancel()
         await asyncio.gather(stop_task, return_exceptions=True)
+    except Exception:
+        # adapter 意外异常时写入者是否结束无法确认；仍须写出结果，不能让宿主只看到无结果的退出。
+        result = ExecutionResult(execution_id=request.execution_id, status='UNKNOWN',
+            error_code='SDK_WORKER_EXCEPTION')
     finally:
         for signum in installed_signals:
             try:
@@ -122,8 +129,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--request', required=True)
     parser.add_argument('--result', required=True)
+    parser.add_argument('--stream-messages', action='store_true',
+                        help='逐条向宿主转发 SDK 消息；仅能力探针需要实时观察时使用')
     args = parser.parse_args()
-    return asyncio.run(run_worker(args.request, args.result))
+    return asyncio.run(run_worker(args.request, args.result, stream_messages=args.stream_messages))
 
 
 if __name__ == '__main__':

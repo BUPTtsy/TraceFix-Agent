@@ -159,7 +159,10 @@ class SDKWorkspace:
 
     def fork_execution(self, execution_id: str):
         safe_relative(execution_id)
-        target = self.execution_dir / 'executions' / execution_id
+        # 新 invocation 与首个 execution 平级（create 固定 <execution>/source 布局），目录深度不随反馈轮次增长；
+        # 嵌套布局在 Windows MAX_PATH 下第二轮即失败。session_root 放宽为同一 Session 的 executions 目录。
+        session_root = self.source.parent.parent
+        target = session_root / execution_id
         if target.exists():
             raise SDKCandidateRejected('该 SDK execution 已存在', execution_id)
         target.mkdir(parents=True)
@@ -167,7 +170,7 @@ class SDKWorkspace:
             (target / name).mkdir()
         metadata = {'input_snapshot': self.input_snapshot.model_dump(), 'authority_snapshot': self.authority_snapshot,
                     'allowed_files': self.allowed_files, 'protected_paths': self.protected_paths,
-                    'exclusions': list(self.exclusions), 'session_root': str(self.source.parent),
+                    'exclusions': list(self.exclusions), 'session_root': str(session_root),
                     'source_root': str(self.source), 'baseline_root': str(self.baseline),
                     'config_dir': str(self.config_dir or self.execution_dir / 'sdk-config')}
         (target / 'input_manifest.json').write_text(json.dumps(metadata, ensure_ascii=False), encoding='utf-8')

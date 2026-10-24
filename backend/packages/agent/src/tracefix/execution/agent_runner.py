@@ -96,11 +96,13 @@ async def worker_capabilities(worker_image: str) -> frozenset[str]:
 
 class AgentExecutionRunner:
     def __init__(self, workspace: SDKWorkspace, *, network: str = '', egress_proxy: str = '',
-                 credentials=None):
+                 credentials=None, stream_messages=False):
         self.workspace = workspace
         self.network = network
         self.egress_proxy = egress_proxy
         self.credentials = credentials
+        # 默认不逐条转发 SDK 消息（完整内容在 /state transcript）；能力探针需实时观察时显式开启。
+        self.stream_messages = stream_messages
         self.container_name = ''
 
     def _environment(self, request=None):
@@ -358,6 +360,8 @@ class AgentExecutionRunner:
             '-m', 'tracefix.agents.claude_sdk_worker', '--request',
             '/control/' + getattr(self, '_request_name', 'request.json'),
             '--result', '/state/result.json'])
+        if getattr(self, 'stream_messages', False):
+            command.append('--stream-messages')
         return command
 
     async def _capture_linux_manifest(self, request, stage):
@@ -453,9 +457,10 @@ class AgentExecutionRunner:
             if stop_path.is_file() and not is_link(stop_path):
                 receipt = StopReceipt.model_validate_json(stop_path.read_text(encoding='utf-8'))
                 if receipt.execution_id == request.execution_id and receipt.writers_stopped:
+                    transcript = self.workspace.execution_dir / 'state' / 'transcript.jsonl'
                     return ExecutionResult(execution_id=request.execution_id, status='STOPPED',
                         sdk_session_id=request.sdk_session_id, error_code='SDK_CONTAINER_STOPPED',
-                        transcript_ref=str(log_path))
+                        transcript_ref=str(transcript if transcript.is_file() else log_path))
             raise RuntimeError('SDK worker 未产生结果；源码与 transcript 已保留')
         result = ExecutionResult.model_validate_json(result_path.read_text(encoding='utf-8'))
         if result.execution_id != request.execution_id:

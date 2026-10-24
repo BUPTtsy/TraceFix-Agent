@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePath, PureWindowsPath
 
 from tracefix.runtime.contracts import digest
 
@@ -112,7 +112,7 @@ class EvaluationConfig:
         return cls(**values)
 
     def payload(self):
-        return {key: str(value) if isinstance(value, Path) else value
+        return {key: str(value) if isinstance(value, PurePath) else value
                 for key, value in asdict(self).items()}
 
     def case_mutations(self):
