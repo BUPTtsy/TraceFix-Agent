@@ -31,6 +31,40 @@ def public_record(value):
     return True
 
 
+_HIDDEN_SOURCES = {'final_scoring_only', 'final_scoring', 'final_oracle', 'held_out',
+                   'held-out', 'heldout', 'oracle'}
+
+
+def visible_record(record):
+    """Chat 与知识引用的严格公开判断：拒绝 held-out、私有或隐藏标记，含 JSON 字符串内嵌值。"""
+    if isinstance(record, dict):
+        if (record.get('learnable') is False or record.get('final_scoring_only') is True
+                or record.get('held_out') is True or record.get('heldout') is True):
+            return False
+        for key in ('source', 'source_type', 'provenance', 'evidence_source', 'split',
+                    'evaluation_split', 'purpose'):
+            value = record.get(key)
+            if isinstance(value, str) and value.lower() in _HIDDEN_SOURCES:
+                return False
+        if record.get('hidden') is True or record.get('private') is True:
+            return False
+        if record.get('public') is False:
+            return False
+        visibility = record.get('visibility')
+        if isinstance(visibility, str) and visibility.lower() in {'hidden', 'private', 'secret'}:
+            return False
+        return all(visible_record(value) for value in record.values())
+    if isinstance(record, (list, tuple)):
+        return all(visible_record(value) for value in record)
+    if isinstance(record, str):
+        try:
+            decoded = json.loads(record)
+        except (TypeError, ValueError):
+            return True
+        return isinstance(decoded, str) or visible_record(decoded)
+    return True
+
+
 def _refs(record):
     refs = [record.get(key) for key in ('ref', 'artifact_ref', 'observation_ref', 'result_ref')]
     refs.extend(record.get('evidence_refs') or record.get('source_refs') or [])

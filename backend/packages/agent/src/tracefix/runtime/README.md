@@ -12,7 +12,7 @@
 
 Agent 工具实现已集中迁入同级 `../tools/` 包：`core.py` 为通用定义与管线，`handlers.py` 为运行时注册入口，`local.py`、`task.py`、`web.py`、`discovery.py`、`chat.py`、`supervisor.py` 保存各类工具的定义及执行，`browser.py` 保存浏览器 schema、动作转换和工具执行，`code_analysis.py` 保存 `CodeAnalyze` 与授权源码分析入口，`effects.py`、`evidence.py` 处理副作用与源码证据。`runtime/` 保留状态机、阶段契约和运行协调；规则及底层分析器仍在 `rules/`。
 
-TraceFix 的模型工具采用同一条路径：`build_tool` → `ToolDefinition[InputT, OutputT]` → `ToolRegistry` → `ToolPipeline`。定义将输入模型、处理器、输出模型及能力元数据放在一起，借鉴 Claude Code `src/Tool.ts` 中 `Tool<Input, Output>`、`ToolDef`、`buildTool` 的关联类型与集中默认值思想。执行仍遵循 TraceFix 的 Run scope、阶段授权、overlay、幂等回执和 UNKNOWN resource fence。
+TraceFix 的模型工具采用同一条路径：`build_tool` → `ToolDefinition[InputT, OutputT]` → `ToolRegistry` → `ToolPipeline`。定义将输入模型、处理器、输出模型及能力元数据放在一起，借鉴 Claude Code `src/Tool.ts` 中 `Tool<Input, Output>`、`ToolDef`、`buildTool` 的关联类型与集中默认值思想。执行仍遵循 TraceFix 的 Run scope、阶段授权、幂等回执和 UNKNOWN resource fence。宿主工具链只读：源码修改只由 Claude Agent SDK 编码后端（`runtime/harness.py`）完成，宿主侧没有 Write/Edit/NotebookEdit、RunTests 或补丁提交工具。
 
 ## 统一格式
 
@@ -40,16 +40,15 @@ handlers[definition.spec.name] = definition.handler
 
 `ToolHandler` 关联输入与同步/异步输出类型。`ToolSpec` 保留旧位置参数兼容，并提供 `output_model`、`aliases`、`search_hint`、`enabled`。输入采用禁止额外字段的 Pydantic 模型或 object JSON Schema；成功输出可用 Pydantic 模型或 JSON Schema 验证。并发默认为 `False`，只有显式声明的安全只读工具才能批次并行。`write`/`external` 必须串行并声明幂等键。
 
-规范名、模型接口名、旧 underscore 名以及显式别名共享内部工具身份；所有命名空间检测冲突。`enabled=False` 的工具不能展示或调用。别名 `Agent` 对应已有 `agent.delegate`，沿用其完整的 `allowed_tools`、文件、证据与写权限契约。
+规范名、模型接口名、旧 underscore 名以及显式别名共享内部工具身份；所有命名空间检测冲突。`enabled=False` 的工具不能展示或调用。别名 `Agent` 对应已有 `agent.delegate`，沿用其完整的 `allowed_tools`、文件与证据契约；委派契约不含写权限字段，`shell_mode` 只有 `disabled` / `readonly`。
 
 ## 通用能力
 
 | 工具 | 功能 | 执行范围 |
 | --- | --- | --- |
 | `Read`、`Glob`、`Grep` | 分页读取、文件名与内容搜索 | 授权工作区和 Worker 文件集合 |
-| `Write`、`Edit`、`NotebookEdit` | 已有文件/Notebook 编辑 | 受管 overlay，修复阶段与显式写权限 |
-| `Bash` | 有界命令执行 | Docker Linux sandbox，授权文件，禁网 |
-| `agent.delegate` / `Agent` | 同步委派 Worker | Supervisor 显式能力与文件集合 |
+| `Bash` | 有界只读命令执行 | Docker Linux sandbox 内的授权文件副本，禁网，改动丢弃不回写 |
+| `agent.delegate` / `Agent` | 同步委派只读 Worker | Supervisor 显式能力与文件集合，不能授予写权限 |
 | `TaskCreate`、`TaskGet`、`TaskList`、`TaskUpdate` | 当前 Run 任务板，状态、负责人、依赖 | Supervisor；任务读可并行，写走串行回执 |
 | `TodoWrite` | 替换当前 Run 待办清单 | Supervisor；最多一个 `in_progress` |
 | `WebFetch` | 有界公网 HTTP(S) 文本抓取 | Supervisor；逐跳目标校验，无宿主代理与凭据 |
@@ -67,15 +66,11 @@ handlers[definition.spec.name] = definition.handler
 
 ## 当前边界
 
-### DeepAgents 只读调查
+### 编码与委派
 
-`ReadOnlyWorker.run(state, spec)` 在 child Run 的 writer 锁内直接调用 `DeepAgentsReadonlyAdapter.run(DeepAgentsInvestigation) → SubtaskResult`，不再创建只包含 investigate 的 StateGraph。DeepAgents 内部 Agent loop 保留，调查 DTO 位于 `runtime/subtask_contracts.py`，从 `runtime.worker` 导入的名称仍兼容。
+repair 的诊断、编码与候选审查（DIAGNOSE / REVIEW）只由 Claude Agent SDK Harness 执行；没有 Harness Job 的 Run 进入这两个阶段时直接报错，不存在宿主模型旁路、hybrid/pipeline 修复模式或 DeepAgents 只读调查。宿主模型仍负责 TestSpec、GUI 探索 Decision、CheckJudgement、复现计划、chat 与 GUI Scout 等非编码调用。
 
-调查在 DIAGNOSE 或授权的 REVIEW 中执行，REVIEW 只接受 patch-reviewer；深度固定为 1。Worker 注入 Read/Grep/Glob 受控入口和冻结证据，复核 source manifest、generation、源码内容版本、文件及所有嵌套证据/artifact 引用；工具操作仍受宿主 operation ledger 和 UNKNOWN/resource fence 约束。框架不具备 Write/Edit/Bash/Git、浏览器、数据库、MCP 动态工具或递归委派权限。
-
-每次模型请求、响应、错误及已观察 usage 回调宿主并记录 child 事件/模型 artifact；失败和取消仍归并消耗，取消向外传播。合法的 rejected/failed 结果记录失败事件，框架异常不会伪装为成功或调用旧 executor。`group()` 继续使用 TaskGroup，并发最多 2 个调查。
-
-主图提供 saver 时，DeepAgents 沿用宿主执行配置和 child thread_id；单独调用 Worker 时不新建 saver。旧外壳 checkpoint 不再读取，当前没有按 child thread_id 恢复调查的业务入口。此行为不构成工具级或跨进程恢复承诺。
+`agent.delegate` 派发的子 Agent 深度固定为 1，只能使用 Read/Glob/Grep 与只读 Bash，不能递归委派；结果中的证据和文件必须属于委派授权范围。
 
 ### 通用工具
 

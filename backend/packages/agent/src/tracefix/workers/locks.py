@@ -127,11 +127,6 @@ class WorkspaceMutex:
             for context in reversed(entered):
                 context.__exit__(None, None, None)
 
-    @contextmanager
-    def patch(self, paths) -> Iterator[None]:
-        with self.workspace_write():
-            yield
-
 
 class LockedWorkspace:
     """Wrap an existing workspace and put every operation behind ``WorkspaceMutex``."""
@@ -145,24 +140,9 @@ class LockedWorkspace:
         with self.mutex.read_lock(path):
             return self.workspace.read(path)
 
-    def write(self, path: str, content: str | bytes):
-        with self.mutex.write_lock(path):
-            if hasattr(self.workspace, "write"):
-                return self.workspace.write(path, content)
-            target = self.mutex.root / path if self.mutex.root else Path(path)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            data = content if isinstance(content, bytes) else content.encode("utf-8")
-            target.write_bytes(data)
-            return {"path": str(path)}
-
     def files(self):
         with self.mutex.workspace_read():
             return list(self.workspace.files())
-
-    def apply(self, proposal):
-        paths = [edit.path for edit in proposal.edits]
-        with self.mutex.workspace_write():
-            return self.workspace.apply(proposal)
 
     def __getattr__(self, name: str):
         return getattr(self.workspace, name)

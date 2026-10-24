@@ -119,9 +119,7 @@ class PydanticAIAdapter:
                        agent_instructions: str | None = None, image: bytes | None = None,
                        **runtime_options) -> Any:
         from tracefix.tools.core import ToolProtocolError, ToolRegistry, ToolRejected, ToolSpec
-        from tracefix.runtime.contracts import BrowserAction, Decision, FinishRepair, PatchProposal
-
-        hybrid_repair = schema is FinishRepair
+        from tracefix.runtime.contracts import BrowserAction, Decision
 
         trace = _RunTrace(messages=copy.deepcopy(list(message_history or ())))
         if schema is not str and (not isinstance(schema, type) or not issubclass(schema, BaseModel)):
@@ -424,15 +422,9 @@ class PydanticAIAdapter:
                             tool_name=spec.name, result=copy.deepcopy(result)) from error
                 if failed and not business_counterexample:
                     await emit_failure(record, failure)
-                    # CandidateRejected 等确定性拒绝的 status 为 rejected，与 FAILED 同属确定未生效。
+                    # 确定性拒绝的 status 为 rejected，与 FAILED 同属确定未生效。
                     deterministic = (failure.status in {'FAILED', 'rejected'}
                                      and not failure.details.get('requires_manual_review'))
-                    if hybrid_repair and deterministic:
-                        # overlay 的确定性拒绝回灌当前会话，仍受单段工具轮次约束。
-                        if spec.submission:
-                            raise exceptions.ModelRetry(json.dumps(receipt, ensure_ascii=False, default=str))
-                        completed_results[call_id] = {'identity': identity, 'result': copy.deepcopy(result)}
-                        return receipt
                     if (feedback_rejections and deterministic and not spec.submission
                             and receipt.get('executed') is False):
                         # Run 内确定未执行的拒绝交还模型纠正；重复调用由工具轮次与死循环检测兜底。
@@ -467,11 +459,7 @@ class PydanticAIAdapter:
                                 and spec.submission_schema is not None), None)
         output_type = schema
         framework_output_tool_names = set()
-        if hybrid_repair and submission_spec is not None:
-            output_type = library.ToolOutput(FinishRepair, name=submission_spec.wire_name,
-                                             max_retries=getattr(self.model, 'max_tool_rounds', 40))
-            framework_output_tool_names.add(submission_spec.wire_name)
-        elif submission_spec is not None:
+        if submission_spec is not None:
             output_type = [library.ToolOutput(schema, name='final_result'), library.ToolOutput(
                 submission_spec.submission_schema, name=submission_spec.wire_name,
                 max_retries=0)]
@@ -565,11 +553,7 @@ class PydanticAIAdapter:
                         if tool_pipeline is not None and tool_pipeline.submission_value is not None:
                             output = tool_pipeline.submission_value
                     try:
-                        output_schema = PatchProposal if hybrid_repair and submitting else schema
-                        checked = output if isinstance(output, output_schema) else output_schema.model_validate(output)
-                        if hybrid_repair and (not submitting or tool_pipeline is None
-                                              or tool_pipeline.submission_value is None):
-                            raise ValueError('混合修复必须经 FinishRepair 工具完成运行时验收')
+                        checked = output if isinstance(output, schema) else schema.model_validate(output)
                         if (schema in {BrowserAction, Decision}
                                 and getattr(checked, 'action', checked).kind != 'finish'):
                             raise ValueError('最终浏览器输出只能是 finish，动作必须通过原生浏览器工具执行')
@@ -594,12 +578,7 @@ class PydanticAIAdapter:
             result = await agent.run(prompt, **run_options)
             trace.messages = copy.deepcopy(result.all_messages())
             trace.context = None
-            if hybrid_repair:
-                if tool_pipeline is None or not isinstance(tool_pipeline.submission_value, PatchProposal):
-                    raise trace.failure('output_validation', '混合修复缺少运行时验收后的候选补丁')
-                output = tool_pipeline.submission_value
-            else:
-                output = result.output if schema is str else schema.model_validate(result.output)
+            output = result.output if schema is str else schema.model_validate(result.output)
             if (schema in {BrowserAction, Decision}
                     and getattr(output, 'action', output).kind != 'finish'):
                 raise trace.failure('output_validation',

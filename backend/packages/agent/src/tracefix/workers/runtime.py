@@ -10,17 +10,18 @@ import asyncio
 import inspect
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Callable, Mapping
 
 from tracefix.execution.browser import MCPBrowser
 from tracefix.execution.policy import Policy
 from tracefix.execution.runner import DockerRunner
-from tracefix.runtime.contracts import digest, new_id
+from tracefix.runtime.contracts import new_id
 from tracefix.workers.contracts import WorkerResult, WorkerStatus, WorkerTask, WorkerTool
 from tracefix.workers.scheduler import WorkerContext, WorkerScheduler
 
 
 # 角色只在声明阶段可用；工具允许集合单独校验，不能由提示词自行扩大。
+# 子 Agent 一律只读，源码修改只由 Claude Agent SDK 完成，因此不存在写入角色。
 ROLE_PHASES: dict[str, frozenset[str]] = {
     'planner': frozenset({'PLAN', 'PREPARE'}),
     'gui-scout': frozenset({'DISCOVER', 'EXPLORE'}),
@@ -28,8 +29,6 @@ ROLE_PHASES: dict[str, frozenset[str]] = {
     'evidence-reviewer': frozenset({'DIAGNOSE'}),
     'reproducer': frozenset({'DISCOVER', 'REPRODUCE'}),
     'patch-reviewer': frozenset({'REVIEW'}),
-    'patch-worker': frozenset({'PATCH'}),
-    'test-writer': frozenset({'PATCH'}),
 }
 
 ROLE_TOOLS: dict[str, frozenset[str]] = {
@@ -42,11 +41,6 @@ ROLE_TOOLS: dict[str, frozenset[str]] = {
     'reproducer': frozenset({WorkerTool.BROWSER.value, WorkerTool.NETWORK.value}),
     'patch-reviewer': frozenset({WorkerTool.FILE_READ.value, WorkerTool.CODE_READ.value,
                                  WorkerTool.CODE_REFERENCES.value}),
-    'patch-worker': frozenset({WorkerTool.FILE_READ.value, WorkerTool.FILE_WRITE.value,
-                               WorkerTool.CODE_READ.value, WorkerTool.CODE_WRITE.value,
-                               WorkerTool.SHELL_PATCH.value}),
-    'test-writer': frozenset({WorkerTool.FILE_READ.value, WorkerTool.FILE_WRITE.value,
-                              WorkerTool.CODE_READ.value}),
 }
 
 
@@ -178,11 +172,9 @@ class IsolatedGuiScout:
         worker.documents = self.engine.documents
         worker.subagent_role = 'gui-scout'
         worker.subagent_depth = 1
-        worker.worker_write_enabled = task.write_enabled
         worker.worker_allowed_tools = list(task.tools)
         worker.worker_shell_mode = task.shell_mode
         worker.worker_allowed_files = list(task.allowed_files)
-        worker.worker_writable_files = list(task.writable_files)
         worker.subagent_parent_step_id = task.metadata.get('parent_step_id')
         # 子 Run 禁止再次委派，避免递归派发绕过角色和并发限制。
         worker.subagent_enabled = False
@@ -247,28 +239,16 @@ class SubAgentRuntime:
 
     def validate(self, task: WorkerTask, *, parent_run_id: str, parent_step_id: str,
                  generation: int | str | None = None, depth: int = 1):
-        # 在入队前集中校验深度、角色、阶段、工具和写入范围。
+        # 在入队前集中校验深度、角色、阶段和只读工具范围。
         role = canonical_role(task.role)
         phase = task.phase.upper()
         if depth != 1 or task.parent_task_id is not None:
             raise SubAgentRejected('子 Agent 不得递归派发')
         if role not in ROLE_PHASES or phase not in ROLE_PHASES[role]:
             raise SubAgentRejected(f'角色 {task.role} 不允许在阶段 {task.phase} 执行')
-        common = {'Bash', 'Read', 'Glob', 'Grep'}
-        if task.write_enabled:
-            common.update({'Write', 'Edit', 'NotebookEdit', 'file.write', 'code.write'})
-        allowed = ROLE_TOOLS[role] | common
+        allowed = ROLE_TOOLS[role] | {'Bash', 'Read', 'Glob', 'Grep'}
         if not set(task.tools) <= allowed:
             raise SubAgentRejected(f'角色 {role} 请求了未授权工具：{sorted(set(task.tools) - allowed)}')
-        if task.writable_files and not task.write_enabled:
-            raise SubAgentRejected('Supervisor 必须显式开启子 Agent 写权限')
-        if task.writable_files and not ({WorkerTool.FILE_WRITE.value,
-                                         WorkerTool.CODE_WRITE.value,
-                                         WorkerTool.SHELL_PATCH.value,
-                                         'Write', 'Edit', 'NotebookEdit', 'Bash'} & set(task.tools)):
-            raise SubAgentRejected('写权限任务必须声明 file.write、code.write 或 shell.patch')
-        if role == 'test-writer' and any(not path.startswith('tests/') for path in task.writable_files):
-            raise SubAgentRejected('test-writer 只能新增 tests/ 文件')
         if generation is not None and task.source_revision is not None and task.source_revision != generation:
             raise SubAgentRejected('子 Agent generation/source_revision 已过期')
         self.trace.emit('subtask.created', parent_run_id=parent_run_id, parent_step_id=parent_step_id,

@@ -14,7 +14,7 @@ from tracefix.agents.pydantic_ai_adapter import PydanticAIAdapter, PydanticAIAda
 from tracefix.model.gateway import Gateway
 from tracefix.model.history import ModelProtocol
 from tracefix.storage.artifacts import redact
-from tracefix.runtime.validation_feedback import _public
+from tracefix.knowledge.workset import visible_record
 
 
 IDENTITY = (
@@ -65,7 +65,7 @@ async def _stream_with_adapter(message, history, project_id, library, *, tools=(
     if not isinstance(message, str) or not message.strip() or len(message) > 8000:
         raise ValueError('请输入 1-8000 字的消息')
     sources = redact([source for source in library.search(message, project_id, 3)
-                      if _public(source)]) if use_knowledge and library is not None else []
+                      if visible_record(source)]) if use_knowledge and library is not None else []
     yield {'sources': [{field: source[field] for field in ('id', 'title', 'version')}
                        for source in sources]}
     turn = []

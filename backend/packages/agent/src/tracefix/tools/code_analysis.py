@@ -33,8 +33,7 @@ def register_code_analysis_tool(engine, state, context, bind):
                 relative = path.relative_to(local.root).as_posix()
                 if not is_graph_file(relative) and path.suffix not in {'.html', '.htm'}:
                     continue
-                staged = local.staged_content(relative)
-                data = staged if staged is not None else path.read_bytes()
+                data = path.read_bytes()
                 graph_files.append((relative, data.decode('utf-8')))
                 if path.suffix not in CODEGRAPH_SUPPORTED_SUFFIXES | {'.html', '.htm'}:
                     continue
@@ -58,8 +57,7 @@ def register_code_analysis_tool(engine, state, context, bind):
         with local.mutex.workspace_read():
             for relative, content in graph_files:
                 path = local.path(str(local.root / relative))
-                staged = local.staged_content(relative)
-                current = staged if staged is not None else path.read_bytes()
+                current = path.read_bytes()
                 stale = stale or digest(current) != digest(content.encode('utf-8'))
         if stale:
             result['errors'].append({'message': 'CodeGraph 查询期间源码或 Run 版本已变化，请重新分析'})
@@ -71,7 +69,7 @@ def register_code_analysis_tool(engine, state, context, bind):
         return result
 
     bind('code.analyze', '使用 CodeGraph 分析授权源码的符号、依赖和调用结构；模板语义检查保留在受限适配器中，支持 JavaScript/TypeScript、React JSX/TSX、Vue3 SFC 和 HTML。'
-         '每个配置仓库维护一个持久图数据库，按当前 Run 完整授权源码和 overlay 同步。默认 symbols；'
+         '每个配置仓库维护一个持久图数据库，按当前 Run 完整授权源码同步。默认 symbols；'
          'context、callers、callees、impact 使用 config.query 指定任务或符号，关系查询范围为完整授权源码；'
          '保留 syntax、elements、a11y_name、event_binding、regex 检查；paths 使用工作区绝对路径，省略时按 path_globs 选择。'
          '结果含实际位置、源码哈希和证据引用；status=error 时应结合页面截图、语义观察和 Read/Grep 回退检测，不能视为通过。',

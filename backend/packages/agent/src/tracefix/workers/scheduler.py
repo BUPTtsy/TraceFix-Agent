@@ -9,7 +9,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Mapping
 
 from .contracts import (
     WorkerEvent,
@@ -90,51 +90,26 @@ class WorkerContext:
         if tool not in self.task.tools:
             raise PermissionError(f"worker tool is not authorized: {tool}")
 
-    def authorize_file(self, path: str, *, write: bool = False) -> None:
-        if write and not self.task.write_enabled:
-            raise PermissionError('Supervisor must explicitly enable worker writes')
+    def authorize_file(self, path: str) -> None:
         normalized = path.replace("\\", "/")
         if normalized not in self.task.allowed_files:
             raise PermissionError(f"worker file is not authorized: {path}")
-        if write and normalized not in self.task.writable_files:
-            raise PermissionError(f"worker write is not authorized: {path}")
 
-    def authorize_shell(self, *, write: bool = False) -> None:
-        if not ({"shell", "shell.readonly", "shell.patch"} & set(self.task.tools)):
+    def authorize_shell(self) -> None:
+        if not ({"shell", "shell.readonly"} & set(self.task.tools)):
             raise PermissionError("worker shell tool is not authorized")
-        if write:
-            if not self.task.write_enabled:
-                raise PermissionError('Supervisor must explicitly enable worker writes')
-            self.require_tool("shell.patch")
-            if not self.task.shell_writes_allowed:
-                raise PermissionError("shell writes are allowed only for a PATCH task")
 
     def authorize_shell_command(self, command: str) -> None:
-        self.authorize_shell(write=_shell_command_writes(command))
+        # 子 Agent 只读；源码修改只由 Claude Agent SDK 完成。
+        self.authorize_shell()
+        if _shell_command_writes(command):
+            raise PermissionError("worker shell is read-only")
 
     def read_file(self, path: str) -> str:
         self.authorize_file(path)
         if self.workspace is None:
             raise RuntimeError("worker workspace is unavailable")
         return self.workspace.read(path)
-
-    def write_file(self, path: str, content: str | bytes) -> Any:
-        self.require_tool("file.write")
-        self.authorize_file(path, write=True)
-        if self.workspace is None:
-            raise RuntimeError("worker workspace is unavailable")
-        return self.workspace.write(path, content)
-
-    def apply_patch(self, proposal: Any) -> Any:
-        self.require_tool("code.write")
-        if self.workspace is None:
-            raise RuntimeError("worker workspace is unavailable")
-        edits = getattr(proposal, "edits", ())
-        for edit in edits:
-            self.authorize_file(edit.path, write=True)
-        if not edits:
-            raise ValueError("worker patch must contain edits")
-        return self.workspace.apply(proposal)
 
 
 def _shell_command_writes(command: str) -> bool:
@@ -152,7 +127,7 @@ def _shell_command_writes(command: str) -> bool:
 
 
 class _AuthorizedWorkspace:
-    """Workspace facade that applies the task's file authorization first."""
+    """Read-only workspace facade that applies the task's file authorization first."""
 
     def __init__(self, context: WorkerContext, delegate: Any):
         self._context = context
@@ -161,18 +136,6 @@ class _AuthorizedWorkspace:
     def read(self, path: str):
         self._context.authorize_file(path)
         return self._delegate.read(path)
-
-    def write(self, path: str, content: str | bytes):
-        self._context.authorize_file(path, write=True)
-        return self._delegate.write(path, content)
-
-    def apply(self, proposal):
-        edits = getattr(proposal, "edits", ())
-        if not edits:
-            raise ValueError("worker patch must contain edits")
-        for edit in edits:
-            self._context.authorize_file(edit.path, write=True)
-        return self._delegate.apply(proposal)
 
 
 @dataclass

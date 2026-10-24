@@ -378,7 +378,7 @@ async def reproduce_finding_acceptance(frozen: FrozenFindingAcceptance, state: R
         runner: AcceptanceRunner, artifacts: Artifacts, artifacts_dir: Path,
         reset_path: str | None = None) -> FindingAcceptanceResult:
     """Execute the independent pre-patch baseline; no request-supplied success is read."""
-    if state.patch_hash or state.patch_ref or state.staged_candidate_refs:
+    if state.patch_hash or state.patch_ref:
         raise ValueError('独立复现必须在候选补丁产生前执行')
     return await _execute(frozen, state, runner, artifacts, artifacts_dir, 'baseline', reset_path)
 

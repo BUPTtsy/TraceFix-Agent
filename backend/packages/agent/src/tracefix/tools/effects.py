@@ -43,7 +43,7 @@ def operation_resources(intent, resources=None):
     values = resources if resources is not None else intent.get('resources')
     if values is None:
         arguments = intent.get('arguments', {})
-        path = arguments.get('file_path') or arguments.get('notebook_path')
+        path = arguments.get('file_path')
         values = [file_resource(path)] if path else ['*']
     if (not isinstance(values, (list, tuple)) or not values
             or any(not isinstance(value, str) or not value.strip() for value in values)):
@@ -156,43 +156,6 @@ def make_operation_executor(store, state, *, notify=None):
     return operation
 
 
-def _prepare_local(payload):
-    text, arguments = payload['content'], payload['arguments']
-    tool = payload['tool']
-    if tool == 'Write':
-        updated = arguments['content']
-    elif tool == 'Edit':
-        count = text.count(arguments['old_string'])
-        if not count or count != 1 and not arguments['replace_all']:
-            raise ValueError('old_string 必须存在且唯一；多处替换需指定 replace_all')
-        updated = text.replace(arguments['old_string'], arguments['new_string'],
-                               -1 if arguments['replace_all'] else 1)
-    elif tool == 'NotebookEdit':
-        notebook = json.loads(text)
-        cells, index, mode = notebook['cells'], arguments['cell_number'], arguments['edit_mode']
-        if index > len(cells) or index == len(cells) and mode != 'insert':
-            raise ValueError('cell_number 超出范围')
-        if mode == 'delete':
-            cells.pop(index)
-        else:
-            cell = dict(cell_type=arguments['cell_type'], metadata={},
-                        source=arguments['new_source'].splitlines(keepends=True))
-            if arguments['cell_type'] == 'code':
-                cell.update(outputs=[], execution_count=None)
-            if mode == 'insert':
-                cell['id'] = payload['cell_id']
-                cells.insert(index, cell)
-            else:
-                cell['metadata'] = cells[index].get('metadata', {})
-                if 'id' in cells[index]:
-                    cell['id'] = cells[index]['id']
-                cells[index] = cell
-        updated = json.dumps(notebook, ensure_ascii=False, indent=1) + chr(10)
-    else:
-        raise ValueError('未知的本地写请求')
-    return dict(content=updated, before_hash=digest(text.encode('utf-8')))
-
-
 def _effect_worker(request, folder):
     directory = Path(folder)
     if os.name != 'nt':
@@ -201,9 +164,7 @@ def _effect_worker(request, folder):
     while not (directory / 'start').exists():
         time.sleep(0.005)
     try:
-        if request['kind'] == 'local.prepare':
-            result = _prepare_local(request['payload'])
-        elif request['kind'] == 'memory.note':
+        if request['kind'] == 'memory.note':
             from tracefix.knowledge.memory import MemoryLibrary
             payload = dict(request['payload'])
             library = MemoryLibrary(payload.pop('path'))

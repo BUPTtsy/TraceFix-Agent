@@ -8,7 +8,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from tracefix.runtime.contracts import Guidance, GuidanceConstraints, Phase, RunStatus, new_id
+from tracefix.runtime.contracts import Guidance, GuidanceConstraints, RunStatus
 from tracefix.storage.artifacts import redact
 
 

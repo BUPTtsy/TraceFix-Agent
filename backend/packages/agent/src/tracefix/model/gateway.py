@@ -7,6 +7,10 @@ from tracefix.model.contracts import ModelError, ModelOutputError, ModelResult
 from tracefix.model.history import ModelProtocol
 
 
+# ModelError/ModelOutputError/ModelResult 为既有调用方保留的公开再导出。
+__all__ = ['Gateway', 'ModelError', 'ModelOutputError', 'ModelResult']
+
+
 class Gateway(ModelProtocol):
     supports_tool_executor = True
     supports_streaming = True

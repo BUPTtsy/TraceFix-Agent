@@ -50,7 +50,7 @@ async def freeze(engine, state):
     if state.reproduction_plan_frozen:
         frozen_plan(engine, state)
         return state
-    if state.patch_hash or state.patch_ref or state.staged_candidate_refs:
+    if state.patch_hash or state.patch_ref:
         raise ValueError('非 GUI 失败基线必须在候选补丁之前冻结')
     plan = make_plan(engine.spec(state), engine.profile)
     ref = engine.put(state, plan, name='非GUI冻结命令计划')
@@ -109,7 +109,7 @@ async def execute(engine, state, target, *, operation, trial=None):
 
 
 async def record_baseline(engine, state, *, trial=0):
-    if state.patch_hash or state.patch_ref or state.staged_candidate_refs:
+    if state.patch_hash or state.patch_ref:
         raise PermissionError('非 GUI 复现不能读取候选补丁后的命令结果')
     target = engine.spec(state).mode
     result = await execute(engine, state, target, operation='baseline.command.' + str(trial), trial=trial)

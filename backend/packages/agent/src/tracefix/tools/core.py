@@ -359,11 +359,6 @@ class ToolPipeline:
             accepted = self.submission_resolver(call.name)
             if accepted is not None:
                 return accepted
-        from tracefix.runtime.contracts import FinishRepair, PatchProposal
-        if call.spec.submission_schema is FinishRepair:
-            if not isinstance(result.result, dict) or not result.result.get('accepted'):
-                raise ToolProtocolError('完成修复缺少运行时验收结果')
-            return PatchProposal.model_validate(result.result['proposal'])
         if call.spec.submission_schema is not None:
             value = (result.result['value'] if isinstance(result.result, dict)
                      and 'value' in result.result else call.input.model_dump(mode='json'))

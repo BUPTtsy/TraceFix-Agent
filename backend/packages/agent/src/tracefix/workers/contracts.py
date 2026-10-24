@@ -3,7 +3,8 @@
 The worker package deliberately keeps the task contract independent from the
 phase engine.  A supervisor may invent a role label for every task, while the
 runtime still validates the tools, files, shell mode, and retry policy that
-the worker is allowed to use.
+the worker is allowed to use.  Workers are strictly read-only: source changes
+are made only by the Claude Agent SDK coding backend.
 """
 from __future__ import annotations
 
@@ -73,20 +74,13 @@ class WorkerEventType(StrEnum):
 class WorkerTool(StrEnum):
     BASH = "Bash"
     READ = "Read"
-    WRITE = "Write"
-    EDIT = "Edit"
     GLOB = "Glob"
     GREP = "Grep"
-    NOTEBOOK_EDIT = "NotebookEdit"
-    RUN_TESTS = "RunTests"
     FILE_READ = "file.read"
-    FILE_WRITE = "file.write"
     CODE_READ = "code.read"
     CODE_REFERENCES = "code.references"
-    CODE_WRITE = "code.write"
     SHELL = "shell"
     SHELL_READONLY = "shell.readonly"
-    SHELL_PATCH = "shell.patch"
     NETWORK = "network"
     BROWSER = "browser"
 
@@ -126,17 +120,15 @@ class WorkerTask(WorkerContract):
         max_length=64,
         validation_alias=AliasChoices("tools", "allowed_tools"),
     )
-    writable_files: list[str] = Field(default_factory=list, max_length=2_000)
-    write_enabled: bool = False
     depends_on: list[str] = Field(default_factory=list, max_length=2_000)
-    shell_mode: Literal["disabled", "readonly", "patch"] = "disabled"
+    shell_mode: Literal["disabled", "readonly"] = "disabled"
     retry_limit: int = Field(default=3, ge=0, le=3)
     timeout_seconds: float | None = Field(default=None, gt=0, le=86_400)
     source_revision: int | str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     allow_worker_spawn: Literal[False] = False
 
-    @field_validator("allowed_files", "writable_files")
+    @field_validator("allowed_files")
     @classmethod
     def normalize_paths(cls, values: list[str]) -> list[str]:
         result = [_safe_relative_path(value) for value in values]
@@ -170,31 +162,16 @@ class WorkerTask(WorkerContract):
 
     @model_validator(mode="after")
     def validate_authorization(self) -> WorkerTask:
-        # 可写范围必须包含于可读范围，shell 写入能力还需绑定 PATCH 阶段。
+        # 子 Agent 一律只读；shell 工具只能在只读模式下授予。
         if self.role_label is None:
             object.__setattr__(self, "role_label", self.role)
-        if not set(self.writable_files) <= set(self.allowed_files):
-            raise ValueError("writable_files must be a subset of allowed_files")
-        if self.shell_mode == "patch" and self.phase.upper() != "PATCH":
-            raise ValueError("shell write mode is only available in the PATCH phase")
         shell_tools = {
             WorkerTool.BASH.value,
             WorkerTool.SHELL.value,
             WorkerTool.SHELL_READONLY.value,
-            WorkerTool.SHELL_PATCH.value,
         }
         if self.shell_mode == "disabled" and shell_tools & set(self.tools):
-            raise ValueError("shell tools require shell_mode=readonly or shell_mode=patch")
-        if self.shell_mode == "readonly":
-            if WorkerTool.SHELL_PATCH.value in self.tools:
-                raise ValueError("shell.patch requires shell_mode=patch")
-            if self.write_enabled:
-                raise ValueError("readonly shell mode cannot grant file write access")
-        if self.shell_mode == "patch" and not (
-            {WorkerTool.BASH.value, WorkerTool.SHELL.value, WorkerTool.SHELL_PATCH.value}
-            & set(self.tools)
-        ):
-            raise ValueError("shell_mode=patch requires a shell tool")
+            raise ValueError("shell tools require shell_mode=readonly")
         return self
 
     @property
@@ -212,10 +189,6 @@ class WorkerTask(WorkerContract):
     @property
     def max_attempts(self) -> int:
         return self.retry_limit + 1
-
-    @property
-    def shell_writes_allowed(self) -> bool:
-        return self.shell_mode == "patch" and self.phase.upper() == "PATCH"
 
     @classmethod
     def from_delegate_args(
@@ -242,9 +215,7 @@ class WorkerTask(WorkerContract):
             data["tools"] = data["allowed_tools"]
         if "shell_mode" not in data:
             tool_values = set(data.get("tools") or [])
-            if "shell.patch" in tool_values:
-                data["shell_mode"] = "patch"
-            elif {"shell", "shell.readonly"} & tool_values:
+            if {"shell", "shell.readonly"} & tool_values:
                 data["shell_mode"] = "readonly"
             else:
                 data["shell_mode"] = "disabled"
@@ -294,7 +265,6 @@ class WorkerResult(WorkerContract):
     )
     unresolved: list[str] = Field(default_factory=list, max_length=100)
     artifacts: list[str] = Field(default_factory=list, max_length=2_000)
-    patch_hash: str | None = None
     attempt: int = Field(default=1, ge=1)
     max_attempts: int = Field(default=4, ge=1)
     thread_name: str = ""

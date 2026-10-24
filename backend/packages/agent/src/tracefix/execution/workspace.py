@@ -1,18 +1,13 @@
 """工作区路径授权、补丁原子应用和冻结证据校验。"""
 
 import difflib
-import ast
-import base64
-import json
-from collections import Counter
-from contextlib import nullcontext
 import os
 import re
 import tempfile
 from fnmatch import fnmatchcase
 from pathlib import Path
 
-from tracefix.runtime.contracts import FileEdit, PatchProposal, digest, new_id
+from tracefix.runtime.contracts import PatchProposal, digest
 from tracefix.runtime.guidance import GuidanceRejected
 from tracefix.execution.platforms import safe_relative, is_link
 from tracefix.execution.repository import (file_manifest, plain_root, repository_binding,
@@ -93,19 +88,6 @@ def test_write_is_approved(relative, approved_test_files=(), protected_paths=())
     return relative in approved_test_files
 
 
-def source_query_terms(query):
-    """提取症状文案、API 路径和标识符，优先保持完整文案。"""
-    text = str(query)
-    terms = {term.casefold(): 1 for term in re.findall(r'[\w\u4e00-\u9fff][\w\u4e00-\u9fff.:-]*', text)
-             if len(term) > 2 and term.casefold() not in {'the', 'and', 'for', 'with', 'from', 'that', 'this'}}
-    anchors = re.findall(r'["\']([^"\'\n]{2,200})["\']', text)
-    anchors += re.findall(r'/[\w./:-]+', text)
-    if 2 <= len(text.strip()) <= 200:
-        anchors.append(text.strip())
-    terms.update({anchor.casefold(): 5 for anchor in anchors})
-    return terms
-
-
 def git(root: Path, *args, env=None):
     if env is not None:
         raise ValueError('Git 环境只能由安全仓库 helper 构造')
@@ -116,27 +98,6 @@ def commit_workspace(root: Path, message: str):
     name = os.getenv('TRACEFIX_GIT_AUTHOR_NAME', '').strip() or 'TraceFix'
     email = os.getenv('TRACEFIX_GIT_AUTHOR_EMAIL', '').strip() or 'tracefix@localhost'
     return safe_commit(root, message, name, email)
-
-
-class CandidateRejected(ValueError):
-    def __init__(self, error_code, *, path, overlay_revision, overlay_hash='', **details):
-        steps = {
-            'ANCHOR_NOT_FOUND': '重读目标符号邻域，保留原始换行，重新取得精确 old_string。',
-            'ANCHOR_AMBIGUOUS': '读取目标实例周围上下文，以相邻函数或对象构造唯一锚点。',
-            'STALE_BASE': '重新读取当前目标及版本，检查变化是否与修复区域重叠后重建局部块。',
-            'DISK_DRIFT': '核对磁盘变化；重新读取当前源码并重建候选，不仅更新 before_hash。',
-            'OVERLAP': '合并相邻冲突块，按同一原始基线重新提交非重叠 edits。',
-            'NO_CHANGE': '删除无效块，依据实际缺陷提交有字节变化的局部修改。',
-            'NEW_SYNTAX_ERROR': '局部重读诊断涉及的代码，修正候选后重新检查完整文件。',
-            'STALE_REF': '读取当前候选及 diff，使用当前 Run 最新路径和版本的引用。',
-            'BASE_REQUIRED': '先 Read 获取 overlay_hash 和 overlay_revision，再提交局部 edits。',
-        }
-        self.details = {'status': 'rejected', 'error_code': error_code, 'path': path,
-                        'overlay_revision': overlay_revision, 'overlay_hash': overlay_hash,
-                        'match_count': 0, 'affected_ranges': [], 'written': False,
-                        'disk_written': False, 'candidate_accepted': False,
-                        'next_step': steps.get(error_code, '重新读取并修正候选。'), **details}
-        super().__init__(json.dumps(self.details, ensure_ascii=False))
 
 
 class Workspace:
@@ -150,15 +111,6 @@ class Workspace:
         # 仅可信人工审批恢复入口设置；工具参数不得传入此授权。
         self.approved_test_files = tuple(approved_test_files)
         self.guidance_constraints = []
-        # Local edit tools write into this overlay until a PatchProposal is
-        # accepted by the normal patch transaction.  Keeping the overlay out
-        # of the working tree preserves the frozen reproduction baseline.
-        self._staged_files = {}
-        self._overlay_revision = 0
-        self._staged_versions = {}
-        self._staged_disk_hashes = {}
-        self._staged_disk_exists = {}
-        self._staged_candidates = {}
         self._created_entries = {}
         self.repository_snapshot = None
 
@@ -368,10 +320,8 @@ class Workspace:
 
     def read(self, relative):
         """读取已授权文件的 UTF-8 文本内容。"""
-        p = self.path(relative)
         # read_text's universal-newline conversion would invalidate CRLF hashes.
-        staged = self._staged_files.get(relative)
-        data = staged if staged is not None else p.read_bytes()
+        data = self.path(relative).read_bytes()
         if len(data) > 200_000:
             raise ValueError("文件过大")
         return data.decode('utf-8')
@@ -385,497 +335,9 @@ class Workspace:
             raise PermissionError('补丁目标必须是普通文件')
         return path.read_bytes() if path.exists() else b''
 
-    def edit_operation(self, relative):
-        path = self.path(relative)
-        self.baseline_bytes(relative)
-        return 'modify' if path.exists() else 'create'
-
-    def staged_content(self, relative):
-        return self._staged_files.get(relative)
-
-    @property
-    def overlay_revision(self):
-        return self._overlay_revision
-
-    def file_overlay_revision(self, relative):
-        return self._staged_versions.get(relative, 0)
-
-    def stage_local_edit(self, relative, edits, *, expected_overlay_revision=None,
-                         expected_overlay_hash=None):
-        """在共同 overlay 基线上执行唯一 exact replacements，返回可物化候选。"""
-        p = self.path(relative, write=True)
-        if not p.is_file() and relative not in self._staged_files:
-            raise PermissionError('本地编辑工具不支持创建新文件')
-        disk = self.baseline_bytes(relative)
-        disk_exists = p.exists()
-        current = self._staged_files.get(relative, disk)
-        revision = self.file_overlay_revision(relative)
-        reject = lambda code, **details: CandidateRejected(
-            code, path=relative, overlay_revision=revision, overlay_hash=digest(current), **details)
-        if expected_overlay_revision is None and expected_overlay_hash is None:
-            raise reject('BASE_REQUIRED')
-        if expected_overlay_revision is not None and expected_overlay_revision != revision:
-            raise reject('STALE_BASE', expected_overlay_revision=expected_overlay_revision)
-        if expected_overlay_hash is not None and expected_overlay_hash != digest(current):
-            raise reject('STALE_BASE', expected_overlay_hash=expected_overlay_hash)
-        disk_hash = self._staged_disk_hashes.get(relative, digest(disk))
-        if (disk_hash != digest(disk)
-                or self._staged_disk_exists.get(relative, disk_exists) != disk_exists):
-            raise reject('DISK_DRIFT', expected_before_hash=disk_hash, actual_before_hash=digest(disk))
-        if not edits:
-            raise ValueError('局部编辑不能为空')
-        matches = []
-        original_text = current.decode('utf-8')
-        for index, (old_string, new_string) in enumerate(edits):
-            if not isinstance(old_string, str) or not old_string:
-                raise reject('ANCHOR_NOT_FOUND', edit_index=index)
-            occurrences = []
-            cursor = 0
-            while True:
-                start = original_text.find(old_string, cursor)
-                if start < 0:
-                    break
-                occurrences.append(start)
-                cursor = start + 1
-            count = len(occurrences)
-            ranges = [{'start_line': original_text[:start].count('\n') + 1,
-                       'end_line': original_text[:start + len(old_string) - 1].count('\n') + 1}
-                      for start in occurrences[:5]]
-            if count == 0:
-                raise reject('ANCHOR_NOT_FOUND', edit_index=index)
-            if count != 1:
-                raise reject('ANCHOR_AMBIGUOUS', edit_index=index, match_count=count,
-                             affected_ranges=ranges, ranges_truncated=count > len(ranges))
-            if old_string == new_string:
-                raise reject('NO_CHANGE', edit_index=index, match_count=1, affected_ranges=ranges)
-            start = occurrences[0]
-            matches.append((start, start + len(old_string), new_string, index))
-        matches.sort()
-        for left, right in zip(matches, matches[1:]):
-            if left[1] > right[0]:
-                raise reject('OVERLAP', edit_indices=[left[3], right[3]],
-                             character_ranges=[[left[0], left[1]], [right[0], right[1]]])
-        text = original_text
-        for start, end, new_string, _ in reversed(matches):
-            text = text[:start] + new_string + text[end:]
-        updated = text.encode('utf-8')
-        if updated == current:
-            raise reject('NO_CHANGE')
-        diagnostics = self.validate_candidate_syntax(
-            [FileEdit(path=relative, before_hash=disk_hash, content=text,
-                      operation='modify' if disk_exists else 'create')], baseline_contents={relative: current})
-        before_text = disk.decode('utf-8').splitlines(keepends=True)
-        after_text = updated.decode('utf-8').splitlines(keepends=True)
-        diff = ''.join(difflib.unified_diff(before_text, after_text,
-                                             fromfile='a/' + relative, tofile='b/' + relative))
-        previous = self._staged_files.get(relative)
-        if (p.exists() != disk_exists or self.baseline_bytes(relative) != disk
-                or self._staged_files.get(relative, disk) != current):
-            raise reject('DISK_DRIFT', expected_before_hash=disk_hash,
-                         actual_before_hash=digest(self.baseline_bytes(relative)))
-        self._staged_files[relative] = updated
-        try:
-            self._validate_staged_constraints()
-        except Exception:
-            if previous is None:
-                self._staged_files.pop(relative, None)
-            else:
-                self._staged_files[relative] = previous
-            raise
-        self._overlay_revision += 1
-        self._staged_versions[relative] = revision + 1
-        self._staged_disk_hashes[relative] = disk_hash
-        self._staged_disk_exists[relative] = disk_exists
-        ref = 'staged_' + new_id('candidate')
-        candidate = {
-            'ref': ref, 'path': relative, 'expected_overlay_revision': revision + 1,
-            'overlay_hash': digest(updated), 'disk_before_hash': digest(disk),
-            'disk_exists': disk_exists,
-            'diff_ref': ref + '.diff', 'diff': diff, 'patch_hash': digest(diff.encode('utf-8')),
-        }
-        self._staged_candidates[ref] = candidate
-        ranges = []
-        for start, end, _, _ in matches:
-            first = original_text[:start].count('\n') + 1
-            last = original_text[:max(start, end - 1)].count('\n') + 1
-            ranges.append({'start_line': first, 'end_line': last})
-        return {'status': 'staged', 'error_code': None, 'match_count': len(matches),
-                'affected_ranges': ranges, 'candidate_ref': ref, 'path': relative,
-                'staged_ref': {key: candidate[key] for key in
-                               ('ref', 'path', 'expected_overlay_revision', 'diff_ref')},
-                'diff_ref': candidate['diff_ref'], 'diff': diff,
-                'overlay_revision': revision + 1,
-                'overlay_hash': candidate['overlay_hash'],
-                'disk_before_hash': candidate['disk_before_hash'],
-                'patch_hash': candidate['patch_hash'], 'diagnostics': diagnostics,
-                'written': False, 'disk_written': False, 'candidate_accepted': True}
-
-    def bind_staged_candidate(self, result, state, artifacts):
-        transient = result['candidate_ref']
-        record = dict(self._staged_candidates[transient])
-        diff_ref = artifacts.put(state.scope_id, state.run_id, record['diff'].encode('utf-8'),
-                                 'diff', label='局部候选差异')
-        record.update(scope_id=state.scope_id, run_id=state.run_id, diff_ref=diff_ref,
-                      content_b64=base64.b64encode(self._staged_files[record['path']]).decode('ascii'))
-        record.pop('ref')
-        record.pop('diff')
-        ref = artifacts.put(state.scope_id, state.run_id, record, label='局部候选完整快照')
-        record['ref'] = ref
-        self._staged_candidates.pop(transient)
-        self._staged_candidates[ref] = record
-        item = {key: record[key] for key in ('ref', 'path', 'expected_overlay_revision', 'diff_ref')}
-        state.staged_candidate_refs = [old for old in state.staged_candidate_refs
-                                      if old['path'] != record['path']] + [item]
-        return {**result, 'candidate_ref': ref, 'diff_ref': diff_ref,
-                'staged_ref': item}
-
-    def materialize_staged_candidates(self, refs, *, state=None, artifacts=None):
-        """将本 Run 当前且未漂移的 staged refs 物化为完整 FileEdit。"""
-        if not refs:
-            raise ValueError('缺少 staged candidate 引用')
-        edits = []
-        seen = set()
-        paths = set()
-        for item in refs:
-            ref = item.ref if hasattr(item, 'ref') else item.get('ref')
-            path = item.path if hasattr(item, 'path') else item.get('path')
-            expected = (item.expected_overlay_revision if hasattr(item, 'expected_overlay_revision')
-                        else item.get('expected_overlay_revision'))
-            candidate = self._staged_candidates.get(ref)
-            revision = self.file_overlay_revision(path)
-            reject = lambda code, **details: CandidateRejected(
-                code, path=path, overlay_revision=revision, **details)
-            if state is not None:
-                supplied = item.model_dump() if hasattr(item, 'model_dump') else item
-                if artifacts is None or supplied not in state.staged_candidate_refs:
-                    raise reject('STALE_REF', candidate_ref=ref)
-                try:
-                    candidate = artifacts.json(state.scope_id, state.run_id, ref)
-                    raw_diff = artifacts.read(state.scope_id, state.run_id, candidate['diff_ref'])
-                except (KeyError, ValueError, PermissionError, OSError) as error:
-                    raise reject('STALE_REF', candidate_ref=ref) from error
-                if (candidate.get('scope_id') != state.scope_id or candidate.get('run_id') != state.run_id
-                        or digest(raw_diff) != candidate.get('patch_hash')):
-                    raise reject('STALE_REF', candidate_ref=ref)
-            if candidate is None or ref in seen or path in paths:
-                raise reject('STALE_REF', candidate_ref=ref)
-            seen.add(ref)
-            paths.add(path)
-            if candidate['path'] != path or candidate['expected_overlay_revision'] != expected:
-                raise reject('STALE_REF', candidate_ref=ref)
-            p = self.path(path, write=True)
-            disk = self.baseline_bytes(path)
-            staged = self._staged_files.get(path)
-            disk_exists = candidate.get('disk_exists', True)
-            if p.exists() != disk_exists or digest(disk) != candidate['disk_before_hash']:
-                raise reject('DISK_DRIFT', expected_before_hash=candidate['disk_before_hash'],
-                             actual_before_hash=digest(disk))
-            if staged is None and state is not None and revision == 0:
-                try:
-                    staged = base64.b64decode(candidate['content_b64'], validate=True)
-                    staged.decode('utf-8')
-                except (ValueError, KeyError) as error:
-                    raise reject('STALE_REF', candidate_ref=ref) from error
-            elif expected != revision:
-                raise reject('STALE_REF', candidate_ref=ref)
-            if staged is None:
-                raise reject('STALE_REF', candidate_ref=ref)
-            if digest(staged) != candidate['overlay_hash']:
-                raise reject('STALE_REF', candidate_ref=ref)
-            diff_ref = item.diff_ref if hasattr(item, 'diff_ref') else item.get('diff_ref')
-            if diff_ref != candidate['diff_ref']:
-                raise reject('STALE_REF', candidate_ref=ref)
-            actual_diff = ''.join(difflib.unified_diff(disk.decode('utf-8').splitlines(keepends=True),
-                staged.decode('utf-8').splitlines(keepends=True), fromfile='a/' + path, tofile='b/' + path))
-            if digest(actual_diff.encode('utf-8')) != candidate['patch_hash']:
-                raise reject('STALE_REF', candidate_ref=ref)
-            edits.append(FileEdit(path=path, before_hash=candidate['disk_before_hash'],
-                                  content=staged.decode('utf-8'),
-                                  operation='modify' if disk_exists else 'create'))
-        return edits
-
-    @staticmethod
-    def syntax_diagnostics(relative, content):
-        """返回候选的最小语法诊断；语言服务不可用时明确返回 unavailable。"""
-        if relative.endswith('.py'):
-            try:
-                ast.parse(content.lstrip('\ufeff'), filename=relative)
-            except SyntaxError as error:
-                return [{'kind': 'syntax', 'line': error.lineno, 'column': error.offset,
-                         'message': error.msg,
-                         'diagnostic_key': digest([error.msg, (error.text or '').strip()])}]
-            return []
-        if relative.endswith(('.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs')):
-            try:
-                from tree_sitter import Language, Parser
-                if relative.endswith(('.ts', '.tsx')):
-                    import tree_sitter_typescript as ts
-                    language = ts.language_tsx() if relative.endswith('.tsx') else ts.language_typescript()
-                else:
-                    import tree_sitter_javascript as javascript
-                    language = javascript.language()
-                raw = content.encode('utf-8')
-                tree = Parser(Language(language)).parse(raw)
-                pending, diagnostics = [tree.root_node], []
-                while pending:
-                    node = pending.pop()
-                    if node.is_error or node.is_missing:
-                        body = raw[node.start_byte:node.end_byte]
-                        diagnostics.append({'kind': 'syntax', 'line': node.start_point.row + 1,
-                            'column': node.start_point.column + 1,
-                            'end_line': node.end_point.row + 1,
-                            'message': 'missing ' + node.type if node.is_missing else 'syntax error',
-                            'diagnostic_key': digest([node.type, body.hex()])})
-                    elif node.has_error:
-                        pending.extend(reversed(node.children))
-                return diagnostics
-            except (ImportError, AttributeError, TypeError):
-                return [{'kind': 'unavailable', 'message': 'file language syntax parser unavailable'}]
-        return [{'kind': 'unavailable', 'message': 'no minimal syntax parser for file type'}]
-
-    def validate_candidate_syntax(self, edits, *, baseline_contents=None):
-        """拒绝相对基线新增语法错误，保留 baseline error 对照信息。"""
-        diagnostics = []
-        for edit in edits:
-            path = self.path(edit.path)
-            baseline = ((baseline_contents or {})[edit.path] if edit.path in (baseline_contents or {})
-                        else self.baseline_bytes(edit.path)).decode('utf-8')
-            before = self.syntax_diagnostics(edit.path, baseline)
-            after = self.syntax_diagnostics(edit.path, edit.content)
-            before_errors = [item for item in before if item['kind'] == 'syntax']
-            after_errors = [item for item in after if item['kind'] == 'syntax']
-            existing = Counter(item['diagnostic_key'] for item in before_errors)
-            added = []
-            for item in after_errors:
-                key = item['diagnostic_key']
-                if existing[key]:
-                    existing[key] -= 1
-                else:
-                    added.append(item)
-            if added:
-                raise CandidateRejected('NEW_SYNTAX_ERROR', path=edit.path,
-                    overlay_revision=self.file_overlay_revision(edit.path),
-                    overlay_hash=digest(baseline.encode('utf-8')),
-                    baseline_diagnostics=before[:20], candidate_diagnostics=after[:20],
-                    added_diagnostics=added[:20], diagnostics_truncated=len(after) > 20)
-            diagnostics.append({'path': edit.path, 'baseline': before,
-                                'candidate': after})
-        return diagnostics
-
-    def stage(self, relative, content):
-        """暂存授权的已有或新文件，并绑定磁盘存在性与用户约束。"""
-        p = self.path(relative, write=True)
-        baseline = self.baseline_bytes(relative)
-        exists = p.exists()
-        self._check_staged_disk(relative, baseline, exists)
-        data = content.encode('utf-8')
-        if not data.strip():
-            raise ValueError('不能暂存空文件')
-        previous = self._staged_files.get(relative)
-        self._staged_files[relative] = data
-        try:
-            self._validate_staged_constraints()
-        except Exception:
-            if previous is None:
-                self._staged_files.pop(relative, None)
-            else:
-                self._staged_files[relative] = previous
-            raise
-        self._overlay_revision += 1
-        self._staged_versions[relative] = self.file_overlay_revision(relative) + 1
-        self._staged_disk_hashes.setdefault(relative, digest(baseline))
-        self._staged_disk_exists.setdefault(relative, exists)
-        return {'path': str(p), 'after_hash': digest(data), 'staged': True,
-                'overlay_revision': self._overlay_revision}
-
-    def stage_many(self, changes):
-        previous = dict(self._staged_files)
-        disk_records = {}
-        try:
-            for relative, content in changes.items():
-                p = self.path(relative, write=True)
-                baseline, exists = self.baseline_bytes(relative), p.exists()
-                self._check_staged_disk(relative, baseline, exists)
-                disk_records[relative] = (digest(baseline), exists)
-                data = content.encode('utf-8') if isinstance(content, str) else content
-                if not data.strip():
-                    raise ValueError('不能暂存空文件')
-                self._staged_files[relative] = data
-            self._validate_staged_constraints()
-        except Exception:
-            self._staged_files = previous
-            raise
-        self._overlay_revision += 1
-        for relative in changes:
-            self._staged_versions[relative] = self.file_overlay_revision(relative) + 1
-            self._staged_disk_hashes.setdefault(relative, disk_records[relative][0])
-            self._staged_disk_exists.setdefault(relative, disk_records[relative][1])
-        return {'files_changed': list(changes), 'staged': True,
-                'overlay_revision': self._overlay_revision}
-
-    def _check_staged_disk(self, relative, baseline, exists):
-        if (relative in self._staged_disk_hashes
-                and (digest(baseline) != self._staged_disk_hashes[relative]
-                     or exists != self._staged_disk_exists.get(relative, True))):
-            raise CandidateRejected('DISK_DRIFT', path=relative,
-                                    overlay_revision=self.file_overlay_revision(relative))
-
-    def clear_staged(self):
-        self._staged_files.clear()
-        self._staged_candidates.clear()
-        self._staged_disk_hashes.clear()
-        self._staged_disk_exists.clear()
-        for relative in self._staged_versions:
-            self._staged_versions[relative] += 1
-        self._overlay_revision += 1
-
-    def unstage_many(self, paths):
-        """全部路径先授权，再原子撤销 overlay；调用方持有工作区写锁。"""
-        paths = list(dict.fromkeys(paths))
-        for relative in paths:
-            self.path(relative, write=True)
-        removed = [relative for relative in paths if relative in self._staged_files]
-        if not removed:
-            return []
-        for relative in removed:
-            self._staged_files.pop(relative, None)
-            self._staged_disk_hashes.pop(relative, None)
-            self._staged_disk_exists.pop(relative, None)
-            self._staged_versions[relative] = self.file_overlay_revision(relative) + 1
-        self._staged_candidates = {ref: item for ref, item in self._staged_candidates.items()
-                                   if item.get('path') not in removed}
-        self._overlay_revision += 1
-        return removed
-
-    def export_overlay(self):
-        """导出绑定源码快照与磁盘基线的完整可恢复 overlay。"""
-        mutex = getattr(self, '_local_tool_mutex', None)
-        with mutex.workspace_write() if mutex else nullcontext():
-            snapshot = self.require_repository_snapshot()
-            return {'version': 1, 'repository_snapshot': digest(snapshot), 'head': self.head(),
-                    'overlay_revision': self._overlay_revision,
-                    'created_entries': json.loads(json.dumps(self._created_entries)),
-                    'files': {path: {'content_b64': base64.b64encode(body).decode('ascii'),
-                                     'disk_hash': self._staged_disk_hashes[path],
-                                     'disk_exists': self._staged_disk_exists.get(path, True)}
-                              for path, body in self._staged_files.items()},
-                    'file_versions': dict(self._staged_versions),
-                    'candidates': json.loads(json.dumps(self._staged_candidates))}
-
-    def restore_overlay(self, value):
-        """先验证整个快照，失败时保持原 overlay，拒绝路径或磁盘漂移。"""
-        mutex = getattr(self, '_local_tool_mutex', None)
-        with mutex.workspace_write() if mutex else nullcontext():
-            snapshot = self.require_repository_snapshot()
-            if (not isinstance(value, dict) or value.get('version') != 1
-                    or value.get('repository_snapshot') != digest(snapshot)
-                    or value.get('head') != self.head()):
-                raise PermissionError('overlay 快照与当前源码或 Git 基线不匹配')
-            revision = value.get('overlay_revision')
-            versions, files, candidates = (value.get('file_versions'), value.get('files'),
-                                           value.get('candidates'))
-            if (type(revision) is not int or revision < 0 or not isinstance(versions, dict)
-                    or not isinstance(files, dict) or not isinstance(candidates, dict)):
-                raise ValueError('overlay 快照格式不完整')
-            restored, disk_hashes, disk_exists = {}, {}, {}
-            for relative, file_revision in versions.items():
-                self.path(relative, write=True)
-                if type(file_revision) is not int or not 0 <= file_revision <= revision:
-                    raise ValueError('overlay 文件版本无效')
-            for relative, record in files.items():
-                path = self.path(relative, write=True)
-                if (relative not in versions or not isinstance(record, dict)
-                        or not isinstance(record.get('content_b64'), str)):
-                    raise ValueError('overlay 文件记录无效')
-                body = base64.b64decode(record['content_b64'], validate=True)
-                body.decode('utf-8')
-                if not body.strip():
-                    raise ValueError('不能恢复空 overlay 文件')
-                existed = record.get('disk_exists', True)
-                if type(existed) is not bool:
-                    raise ValueError('overlay 磁盘存在性记录无效')
-                if (path.exists() != existed or digest(self.baseline_bytes(relative)) != record.get('disk_hash')
-                        or (not existed and record.get('disk_hash') != digest(b''))):
-                    raise CandidateRejected('DISK_DRIFT', path=relative,
-                                            overlay_revision=revision)
-                restored[relative], disk_hashes[relative] = body, record['disk_hash']
-                disk_exists[relative] = existed
-            for ref, candidate in candidates.items():
-                if not isinstance(ref, str) or not isinstance(candidate, dict):
-                    raise ValueError('overlay 候选记录无效')
-                relative = candidate.get('path')
-                self.path(relative, write=True)
-                # 旧版本候选仍可用于审计；只允许引用当前快照中的路径和基线。
-                if (relative not in restored or candidate.get('ref') != ref
-                        or candidate.get('disk_before_hash') != disk_hashes[relative]
-                        or candidate.get('disk_exists', True) != disk_exists[relative]
-                        or type(candidate.get('expected_overlay_revision')) is not int
-                        or not 0 < candidate['expected_overlay_revision'] <= versions[relative]):
-                    raise ValueError('overlay 候选绑定无效')
-            created_entries = value.get('created_entries', {})
-            if not isinstance(created_entries, dict):
-                raise ValueError('overlay 新增文件 manifest 无效')
-            old = (self._staged_files, self._staged_disk_hashes, self._staged_disk_exists,
-                   self._created_entries,
-                   self._staged_versions, self._staged_candidates, self._overlay_revision)
-            try:
-                self._staged_files, self._staged_disk_hashes = restored, disk_hashes
-                self._staged_disk_exists = disk_exists
-                self._created_entries = created_entries
-                self._staged_versions, self._staged_candidates = dict(versions), dict(candidates)
-                self._overlay_revision = revision
-                self.check_frozen(snapshot)
-                self._validate_staged_constraints()
-            except Exception:
-                (self._staged_files, self._staged_disk_hashes, self._staged_disk_exists,
-                 self._created_entries, self._staged_versions,
-                 self._staged_candidates, self._overlay_revision) = old
-                raise
-
-    def _validate_staged_constraints(self):
-        if not self.guidance_constraints:
-            return
-        changed_paths = set()
-        changed_lines = 0
-        for relative, data in self._staged_files.items():
-            baseline = self.baseline_bytes(relative)
-            if baseline == data:
-                continue
-            self.path(relative, write=True)
-            changed_paths.add(relative)
-            before = baseline.decode('utf-8').splitlines(keepends=True)
-            after = data.decode('utf-8').splitlines(keepends=True)
-            changed_lines += sum(end_before - start_before + end_after - start_after
-                                 for kind, start_before, end_before, start_after, end_after
-                                 in difflib.SequenceMatcher(a=before, b=after, autojunk=False).get_opcodes()
-                                 if kind != 'equal')
-        # Include committed working-tree edits as well as staged changes.
-        for relative in git(self.root, 'diff', '--name-only', 'HEAD').decode().splitlines():
-            if relative in self._staged_files:
-                continue
-            current = self.path(relative).read_bytes()
-            baseline = self._commit_bytes('HEAD', relative)
-            if current == baseline:
-                continue
-            changed_paths.add(relative)
-            before = baseline.decode('utf-8').splitlines(keepends=True)
-            after = current.decode('utf-8').splitlines(keepends=True)
-            changed_lines += sum(end_before - start_before + end_after - start_after
-                                 for kind, start_before, end_before, start_after, end_after
-                                 in difflib.SequenceMatcher(a=before, b=after, autojunk=False).get_opcodes()
-                                 if kind != 'equal')
-        for constraint in self.guidance_constraints:
-            if constraint.max_files_changed is not None and len(changed_paths) > constraint.max_files_changed:
-                raise GuidanceRejected('暂存修改超过用户约束的文件数', details={
-                    'actual_files': len(changed_paths), 'max_files_changed': constraint.max_files_changed})
-            if constraint.max_lines_changed is not None and changed_lines > constraint.max_lines_changed:
-                raise GuidanceRejected('暂存修改超过用户约束的行数', details={
-                    'actual_lines': changed_lines, 'max_lines_changed': constraint.max_lines_changed})
-
     def files(self):
         """枚举根目录下可读的普通文件，排除链接和受保护目录。"""
         from tracefix.rules.codegraph import CODEGRAPH_SUPPORTED_SUFFIXES
-        seen = set()
         for p in sorted(self.root.rglob('*')):
             if p.is_file() and p.suffix in CODEGRAPH_SUPPORTED_SUFFIXES | {'.css', '.json', '.html', '.htm'}:
                 rel = p.relative_to(self.root).as_posix()
@@ -883,119 +345,13 @@ class Workspace:
                     self.path(rel)
                 except PermissionError:
                     continue
-                seen.add(rel)
                 yield rel
-        for relative in sorted(self._staged_files.keys() - seen):
-            self.path(relative)
-            if Path(relative).suffix in CODEGRAPH_SUPPORTED_SUFFIXES | {'.css', '.json', '.html', '.htm'}:
-                yield relative
-
-    def cards(self, limit_chars=60_000, preferred_paths=()):
-        """按偏好顺序收集受字符预算限制的文件上下文卡片。"""
-        result, total = [], 0
-        ordered = sorted(self.files(), key=lambda p: (p not in preferred_paths, p))
-        for path in ordered:
-            body = self.read(path)
-            if total + len(body) > limit_chars:
-                continue
-            total += len(body)
-            baseline = self.baseline_bytes(path)
-            result.append({"path": path, "content": body, "before_hash": digest(baseline)})
-        return result
-
-    def source_bytes(self, relative):
-        """取得同次读取的磁盘基线与 overlay 内容，并拒绝读取期间变化。"""
-        path = self.path(relative)
-        if not path.exists() and relative in self._staged_files:
-            body = self._staged_files[relative]
-            if path.exists():
-                raise ValueError('源码读取期间发生变化')
-            return b'', body
-        before = path.stat()
-        staged = self.staged_content(relative)
-        baseline = path.read_bytes()
-        after = path.stat()
-        if ((before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
-                after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-                or staged != self.staged_content(relative)):
-            raise ValueError('源码读取期间发生变化')
-        return baseline, staged if staged is not None else baseline
-
-    def fragments(self, query, preferred_paths=(), limit_chars=16_000, context_lines=60, max_files=6):
-        """按症状词元返回少量有界源码片段。"""
-        if limit_chars < 1 or context_lines < 0 or max_files < 1:
-            raise ValueError('源码片段参数无效')
-        source_revision = digest(self.repository_snapshot) if self.repository_snapshot is not None else ''
-        query_terms = source_query_terms(query)
-        preferred = [str(Path(path).as_posix()) for path in preferred_paths]
-        candidates = []
-        for relative in self.files():
-            try:
-                baseline, data = self.source_bytes(relative)
-                body = data.decode('utf-8')
-            except (OSError, UnicodeDecodeError, PermissionError):
-                continue
-            folded = body.casefold()
-            score = sum(min(folded.count(term), 5) * weight for term, weight in query_terms.items())
-            name_score = sum(term in relative.casefold() for term in query_terms)
-            related_score = sum(marker in folded for marker in ('handler', 'store', 'hydration', 'api', 'i18n'))
-            preferred_score = len(preferred) - preferred.index(relative) if relative in preferred else 0
-            if score or name_score or preferred_score:
-                candidates.append((score * 10 + name_score * 3 + related_score + preferred_score,
-                                   relative, body, baseline, data))
-        candidates.sort(key=lambda item: (-item[0], item[1]))
-        has_hits = any(any(term in item[2].casefold() for term in query_terms) for item in candidates)
-        cards, used = [], 0
-        for _, relative, body, baseline, data in candidates:
-            if len(cards) >= max_files:
-                break
-            lines = body.splitlines()
-            folded_lines = [line.casefold() for line in lines]
-            scored_lines = [(sum(weight for term, weight in query_terms.items() if term in line), index)
-                            for index, line in enumerate(folded_lines)]
-            hit_lines = [index for score, index in sorted(scored_lines, key=lambda item: (-item[0], item[1]))
-                         if score]
-            if not hit_lines:
-                if relative not in preferred or has_hits or len(cards) >= min(max_files, 3):
-                    continue
-                ranges = [(0, min(len(lines), 160), 0)]
-            else:
-                ranges = []
-                for hit in hit_lines:
-                    start = max(0, hit - context_lines)
-                    end = min(len(lines), hit + context_lines + 1)
-                    if not any(start >= old_start and end <= old_end for old_start, old_end, _ in ranges):
-                        ranges.append((start, end, hit))
-            for start, end, center in ranges:
-                content = '\n'.join(f'{line_no}\t{lines[line_no - 1]}'
-                                     for line_no in range(start + 1, end + 1))
-                while used + len(content) > limit_chars and end - start > 1:
-                    if center - start >= end - center:
-                        start += 1
-                    else:
-                        end -= 1
-                    content = '\n'.join(f'{line_no}\t{lines[line_no - 1]}'
-                                        for line_no in range(start + 1, end + 1))
-                if not content or used + len(content) > limit_chars:
-                    continue
-                current_baseline, current_data = self.source_bytes(relative)
-                if current_baseline != baseline or current_data != data:
-                    raise ValueError('源码片段内容版本已变化')
-                cards.append({'path': relative, 'relative_path': relative, 'content': content,
-                              'before_hash': digest(baseline), 'start_line': start + 1,
-                              'end_line': end, 'content_version': digest(data),
-                              'source_revision': source_revision, 'overlay': data != baseline,
-                              'truncated': start > 0 or end < len(lines)})
-                used += len(content)
-                break
-        return cards
 
     def validate_guidance_patch(self, patch: PatchProposal):
         # 相对当前 HEAD 计算已有改动与候选补丁的累计变化，执行用户指定的总量限制。
         if not self.guidance_constraints:
             return
-        replacements = dict(self._staged_files)
-        replacements.update({edit.path: edit.content.encode('utf-8') for edit in patch.edits})
+        replacements = {edit.path: edit.content.encode('utf-8') for edit in patch.edits}
         paths = set(git(self.root, 'diff', '--name-only', 'HEAD').decode().splitlines()) | set(replacements)
         changed_paths, changed_lines = [], 0
         for relative in sorted(paths):
@@ -1083,7 +439,6 @@ class Workspace:
                 self._replace_bytes(index, index_before)
             self._created_entries = entries_before
             raise
-        self.clear_staged()
         return result
 
     @staticmethod

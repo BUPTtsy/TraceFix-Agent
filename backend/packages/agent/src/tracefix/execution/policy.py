@@ -37,9 +37,7 @@ class Policy:
 
     def browser(self, state, action: BrowserAction, spec, observation):
         """校验动作阶段、TestSpec 授权、观测新鲜度和元素引用绑定。"""
-        diagnostic = (state.phase == Phase.DIAGNOSE and state.mode == 'repair'
-                      and getattr(state, 'repair_mode', None) == 'hybrid')
-        if state.run_status != RunStatus.RUNNING or (not diagnostic and state.phase not in {Phase.PREPARE, Phase.EXPLORE, Phase.REPRODUCE, Phase.VERIFY}):
+        if state.run_status != RunStatus.RUNNING or state.phase not in {Phase.PREPARE, Phase.EXPLORE, Phase.REPRODUCE, Phase.VERIFY}:
             raise PermissionError("当前状态下浏览器不可用")
         if action.kind not in spec.authorized_actions:
             raise PermissionError(f'动作 {action.kind!r} 超出 TestSpec 授权范围：{spec.authorized_actions}')

@@ -13,7 +13,7 @@ from tracefix.execution.workspace import Workspace
 from tracefix.runtime.contracts import Contract, Phase
 from tracefix.tools.local import GlobInput, GrepInput, LocalTools, ReadInput
 from tracefix.tools.core import ToolPipeline, ToolRegistry, ToolRejected, build_tool
-from tracefix.runtime.validation_feedback import _public
+from tracefix.knowledge.workset import visible_record
 from tracefix.storage.artifacts import redact
 
 
@@ -99,7 +99,7 @@ def build_chat_tools(scopes, ctx, library, artifacts, session_id, *, emit=None, 
     def bind(name, description, input_model, callback):
         async def handler(arguments, call_id):
             result = await asyncio.to_thread(callback, arguments)
-            if not _public(result):
+            if not visible_record(result):
                 raise ToolRejected('Chat 查询结果包含非公开判定数据')
             return redact(result)
 
@@ -118,7 +118,7 @@ def build_chat_tools(scopes, ctx, library, artifacts, session_id, *, emit=None, 
     if use_knowledge:
         def search(arguments):
             return {'documents': [record for record in library.search(arguments.query, ctx.active_scope, arguments.limit)
-                                  if _public(record)]}
+                                  if visible_record(record)]}
 
         bind('DocumentSearch', '检索当前项目和公开全局知识文档，返回正文摘录及真实版本来源。',
              DocumentSearchInput, search)

@@ -7,29 +7,17 @@ from tracefix.knowledge.context import POLICY
 
 PROMPT_VERSION = 'stage-prefix-v4'
 
-REPAIR_LOOP = '''当前处于混合修复内循环。根据冻结目标、TestSpec、失败基线和最新验证反馈，
-自主组织 Read/Grep/Glob、局部 Edit、RunTests 以及按需委派；每次根据真实工具结果调整下一步。
-先建立现象与代码的证据联系，优先小范围可验证修改；检查当前 overlay 和 diff 后再提交。
-段边界保留当前修改和工具会话，继续先前调查即可，无需重新进行固定诊断流程。
-遇到重复失败、撤销或进展警告时，核对原件并改变有证据支持的策略，不重复无效提交。
-FinishRepair 只提交 summary、可选 diagnosis 与 self_test_refs；补丁由运行时从当前 overlay 生成。
-RunTests 自测成功和 FinishRepair 接受均不代表修复成功，最终结论由外层 PATCH/VERIFY 决定。
-不得修改测试、断言、权限、受保护路径或通过 Bash 绕过 Edit；遵守当前用户引导和约束。'''
-
 STAGE_POLICIES = {
     'PREPARE': '当前阶段负责将用户目标编译为可执行、可核验的测试规范。先区分用户报告、首次页面观测与尚未证实的假设，不预设缺陷必然存在。根据真实页面元素和完整可访问名称定义操作、预期结果及刷新后的状态断言；动态元素必须有明确步骤支持。只申请完成目标所需的最小动作权限，并设计与原问题不同的独立回归场景。信息不足时明确说明限制，不编造页面、登录状态或成功条件。输出前检查断言是否真正衡量用户要求，以及授权动作是否覆盖必要流程；规范冻结后由运行时负责执行与判定。',
     'EXPLORE': '当前阶段负责在冻结测试规范和授权范围内探索页面，收集足以验证目标的真实证据。先核对最新观测、已执行动作与待验证条件，再选择能够推进验证的单个动作；等待工具返回后才继续，不复用过期元素引用。优先完成目标要求的操作及刷新验证，不做无关探索。出现重复动作、状态不变或工具错误时，检查原因并调整合法操作，不盲目重试或扩大权限。区分已观察事实与推测，引用实际存在的证据。完成必要交互后请求结束，由运行时执行确定性断言；结束请求、工具成功和模型信心都不能证明任务成功。',
-    'DIAGNOSE': '当前阶段负责解释已复现的失败并提出最小补丁。先核对失败断言、重放证据、当前源码及既往验证结果，建立现象、相关代码、原因与修复之间可核对的证据链。检查环境差异、定位错误等替代解释，不把用户猜测或检索记忆直接当作根因。只依据授权文件和最新内容设计修改，保留无关行为，不降低测试、断言或权限要求。证据不足时明确诊断限制，不虚构原因或保证修复成功。补丁必须使用真实证据引用及当前版本，优先局部编辑并确认候选引用；若已有修复失败，应解释反馈与本次改动的关系，最终效果仍由重放和独立回归验证。',
 }
 
 
 def stage_policy(schema, context):
-    if schema.__name__ == 'FinishRepair':
-        return REPAIR_LOOP
     phase = context.get('phase')
     if phase is None:
         phase = {'TestSpec': 'PREPARE', 'Decision': 'EXPLORE',
-                 'BrowserAction': 'EXPLORE', 'PatchProposal': 'DIAGNOSE'}.get(schema.__name__)
+                 'BrowserAction': 'EXPLORE'}.get(schema.__name__)
     return STAGE_POLICIES.get(str(phase), '')
 
 
@@ -92,7 +80,7 @@ observation_id 和 element_ref 必须来自本次观测，不得编造、截断�
 ELEMENT_DISCOVERY = """
 识别按钮、链接、表单及其他可操作元素时，结合最新页面语义观测与授权源码，不得仅凭截图外观判断可点击性。
 使用 Glob 定位相关组件，用 Grep 搜索页面文案、aria-label、role、事件绑定和动态渲染条件，再用 Read 核对相关代码及上下文。
-需要核对代码结构时调用 CodeAnalyze，默认从仓库持久 CodeGraph 图索引返回 symbols；context、callers、callees、impact 配合 config.query 提供跨文件上下文和调用关系。索引绑定当前 Run 的授权源码和 overlay 版本。
+需要核对代码结构时调用 CodeAnalyze，默认从仓库持久 CodeGraph 图索引返回 symbols；context、callers、callees、impact 配合 config.query 提供跨文件上下文和调用关系。索引绑定当前 Run 的授权源码版本。
 React JSX/TSX、Vue3 template/script、JavaScript、TypeScript 与 HTML 的语法、元素、可访问名称及事件绑定可指定 syntax、elements、a11y_name、event_binding；建图成功不代表这些规则通过。
 辅助分析器报错时保留失败记录，回退到当前页面截图和语义观察，结合已读取源码继续判断；证据不足应明确无法判断，不能把工具失败当作检查通过。
 Glob/Grep 的 path 可省略以搜索当前工作区；Read.file_path 必须使用返回的绝对路径，或 workspace_root 下的绝对路径。
@@ -125,20 +113,7 @@ behavior_scenarios 用于保留相关业务能力，每项含唯一 id、descrip
 所有业务场景在修改代码前随 TestSpec 一起冻结，修补后不能增删场景、替换步骤或放宽断言。
 """
 
-PATCH = """
-PatchProposal 输出规范：summary 简述可核对的原因；evidence_refs 必须逐字从上下文的 available_evidence_refs 或 failures 中选择。
-evidence_refs 只能填写当前 Run 的 Artifact 引用，不能填写源码路径、测试路径、函数名、检索 ID 或自行编造的文件名；源码路径只能出现在 edits.path。
-rule_refs 只能引用 detection_rules 中实际注入的规则 id；没有对应规则时返回空数组。
-补丁可以使用两种来源：基线兼容的 edits 完整 FileEdit，或局部 Edit 返回的 staged_refs。staged_refs 必须逐字复制当前 Run 的候选 ref、path、expected_overlay_revision、diff_ref；不要猜测、复用旧 Run 或跨 Run 引用。
-staged_refs 经运行时检查 overlay revision、候选 path、磁盘 before_hash 和 patch_hash 后物化为完整 FileEdit；模型不需要重写未改变全文。staged_refs 与 edits 同时出现时路径集合必须一致。
-edits 的 path 必须是允许编辑的项目相对路径；before_hash 必须原样复制当前文件卡片中的校验值；content 仅适用于兼容 whole 模式，必须是修改后的完整文件内容，不是 diff、片段或省略号。
-局部编辑只使用唯一 exact anchor 和同一共同基线；重复、过期、漂移、重叠、无变化或新增语法错误都应保留失败反馈并按 error_code 重读/修正，不使用 fuzzy 或 replace_all。
-每个 edit 都必须相对当前文件产生实际字节变化，未修改的文件不要放入 edits。不得修改测试、断言或权限来使验证通过。
-"""
-
-
 def output_instructions(schema, *, include_common=True):
-    specific = {'TestSpec': SPEC, 'Decision': ACTION, 'BrowserAction': ACTION,
-                'PatchProposal': PATCH, 'FinishRepair': REPAIR_LOOP}.get(schema.__name__, '')
+    specific = {'TestSpec': SPEC, 'Decision': ACTION, 'BrowserAction': ACTION}.get(schema.__name__, '')
     discovery = ELEMENT_DISCOVERY if schema.__name__ in {'TestSpec', 'Decision', 'BrowserAction', 'CheckJudgement'} else ''
     return (COMMON if include_common else '') + NATIVE_OUTPUT + discovery + specific

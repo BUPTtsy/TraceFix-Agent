@@ -4,12 +4,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 from pydantic import ConfigDict, Field
 
-from tracefix.runtime.contracts import (BrowserAction, CheckJudgement, Contract, Decision, FinishRepair, PatchProposal,
+from tracefix.runtime.contracts import (BrowserAction, CheckJudgement, Contract, Decision,
                                        Phase, TestSpec, digest)
 from tracefix.tools.core import ToolPipeline, ToolRegistry, ToolRejected, build_tool
 from tracefix.tools.effects import file_resource, make_operation_executor, run_effect
@@ -73,29 +72,11 @@ def _value(value):
     return value.model_dump(mode='json') if hasattr(value, 'model_dump') else value
 
 
-def materialize_patch_proposal(engine, state, proposal):
-    if not proposal.staged_refs:
-        return proposal
-    if state.mode != 'repair' or state.phase not in {Phase.DIAGNOSE, Phase.PATCH}:
-        raise ToolRejected('当前 Run 阶段不允许物化修复候选')
-    if engine.workspace.require_repository_snapshot()['scope_id'] != state.scope_id:
-        raise ToolRejected('候选工作区快照与当前 Run scope 不一致')
-    edits = engine.workspace.materialize_staged_candidates(
-        proposal.staged_refs, state=state, artifacts=engine.artifacts)
-    if proposal.edits and proposal.edits != edits:
-        raise ToolRejected('STALE_REF: 提交的完整内容与确认候选不一致；未接受补丁')
-    return PatchProposal.model_validate({**proposal.model_dump(mode='json'),
-                                        'edits': [edit.model_dump(mode='json') for edit in edits]})
-
-
 def build_runtime_tools(engine, state, schema, context=None, validate_output=None):
     from tracefix.tools.local import local_tool_context, register_local_tools
     context = local_tool_context(engine, context)
-    # 子 Agent 默认只读，写权限及路径由 Supervisor 契约显式声明。
+    # 子 Agent 一律只读；源码修改只由 Claude Agent SDK 完成。
     worker_mode = context.get('worker_depth') == 1
-    worker_allowed_files = {
-        str(path).replace('\\', '/') for path in context.get('worker_allowed_files', [])
-    }
     worker_allowed_tools = set(context.get('worker_allowed_tools', []))
     worker_shell_mode = context.get('worker_shell_mode', 'disabled')
     registry, handlers, submissions = ToolRegistry(), {}, {}
@@ -107,10 +88,8 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
         if name not in worker_allowed_tools:
             return False
         if name == 'Bash':
-            return worker_shell_mode in {'readonly', 'patch'}
-        if side_effect in {'write', 'external'}:
-            return context.get('worker_write_enabled') is True
-        return True
+            return worker_shell_mode == 'readonly'
+        return side_effect not in {'write', 'external'}
 
     def bind(name, description, input_model, handler, *, phases, side_effect='read',
              parallel_safe=True, submission=False, output_limit_tokens=4000, timeout_s=45,
@@ -131,15 +110,7 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
         registry.register(definition.spec)
         handlers[name] = definition.handler
 
-    register_local_tools(engine, state, context, bind,
-                         track_repair_progress=schema is FinishRepair and phase == Phase.DIAGNOSE)
-
-    from tracefix.tools.test_runner import register_test_runner
-    register_test_runner(engine, state, context, bind)
-
-    from tracefix.tools.repair import register_repair_tools
-    register_repair_tools(engine, state, context, bind, schema=schema,
-                          submissions=submissions, validate_output=validate_output)
+    register_local_tools(engine, state, context, bind)
 
     from tracefix.tools.code_analysis import register_code_analysis_tool
     from tracefix.tools.context7 import register_context7_tools
@@ -151,28 +122,6 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
     register_task_tools(engine, state, context, bind)
     register_web_tools(engine, state, context, bind)
 
-    from tracefix.tools.git_history import register_git_history
-    register_git_history(engine, state, context, bind)
-    if (not worker_mode and state.mode == 'repair' and state.repair_mode == 'hybrid'
-            and phase == Phase.DIAGNOSE and engine.spec(state).mode == 'gui'):
-        from tracefix.tools.browser import execute_browser_tool, native_browser_tools
-        for definition in native_browser_tools(BrowserAction):
-            tool = definition['function']
-
-            async def diagnostic_browser(arguments, call_id, name=tool['name']):
-                result, updated_context = await execute_browser_tool(engine, state, context,
-                    name, arguments, call_id, state.budget.model_calls)
-                context.update(updated_context)
-                if result.get('isError'):
-                    from tracefix.tools.core import ToolResult
-                    return ToolResult(call_id=call_id, name=name, result=result,
-                                      isError=True, error=result.get('error'))
-                return result
-
-            bind(tool['name'], tool['description'] + ' Diagnostic only: never changes frozen replay plan.',
-                 tool['parameters'], diagnostic_browser, phases={Phase.DIAGNOSE},
-                 side_effect='external', parallel_safe=False)
-
     if not worker_mode and os.getenv('TRACEFIX_AGENT_MODE', '').lower() != 'single':
         from tracefix.workers.contracts import WorkerResult, WorkerTask
         from tracefix.tools.supervisor import supervisor_tools
@@ -181,16 +130,13 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
         async def delegate(arguments, call_id):
             if os.getenv('TRACEFIX_AGENT_MODE', '').lower() == 'single':
                 raise ToolRejected('single 模式禁用模型子 Agent 委派')
+            # WorkerTask 契约不含写权限字段；宿主模型只做检测与验收，子 Agent 一律只读。
             task = WorkerTask.from_delegate_args(arguments, run_id=state.run_id,
                                                 source_revision=state.revision)
-            if task.write_enabled and not task.writable_files:
-                raise ToolRejected('开启子 Agent 写权限必须显式指定 writable_files')
             if not set(task.allowed_artifacts) <= set(state.evidence_refs):
                 raise ToolRejected('委派证据必须属于父 Run')
             for relative in task.allowed_files:
                 engine.workspace.path(relative)
-            for relative in task.writable_files:
-                engine.workspace.path(relative, write=True)
             child = state.model_copy(deep=True, update={
                 'run_id': new_id('subrun'), 'parent_run_id': state.run_id,
                 'budget': Usage(), 'model_exchange_refs': [], 'context_manifest_refs': [],
@@ -202,7 +148,7 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
                 'report_ref': None, 'approval_ref': None, 'rule_snapshot_ref': None,
                 'rule_snapshot_hash': '',
                 'reasoning_refs': [], 'compaction_refs': [], 'working_memory_ref': None,
-                'baseline_validation_refs': [], 'diagnosis_feedback_refs': [],
+                'baseline_validation_refs': [],
                 'task_board_ref': None, 'todo_list_ref': None,
                 'inherited_evidence_refs': []})
 
@@ -245,23 +191,14 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
             engine.event(state, 'subtask.started', {'child_run_id': child.run_id,
                 'parent_step_id': parent_step, 'role': task.role, 'generation': task.source_revision})
             try:
-                from tracefix.runtime.attempt_worker import attempt_candidate, attempt_workspace
-                isolation = (attempt_workspace(engine, state, child, task) if task.write_enabled
-                             else nullcontext((engine, None)))
-                with isolation as (worker_engine, baseline):
-                    call = worker_engine.model_call(child, WorkerResult, {
-                        'worker_depth': 1, 'worker_write_enabled': task.write_enabled,
-                        'worker_attempt': task.write_enabled, 'worker_same_model': True,
-                        'worker_allowed_files': task.allowed_files,
-                        'worker_writable_files': task.writable_files,
-                        'allowed_tools': task.allowed_tools,
-                        'worker_shell_mode': task.shell_mode,
-                        'goal': task.goal, 'instruction': task.prompt,
-                        'role': task.role, 'allowed_evidence_refs': child.evidence_refs})
-                    result = await (asyncio.wait_for(call, timeout=task.timeout_seconds)
-                                    if task.timeout_seconds is not None else call)
-                    attempt = (attempt_candidate(engine, state, worker_engine, child, task, baseline)
-                               if task.write_enabled else None)
+                call = engine.model_call(child, WorkerResult, {
+                    'worker_depth': 1, 'worker_same_model': True,
+                    'worker_allowed_files': task.allowed_files,
+                    'allowed_tools': task.allowed_tools, 'worker_shell_mode': task.shell_mode,
+                    'goal': task.goal, 'instruction': task.prompt,
+                    'role': task.role, 'allowed_evidence_refs': child.evidence_refs})
+                result = await (asyncio.wait_for(call, timeout=task.timeout_seconds)
+                                if task.timeout_seconds is not None else call)
                 reverse_artifacts = {value: key for key, value in copied_artifacts.items()}
                 result.evidence_refs = [reverse_artifacts.get(reference, reference)
                                         for reference in result.evidence_refs]
@@ -276,10 +213,6 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
                 result.task_id, result.run_id = task.task_id, state.run_id
                 result.role, result.phase = task.role, task.phase
                 result.data['child_run_id'] = child.run_id
-                if attempt is not None:
-                    result.data['attempt'] = attempt
-                    # 子模型自报 hash/成功只代表尝试结果，不能作为父候选或最终验证。
-                    result.patch_hash = None
                 result.data['usage'] = child.budget.model_dump()
                 engine.event(state, 'subtask.completed', {'child_run_id': child.run_id,
                     'parent_step_id': parent_step, 'role': task.role, 'usage': result.data['usage']})
@@ -371,8 +304,6 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
         submission = ('submit_test_spec', StrictTestSpec, Phase.PREPARE)
     elif schema in {Decision, BrowserAction}:
         submission = ('finish_exploration', schema, Phase.EXPLORE)
-    elif schema is PatchProposal and state.repair_mode != 'hybrid':
-        submission = ('propose_patch', PatchProposal, Phase.DIAGNOSE)
     elif schema is ReportFindings:
         submission = ('report_findings', ReportFindings, phase)
     if submission and not worker_mode:
@@ -398,20 +329,10 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
                         allowed_evidence.add(state.observation_ref)
                 if hasattr(value, 'evidence_refs') and not set(value.evidence_refs) <= allowed_evidence:
                     raise ToolRejected('提交引用了当前 Run 之外的证据')
-                if schema is PatchProposal:
-                    value = materialize_patch_proposal(engine, state, value)
-                    engine.validate_patch_candidate(value, state=state)
             except Exception as error:
                 if (getattr(error, 'status', 'FAILED') != 'FAILED'
                         or getattr(error, 'details', {}).get('requires_manual_review')):
                     raise
-                details = dict(getattr(error, 'details', {}))
-                if getattr(error, 'error_code', None):
-                    details.setdefault('error_code', error.error_code)
-                if schema is PatchProposal and details.get('error_code'):
-                    from tracefix.tools.core import ToolResult
-                    return ToolResult(call_id=call_id, name=name, isError=True,
-                        result=details, error={**details, 'message': str(error), 'executed': False})
                 raise ToolRejected(str(error)) from error
             submissions[name] = value
             return {'accepted': True, 'submission': name, 'value': value.model_dump(mode='json')}
@@ -420,16 +341,12 @@ def build_runtime_tools(engine, state, schema, context=None, validate_output=Non
              input_model, submit, phases={required_phase}, side_effect='write',
              parallel_safe=False, submission=True, output_limit_tokens=2000)
     def resources(name, arguments):
-        if name in {'Write', 'Edit', 'NotebookEdit'}:
-            return [file_resource(arguments.get('file_path') or arguments['notebook_path'])]
-        if name in {'Bash', 'RevertOverlay', 'finish_repair'}:
+        if name == 'Bash':
             return [file_resource(engine.workspace.root)]
         if name == 'memory.note':
             return [file_resource(memory.path)]
         if name == 'agent.delegate':
-            paths = arguments.get('writable_files') or []
-            return ([file_resource(engine.workspace.root / path) for path in paths]
-                    if paths else ['delegation:' + state.run_id])
+            return ['delegation:' + state.run_id]
         if name in {'TaskCreate', 'TaskUpdate', 'TodoWrite'}:
             return ['run-tasks:' + state.scope_id + ':' + state.run_id]
         if name == 'Skill':

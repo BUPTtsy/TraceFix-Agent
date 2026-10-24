@@ -21,12 +21,12 @@ from langgraph.errors import GraphInterrupt, GraphRecursionError
 
 from tracefix.execution.browser import (MCPActionNotDispatched, MCPActionUnknown, MCPConnectionError, assertions,
     resolve_locator, validate_spec_observation)
-from tracefix.model.gateway import Gateway, ModelError, ModelOutputError
+from tracefix.model.gateway import ModelError, ModelOutputError
 from tracefix.model.chat_completions import reasoning_records
 from tracefix.knowledge.context import SkillCatalog, build_context
 from tracefix.knowledge.selection import select_documents
-from tracefix.rules import (Finding, RuleResolver, RuleSnapshot, evaluate_oracle, evaluate_oracle_result,
-                            evaluate_static, evaluate_static_result)
+from tracefix.rules import (Finding, RuleSnapshot, evaluate_oracle, evaluate_oracle_result,
+                            evaluate_static_result)
 from tracefix.rules.resolver import render_rule_context, rule_applies
 from tracefix.runtime.contracts import (BudgetExceeded, BrowserAction, CheckJudgement, CheckPlan,
     CheckResult, Decision, GoalCheckDraft, Outcome,
@@ -34,23 +34,17 @@ from tracefix.runtime.contracts import (BudgetExceeded, BrowserAction, CheckJudg
     reduce_state, verification_gate)
 from tracefix.runtime.guidance import (GuidanceLedger, GuidanceRejected, active_guidance,
                                       retarget_state)
-from tracefix.runtime.repair_mode import repair_mode_fields
-from tracefix.runtime.repair_progress import assess_repair, observe_repair
-from tracefix.tools.handlers import build_runtime_tools, materialize_patch_proposal
+from tracefix.tools.handlers import build_runtime_tools
 from tracefix.tools.browser import execute_browser_tool
 from tracefix.tools.evidence import attach_source_evidence_tools
 from tracefix.runtime.skills import SkillStore
 from tracefix.runtime.finding_acceptance import (FrozenFindingAcceptance, _binding, _judge_report,
     _validate_current, freeze_finding_acceptance, read_finding_reproduction)
-from tracefix.runtime.validation_feedback import (ValidationFeedback, build_validation_feedback,
-    feedback_is_current)
 from tracefix.runtime.verification import verification_binding
 from tracefix.tools.effects import file_resource, make_operation_executor
 from tracefix.runtime.event_adapter import EventAdapter, EventCursor
 from tracefix.runtime.recovery import (RecoveryAction, RecoveryCause, RecoveryController,
                                       classify_cause, has_real_progress)
-from tracefix.runtime.diagnosis import (DiagnosisDraft, DiagnosisReport, binding_from_observation,
-    symptom_query, validate_report)
 from tracefix.runtime.checks import make_check_plan, oracle_ready, scope_matches, summarize_checks
 from tracefix.knowledge.assembler import ContextAssembler, ContextWindowError
 from tracefix.storage.artifacts import redact, sanitize
@@ -227,7 +221,6 @@ class Engine:
     LOOP_NO_PROGRESS_WARNING = 20
     LOOP_NO_PROGRESS_LIMIT = 40
     LOOP_RECOVERY_GRACE_STEPS = 4
-    DIAGNOSIS_RETRY_LIMIT = 3
 
     def __init__(self, store, artifacts, scopes, context, profile, workspace, runner,
                  browser, model, retriever, source, checkpointer, notify=None,
@@ -679,7 +672,7 @@ class Engine:
         if not callable(method):
             return self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.INCONCLUSIVE,
                                 error='当前环境缺少 Finding 独立验收执行器')
-        if not verify and (s.patch_hash or s.patch_ref or s.staged_candidate_refs):
+        if not verify and (s.patch_hash or s.patch_ref):
             raise ValueError('Finding 独立复现必须先于任何候选补丁')
         stage = 'verify' if verify else 'baseline'
         intent = {'acceptance_hash': frozen.acceptance_hash, 'stage': stage,
@@ -1230,13 +1223,6 @@ class Engine:
                              'count': error_count})
         if s.loop_no_progress_steps == self.LOOP_NO_PROGRESS_WARNING:
             warnings.append({'kind': 'no_progress', 'steps': s.loop_no_progress_steps})
-        if s.repair_mode == 'hybrid' and s.phase == Phase.DIAGNOSE:
-            # 同一 DIAGNOSE 内允许多个有进展的工具段，使用实际修复语义判停。
-            warnings = [item for item in warnings if item['kind'] != 'state_repeated']
-            signals = [item for item in signals if item['kind'] != 'state_repeated']
-            repair = assess_repair(s)
-            warnings.extend(repair['warnings'])
-            signals.extend(repair['signals'])
         return fingerprint, warnings, signals
 
     async def _recovery_action(self, s, decision):
@@ -1287,9 +1273,6 @@ class Engine:
                     'no_progress_steps': s.loop_no_progress_steps}
         if (s.loop_evidence or {}).get('verification_results'):
             evidence['verification_results'] = s.loop_evidence['verification_results']
-        for key in ('repair', 'repair_session'):
-            if key in (s.loop_evidence or {}):
-                evidence[key] = s.loop_evidence[key]
         episode_key = self.recovery.active_episode_id(s.recovery_episodes, cause)
         if episode_key is None:
             episode_key = digest([s.run_id, cause.value, s.revision])
@@ -1313,9 +1296,6 @@ class Engine:
             status='continued' if decision.can_continue else 'settled')
         if decision.can_continue:
             target_phase = s.phase
-            if s.repair_mode == 'hybrid' and decision.action.value == 'correct_strategy':
-                observe_repair(self, s, 'correction')
-                evidence['repair'] = s.loop_evidence.get('repair', {})
             if (decision.action.value == 'correct_strategy'
                     and s.phase in {Phase.PATCH, Phase.VERIFY}):
                 target_phase = Phase.DIAGNOSE
@@ -1445,8 +1425,7 @@ class Engine:
         original_validation = validate_output
 
         def validate_candidate(candidate):
-            if schema.__name__ != 'FinishRepair':
-                self.acknowledge_guidance(s, candidate, ctx)
+            self.acknowledge_guidance(s, candidate, ctx)
             if original_validation:
                 original_validation(candidate)
             if hasattr(candidate, 'rule_refs'):
@@ -1467,7 +1446,7 @@ class Engine:
         if s.error:
             ctx = {**ctx, 'runtime_feedback': s.error,
                    'runtime_error_details': s.error_details}
-        if self.memory is not None and not ctx.get('worker_readonly_investigation'):
+        if self.memory is not None:
             # 每次调用重新读取 L1/L2，让工具写入的新记忆立即生效；L2 按源码 manifest 隔离。
             ctx['working_memory'] = self.memory.working_memory(
                 s.scope_id, s.run_id, query=s.goal, phase=s.phase,
@@ -1720,9 +1699,6 @@ class Engine:
         result = await selected_model.generate(schema, ctx, image=image,
             agent_instructions=self.agent_instructions(s), on_attempt=attempt,
             on_response=response, on_error=error, on_usage=usage, **generation_kwargs)
-        if schema.__name__ == 'FinishRepair' and not isinstance(tool_pipeline.submission_value, PatchProposal):
-            raise ModelOutputError('FinishRepair 必须通过运行时提交工具，不能直接返回补丁或成功声明',
-                                   category='output_validation')
         if tool_pipeline.submission_value is not None:
             result = type(result)(tool_pipeline.submission_value, result.usage,
                                   result.model_revision, result.finish_reason)
@@ -1734,11 +1710,10 @@ class Engine:
             self.store.save(s)
         self.event(s, 'model.called', {'model_revision': result.model_revision, 'usage': result.usage,
                                       'finish_reason': result.finish_reason})
-        if isinstance(result.value, (Decision, PatchProposal)):
+        if isinstance(result.value, Decision):
             self.event(s, 'model.decision', {'summary': result.value.summary,
                 'evidence_refs': result.value.evidence_refs,
-                'action': result.value.action.model_dump() if isinstance(result.value, Decision) else
-                          {'kind': 'propose_patch', 'files': [edit.path for edit in result.value.edits]}})
+                'action': result.value.action.model_dump()})
         return result.value
 
     async def capture(self, s, raw, action=None):
@@ -1889,7 +1864,7 @@ class Engine:
     def _graph(self, saver):
         graph = StateGraph(GraphState)
         names = ['prelude', 'prepare', 'decide', 'execute', 'explore_gate', 'reproduce',
-                 'check_suite', 'diagnose', 'repair_loop', 'patch', 'verify', 'review', 'paused', 'finalize',
+                 'check_suite', 'patch', 'verify', 'paused', 'finalize',
                  'harness_initialize', 'harness_claim', 'harness_code', 'harness_review',
                  'harness_accept', 'harness_final']
         for name in names:
@@ -1897,11 +1872,6 @@ class Engine:
                 s = RunState(**data['data'])
                 # Usage committed before a crash takes precedence over old graph state.
                 saved = self.store.load(s.run_id, s.scope_id)
-                if node == 'repair_loop' and saved.revision >= s.revision:
-                    # 段内中断后的持久化会话优先于上一个图 checkpoint。
-                    s = saved
-                    if s.phase != Phase.DIAGNOSE:
-                        return self.output(s, 'prelude')
                 s.guidance = saved.guidance
                 s.guidance_constraints = saved.guidance_constraints
                 for metric in ('model_calls', 'browser_actions', 'patches', 'subtasks', 'tokens', 'cost_usd'):
@@ -1987,10 +1957,7 @@ class Engine:
                     s = self.changed(current, last_error_signature=signature,
                                      loop_error_signatures=current.loop_error_signatures + [signature])
                     _, _, loop_signals = self._loop_assessment(s)
-                    diagnostic_feedback = (s.phase in {Phase.DIAGNOSE, Phase.PATCH}
-                        and (isinstance(e, (ModelOutputError, BudgetExceeded))
-                             or s.execution_mode == 'batch' and isinstance(e, ValueError)))
-                    if (loop_signals and not diagnostic_feedback
+                    if (loop_signals
                             and not (isinstance(e, (ModelError, MCPConnectionError, MCPActionUnknown))
                             and e.status in {'UNKNOWN_OPERATION', 'WAITING_NETWORK'})):
                         s = await self._mark_loop(s, self._loop_state_fingerprint(s), [], loop_signals)
@@ -2045,43 +2012,9 @@ class Engine:
                     if (isinstance(e, (ModelOutputError, BudgetExceeded))
                             or s.execution_mode == 'batch' and isinstance(e, ValueError)):
                         current = self.store.load(s.run_id, s.scope_id)
-                        retryable_phase = current.phase in {Phase.DIAGNOSE, Phase.PATCH}
-                        retry_count = current.diagnosis_retry_count + (1 if retryable_phase else 0)
-                        feedback_ref = None
-                        if retryable_phase:
-                            feedback_ref, feedback = self._diagnosis_feedback(current, e)
-                            feedback_text = ('输出未通过校验。请重新读取相关文件和失败证据，'
-                                              '提出有实际差异的最小补丁；本次反馈：'
-                                              + feedback['message'])
-                            details = {'feedback': feedback_text,
-                                       'retry_count': retry_count,
-                                       'feedback_ref': feedback_ref,
-                                       'additional_context': ['diagnosis_feedback_refs',
-                                                              'current_workspace_diff',
-                                                              'latest_failure_evidence']}
-                            if s.execution_mode == 'batch' and retry_count >= self.DIAGNOSIS_RETRY_LIMIT:
-                                s = self.changed(current, phase=Phase.FINALIZE,
-                                    run_status=RunStatus.RUNNING,
-                                    outcome=Outcome.REPAIR_EXHAUSTED,
-                                    diagnosis_retry_count=retry_count,
-                                    diagnosis_feedback_refs=current.diagnosis_feedback_refs + [feedback_ref],
-                                    error=sanitize(f'{type(e).__name__}: {error_message(e)}')[:1500],
-                                    error_details={**details, 'terminal_reason': 'diagnosis_retry_limit'},
-                                    pending_action=None)
-                                self.event(s, 'run.error', {'error': s.error,
-                                    'error_details': s.error_details,
-                                    'action': '诊断重试次数耗尽，输出最终报告'})
-                                return self.output(s, 'finalize')
-                        else:
-                            details = {'feedback': '输出未通过校验，请依据错误重新输出'}
-                        delta = {'error': sanitize(f'{type(e).__name__}: {error_message(e)}')[:1500],
-                                 'error_details': details, 'pending_action': None}
-                        if retryable_phase:
-                            delta.update(diagnosis_retry_count=retry_count,
-                                         diagnosis_feedback_refs=current.diagnosis_feedback_refs + [feedback_ref])
-                            if current.phase == Phase.PATCH:
-                                delta.update(phase=Phase.DIAGNOSE, patch_ref=None)
-                        s = self.changed(current, **delta)
+                        s = self.changed(current, error=sanitize(f'{type(e).__name__}: {error_message(e)}')[:1500],
+                                         error_details={'feedback': '输出未通过校验，请依据错误重新输出'},
+                                         pending_action=None)
                         self.event(s, 'run.error', {'error': s.error, 'error_details': s.error_details,
                                                     'action': '反馈给模型并重试'})
                         return self.output(s, 'prelude')
@@ -2089,9 +2022,7 @@ class Engine:
                         s = self.changed(s, error=sanitize(f'{type(e).__name__}: {error_message(e)}')[:1500],
                                          error_details={'feedback': '该动作被策略拒绝，请根据原因重新决策',
                                                         **(e.details if isinstance(e, GuidanceRejected) else {})},
-                                         pending_action=None,
-                                         **({'phase': Phase.DIAGNOSE, 'patch_ref': None}
-                                            if isinstance(e, GuidanceRejected) and s.phase == Phase.PATCH else {}))
+                                         pending_action=None)
                         self.event(s, 'run.error', {'error': s.error, 'error_details': s.error_details,
                                                     'action': '反馈给模型'})
                         return self.output(s, 'prelude')
@@ -2127,14 +2058,6 @@ class Engine:
                             outcome=outcome, error=message, error_details=details,
                             pending_action=None)
 
-    def _diagnosis_feedback(self, s, error):
-        """Persist rich feedback so the next patch proposal has new context."""
-        detail = {'type': type(error).__name__, 'message': sanitize(error_message(error)),
-                  'phase': str(s.phase), 'attempt': s.diagnosis_retry_count + 1,
-                  'error_details': redact(getattr(error, 'details', {}) or {})}
-        ref = self.put(s, detail, name='诊断重试反馈')
-        return ref, detail
-
     def route(self, s):
         if s.harness_job_id:
             if self.harness is None:
@@ -2147,10 +2070,11 @@ class Engine:
                 return 'harness_review'
         if s.phase != Phase.FINALIZE and s.check_suite_stage and not s.check_suite_completed:
             return 'check_suite'
+        if s.phase in {Phase.DIAGNOSE, Phase.REVIEW}:
+            # 编码与候选审查只由 SDK Harness 执行，不保留宿主模型旁路。
+            raise RuntimeError('repair 编码只能由 Claude Agent SDK Harness 执行')
         return {Phase.PREPARE: 'prepare', Phase.EXPLORE: 'decide', Phase.REPRODUCE: 'reproduce',
-                Phase.DIAGNOSE: 'repair_loop' if s.repair_mode == 'hybrid' else 'diagnose',
-                Phase.PATCH: 'patch', Phase.VERIFY: 'verify',
-                Phase.REVIEW: 'review', Phase.FINALIZE: 'finalize'}[s.phase]
+                Phase.PATCH: 'patch', Phase.VERIFY: 'verify', Phase.FINALIZE: 'finalize'}[s.phase]
 
     async def prelude(self, s, _):
         if s.harness_job_id:
@@ -2360,14 +2284,15 @@ class Engine:
             return self.output(s, 'prelude')
         if s.harness_job_id and s.harness_stage == 'initialize':
             return self.output(s, 'harness_initialize')
-        if s.coding_backend == 'claude_sdk' and not s.harness_job_id and s.test_spec_ref:
+        if s.mode == 'repair' and not s.harness_job_id and s.test_spec_ref:
             from tracefix.runtime.harness_bootstrap import create_harness_job
+            if not s.coding_config_ref:
+                raise PermissionError('repair 任务缺少冻结的 Claude Agent SDK 配置')
             s = create_harness_job(self, s, console_task_id=s.job_id or s.run_id,
                 local_commit_authorized=True, config=self.get(s, s.coding_config_ref))
             return self.output(s, 'harness_initialize')
         if command_mode:
-            phase = Phase.VERIFY if s.continuation_count and s.patch_hash and s.reproduced else Phase.EXPLORE
-            return self.output(self.changed(s, phase=phase, step=0), 'prelude')
+            return self.output(self.changed(s, phase=Phase.EXPLORE, step=0), 'prelude')
         if s.repair_source and self._finding_acceptance(s) is not None and not s.finding_reproduction_ref:
             s = await self.execute_finding_acceptance(s)
             if s.phase == Phase.FINALIZE:
@@ -2404,10 +2329,8 @@ class Engine:
         if not s.check_plan_ref:
             s = await self.ensure_check_plan(s)
             return self.output(s, 'prelude')
-        phase = Phase.VERIFY if s.continuation_count and s.patch_hash and (s.reproduced or s.initial_check_result_refs) and s.replay_plan_ref else Phase.EXPLORE
-        if phase == Phase.EXPLORE:
-            await self.discover(s)
-        s = self.changed(s, phase=phase, step=0)
+        await self.discover(s)
+        s = self.changed(s, phase=Phase.EXPLORE, step=0)
         return self.output(s, 'prelude')
 
     def record_gui_issues(self, s, decision, observation):
@@ -3042,12 +2965,6 @@ class Engine:
         return self.changed(s, exploration_plan_ref=s.replay_plan_ref, replay_plan_ref=ref,
                             reproduction_binding_ref=binding, reproduction_plan_frozen=True)
 
-    async def repair_loop(self, s, _):
-        if s.harness_job_id:
-            return await self.harness.code(self, s)
-        from tracefix.runtime.repair_loop import run_segment
-        return await run_segment(self, s)
-
     async def harness_initialize(self, s, _):
         output = await self.harness.initialize(self, s)
         self.harness.project(s)
@@ -3073,351 +2990,6 @@ class Engine:
 
     async def harness_final(self, s, _):
         return await self.harness.final(self, s)
-
-    async def diagnose(self, s, _):
-        if s.mode == 'repair':
-            self.require_repair_rule_coverage(s)
-            if s.repair_source and not s.reproduced:
-                raise ValueError('Finding Repair 必须在独立 Run 内重新稳定复现后诊断')
-        self.warn_retrieval_degraded(s)
-        self.workspace.check_frozen(self.source)
-        overlay = s.source_manifest + (':' + s.patch_hash if s.patch_hash else '')
-        await self.retriever.index(self.workspace, overlay)
-        readers = {
-            'artifact_exists': lambda ref: self.artifacts.exists(s.scope_id, s.run_id, ref),
-            'artifact_read': lambda ref: self.get(s, ref),
-        }
-        code = await self.retriever.retrieve(s.goal, overlay, 'M1', 10,
-            state=s, phase=s.phase)
-        recipes = await self.retriever.retrieve(s.goal, s.source_manifest, 'M3', 3,
-            state=s, phase=s.phase, allow_compatible=False, **readers)
-        observation = self.get(s, s.observation_ref) if s.observation_ref else None
-        action_observations = self.phase_observations(s, Phase.VERIFY if s.patch_hash else Phase.REPRODUCE)[-4:]
-        if not action_observations:
-            action_observations = self.phase_observations(s, Phase.EXPLORE)[-4:]
-        query_observation = {**(observation or {}), 'network': '\n'.join(
-            [str((observation or {}).get('network', ''))] +
-            [str(item['observation'].get('network', '')) for item in action_observations])}
-        query = symptom_query(s.goal, self.spec(s).assertions, query_observation)
-        # 直接读取当前授权文件以核验检索卡片，并提供补丁校验所需的 before_hash。
-        preferred = [json.loads(card['content']).get('path') for card in code if card.get('content', '').startswith('{')]
-        card_limit = 60_000 * (s.diagnosis_retry_count + 1)
-        broad_cards = self.workspace.cards(limit_chars=card_limit, preferred_paths=preferred)
-        if hasattr(self.workspace, 'fragments'):
-            cards = self.workspace.fragments(query, preferred_paths=preferred, limit_chars=24_000)
-            if not cards:
-                cards = broad_cards
-        else:
-            cards = broad_cards
-        if self.rule_library and self.rule_resolver:
-            files = []
-            for path in self.workspace.files():
-                try:
-                    files.append((path, self.workspace.read(path)))
-                except (OSError, PermissionError, ValueError):
-                    continue
-            for rule in self.active_rules(s, str(Phase.DIAGNOSE)):
-                findings = evaluate_static(rule, files, job_id=s.run_id, run_id=s.run_id)
-                source_ref = self.put(s, {'scope_id': s.scope_id, 'run_id': s.run_id,
-                    'source_manifest': s.source_manifest, 'patch_hash': s.patch_hash,
-                    'files': [{'path': path, 'content_hash': digest(content)} for path, content in files]},
-                    name='静态规则诊断证据') if findings else None
-                if source_ref:
-                    s.evidence_refs = list(dict.fromkeys(s.evidence_refs + [source_ref]))
-                for finding in findings:
-                    saved = self.rule_library.save_finding(self.bind_finding(s, finding, rule,
-                        evidence_refs=[source_ref]))
-                    self.event(s, 'finding.created', {'finding_id': saved.id, 'rule_id': saved.rule_id,
-                                                     'rule_version': saved.rule_version, 'source': 'static',
-                                                     'finding': saved.model_dump(mode='json'),
-                                                     'expectation': rule.name})
-        observation = self.get(s, s.observation_ref) if s.observation_ref else None
-        if s.observation_ref and s.observation_ref not in s.evidence_refs:
-            s = self.changed(s, evidence_refs=s.evidence_refs + [s.observation_ref])
-        for item in action_observations:
-            if item['observation_ref'] not in s.evidence_refs:
-                s.evidence_refs.append(item['observation_ref'])
-        for card in cards:
-            card_ref = self.put(s, card, name='诊断源码片段')
-            card['artifact_ref'] = card_ref
-            if card_ref not in s.evidence_refs:
-                s.evidence_refs.append(card_ref)
-        context = build_context(s, self.spec(s).model_dump(), observation=observation, cards=cards,
-                                rules=self.active_rules(s, str(Phase.DIAGNOSE)))
-        context['reference_documents'] = await select_documents(self, s)
-        validations = []
-        validation_observations = []
-        for validation_ref in s.validation_refs:
-            validation = self.get(s, validation_ref)
-            if validation.get('patch_hash') != s.patch_hash:
-                continue
-            result = self.get(s, validation['artifact_ref'])
-            validations.append({**validation, 'result': result})
-            observation_ref = result.get('observation_ref')
-            if observation_ref:
-                validation_observations.append({'observation_ref': observation_ref,
-                                               'observation': self.get(s, observation_ref)})
-                if observation_ref not in s.evidence_refs:
-                    s.evidence_refs.append(observation_ref)
-        self.store.save(s)
-        context['available_evidence_refs'] = list(dict.fromkeys(context['available_evidence_refs'] + s.evidence_refs))
-        context.update(instruction='请诊断并提出最小局部补丁。优先 Read 取得当前 overlay_hash/revision，使用唯一 exact anchor 的 Edit(edits) 生成候选；检查真实 diff 后提交 staged_refs。运行时物化完整内容，模型无需重写未变全文。兼容旧 whole edits。只能编辑当前允许的文件并引用已有证据，失败按 error_code 重读/修正。',
-                       allowed_files=self.workspace.allowed_files, repair_memory=recipes, retrieval_ids=[x['id'] for x in code],
-                       failures=[self.get(s, r) for r in s.evidence_refs[-4:]],
-                       previous_validation=validations, validation_observations=validation_observations,
-                       replay_plan=self.get(s, s.replay_plan_ref) if s.replay_plan_ref else [],
-                       current_workspace_diff=self.workspace.diff(),
-                       diagnosis_retry_count=s.diagnosis_retry_count,
-                       diagnosis_feedback=self.current_diagnosis_feedback(s),
-                       staged_candidates=list(s.staged_candidate_refs))
-        diagnosis_report = None
-        action_id, window_start = None, None
-        for event in reversed(self.store.trace(s.run_id, s.scope_id)):
-            if event['type'] == 'tool.started' and event.get('payload', {}).get('intent', {}).get('kind') in {'click', 'type', 'select', 'press'}:
-                action_id, window_start = event['payload'].get('operation_id'), event.get('at')
-                break
-        binding = binding_from_observation(s, observation or {}, action_id=action_id,
-            window_start=window_start, window_end=(observation or {}).get('observed_at'),
-            dom_assertions=assertions((observation or {}).get('snapshot', ''), self.spec(s).assertions)['assertions'])
-        channel_refs = list((observation or {}).get('raw_refs', {}).values())
-        channel_refs.extend(ref for item in action_observations
-                            for ref in item['observation'].get('raw_refs', {}).values())
-        diagnosis_refs = list(dict.fromkeys(context['available_evidence_refs'] + [
-            ref for ref in channel_refs if self.artifacts.exists(s.scope_id, s.run_id, ref)]))
-        diagnosis_context = {'policy': context['policy'], 'goal': s.goal,
-                'scope': s.scope_id, 'test_spec': self.spec(s).model_dump(mode='json'),
-                'observation': observation,
-                'symptom_binding': binding.model_dump(mode='json'),
-                'source_fragments': cards,
-                'cards': cards,
-                'workspace_root': str(self.workspace.root),
-                'action_observations': [{
-                    'action': item['action'], 'observation_ref': item['observation_ref'],
-                    'observed_at': item['observation'].get('observed_at'),
-                    'url': item['observation'].get('url'),
-                    'raw_refs': item['observation'].get('raw_refs', {}),
-                    'assertions': assertions(item['observation'].get('snapshot', ''), self.spec(s).assertions)['assertions'],
-                    'console': self._bounded_text(item['observation'].get('console', ''), 6000)[0],
-                    'network': self._bounded_text(item['observation'].get('network', ''), 6000)[0],
-                    'collection': item['observation'].get('collection', {})} for item in action_observations],
-                'evidence_refs': diagnosis_refs,
-                'available_evidence_refs': diagnosis_refs,
-                'validation_results': [{'kind': item['kind'], 'passed': item['passed'],
-                    'assertions': item['result'].get('assertions', []),
-                    'observation_ref': item['result'].get('observation_ref')} for item in validations],
-                'worker_depth': 1, 'worker_same_model': True,
-                'worker_readonly_investigation': True,
-                'worker_allowed_files': list(dict.fromkeys(card['path'] for card in cards))[:15],
-                'allowed_tools': ['Read', 'Grep', 'Glob'],
-                'worker_allowed_tools': ['Read', 'Grep', 'Glob'],
-                'worker_write_enabled': False, 'worker_shell_mode': 'disabled',
-                'instruction': '输出可反驳的少量诊断假设；只能引用已有 evidence_refs 和当前源码片段。'
-                               'Read 参数是 file_path（workspace_root 下绝对路径）、offset（起始行）、limit（行数），'
-                               '可选 expected_content_version；按需读取命中邻域即可。'
-                               '沿文案/API搜索命中追踪 handler、store/state、API、hydration；'
-                               '无关404仅为线索，不能单独证明因果。source-map/initiator 不可用时标 unavailable，不推断无请求。'}
-        input_ref = self.put(s, diagnosis_context, name='诊断输入')
-        self.event(s, 'diagnosis.started', {'input_ref': input_ref, 'source_manifest': s.source_manifest,
-                                         'observation_ref': s.observation_ref})
-        model_support = getattr(self.model, 'supports_structured_diagnosis', False)
-        if model_support:
-            versions = {card['path']: card.get('content_version', digest(self.workspace.source_bytes(card['path'])[1]))
-                        for card in cards}
-            def validate_diagnosis(candidate):
-                try:
-                    candidate = DiagnosisReport(**candidate.model_dump(mode='json'),
-                        binding=binding, source_version=s.source_manifest)
-                    candidate_versions = dict(versions)
-                    for hypothesis in candidate.hypotheses:
-                        for path in hypothesis.candidate_paths:
-                            self.workspace.path(path.path)
-                            candidate_versions[path.path] = digest(self.workspace.source_bytes(path.path)[1])
-                    validate_report(candidate, evidence_refs=s.evidence_refs + diagnosis_refs,
-                        allowed_files=list(self.workspace.files()), source_manifest=s.source_manifest,
-                        environment_digest=s.environment_digest, binding=binding, content_versions=candidate_versions)
-                except (ValueError, PermissionError) as error:
-                    raise ModelOutputError(str(error), category='diagnosis_validation') from error
-            diagnosis_draft = await self.model_call(s, DiagnosisDraft, diagnosis_context,
-                                                   validate_output=validate_diagnosis)
-            diagnosis_report = DiagnosisReport(**diagnosis_draft.model_dump(mode='json'),
-                binding=binding, source_version=s.source_manifest)
-            validate_report(diagnosis_report, evidence_refs=s.evidence_refs + diagnosis_refs,
-                allowed_files=list(self.workspace.files()), source_manifest=s.source_manifest,
-                environment_digest=s.environment_digest, binding=binding,
-                content_versions={path: digest(self.workspace.source_bytes(path)[1])
-                                  for hypothesis in diagnosis_report.hypotheses
-                                  for path in (candidate.path for candidate in hypothesis.candidate_paths)})
-            diagnosis_ref = self.put(s, diagnosis_report.model_dump(mode='json'), name='结构化诊断')
-            context['diagnosis_report_ref'] = diagnosis_ref
-            context['diagnosis'] = diagnosis_report.model_dump(mode='json')
-            context['hypothesis_refs'] = [item.id for item in diagnosis_report.hypotheses]
-            s.hypothesis_refs.append(diagnosis_ref)
-            self.store.save(s)
-            self.event(s, 'diagnosis.completed', {'report_ref': diagnosis_ref, 'generated_by': 'model',
-                'statuses': [item.status for item in diagnosis_report.hypotheses]})
-            if not any(item.status == 'supported' for item in diagnosis_report.hypotheses):
-                raise ModelOutputError('诊断尚无当前证据支持的根因；需执行区分性探针或补充来源',
-                    category='diagnosis_unresolved', details={'diagnosis_ref': diagnosis_ref,
-                        'unresolved': diagnosis_report.unresolved})
-        else:
-            diagnosis_report = DiagnosisReport(binding=binding, source_version=s.source_manifest,
-                generated_by='deterministic_unavailable', unresolved=['当前模型未声明结构化诊断支持'])
-            diagnosis_ref = self.put(s, diagnosis_report.model_dump(mode='json'), name='诊断不可用')
-            context['diagnosis'] = diagnosis_report.model_dump(mode='json')
-            self.event(s, 'diagnosis.unavailable', {'report_ref': diagnosis_ref,
-                'generated_by': 'deterministic_unavailable'})
-        if s.diagnosis_retry_count:
-            context['instruction'] += (' 上一次未形成有效补丁。重新核对完整复现步骤、当前页面、失败断言与源码调用链；'
-                                       '按未决预测定向搜索/重读片段；只包含实际有改动的文件，'
-                                       '不要为了满足输出要求编造无意义改动。')
-        worker_enabled = (os.getenv('TRACEFIX_WORKER', '1') != '0'
-            and os.getenv('TRACEFIX_AGENT_MODE', '').lower() != 'single'
-            and getattr(self, 'subagent_enabled', True)
-            and not getattr(self, 'subagent_depth', 0))
-        self.event(s, 'diagnosis.worker.policy', {'agent_mode': os.getenv('TRACEFIX_AGENT_MODE', 'multi'),
-            'legacy_worker_switch': os.getenv('TRACEFIX_WORKER', '1'), 'enabled': worker_enabled})
-        if worker_enabled:
-            from tracefix.runtime.worker import ReadOnlyWorker, SubtaskSpec
-            specs = [SubtaskSpec(s.goal, 'code-explorer', s.revision,
-                tuple(card['path'] for card in cards[:3]), tuple(s.evidence_refs[-2:]))]
-            # 非 GUI 目标没有页面观测；只委派实际存在的观测，不能把空引用当作证据授权。
-            observed = tuple(ref for ref in dict.fromkeys([s.observation_ref] +
-                [item['observation_ref'] for item in action_observations]) if ref)
-            if observed:
-                specs.append(SubtaskSpec(s.goal, 'evidence-reviewer', s.revision, (), observed))
-            results = await ReadOnlyWorker(self).group(s, specs)
-            accepted = []
-            for result in results:
-                worker_ref = self.put(s, result.model_dump(), name='子任务调查结果')
-                s.subtask_refs.append(worker_ref)
-                if result.status in {'completed', 'partial'} and (not result.unresolved or result.evidence_refs or result.files):
-                    accepted.append(result.model_dump())
-            context['investigations'] = accepted
-            context['read_only_investigations'] = accepted
-            claims = {}
-            for investigation in accepted:
-                for hypothesis in investigation.get('hypotheses', []):
-                    for candidate in hypothesis.get('candidate_paths', []):
-                        claims.setdefault(candidate['path'], []).append(hypothesis['summary'])
-            context['investigation_conflicts'] = [{'path': path, 'hypotheses': list(dict.fromkeys(summaries))}
-                for path, summaries in claims.items() if len(set(summaries)) > 1]
-            if context['investigation_conflicts']:
-                context['instruction'] += ' 只读调查存在冲突；先依据原件消歧，调查结果不能覆盖当前观察或补丁。'
-            self.store.save(s)
-        patch = await self.model_call(s, PatchProposal, context)
-        try:
-            patch = materialize_patch_proposal(self, s, patch)
-        except (ValueError, PermissionError) as error:
-            raise ModelOutputError(str(error), category='output_validation',
-                                   details=getattr(error, 'details', {})) from error
-        self.validate_rule_refs(s, patch.rule_refs)
-        if not set(patch.evidence_refs) <= set(s.evidence_refs):
-            invalid = sorted(set(patch.evidence_refs) - set(s.evidence_refs))
-            raise ModelOutputError(
-                '补丁引用了不存在的证据：' + '、'.join(invalid),
-                category='output_validation',
-                details={'invalid_evidence_refs': invalid})
-        self.validate_patch_candidate(patch, state=s)
-        ref = self.put(s, patch.model_dump(), name='补丁方案')
-        s = self.changed(s, phase=Phase.PATCH, patch_ref=ref, hypothesis_refs=s.hypothesis_refs+[ref],
-                         diagnosis_retry_count=0, error=None, error_details=None,
-                         last_error_signature=None)
-        return self.output(s, 'prelude')
-
-    def validate_patch_candidate(self, patch, *, state=None):
-        paths = [edit.path for edit in patch.edits]
-        if not paths:
-            raise ModelOutputError('候选必须先物化非空 edits', category='output_validation')
-        if len(paths) != len(set(paths)):
-            raise ModelOutputError('补丁包含重复的编辑路径', category='output_validation')
-        for edit in patch.edits:
-            try:
-                path = self.workspace.path(edit.path, write=True)
-            except (PermissionError, ValueError, FileNotFoundError) as error:
-                details = {**getattr(error, 'details', {}),
-                           'path': edit.path, 'reason': sanitize(error_message(error))}
-                if getattr(error, 'error_code', None):
-                    details['error_code'] = error.error_code
-                raise ModelOutputError('补丁路径未通过授权校验：' + edit.path,
-                    category='output_validation',
-                    details=details) from error
-            exists = path.is_file()
-            if (edit.operation == 'create') == exists:
-                raise ModelOutputError('补丁操作与目标文件是否存在不匹配：' + edit.path,
-                    category='output_validation', details={'error_code': 'STALE_BASE', 'written': False})
-            current = path.read_bytes() if exists else b''
-            if digest(current) != edit.before_hash:
-                raise ModelOutputError(
-                    '补丁基准哈希不匹配：' + edit.path,
-                    category='output_validation',
-                    details={'error_code': 'STALE_BASE', 'path': edit.path,
-                             'expected_before_hash': edit.before_hash, 'written': False,
-                             'actual_before_hash': digest(current),
-                             'next_step': '重新读取当前源码并重建局部候选，不能只更新 before_hash。'})
-            if not edit.content.strip() or current == edit.content.encode('utf-8'):
-                raise ModelOutputError(
-                    '补丁包含无实际改动的文件：' + edit.path,
-                    category='output_validation',
-                    details={'error_code': 'NO_CHANGE', 'written': False,
-                             'path': edit.path, 'reason': 'no_effective_change',
-                             'proposal_summary': patch.summary,
-                             'proposed_paths': paths})
-        try:
-            self.workspace.validate_guidance_patch(patch)
-        except PermissionError as error:
-            raise ModelOutputError('补丁不符合当前编辑约束：' + sanitize(error_message(error)),
-                category='output_validation', details=getattr(error, 'details', {})) from error
-        try:
-            self.workspace.validate_candidate_syntax(patch.edits)
-        except ValueError as error:
-            raise ModelOutputError(str(error), category='output_validation',
-                                   details=getattr(error, 'details', {})) from error
-        if state is not None:
-            fingerprint = self.candidate_fingerprint(patch)
-            for record in state.failed_candidate_signatures:
-                if (record.get('fingerprint') == fingerprint
-                        and record.get('source_manifest') == state.source_manifest
-                        and record.get('environment_digest') == state.environment_digest
-                        and record.get('test_spec_hash') == state.test_spec_hash):
-                    raise ModelOutputError('公开验证已经否定相同候选；请依据反证修正实际内容。',
-                        category='output_validation', details={'error_code': 'FAILED_CANDIDATE_REPEATED',
-                            'written': False, 'feedback_ref': record['feedback_ref'],
-                            'failed_patch_hash': record['patch_hash'],
-                            'next_step': '读取绑定失败反馈，修改实际候选后重新提交。'})
-
-    def candidate_fingerprint(self, patch=None):
-        replacements = {edit.path: edit.content.encode('utf-8') for edit in patch.edits} if patch else {}
-        changes = {}
-        source_files = self.source.get('files', {})
-        staged_files = self.workspace._staged_files
-        created_files = {path for path, entry in self.workspace._created_entries.items()
-                         if entry['kind'] == 'file'}
-        for path in sorted(set(source_files) | set(replacements) | set(staged_files) | created_files):
-            baseline_hash = source_files.get(path, digest(b''))
-            current = replacements.get(path)
-            if current is None:
-                current = staged_files.get(path)
-            if current is None:
-                current = self.workspace.path(path).read_bytes()
-            current_hash = digest(current)
-            if path not in source_files or current_hash != baseline_hash:
-                changes[path] = current_hash
-        return digest(changes)
-
-    def current_diagnosis_feedback(self, state):
-        records = []
-        plan_hash = self.verification_context(state)['plan_hash']
-        for ref in state.diagnosis_feedback_refs:
-            raw = self.get(state, ref)
-            if raw.get('type') == 'validation_feedback':
-                feedback = ValidationFeedback.model_validate(raw)
-                if not feedback_is_current(feedback, state, replay_plan_hash=plan_hash,
-                        artifact_exists=lambda item: self.artifacts.exists(state.scope_id, state.run_id, item),
-                        artifact_read=lambda item: self.get(state, item),
-                        artifact_read_bytes=lambda item: self.artifacts.read(state.scope_id, state.run_id, item)):
-                    continue
-            records.append(raw)
-        return records[-self.DIAGNOSIS_RETRY_LIMIT:]
 
     async def patch(self, s, _):
         self.scopes.assert_current(self.context)
@@ -3545,28 +3117,7 @@ class Engine:
             replay_plan_hash=binding['plan_hash'])
         ref = self.put(s, validation.model_dump(), name=validation_name+'验证记录')
         s = self.changed(s, validation_refs=s.validation_refs+[ref], replay_index=0)
-        if s.repair_mode == 'hybrid':
-            checkpoints = [self.get(s, item) for item in result.get('checkpoint_refs', [])]
-            observe_repair(self, s, 'verify', result={**result, 'result_ref': artifact,
-                'validation_ref': ref, 'candidate_fingerprint': self.candidate_fingerprint()},
-                **({'passed_counts': {'behavior': sum(item.get('passed') is True for item in checkpoints)}}
-                   if checkpoints else {}))
         if not validation.passed:
-            feedback = build_validation_feedback(s, validation,
-                artifact_exists=lambda item: self.artifacts.exists(s.scope_id, s.run_id, item),
-                artifact_read=lambda item: self.get(s, item),
-                artifact_read_bytes=lambda item: self.artifacts.read(s.scope_id, s.run_id, item),
-                replay_plan_hash=binding['plan_hash'], validation_ref=ref)
-            feedback_ref = self.put(s, feedback.model_dump(mode='json'), name='公开开发验证反馈')
-            failed = list(s.failed_candidate_signatures)
-            if (feedback.status == 'failed' and feedback.failed_candidate
-                    and feedback.failure_class in {'editing', 'counterevidence'}):
-                failed.append({'fingerprint': self.candidate_fingerprint(),
-                    'source_manifest': s.source_manifest, 'environment_digest': s.environment_digest,
-                    'test_spec_hash': s.test_spec_hash, 'patch_hash': s.patch_hash,
-                    'candidate_ref': s.patch_ref, 'feedback_ref': feedback_ref})
-            s = self.changed(s, diagnosis_feedback_refs=s.diagnosis_feedback_refs + [feedback_ref],
-                             failed_candidate_signatures=failed[-50:])
             self.event(s, 'gate.decided', {'validation': kind, 'passed': False})
             if s.harness_job_id and s.harness_stage != 'final_acceptance':
                 self.harness.failed_feedback(self, s)
@@ -3599,51 +3150,10 @@ class Engine:
             self.event(s, 'run.error', {'error': s.error, 'error_details': s.error_details,
                                         'action': '保留未验证补丁并清理运行环境'})
             return self.output(s, 'finalize')
-        if s.harness_job_id:
-            return self.output(self.changed(s, phase=Phase.REVIEW, outcome=Outcome.FIX_VERIFIED,
-                run_status=RunStatus.RUNNING, approval_ref=None), 'harness_review')
-        if s.execution_mode == 'batch':
-            s = self.changed(s, phase=Phase.FINALIZE, outcome=Outcome.FIX_VERIFIED,
-                             run_status=RunStatus.RUNNING, approval_ref=None,
-                             error=None, error_details=None)
-            return self.output(s, 'finalize')
-        approval = self.store.approval(s, {'action': 'local_commit', 'branch': 'tracefix/'+s.run_id})
-        s = self.changed(s, phase=Phase.REVIEW, outcome=Outcome.FIX_VERIFIED,
-                         approval_ref=approval, run_status=RunStatus.WAITING_APPROVAL)
-        return self.output(s, 'review')
-
-    async def review(self, s, _):
-        if s.harness_job_id:
-            return await self.harness.review(self, s)
-        # This node re-enters after interrupt. Approval parser wrote a bound record;
-        # model or webpage strings cannot supply authorization.
-        interrupt({'approval_id': s.approval_ref, 'patch_hash': s.patch_hash,
-                   'action': '创建本地候选提交；不得发布到远程或合并'})
-        action = {'action': 'local_commit', 'branch': 'tracefix/'+s.run_id}
-        self.workspace.check_frozen(self.source)
-        if not s.patch_base_commit:
-            s = self.changed(s, patch_base_commit=self.workspace.head())
-        if digest(self.workspace.diff(s.patch_base_commit).encode()) != s.patch_hash:
-            raise PermissionError('审批对应的补丁哈希已变化')
-        persisted = self.store.load(s.run_id, s.scope_id)
-        approval_fields = ('validation_refs', 'evidence_refs', 'patch_hash', 'patch_base_commit',
-            'source_manifest', 'environment_digest', 'test_spec_ref', 'test_spec_hash',
-            'replay_plan_ref', 'reproduction_plan_frozen', 'reproduced', 'source_aligned')
-        if (any(getattr(persisted, field) != getattr(s, field) for field in approval_fields)
-                or not await self.runtime_verification_passed(persisted)):
-            s = self.changed(persisted, phase=Phase.FINALIZE, run_status=RunStatus.RUNNING,
-                outcome=Outcome.INFRA_FAILURE, error='审批对应的验证证据已失效',
-                error_details={'terminal_reason': 'approval_verification_invalid'})
-            return self.output(s, 'finalize')
-        approved = self.store.consume_approval(s.approval_ref, s, action)
-        branch = None
-        if approved:
-            async def commit():
-                return {'branch': self.workspace.branch(action['branch'])}
-            receipt = await self.operation(s, 'local.commit', action, commit)
-            branch = receipt['branch']
-        s = self.changed(s, phase=Phase.FINALIZE, run_status=RunStatus.RUNNING, local_branch=branch)
-        return self.output(s, 'finalize')
+        if not s.harness_job_id:
+            raise RuntimeError('修复验收只能由 Claude Agent SDK Harness 接纳')
+        return self.output(self.changed(s, phase=Phase.REVIEW, outcome=Outcome.FIX_VERIFIED,
+            run_status=RunStatus.RUNNING, approval_ref=None), 'harness_review')
 
     async def paused(self, s, _):
         if s.execution_mode == 'batch' and s.error:
@@ -3674,7 +3184,6 @@ class Engine:
         return self.output(s, 'prelude')
 
     async def finalize(self, s, _):
-        from tracefix.runtime.repair_loop import report_summary
         if s.harness_job_id:
             self.harness._check(self, s)
         if s.outcome == Outcome.NO_BUG_FOUND and not self.rules_fully_checked(s, Phase.EXPLORE):
@@ -3723,7 +3232,7 @@ class Engine:
                     error_details={'integration_blocker': 'finding_source_invalid', 'reason': str(error)})
                 patch_verification = 'unverified' if patch_available else 'none'
         repair_commit = None
-        if verified and (s.execution_mode == 'batch' or s.harness_job_id) and not s.local_branch:
+        if verified and s.harness_job_id and not s.local_branch:
             action = {'action': 'local_commit', 'branch': 'tracefix/'+s.run_id}
             try:
                 async def commit():
@@ -3777,7 +3286,6 @@ class Engine:
                   RunStatus.FAILED if s.outcome in {Outcome.INFRA_FAILURE, Outcome.POLICY_BLOCKED, Outcome.REPAIR_EXHAUSTED}
                   or isinstance(s.error, str) and s.error.startswith('ModelOutputError:') else RunStatus.COMPLETED)
         report = {'schema_version': s.schema_version, 'run_id': s.run_id, 'scope_id': s.scope_id,
-                  **repair_mode_fields(s),
                   'run_status': status, 'mode': s.mode, 'execution_mode': s.execution_mode,
                   'goal': s.goal, 'parent_run_id': s.parent_run_id,
                   'continuation_instruction': s.continuation_instruction,
@@ -3796,9 +3304,6 @@ class Engine:
                   'patch_diff_ref': diff_ref, 'patch_available': patch_available,
                   'patch_verification': patch_verification, 'patch_export_error': diff_error,
                   'result_summary': result_summary,
-                  'diagnosis_retry_count': s.diagnosis_retry_count,
-                  'repair_loop': report_summary(self, s) if s.repair_mode == 'hybrid' else None,
-                  'diagnosis_feedback_refs': s.diagnosis_feedback_refs,
                   'budget': s.budget.model_dump(), 'evidence_refs': [reference for reference in s.evidence_refs
                       if not re.search(r'模型|推理|上下文|指令|记忆|源码|状态|事件', reference)],
                   'execution_backend': type(self.runner).__name__, 'source_manifest': s.source_manifest,
@@ -3848,7 +3353,6 @@ class Engine:
         except (OSError, ValueError, KeyError) as error:
             report['rules_error'] = sanitize(str(error))[:1500]
         report['provenance'] = {'scope_id': s.scope_id, 'project_id': s.project_id or s.scope_id,
-            **repair_mode_fields(s),
             'repo_id': self.rule_scope(s)['repo_id'], 'run_id': s.run_id,
             'repo_snapshot_ref': s.repo_snapshot_ref, 'source_manifest': s.source_manifest,
             'base_commit': self.source.get('commit'), 'patch_base_commit': s.patch_base_commit,

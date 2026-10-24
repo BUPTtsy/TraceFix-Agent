@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from tracefix.runtime.contracts import RunState, digest, new_id
-from tracefix.storage.artifacts import sanitize, redact
+from tracefix.storage.artifacts import redact
 from tracefix.tools.effects import (operation_epoch, operation_resources,
                                      reconciliation_result, recovery_identity, resource_fence_conflicts)
 

@@ -17,9 +17,7 @@ def supervisor_tools():
             'allowed_tools': {'type': 'array', 'items': {'type': 'string'}, 'maxItems': 64},
             'allowed_files': {'type': 'array', 'items': {'type': 'string'}, 'maxItems': 2000},
             'allowed_artifacts': {'type': 'array', 'items': {'type': 'string'}, 'maxItems': 2000},
-            'writable_files': {'type': 'array', 'items': {'type': 'string'}, 'maxItems': 2000},
-            'write_enabled': {'type': 'boolean', 'description': 'Supervisor 显式授予子 Agent 写权限；省略或 false 时仅可读。可写范围仍由 writable_files 限制。'},
-            'shell_mode': {'type': 'string', 'enum': ['disabled', 'readonly', 'patch']},
+            'shell_mode': {'type': 'string', 'enum': ['disabled', 'readonly']},
             'depends_on': {'type': 'array', 'items': {'type': 'string'}, 'maxItems': 2000},
             'expected_output': {'type': 'string', 'minLength': 1, 'maxLength': 4000},
             'completion_criteria': {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1, 'maxItems': 30},
@@ -37,5 +35,6 @@ def supervisor_tools():
             'timeout_seconds': {'type': 'number', 'exclusiveMinimum': 0, 'maximum': 86400},
         }, 'required': ['task_ids'], 'additionalProperties': False,
     }
-    return [ToolSpec('agent.delegate', '派发一个详细、可验收且不可递归的 Worker 任务。', delegate, True),
+    return [ToolSpec('agent.delegate', '派发一个详细、可验收且不可递归的只读 Worker 任务；Worker 不能修改源码。',
+                     delegate, True),
             ToolSpec('agent.join', '等待已经派发的 Worker 并返回结构化结果。', join, False)]

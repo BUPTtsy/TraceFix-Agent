@@ -8,18 +8,16 @@ from tracefix.runtime.contracts import digest
 
 
 def diff_fingerprint(workspace, state):
-    """比较内容而非 overlay 版本，物化前后保持同一候选的身份。"""
+    """按工作区相对修复基线的实际内容计算候选身份。"""
     base = state.patch_base_commit or workspace.head()
     changed = git(workspace.root, 'diff', '--no-ext-diff', '--name-only', '-z', base, '--')
     paths = {path for path in changed.decode('utf-8').split('\0') if path}
     workspace.require_repository_snapshot()
-    paths.update(workspace._staged_files)
     entries = []
     for relative in sorted(paths):
         path = workspace.path(relative)
         before = workspace.commit_bytes(base, relative)
-        staged = workspace.staged_content(relative)
-        after = staged if staged is not None else path.read_bytes()
+        after = path.read_bytes()
         exists = bool(git(workspace.root, 'ls-tree', '-z', base, '--', ':(literal)' + relative))
         if before != after or not exists:
             entries.append([relative, digest(before), digest(after), 'modify' if exists else 'create'])
@@ -31,26 +29,17 @@ def record_tool_action(engine, state, name, arguments, result):
     values = arguments.model_dump(mode='json') if hasattr(arguments, 'model_dump') else dict(arguments)
     values.pop('description', None)
     values.pop('timeout', None)
-    for key in ('file_path', 'notebook_path'):
+    for key in ('file_path',):
         if key in values:
             values[key] = str(values[key]).replace('\\', '/').removeprefix(
                 engine.workspace.root.as_posix().rstrip('/') + '/')
-    if name in {'Edit', 'Write', 'NotebookEdit'}:
-        value = values.get('file_path') or values['notebook_path']
-        path = str(value).removeprefix('/workspace/')
-        content = engine.workspace.staged_content(path)
-        if content is None:
-            content = engine.workspace.path(path).read_bytes()
-        fingerprint = digest([name, path, digest(content)])
-    elif name == 'Bash':
+    if name == 'Bash':
         command = values.get('command', '')
         try:
             command = shlex.split(command)
         except ValueError:
             pass
         fingerprint = digest([name, command])
-    elif name == 'RunTests':
-        fingerprint = digest([name, values.get('target', 'unit'), result['diff_fingerprint']])
     else:
         fingerprint = digest([name, values, diff_fingerprint(engine.workspace, state)])
     updated = engine.changed(state,
