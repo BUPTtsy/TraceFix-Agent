@@ -55,11 +55,9 @@ def create_harness_job(engine, state, *, console_task_id, local_commit_authorize
                        store=None, runner_factory=None, final_verifier=None, rebind=None):
     config = (load_claude_sdk_config() if config is None else
               ClaudeSdkConfig.model_validate(config))
-    if config.backend == 'legacy':
-        return state
     if (state.mode != 'repair' or not local_repository_config(state.remote_config)
             or not local_commit_authorized):
-        raise PermissionError('SDK Harness 只接受已授权本地提交且无远端发布的 repair 任务')
+        raise PermissionError('SDK Harness 只接受已授权本地提交、受管仓库配置的 repair 任务')
     if not state.test_spec_ref or not state.test_spec_hash:
         raise ValueError('SDK Harness 启动前必须冻结 TestSpec')
     spec = engine.get(state, state.test_spec_ref)

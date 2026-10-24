@@ -16,6 +16,7 @@ from tracefix.runtime.contracts import Contract
 from tracefix.runtime.harness import pending_harness_operations
 from tracefix.runtime.harness_bootstrap import restore_harness_runtime
 from tracefix.runtime.harness_contracts import ExecutionCheckpoint
+from tracefix.service.delivery import approval_view, delivery_record
 from tracefix.storage.artifacts import Artifacts
 from tracefix.storage.harness import HarnessConflict, PostgresHarnessStore
 from tracefix.storage.harness_projection import project_pending
@@ -164,6 +165,13 @@ class HarnessControl:
             raise HarnessConflict('原执行者尚未确认结束')
         return execution.checkpoint_ref
 
+    def approval(self, job):
+        """交付审批子集；控制面刷新时据此保留 waiting_approval，而不是覆盖为 completed。"""
+        initializer = next((session for session in self.authority.list_sessions(
+            job.job_id, scope_id=job.scope_id) if session.kind == 'initializer'), None)
+        record = delivery_record(self.root, initializer.run_id) if initializer is not None else None
+        return approval_view(record) if record is not None else None
+
     async def dispatch(self, request):
         job = self.job(request.fields)
         state = self.state(job)
@@ -194,7 +202,8 @@ class HarnessControl:
             'resume_blockers': blockers, 'harness_job_id': job.job_id,
             'harness_session_id': state.harness_session_id, 'current_run_id': state.run_id,
             'accepted_commit': job.accepted_commit, 'quality': job.quality,
-            'owner_epoch': job.owner_epoch, 'revision': job.revision}
+            'owner_epoch': job.owner_epoch, 'revision': job.revision,
+            'approval': self.approval(job)}
 
 
 def main():

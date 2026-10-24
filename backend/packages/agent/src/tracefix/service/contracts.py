@@ -34,24 +34,28 @@ class ServiceTestSpec(TestSpec):
 
 
 class ExecutionRequest(Contract):
-    backend: Literal['legacy', 'claude_sdk'] = 'legacy'
+    # repair 一律由 Claude Agent SDK 编码；该字段仅允许显式声明同一后端。
+    backend: Literal['claude_sdk'] | None = None
     mode: Literal['batch'] = Field(default='batch', validation_alias=AliasChoices('executionMode', 'mode'))
     url: str | None = Field(default=None, max_length=2048)
     spec: ServiceTestSpec | None = None
-    repair_mode: Literal['hybrid', 'pipeline'] | None = Field(
-        default=None, validation_alias=AliasChoices('repairMode', 'repair_mode'))
 
     @model_validator(mode='before')
     @classmethod
     def matching_aliases(cls, value):
         if isinstance(value, dict):
             value = dict(value)
-            for public, internal in (('executionMode', 'mode'), ('repairMode', 'repair_mode')):
-                if public in value and internal in value:
-                    if value[public] != value[internal]:
-                        raise ValueError(f'{public} 与 {internal} 不能矛盾')
-                    value.pop(internal)
+            if 'executionMode' in value and 'mode' in value:
+                if value['executionMode'] != value['mode']:
+                    raise ValueError('executionMode 与 mode 不能矛盾')
+                value.pop('mode')
         return value
+
+
+class ApprovalDecision(Contract):
+    approval_id: str = Field(pattern=r'^dlv_[a-f0-9]{32}$')
+    decision: Literal['approve', 'reject']
+    decided_by: str = Field(min_length=1, max_length=120)
 
 
 class GitHubRead(Contract):
@@ -105,6 +109,8 @@ class ServiceRequest(Contract):
     source_finding_ids: list[str] = Field(default_factory=list, max_length=256)
     github_reads: list[GitHubRead] = Field(default_factory=list, max_length=64)
     finding_acceptance: FindingAcceptance | None = None
+    # 仅 --deliver-stdin 入口允许且要求该字段。
+    approval_decision: ApprovalDecision | None = None
 
     @model_validator(mode='before')
     @classmethod
@@ -116,8 +122,10 @@ class ServiceRequest(Contract):
 
     @model_validator(mode='after')
     def consistent_identity(self):
-        if self.execution.backend == 'claude_sdk' and self.mode != 'repair':
+        if self.execution.backend is not None and self.mode != 'repair':
             raise ValueError('SDK 后端仅用于 repair 任务')
+        if self.approval_decision is not None and self.mode != 'repair':
+            raise ValueError('审批决定仅用于 repair 任务')
         snapshot = self.repository_snapshot
         if (snapshot.repo_id != self.repo_id or snapshot.projectId != self.repo_id
                 or snapshot.repository_config.get('frozen_run_id') != self.run_id):

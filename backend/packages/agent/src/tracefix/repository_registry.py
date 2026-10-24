@@ -107,8 +107,8 @@ def config_digest(config: dict) -> str:
 
 def validate_repair_config(config):
     """可选修复设置属于仓库配置，不改变历史 Profile 的摘要。"""
-    if 'repair_mode' in config and config['repair_mode'] not in ('hybrid', 'pipeline'):
-        raise RepositoryError('INVALID_REPAIR_MODE', 'repair_mode 必须是 hybrid 或 pipeline')
+    if 'require_approval' in config and not isinstance(config['require_approval'], bool):
+        raise RepositoryError('INVALID_REQUIRE_APPROVAL', 'require_approval 必须是布尔值')
     if 'protected_paths' in config:
         from tracefix.execution.workspace import validate_protected_paths
         try:
@@ -224,7 +224,7 @@ class RepositoryRegistry:
     def _validate_record(self, fields: dict, identifier: str, *, checkout_root=None):
         allowed = {'repo_id', 'projectId', 'id', 'root', 'owner', 'repo', 'default_ref', 'profile',
                    'profile_ref', 'allowed_files', 'allowed_urls', 'credential_ref', 'enabled',
-                   'checkout_mode', 'publish_branch', 'repair_mode', 'protected_paths'}
+                   'checkout_mode', 'publish_branch', 'require_approval', 'protected_paths'}
         if set(fields) - allowed:
             raise RepositoryError('INVALID_FIELDS', '仓库注册包含未知字段')
         validate_repair_config(fields)
@@ -308,8 +308,8 @@ class RepositoryRegistry:
                   'allowed_files': allowed_files, 'allowed_urls': allowed_urls,
                   'credential_ref': credential_ref, 'enabled': enabled,
                   'checkout_mode': checkout_mode, 'publish_branch': publish_branch}
-        if 'repair_mode' in fields:
-            config['repair_mode'] = fields['repair_mode']
+        if 'require_approval' in fields:
+            config['require_approval'] = fields['require_approval']
         if 'protected_paths' in fields:
             config['protected_paths'] = list(dict.fromkeys(fields['protected_paths']))
         config['config_digest'] = config_digest(config)
@@ -380,7 +380,7 @@ class RepositoryRegistry:
             old = item['repository_config']
             validate_stored_config(Project(**{**item, 'root': plain_root(self.path.parent / item['root'])}))
             fields = {key: deepcopy(value) for key, value in old.items()
-                      if key not in {'version', 'commit', 'config_digest', 'frozen_run_id'}}
+                      if key not in {'version', 'commit', 'config_digest', 'frozen_run_id', 'repair_mode'}}
             fields.update(patch)
             if patch.get('profile_ref'):
                 fields.pop('profile', None)
@@ -428,7 +428,7 @@ class RepositoryRegistry:
                     raise RepositoryError('RUN_ID_CONFLICT', 'run_id 已绑定其他仓库', 409)
                 return self._frozen_result(project.repository_config, frozen_registry)
             fields = {key: deepcopy(value) for key, value in config.items()
-                      if key not in {'version', 'commit', 'config_digest', 'frozen_run_id'}}
+                      if key not in {'version', 'commit', 'config_digest', 'frozen_run_id', 'repair_mode'}}
             fields['profile_ref'] = None
             checkout_root = target / 'checkout' if config.get('checkout_mode') == 'managed' else None
             frozen_config = self._validate_record(fields, config['repo_id'], checkout_root=checkout_root)

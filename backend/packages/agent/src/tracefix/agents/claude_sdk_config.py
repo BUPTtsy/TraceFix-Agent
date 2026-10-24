@@ -20,7 +20,8 @@ def _origin(url):
 
 
 class ClaudeSdkConfig(Contract):
-    backend: Literal['legacy', 'claude_sdk'] = 'legacy'
+    # 字段保留在序列化与摘要中，已冻结 SDK Job 的 config_hash 保持不变；编码只有 SDK 一条路径。
+    backend: Literal['claude_sdk'] = 'claude_sdk'
     model_id: str = ''
     credential_ref: str = ''
     # 空值不进入序列化与摘要，已冻结的旧 SDK Job 摘要保持不变。
@@ -34,8 +35,6 @@ class ClaudeSdkConfig(Contract):
 
     @model_validator(mode='after')
     def validate_backend(self):
-        if self.backend == 'legacy':
-            return self
         if not self.model_id or self.model_id in {'latest', 'default', 'sonnet', 'opus', 'haiku'}:
             raise ValueError('SDK 后端必须冻结明确的 Claude 模型 ID')
         if not re.fullmatch(r'env:[A-Z][A-Z0-9_]*', self.credential_ref):
@@ -102,8 +101,7 @@ def load_claude_sdk_config(environment=None):
         raise ValueError('Context7 MCP 需要在 TRACEFIX_SDK_EGRESS_ALLOWLIST 中放行 ' + CONTEXT7_ORIGIN)
     if not enabled:
         allowlist = [origin for origin in allowlist if origin != CONTEXT7_ORIGIN]
-    return ClaudeSdkConfig(backend=setting('TRACEFIX_CODING_BACKEND') or 'legacy',
-        model_id=setting('TRACEFIX_CLAUDE_MODEL') or (setting('TRACEFIX_TEXT_MODEL') if reuse else ''),
+    return ClaudeSdkConfig(model_id=setting('TRACEFIX_CLAUDE_MODEL') or (setting('TRACEFIX_TEXT_MODEL') if reuse else ''),
         credential_ref=credential_ref, base_url=base_url,
         worker_image=setting('TRACEFIX_SDK_WORKER_IMAGE'),
         # 未显式配置白名单时只放行实际模型接口的 origin。

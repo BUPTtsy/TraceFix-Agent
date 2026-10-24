@@ -17,7 +17,7 @@ from tracefix.connectors import GitHubMCPError
 from tracefix.execution.workspace import commit_workspace, git
 from tracefix.knowledge.documents import DocumentLibrary
 from tracefix.repository_registry import RepositoryRegistry, config_digest
-from tracefix.rules import Finding, Rule, RuleLibrary
+from tracefix.rules import Rule, RuleLibrary
 from tracefix.runtime.contracts import Outcome, RunState, digest
 from tracefix.runtime.smoke import FakeBrowser, FakeModel, FakeRunner
 from tracefix.service.config import ServiceSettings, validate_snapshot
@@ -100,15 +100,17 @@ def service_fixture(tmp_path, monkeypatch):
         return resource
 
     monkeypatch.setenv('TRACEFIX_API_KEY', 'fake-service-model-key')
+    # repair 新 Run 必须冻结 SDK 配置；凭据只以 env 引用进入冻结配置。
+    monkeypatch.setenv('TRACEFIX_CLAUDE_MODEL', 'claude-sonnet-4-6')
+    monkeypatch.setenv('TRACEFIX_CLAUDE_API_KEY', 'fake-sdk-model-key')
+    monkeypatch.setenv('TRACEFIX_SDK_WORKER_IMAGE', 'sha256:' + 'a' * 64)
+    for name in ('TRACEFIX_CLAUDE_BASE_URL', 'TRACEFIX_CLAUDE_CREDENTIAL_REF', 'TRACEFIX_SDK_EGRESS_ALLOWLIST'):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.delenv('TRACEFIX_CONSOLE_RUN_ID', raising=False)
     monkeypatch.delenv('TRACEFIX_SESSION_REMOTE', raising=False)
     monkeypatch.setattr('tracefix.service.session.DockerRunner', runner)
     monkeypatch.setattr('tracefix.service.session.MCPBrowser', browser)
     monkeypatch.setattr('tracefix.service.session.Gateway', lambda: FakeModel(runners[-1].workspace))
-    # 新 Run 冻结先于 runner 创建，能力探测与绑定后的 FakeModel 保持一致。
-    model_capabilities = SimpleNamespace(supports_tool_executor=False)
-    monkeypatch.setattr('tracefix.service.run.Gateway', lambda: model_capabilities)
-    monkeypatch.setattr('tracefix.service.finding.Gateway', lambda: model_capabilities)
 
     def request(run_id='run_alpha', **fields):
         snapshot = registry.freeze('alpha', run_id)
@@ -283,7 +285,18 @@ def acceptance_payload(fixture, request, finding, *, allow_revision_rebind=False
         'spec': spec.model_dump(mode='json'), 'spec_hash': digest(spec)}
 
 
-async def test_finding_repair_reexports_source_and_does_not_inherit_success(service_fixture):
+def stop_before_sdk_coding(fixture, monkeypatch):
+    """服务层只验证 SDK 编码前的来源重导出与绑定；编码本身需要真实 worker 与 PostgreSQL 权威存储。"""
+    entered = []
+
+    async def drive(self, state):
+        entered.append(state.model_copy(deep=True))
+
+    monkeypatch.setattr(fixture.factory, 'drive', drive)
+    return entered
+
+
+async def test_finding_repair_reexports_source_and_does_not_inherit_success(service_fixture, monkeypatch):
     fixture = service_fixture
     library, finding = await create_source(fixture)
     source = fixture.store.load('source_run', 'alpha')
@@ -294,112 +307,126 @@ async def test_finding_repair_reexports_source_and_does_not_inherit_success(serv
     request.execution.spec.assertions = [request.execution.spec.assertions[0].model_copy(update={
         'locator': request.execution.spec.assertions[0].locator.model_copy(update={
             'role': 'checkbox', 'name': 'Complete task'}), 'condition': 'checked'})]
+    entered = stop_before_sdk_coding(fixture, monkeypatch)
     result = await execute_request(request, fixture.settings, session_factory=fixture.factory)
+    # 编码被截停，服务以未到终态收尾，不能把来源 Run 的成功当作本 Run 结论。
+    assert result['error']['code'] == 'nonterminal_run' and result['outcome'] == 'INFRA_FAILURE'
     assert result['report_ref'], result
-    state = fixture.store.load('repair_run', 'alpha')
-    assert state.repair_source.source_run_id == 'source_run'
+    assert [item.run_id for item in entered] == ['repair_run']
+    handoff = entered[0]
+    assert handoff.repair_source.source_run_id == 'source_run'
     assert fixture.runners[-1].workspace.root != fixture.runners[0].workspace.root
-    assert state.repair_source.target_base_commit == request.repository_snapshot.commit
-    assert not state.repair_source.revision_rebound
-    assert state.repair_mode == 'pipeline' and state.repair_mode_requested == 'hybrid'
-    assert state.repair_mode_reason == 'model_without_tools'
-    assert state.reproduced and state.trial == 3 and state.outcome == Outcome.FIX_VERIFIED, result
-    assert library.finding(finding.id).status == 'fixed'
-    assert state.repair_source.findings[0]['fix_guidance'] == '将真实保存结果持久化'
+    assert handoff.repair_source.target_base_commit == request.repository_snapshot.commit
+    assert not handoff.repair_source.revision_rebound
+    # repair 只走 SDK：新 Run 冻结 SDK 配置，且不继承来源 Run 的复现与修复结论。
+    assert handoff.coding_backend == 'claude_sdk' and handoff.coding_config_ref
+    assert not handoff.reproduced and handoff.outcome is None and not handoff.patch_hash
+    assert library.finding(finding.id).status != 'fixed'
+    assert handoff.repair_source.findings[0]['fix_guidance'] == '将真实保存结果持久化'
     assert fixture.runners[-1].closed
 
 
-@pytest.mark.parametrize('failure', ['none', 'publication', 'cleanup', 'store_close'])
-async def test_verified_publication_persists_before_store_close_and_preserves_evidence(service_fixture, monkeypatch, failure):
-    from tracefix.execution.repository import run_git
-    from tracefix.runtime.contracts import RunStatus
+def completed_sdk_job(session, state):
+    """把当前 Run 投影为已通过最终累计验收的 SDK Job 子 Run，交付前的服务流程与真实 Harness 一致。"""
+    from tracefix.runtime.contracts import Phase, RunStatus
+    from tracefix.runtime.harness_contracts import HarnessJob
+    from tracefix.storage.harness import MemoryHarnessStore
+    authority = MemoryHarnessStore(session.artifacts)
+    job = authority.create_job(HarnessJob(job_id='sdk-job', scope_id=state.scope_id, repo_id='owner/app',
+        console_task_id='task_alpha', goal_hash=digest(state.goal), origin_base_commit='a' * 40,
+        acceptance_refs=['spec']))
+    authority.jobs[job.job_id].status = 'COMPLETED'
+    session.engine.harness = SimpleNamespace(store=authority, job=lambda current: authority.get_job(
+        current.harness_job_id, scope_id=current.scope_id))
+    child = state.model_copy(deep=True, update={'run_id': 'sdk-current', 'harness_job_id': job.job_id,
+        'harness_session_id': 'sdk-session', 'harness_stage': 'handoff', 'run_status': RunStatus.COMPLETED,
+        'phase': Phase.FINALIZE, 'outcome': Outcome.FIX_VERIFIED})
+    child.report_ref = session.artifacts.put(child.scope_id, child.run_id, {'run_id': child.run_id,
+        'scope_id': child.scope_id, 'run_status': 'COMPLETED', 'outcome': 'FIX_VERIFIED',
+        'patch_available': False, 'patch_verification': 'none'})
+    session.store.save(child)
+    session.state = lambda: session.store.load(child.run_id, child.scope_id)
+    return authority
+
+
+@pytest.mark.parametrize('failure', ['none', 'delivery', 'cleanup', 'store_close'])
+async def test_sdk_delivery_runs_after_service_cleanup_and_before_store_close(service_fixture, monkeypatch, failure):
+    from tracefix.service import run
+    from tracefix.service.delivery import DeliveryError
     fixture = service_fixture
-    events = []
-    import shutil
-
-    def managed_clone(settings, destination):
-        if destination == fixture.root:
-            run_git(destination, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
-            return
-        shutil.copytree(fixture.root, destination)
-        run_git(destination, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
-
-    monkeypatch.setattr('tracefix.repository_registry.prepare_checkout', managed_clone)
-    fixture.registry.update('alpha', {'checkout_mode': 'managed'})
+    events, calls, authorities = [], [], []
     original_runtime = fixture.factory.ensure_runtime
 
     async def runtime(self):
         await original_runtime(self)
+        if getattr(self, 'store_close_registered', False):
+            return
+        # ensure_runtime 在一次 Run 中会被多次调用，存储关闭回调只登记一次。
+        self.store_close_registered = True
 
         def close_store():
-            latest = fixture.store.load('repair_publication', 'alpha')
-            report = self.artifacts.json('alpha', latest.run_id, latest.report_ref)
-            events.append(('store_close', report.get('publication')))
+            events.append('store_close')
             if failure == 'store_close':
                 raise RuntimeError('close failed')
 
         self.runtime_stack.callback(close_store)
 
-    async def verified_drive(self, state):
-        workspace = self.engine.workspace
-        baseline = workspace.head()
-        workspace.path('src/value.ts', write=True).write_text('export const persisted = true;\n', encoding='utf-8')
-        raw = workspace.diff(baseline).encode()
-        branch = workspace.branch('tracefix/' + state.run_id)
-        state.run_status, state.outcome = RunStatus.COMPLETED, Outcome.FIX_VERIFIED
-        state.local_branch, state.patch_base_commit, state.patch_hash = branch, baseline, digest(raw)
-        reference = self.artifacts.put(state.scope_id, state.run_id, raw.decode('utf-8'), 'diff')
-        report = {'run_id': state.run_id, 'scope_id': state.scope_id, 'run_status': 'COMPLETED',
-            'outcome': 'FIX_VERIFIED', 'patch_diff_ref': reference, 'patch_hash': state.patch_hash,
-            'patch_available': True, 'patch_verification': 'verified', 'result_summary': '修复通过真实差异验证',
-            'branch': branch, 'repair_commit': workspace.head()}
-        state.report_ref = self.artifacts.put(state.scope_id, state.run_id, report)
-        self.store.save(state)
+    async def drive(self, state):
+        authorities.append(completed_sdk_job(self, state))
 
     class Services(RunServices):
         async def aclose(self):
             await super().aclose()
-            events.append(('services_close', None))
+            events.append('services_close')
             if failure == 'cleanup':
                 self.cleanup_errors.append({'code': 'resource_close_failed'})
 
-    from tracefix.service.publication import prepare_publication as publish
+    publication = {'status': 'local', 'branch': 'codex/tracefix-repair_delivery', 'commit': 'd' * 40, 'error': None}
+    record = {'approval_id': 'dlv_' + 'a' * 32, 'status': 'approved', 'job_id': 'sdk-job',
+        'run_id': 'repair_delivery', 'scope_id': 'alpha', 'accepted_commit': 'b' * 40, 'patch_hash': 'c' * 64,
+        'diff_ref': 'diff', 'publish_branch': False, 'require_approval': False,
+        'requested_at': '2026-10-24T00:00:00+00:00', 'decision': 'approve', 'decided_by': 'auto',
+        'decided_at': '2026-10-24T00:00:00+00:00', 'publication': publication}
 
-    def publication(*arguments, **options):
-        events.append(('publication', None))
-        assert events[0][0] == 'services_close'
-        if failure == 'publication':
-            return {'status': 'failed', 'branch': None, 'commit': None, 'error': {'code': 'publication_failed'}}
-        return publish(*arguments, **options)
+    def deliver(**options):
+        events.append('delivery')
+        calls.append(options)
+        if failure == 'delivery':
+            raise DeliveryError('PATCH_HASH_MISMATCH')
+        return record
 
     monkeypatch.setattr(fixture.factory, 'ensure_runtime', runtime)
-    monkeypatch.setattr(fixture.factory, 'drive', verified_drive)
-    monkeypatch.setattr('tracefix.service.run.prepare_publication', publication)
-    request = fixture.request('repair_publication', mode='repair')
-    frozen = request.repository_snapshot.repository_config
-    assert frozen['checkout_mode'] == 'managed'
-    assert frozen['root'] != str(fixture.root)
-    assert frozen['root'] == str(fixture.settings.data_root / 'frozen-repositories' / request.run_id / 'checkout')
+    monkeypatch.setattr(fixture.factory, 'drive', drive)
+    monkeypatch.setattr(run, 'open_delivery', deliver)
+    request = fixture.request('repair_delivery', mode='repair')
     result = await execute_request(request, fixture.settings, session_factory=fixture.factory, services_factory=Services)
     if failure == 'cleanup':
-        assert not any(event[0] == 'publication' for event in events)
-        assert result['outcome'] == 'INFRA_FAILURE'
+        # 资源清理失败时不交付，SDK Job 保持可恢复而不是终态。
+        assert events == ['services_close', 'store_close'] and not calls
+        assert result['terminal'] is False and 'CLEANUP_FAILED' in result['resume_blockers']
         return
-    assert result['outcome'] == 'FIX_VERIFIED'
-    assert result['summary'] == '修复通过真实差异验证'
-    assert result['patch_verification'] == 'verified' and result['diff']
-    assert events[-1][0] == 'store_close' and events[-1][1] == result['publication']
-    assert result['report']['repair_commit']
-    if failure == 'publication':
-        assert result['publication']['status'] == 'failed'
-        assert result['commit'] == result['report']['repair_commit']
-    else:
-        assert result['publication']['status'] == 'local'
-        checkout = fixture.settings.data_root / 'publications' / request.run_id / 'checkout'
-        assert run_git(checkout, 'rev-parse', 'HEAD^').decode().strip() == request.repository_snapshot.commit
-        assert result['commit'] == result['publication']['commit']
+    assert events == ['services_close', 'delivery', 'store_close']
+    # 交付使用 Harness 权威存储、冻结仓库配置与部署凭据解析，而不是请求中的任意字段。
+    options = calls[0]
+    assert options['authority'] is authorities[0] and options['artifacts'] is fixture.sessions[-1].artifacts
+    assert (options['data_root'], options['scope_id'], options['job_id'], options['run_id']) == (
+        fixture.settings.data_root, 'alpha', 'sdk-job', 'repair_delivery')
+    assert options['repository_config'] == request.repository_snapshot.repository_config
+    assert options['resolve_credential'] == fixture.settings.resolve_credential
+    assert result['run_status'] == 'COMPLETED' and result['terminal'] is True
+    console = DocumentLibrary(fixture.settings.console_db).run('repair_delivery')
+    assert console['status'] == 'completed' and console['publication'] == result['publication']
+    if failure == 'delivery':
+        assert result['publication'] == {'status': 'failed', 'branch': None, 'commit': None,
+                                         'error': {'code': 'PATCH_HASH_MISMATCH'}}
+        assert result['approval'] is None
+        return
+    assert result['publication'] == publication and result['approval'] is None
+    assert (result['branch'], result['commit']) == (publication['branch'], publication['commit'])
     if failure == 'store_close':
         assert result['cleanup_errors'] == [{'code': 'runtime_close_failed'}]
+    else:
+        assert 'cleanup_errors' not in result
 
 
 async def test_unverified_json_acceptance_and_implicit_revision_change_rejected(service_fixture):
@@ -418,9 +445,10 @@ async def test_unverified_json_acceptance_and_implicit_revision_change_rejected(
     assert len(fixture.runners) == 1
 
 
-async def test_explicit_revision_change_requires_typed_bound_acceptance(service_fixture):
+async def test_explicit_revision_change_requires_typed_bound_acceptance(service_fixture, monkeypatch):
     fixture = service_fixture
     _, finding = await create_source(fixture)
+    stop_before_sdk_coding(fixture, monkeypatch)
     (fixture.root / 'src/value.ts').write_text('export const persisted = false;\nexport const revision = 2;\n')
     git(fixture.root, 'add', 'src/value.ts')
     commit_workspace(fixture.root, '重新冻结验收版本')
@@ -459,30 +487,6 @@ async def test_service_rejects_source_before_new_workspace(service_fixture, dama
                               source_finding_ids=[finding.id])
     result = await execute_request(request, fixture.settings, session_factory=fixture.factory)
     assert result['error']['code'] == 'finding_source_invalid' and len(fixture.runners) == 1
-
-
-async def test_guided_finding_remains_inconclusive_without_c_acceptance(service_fixture):
-    fixture = service_fixture
-    library = RuleLibrary(fixture.settings.console_db)
-    rule = library.save_rule(Rule(id='guided_feedback', name='检查可访问反馈', status='enabled',
-        scope={'project_ids': ['alpha']}, phases=['EXPLORE', 'DIAGNOSE', 'PATCH', 'VERIFY'],
-        detection={'type': 'guided', 'guided': {'prompt': '检查页面是否显示结果'}}, fix_guidance='增加可访问提示'))
-    await execute_request(fixture.request('source_run', additional_rule_ids=['guided_feedback']),
-                          fixture.settings, session_factory=fixture.factory)
-    source = fixture.store.load('source_run', 'alpha')
-    finding = library.save_finding(Finding(id='finding_guided', job_id='task_alpha',
-        run_id=source.run_id, scope_id='alpha', project_id='alpha', repo_id='owner/app',
-        rule_id=rule.id, rule_version=rule.version, source='guided', severity='major',
-        title='缺少可访问反馈', expected='出现操作反馈', actual='没有操作反馈',
-        location={'url': source.url}, evidence_refs=[source.observation_ref], fingerprint='guided',
-        source_base_commit=fixture.request('source_run').repository_snapshot.commit,
-        source_manifest=source.source_manifest))
-    request = fixture.request('repair_guided', mode='repair', source_run_id='source_run',
-                              source_finding_ids=[finding.id])
-    result = await execute_request(request, fixture.settings, session_factory=fixture.factory)
-    assert result['outcome'] == 'INCONCLUSIVE'
-    assert library.finding(finding.id).status != 'fixed'
-    assert not fixture.store.load(request.run_id, 'alpha').patch_hash
 
 
 async def test_no_engine_context_consumption_is_reported_as_integration_failure(service_fixture):

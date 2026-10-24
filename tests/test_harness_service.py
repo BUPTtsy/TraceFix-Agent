@@ -33,9 +33,9 @@ def authority_job(artifacts, *, status='STOPPED', scope='alpha', task='task_alph
 async def test_sdk_pause_returns_after_cleanup_and_never_terminalizes(service_fixture, monkeypatch, cleanup_failed):
     fixture = service_fixture
     terminalize = AsyncMock(side_effect=AssertionError('SDK 不能 terminal_failure'))
-    publish = Mock(side_effect=AssertionError('SDK 不能 publication'))
+    deliver = Mock(side_effect=AssertionError('未通过最终累计验收的 SDK Job 不能交付'))
     monkeypatch.setattr(run, 'terminal_failure', terminalize)
-    monkeypatch.setattr(run, 'prepare_publication', publish)
+    monkeypatch.setattr(run, 'open_delivery', deliver)
 
     class Services(RunServices):
         async def aclose(self):
@@ -61,7 +61,7 @@ async def test_sdk_pause_returns_after_cleanup_and_never_terminalizes(service_fi
     if cleanup_failed:
         assert result['resume_blockers'] == ['CLEANUP_FAILED']
     terminalize.assert_not_called()
-    publish.assert_not_called()
+    deliver.assert_not_called()
     assert fixture.store.load('sdk-current', 'alpha').run_status == 'PAUSED'
 
 
@@ -197,3 +197,65 @@ async def test_restore_preparation_failure_closes_created_services():
         await run.restore_run_services(request, SimpleNamespace(), session, state,
             services_factory=lambda *args: services)
     services.aclose.assert_awaited_once()
+
+
+def test_reconstructed_project_digest_matches_frozen_registry(service_fixture):
+    from pathlib import Path
+    from tracefix.config import load_projects
+    from tracefix.service.delivery import frozen_project
+    snapshot = service_fixture.request('repair_digest', mode='repair').repository_snapshot
+    frozen = load_projects(Path(snapshot.projects_path))['alpha']
+    rebuilt = frozen_project(snapshot.repository_config)
+    assert digest(rebuilt.model_dump(mode='json')) == digest(frozen.model_dump(mode='json'))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('delivery', ['pending', 'auto', 'failed'])
+async def test_completed_sdk_job_goes_through_delivery_before_console_update(service_fixture, monkeypatch, delivery):
+    from tracefix.knowledge.documents import DocumentLibrary
+    from tracefix.service.delivery import DeliveryError
+    fixture = service_fixture
+    diff = 'diff --git a/src/a.ts b/src/a.ts\n+fixed\n'
+
+    async def drive(session, state):
+        authority, runtime = authority_job(session.artifacts, status='COMPLETED')
+        session.engine.harness = runtime
+        child = state.model_copy(deep=True, update={'run_id': 'sdk-current', 'harness_job_id': 'sdk-job',
+            'harness_session_id': 'sdk-session', 'harness_stage': 'handoff',
+            'run_status': RunStatus.COMPLETED, 'phase': Phase.FINALIZE, 'outcome': Outcome.FIX_VERIFIED})
+        child.report_ref = session.artifacts.put(child.scope_id, child.run_id, {'run_id': child.run_id,
+            'scope_id': child.scope_id, 'run_status': 'COMPLETED', 'outcome': 'FIX_VERIFIED',
+            'patch_available': False, 'patch_verification': 'none'})
+        session.store.save(child)
+        session.state = lambda: session.store.load(child.run_id, child.scope_id)
+        ref = session.artifacts.put('alpha', 'run_alpha', diff.encode(), 'diff', label='交付累计差异')
+        record = {'approval_id': 'dlv_' + 'a' * 32, 'status': 'pending', 'job_id': 'sdk-job',
+            'run_id': 'run_alpha', 'scope_id': 'alpha', 'accepted_commit': 'b' * 40, 'patch_hash': 'c' * 64,
+            'diff_ref': ref, 'publish_branch': False, 'require_approval': True,
+            'requested_at': '2026-10-24T00:00:00+00:00', 'decision': None, 'decided_by': None,
+            'decided_at': None, 'publication': None}
+        if delivery == 'auto':
+            record.update(status='approved', decision='approve', decided_by='auto', require_approval=False,
+                publication={'status': 'local', 'branch': 'codex/tracefix-run_alpha', 'commit': 'd' * 40,
+                             'error': None})
+        if delivery == 'failed':
+            monkeypatch.setattr(run, 'open_delivery', Mock(side_effect=DeliveryError('PATCH_HASH_MISMATCH')))
+        else:
+            monkeypatch.setattr(run, 'open_delivery', Mock(return_value=record))
+
+    monkeypatch.setattr(fixture.factory, 'drive', drive)
+    result = await run.execute_request(fixture.request(), fixture.settings,
+        session_factory=fixture.factory)
+    record = DocumentLibrary(fixture.settings.console_db).run('run_alpha')
+    if delivery == 'pending':
+        assert result['run_status'] == 'WAITING_APPROVAL' and result['terminal'] is False
+        assert result['approval']['status'] == 'pending' and result['delivery_diff'] == diff
+        assert record['status'] == 'waiting_approval' and record['approval']['id'] == result['approval']['id']
+        assert record['delivery_diff'] == diff and record['finishedAt'] is None
+    elif delivery == 'auto':
+        assert result['run_status'] == 'COMPLETED' and result['terminal'] and result['approval'] is None
+        assert result['commit'] == 'd' * 40 and record['status'] == 'completed'
+        assert record['publication']['status'] == 'local'
+    else:
+        assert result['publication']['error'] == {'code': 'PATCH_HASH_MISMATCH'}
+        assert result['publication']['status'] == 'failed' and record['status'] == 'completed'

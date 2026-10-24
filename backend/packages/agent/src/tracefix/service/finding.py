@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from tracefix.model.gateway import Gateway
-from tracefix.runtime.repair_mode import resolve_repair_mode_fields
 from tracefix.runtime.finding_acceptance import FrozenFindingAcceptance, freeze_finding_acceptance
 from tracefix.runtime.finding_source import SourceRunIdentity, create_finding_repair_run
 from tracefix.service.contracts import ServiceTestSpec
@@ -73,11 +71,6 @@ def finding_repair_state(request, session, rule_resolver, rule_library):
         if (state.scope_id != request.repo_id or state.run_id == state.repair_source.source_run_id
                 or state.repair_source.source_repo_id != config['owner'] + '/' + config['repo']):
             raise ValueError
-        source = session.store.load(state.repair_source.source_run_id, state.repair_source.source_scope_id)
-        if source.mode == 'test':
-            state = state.model_copy(update=resolve_repair_mode_fields(
-                requested=request.execution.repair_mode, project_config=config, run_mode='repair',
-                model=Gateway(), repair_source=state.repair_source))
         return state
     except (ValueError, OSError, KeyError, PermissionError):
         raise ServiceError('finding_source_invalid', '来源 Run/Finding 或证据闭包无效') from None

@@ -145,3 +145,47 @@ def test_raw_diff_export_rejects_redacted_or_control_text(tmp_path, text):
     with pytest.raises(ServiceError) as error:
         preserve_report_diff(state, artifacts, SimpleNamespace(diff=lambda base: diff))
     assert error.value.code == 'patch_export_redacted' and state.report_ref == original
+
+
+APPROVAL = {'approval_id': 'dlv_' + 'a' * 32, 'decision': 'approve', 'decided_by': 'alice'}
+
+
+def test_approval_decision_contract_for_repair_requests():
+    request = ServiceRequest.model_validate({**request_payload(), 'mode': 'repair', 'approval_decision': APPROVAL})
+    assert request.approval_decision.decision == 'approve'
+    assert ServiceRequest.model_validate({**request_payload(), 'mode': 'repair'}).approval_decision is None
+
+
+@pytest.mark.parametrize('patch', [
+    {'mode': 'repair', 'approval_decision': {**APPROVAL, 'approval_id': 'dlv_' + 'A' * 32}},
+    {'mode': 'repair', 'approval_decision': {**APPROVAL, 'approval_id': 'dlv_short'}},
+    {'mode': 'repair', 'approval_decision': {**APPROVAL, 'decision': 'maybe'}},
+    {'mode': 'repair', 'approval_decision': {**APPROVAL, 'decided_by': ''}},
+    {'mode': 'repair', 'approval_decision': {**APPROVAL, 'decided_by': 'x' * 121}},
+    {'mode': 'repair', 'approval_decision': {**APPROVAL, 'extra': 1}},
+    {'mode': 'repair', 'approval_decision': {**APPROVAL, 'decided_by': 'ghp_' + 'a' * 40}},
+    {'mode': 'repair', 'approval_decision': {**APPROVAL, 'token': 'private'}},
+    {'mode': 'test', 'approval_decision': APPROVAL},
+])
+def test_approval_decision_is_validated(patch):
+    with pytest.raises(ValidationError):
+        ServiceRequest.model_validate({**request_payload(), **patch})
+
+
+@pytest.mark.parametrize('execution, mode, valid', [
+    ({'backend': 'claude_sdk'}, 'repair', True), ({}, 'repair', True),
+    ({'backend': 'claude_sdk'}, 'test', False), ({'backend': 'legacy'}, 'repair', False),
+    ({'repairMode': 'hybrid'}, 'repair', False), ({'repair_mode': 'pipeline'}, 'repair', False),
+])
+def test_repair_always_uses_sdk_and_repair_mode_is_removed(execution, mode, valid):
+    payload = {**request_payload(), 'mode': mode, 'execution': {'mode': 'batch', **execution}}
+    if valid:
+        assert ServiceRequest.model_validate(payload).execution.backend in {'claude_sdk', None}
+    else:
+        with pytest.raises(ValidationError):
+            ServiceRequest.model_validate(payload)
+
+
+def test_failure_result_has_no_repair_mode_fields():
+    from tracefix.service.results import failure_result
+    assert not [key for key in failure_result() if key.startswith('repair_mode')]
