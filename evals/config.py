@@ -1,4 +1,4 @@
-"""四格实验的公开固定输入；候选补丁是每组运行输出。"""
+"""冻结评测用例的固定输入；由 evals.freeze 写入与校验。"""
 from __future__ import annotations
 
 import json
@@ -7,26 +7,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePath, PureWindowsPath
 
 from tracefix.runtime.contracts import digest
-
-
-@dataclass(frozen=True)
-class AblationGroup:
-    agent_mode: str
-    cross_run_memory: bool
-    arm: str | None = None
-
-    def __post_init__(self):
-        if self.agent_mode not in {'single', 'multi'} or self.arm not in {None, 'pipeline', 'hybrid'}:
-            raise ValueError('实验组或修复模式无效')
-
-    @property
-    def name(self):
-        prefix = self.arm + '-' if self.arm else ''
-        return prefix + f'{self.agent_mode}-memory-{"on" if self.cross_run_memory else "off"}'
-
-
-GROUPS = tuple(AblationGroup(mode, memory) for mode in ('single', 'multi')
-               for memory in (False, True))
 
 
 @dataclass(frozen=True)
