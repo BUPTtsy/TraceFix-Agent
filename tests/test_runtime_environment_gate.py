@@ -11,6 +11,7 @@ from tracefix.config import Profile
 from tracefix.runtime.contracts import Outcome, Phase, RunStatus, Validation, digest
 from tracefix.runtime.smoke import make_engine
 from tracefix.runtime.verification import verify_artifacts
+from tests.support_sdk_candidate import finalize_sdk_candidate, verified_sdk_candidate
 
 
 async def test_runtime_gate_rejects_inspection_failure_and_propagates_cancel(tmp_path):
@@ -35,13 +36,15 @@ async def test_runtime_gate_rejects_inspection_failure_and_propagates_cancel(tmp
 
 @pytest.mark.parametrize('execution_mode', ['interactive', 'batch'])
 async def test_verify_live_gate_fails_once_and_finalizes_unverified_patch(tmp_path, execution_mode):
-    engine, state = make_engine(tmp_path)
+    engine, state = await verified_sdk_candidate(tmp_path, stop_before_verify=True)
     state.execution_mode = execution_mode
-    engine.runner.inspect_results = ['fake-ci-environment', 'permanent-drift']
-    await engine.run(state)
+    before = engine.runner.inspect_calls
+    engine.runner.inspect_results = ['permanent-drift']
+    output = await engine.run(state)
+    state = type(state).model_validate(output['data'])
     finished = engine.store.load(state.run_id, state.scope_id)
     report = engine.get(finished, finished.report_ref)
-    assert engine.runner.inspect_calls == 2
+    assert engine.runner.inspect_calls == before + 1
     assert finished.outcome == Outcome.INFRA_FAILURE
     assert finished.error_details['terminal_reason'] == 'runtime_environment_gate_failed'
     assert finished.validation_refs and finished.approval_ref is None
@@ -131,12 +134,7 @@ def docker_runner(tmp_path):
 
 @pytest.fixture
 async def verified_engine(tmp_path):
-    engine, state = make_engine(tmp_path)
-    await engine.run(state)
-    state = engine.store.load(state.run_id, state.scope_id)
-    assert state.run_status == RunStatus.WAITING_APPROVAL, state.error
-    assert engine.verification_passed(state)
-    return engine, state
+    return await verified_sdk_candidate(tmp_path)
 
 
 async def test_runtime_gate_requires_strict_new_return_and_offline_checker_is_separate(verified_engine):
@@ -186,20 +184,18 @@ async def test_live_sample_cannot_bypass_workspace_or_typed_evidence(verified_en
     assert engine.runner.inspect_calls == before + 1
 
 
-async def test_review_rejects_inspect_failure_before_consuming_approval(verified_engine, monkeypatch):
+async def test_sdk_review_rejects_inspect_failure_before_committing(verified_engine, monkeypatch):
     engine, state = verified_engine
-    engine.store.decide_approval(state.approval_ref, state, 'approve')
     original_head = engine.workspace.head()
     engine.runner.inspect_results = [RuntimeError('container missing')]
-    monkeypatch.setattr(engine.store, 'consume_approval', lambda *args: pytest.fail('must not consume approval'))
-    await engine.run(resume='approve')
-    finished = engine.store.load(state.run_id, state.scope_id)
-    report = engine.get(finished, finished.report_ref)
-    assert finished.outcome == Outcome.INFRA_FAILURE
-    assert finished.error_details['terminal_reason'] == 'approval_verification_invalid'
-    assert engine.workspace.head() == original_head and not finished.local_branch
-    assert report['patch_verification'] == 'unverified'
-    assert engine.runner.closed and engine.browser.closed
+    monkeypatch.setattr(engine.store, 'consume_approval', lambda *args: pytest.fail('SDK 不消费宿主审批'))
+    output = await engine.harness.review(engine, state)
+    rejected = type(state).model_validate(output['data'])
+    assert output['next_node'] == 'harness_code' and rejected.outcome is None
+    assert engine.workspace.head() == original_head and not rejected.local_branch
+    assert rejected.approval_ref is None
+    feedback = engine.get(rejected, engine.harness.session(rejected).feedback_ref)
+    assert not engine.get(rejected, feedback['verification_ref'])['passed']
 
 
 async def test_review_and_finalize_use_new_samples_not_stale_cache(verified_engine):
@@ -213,9 +209,7 @@ async def test_review_and_finalize_use_new_samples_not_stale_cache(verified_engi
 
     engine.runner.inspect_images = inspect
     engine.runner.actual_digest = 'stale-cache'
-    engine.store.decide_approval(state.approval_ref, state, 'reject')
-    await engine.run(resume='reject')
-    finished = engine.store.load(state.run_id, state.scope_id)
+    finished = await finalize_sdk_candidate(engine, state)
     assert calls == ['live', 'live'] and finished.outcome == Outcome.FIX_VERIFIED
     assert engine.get(finished, finished.report_ref)['patch_verification'] == 'verified'
     assert engine.runner.closed and engine.browser.closed
