@@ -5,6 +5,8 @@ from tracefix.model.gateway import Gateway, ModelOutputError, ModelResult
 from tracefix.runtime.contracts import (Assertion, BrowserAction, Decision, FileEdit, Locator, ObservableWait, Outcome,
     PatchProposal, Phase, ReproductionPlan, RunState, RunStatus, Validation, digest)
 from tracefix.runtime.smoke import PNG, FakeBrowser, make_engine
+from tests.test_harness_graph import create_harness_engine
+from tests.support_sdk_candidate import verified_sdk_candidate
 
 
 @pytest.mark.parametrize('newline', ['\n', '\r\n'])
@@ -65,16 +67,7 @@ class ToggleBrowser(FakeBrowser):
 
 async def test_retries_are_excluded_before_patch_and_same_plan_verifies_persistence(tmp_path):
     engine, state = make_engine(tmp_path)
-    engine.browser = ToggleBrowser(engine.workspace)
     engine.LOOP_STATE_LIMIT = 100
-    original_command = engine.runner.command
-
-    async def command(kind):
-        if kind == 'reset':
-            engine.browser.checked = False
-        return await original_command(kind)
-
-    engine.runner.command = command
     fallback = engine.model
     actions = exploration_actions()
     plan_requests = []
@@ -113,9 +106,30 @@ async def test_retries_are_excluded_before_patch_and_same_plan_verifies_persiste
 
     engine.model = ExploringModel()
     spec_hash = state.test_spec_hash
-    await engine.run(state)
-    saved = engine.store.load(state.run_id, state.scope_id)
-    assert saved.run_status == RunStatus.WAITING_APPROVAL, saved.error
+    engine, state, harness, _ = await create_harness_engine(tmp_path / 'sdk', engine_state=(engine, state))
+    original_rebind = harness.rebind
+
+    async def rebind(current, workspace, source):
+        await original_rebind(current, workspace, source)
+        current.browser = ToggleBrowser(workspace)
+        original_command = current.runner.command
+
+        async def command(kind):
+            if kind == 'reset':
+                current.browser.checked = False
+            return await original_command(kind)
+
+        current.runner.command = command
+
+    async def stop_at_review(current, active):
+        return current.output(active, 'end')
+
+    harness.rebind = rebind
+    harness.review = stop_at_review
+    output = await engine.run(state)
+    saved = RunState.model_validate(output['data'])
+    assert saved.run_status == RunStatus.RUNNING and saved.phase == Phase.REVIEW, saved.error
+    assert saved.approval_ref is None and saved.run_id != state.run_id
     assert saved.outcome == Outcome.FIX_VERIFIED
     assert saved.budget.patches == 1
     assert saved.trial == 0 and saved.reproduced is False and len(saved.validation_refs) == 6
@@ -257,75 +271,31 @@ async def test_verification_preserves_reload_and_checks_final_state(tmp_path, lo
 
 
 @pytest.mark.parametrize('invented_reference', [False, True])
-async def test_diagnose_reads_current_validation_and_checks_its_observation_refs(tmp_path, monkeypatch, invented_reference):
-    engine, state = make_engine(tmp_path)
-    engine.subagent_enabled = True
-    monkeypatch.setenv('TRACEFIX_WORKER', '1')
-    monkeypatch.setenv('TRACEFIX_AGENT_MODE', 'multi')
-    investigated_roles = []
-
-    async def investigate(worker, parent, specs):
-        saved = engine.store.load(parent.run_id, parent.scope_id)
-        assert saved.evidence_refs == parent.evidence_refs
-        for spec in specs:
-            versions = {path: digest(engine.workspace.source_bytes(path)[1])
-                        for path in spec.allowed_files}
-            worker._current(parent, spec, parent.source_manifest, versions)
-            investigated_roles.append(spec.role)
-        return []
-
-    monkeypatch.setattr('tracefix.runtime.worker.ReadOnlyWorker.group', investigate)
-    engine.store.save(state)
-    output = await engine.prepare(state, None)
-    state = RunState(**output['data'])
-    assert engine.runner.started and not engine.runner.closed
-    assert state.source_aligned and state.environment_digest == engine.runner.environment_digest
-    state.phase = Phase.DIAGNOSE
-    state.reproduced = True
-    plan = [BrowserAction(kind='observe').model_dump()]
-    state.replay_plan_ref = engine.put(state, plan)
-    state.reproduction_plan_frozen = True
-    state.patch_hash = 'current-patch'
-    stale = Validation(kind='original', passed=False, scope_id=state.scope_id, run_id=state.run_id,
-        source_manifest=state.source_manifest, replay_plan_hash=digest(plan),
-        patch_hash='old-patch', environment_digest=state.environment_digest,
-        test_spec_hash=state.test_spec_hash, artifact_ref='missing-old-result.json')
-    state.validation_refs = [engine.put(state, stale.model_dump())]
-    engine.store.save(state)
-    engine.event(state, 'patch.applied', {'patch_hash': state.patch_hash})
+async def test_sdk_feedback_reads_current_validation_and_rejects_missing_artifacts(tmp_path, invented_reference):
+    engine, state = await verified_sdk_candidate(tmp_path)
     observation = {'id': 'latest', 'url': state.url, 'snapshot': '- checkbox "Complete task" [ref=e1]',
                    'network': 'PATCH /api/tasks/1 => [200] OK', 'console': ''}
     state.observation_ref = await engine.capture(state, {**observation, 'png': PNG})
     observation = engine.get(state, state.observation_ref)
     result, result_ref = engine.check(state, engine.spec(state).assertions)
     assert not result['passed']
-    current = stale.model_copy(update={'patch_hash': state.patch_hash, 'artifact_ref': result_ref})
-    state.validation_refs.append(engine.put(state, current.model_dump()))
-    state.phase = Phase.VERIFY
-    engine.event(state, 'tool.started', {'operation_id': 'verify-click', 'intent': {'kind': 'click'}})
-    engine.event(state, 'tool.completed', {'operation_id': 'verify-click',
-                                         'receipt': {'observation_ref': state.observation_ref}})
-    state.phase = Phase.DIAGNOSE
+    original = next(engine.get(state, ref) for ref in state.validation_refs
+                    if engine.get(state, ref)['kind'] == 'original')
+    current = Validation.model_validate({**original, 'passed': False,
+        'artifact_ref': '9999_missing.json' if invented_reference else result_ref})
+    current_ref = engine.put(state, current.model_dump())
+    state.validation_refs.append(current_ref)
     engine.store.save(state)
-
-    async def generate(schema, context, **options):
-        assert schema is PatchProposal
-        assert context['observation'] == observation
-        assert len(context['previous_validation']) == 1
-        assert context['previous_validation'][0]['result']['assertions'] == result['assertions']
-        assert context['validation_observations'][0]['observation']['network'] == observation['network']
-        assert state.observation_ref in context['available_evidence_refs']
-        value = PatchProposal(summary='根据最新验证证据诊断',
-            evidence_refs=['invented.json' if invented_reference else state.observation_ref], edits=[FileEdit(
-            path='src/value.ts', before_hash=digest(engine.workspace.read('src/value.ts').encode()),
-            content='export const persisted = true;\n')])
-        return ModelResult(value, {}, 'fake', 'stop')
-
-    engine.model.generate = generate
     if invented_reference:
-        with pytest.raises(ModelOutputError, match='补丁引用了不存在的证据'):
-            await engine.diagnose(state, None)
+        with pytest.raises((OSError, ValueError)):
+            engine.harness.failed_feedback(engine, state)
+        assert engine.harness.session(state).feedback_ref is None
     else:
-        output = await engine.diagnose(state, None)
-        assert output['data']['phase'] == Phase.PATCH
-    assert investigated_roles == ['code-explorer', 'evidence-reviewer']
+        engine.harness.failed_feedback(engine, state)
+        feedback = engine.get(state, engine.harness.session(state).feedback_ref)
+        verification = engine.get(state, feedback['verification_ref'])
+        assert verification['passed'] is False
+        assert verification['regression_refs'][-1] == current_ref
+        recorded = engine.get(state, engine.get(state, current_ref)['artifact_ref'])
+        assert recorded['observation_ref'] == state.observation_ref
+        assert engine.get(state, recorded['observation_ref']) == observation
