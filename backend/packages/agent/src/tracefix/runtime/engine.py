@@ -3214,17 +3214,6 @@ class Engine:
                     error='最终运行环境、补丁或验证证据已失效，无法输出已验证修复',
                     error_details={'terminal_reason': 'final_verification_invalid',
                                    'patch_export_error': diff_error})
-        patch_verification = ('verified' if verified else 'unverified' if patch_available else 'none')
-        try:
-            source_findings = self.finish_source_findings(s, verified=verified)
-        except (OSError, ValueError, KeyError) as error:
-            source_findings = []
-            if verified:
-                verified = False
-                s = self.changed(s, outcome=Outcome.INFRA_FAILURE,
-                    error='来源 Finding 或证据已变化，拒绝回写已验证修复',
-                    error_details={'integration_blocker': 'finding_source_invalid', 'reason': str(error)})
-                patch_verification = 'unverified' if patch_available else 'none'
         repair_commit = None
         if verified and s.harness_job_id and not s.local_branch:
             action = {'action': 'local_commit', 'branch': 'tracefix/'+s.run_id}
@@ -3250,6 +3239,25 @@ class Engine:
                                    'reason': sanitize(error_message(error))[:300]})
         elif verified and s.local_branch:
             repair_commit = self.workspace.head()
+        if verified:
+            verified = await self.runtime_verification_passed(s)
+            if s.harness_job_id:
+                self.harness._check(self, s)
+            if not verified:
+                s = self.changed(s, outcome=Outcome.INFRA_FAILURE,
+                    error='本地提交后的运行环境、补丁或验证证据已失效，拒绝输出已验证修复',
+                    error_details={'terminal_reason': 'final_verification_invalid'})
+        patch_verification = ('verified' if verified else 'unverified' if patch_available else 'none')
+        try:
+            source_findings = self.finish_source_findings(s, verified=verified)
+        except (OSError, ValueError, KeyError) as error:
+            source_findings = []
+            if verified:
+                verified = False
+                s = self.changed(s, outcome=Outcome.INFRA_FAILURE,
+                    error='来源 Finding 或证据已变化，拒绝回写已验证修复',
+                    error_details={'integration_blocker': 'finding_source_invalid', 'reason': str(error)})
+                patch_verification = 'unverified' if patch_available else 'none'
         summaries = {
             Outcome.FIX_VERIFIED: '修复补丁通过全部确定性验证，可供后续流程消费。',
             Outcome.NO_BUG_FOUND: '本次测试规范未发现缺陷，未生成修复补丁。',

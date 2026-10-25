@@ -282,3 +282,33 @@ async def test_fake_contract_failed_repair_validation_keeps_source_unfixed(tmp_p
     assert session.feedback_ref
     feedback = engine.get(completed, session.feedback_ref)
     assert not engine.get(completed, feedback['verification_ref'])['passed']
+
+
+async def test_post_commit_evidence_damage_never_marks_source_finding_fixed(tmp_path):
+    engine, repair, library, finding = await executable_repair_fixture(tmp_path)
+    original_rebind = engine.harness.rebind
+
+    async def rebind(current, workspace, source):
+        await original_rebind(current, workspace, source)
+        original_branch = workspace.branch
+
+        def damage_after_commit(name):
+            branch = original_branch(name)
+            active = current.store.load(current.current_run, repair.scope_id)
+            validation = current.get(active, active.validation_refs[0])
+            evidence = current.artifacts.root / active.scope_id / active.run_id / validation['artifact_ref']
+            evidence.write_bytes(b'corrupt')
+            return branch
+
+        workspace.branch = damage_after_commit
+
+    engine.harness.rebind = rebind
+    output = await engine.run(repair)
+    completed = RunState.model_validate(output['data'])
+    assert completed.local_branch
+    assert completed.outcome == Outcome.INFRA_FAILURE
+    assert completed.error_details['terminal_reason'] == 'final_verification_invalid'
+    assert library.finding(finding.id).status != 'fixed'
+    assert engine.harness.job(completed).status == 'BLOCKED'
+    report = engine.get(completed, completed.report_ref)
+    assert report['patch_verification'] == 'unverified' and not report['provenance']['verified']

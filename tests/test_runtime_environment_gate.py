@@ -211,7 +211,7 @@ async def test_review_and_finalize_use_new_samples_not_stale_cache(verified_engi
     engine.runner.inspect_images = inspect
     engine.runner.actual_digest = 'stale-cache'
     finished = await finalize_sdk_candidate(engine, state)
-    assert calls == ['live', 'live'] and finished.outcome == Outcome.FIX_VERIFIED
+    assert calls == ['live', 'live', 'live'] and finished.outcome == Outcome.FIX_VERIFIED
     assert engine.get(finished, finished.report_ref)['patch_verification'] == 'verified'
     assert engine.runner.closed and engine.browser.closed
 
