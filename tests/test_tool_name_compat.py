@@ -214,56 +214,39 @@ async def test_batch_rejected_submission_is_audited_before_context_retry(monkeyp
     assert pipeline.submission_value is None
 
 
-async def test_native_batch_noop_submissions_refresh_context_and_produce_valid_patch(tmp_path, monkeypatch):
-    from tracefix.runtime.contracts import PatchProposal, RunStatus, Outcome
-    from tracefix.runtime.smoke import make_engine
+async def test_sdk_noop_candidate_is_rejected_without_host_patch_fallback(tmp_path):
+    from tracefix.agents.claude_sdk_adapter import ExecutionResult
+    from tracefix.runtime.contracts import PatchProposal, RunState, RunStatus, Outcome
+    from tests.test_harness_graph import create_harness_engine, IncrementExecutor
 
-    engine, state = make_engine(tmp_path)
-    state.execution_mode = 'batch'
-    engine.subagent_enabled = False
-    inner = engine.model
-    gateway = Gateway(key='fixture', stream=False)
-    contexts, requests = [], []
+    engine, state, harness, _ = await create_harness_engine(tmp_path)
+    generate = engine.model.generate
 
-    class NativePatches:
-        supports_tool_executor = True
-        supports_context_assembler = True
+    async def readonly_model(schema, context, **options):
+        assert schema is not PatchProposal
+        return await generate(schema, context, **options)
 
-        async def generate(self, schema, context, **kwargs):
-            if schema is PatchProposal:
-                contexts.append(copy.deepcopy(context))
-                return await gateway.generate(schema, context, **kwargs)
-            callbacks = {name: value for name, value in kwargs.items() if name in {
-                'image', 'agent_instructions', 'on_attempt', 'on_response', 'on_error', 'on_usage'}}
-            return await inner.generate(schema, context, **callbacks)
+    class NoopExecutor(IncrementExecutor):
+        async def start(self, request, emit):
+            if request.role == 'initializer':
+                return await super().start(request, emit)
+            self.requests.append(request)
+            return ExecutionResult(execution_id=request.execution_id, status='SUCCEEDED',
+                sdk_session_id='sdk-' + request.session_id, summary='未修改文件',
+                structured_output={'summary': '未修改文件', 'unresolved': []})
 
-    async def handle(request):
-        requests.append(json.loads(request.content))
-        context = contexts[-1]
-        source = next(card for card in context['cards'] if card['path'] == 'src/value.ts')
-        proposal = {'summary': '修复状态持久化', 'evidence_refs': context['available_evidence_refs'][-1:],
-                    'edits': [{'path': source['path'], 'before_hash': source['before_hash'],
-                              'content': source['content'] if len(contexts) <= 2
-                              else 'export const persisted = true;\n'}]}
-        return completion([call('propose_patch', 'patch-' + str(len(contexts)), proposal)])
-
-    def client(boundary):
-        return httpx.AsyncClient(transport=protocol.BoundaryTransport(httpx.MockTransport(handle), boundary),
-            event_hooks={'request': [boundary.before], 'response': [boundary.received]})
-
-    monkeypatch.setattr(protocol, 'create_http_client', client)
-    engine.model = NativePatches()
-    await engine.run(state)
-    finished = engine.store.load(state.run_id, state.scope_id)
-    assert finished.run_status == RunStatus.COMPLETED, (finished.error, finished.error_details)
-    assert finished.outcome == Outcome.FIX_VERIFIED
-    assert len(requests) == len(contexts) == 3
-    assert [context['diagnosis_retry_count'] for context in contexts] == [0, 1, 2]
-    assert len(contexts[2]['diagnosis_feedback']) == 2
-    assert all(context['execution_mode'] == 'batch' for context in contexts)
-    assert all(context['available_evidence_refs'][-1] in context['evidence_refs'] for context in contexts)
-    report = engine.get(finished, finished.report_ref)
-    assert report['patch_verification'] == 'verified'
+    executor = NoopExecutor()
+    engine.model.generate = readonly_model
+    harness.runner = executor
+    output = await engine.run(state)
+    rejected = RunState.model_validate(output['data'])
+    job = harness.job(rejected)
+    assert rejected.run_status == RunStatus.PAUSED and rejected.outcome != Outcome.FIX_VERIFIED
+    assert job.status == 'BLOCKED' and job.accepted_commit == job.origin_base_commit
+    assert rejected.budget.patches == 0 and rejected.patch_ref is None
+    assert engine.workspace.read('src/value.ts') == 'export const persisted = false;\n'
+    assert not engine.workspace.diff() and not rejected.local_branch
+    assert [request.role for request in executor.requests] == ['initializer', 'coder']
 
 
 @pytest.mark.parametrize('reference_kind', ['artifact', 'observation_id', 'screenshot'])
