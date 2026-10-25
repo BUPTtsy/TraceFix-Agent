@@ -48,7 +48,7 @@ class BehaviorBrowser(FakeBrowser):
         return raw
 
 
-async def verification_engine(tmp_path, failure=None, scenarios=None):
+async def verification_engine(tmp_path, failure=None, scenarios=None, start_at_behavior=False):
     class BehaviorModel(FakeModel):
         async def generate(self, schema, context, **options):
             result = await super().generate(schema, context, **options)
@@ -83,6 +83,17 @@ async def verification_engine(tmp_path, failure=None, scenarios=None):
 
     engine.runner.command = command
     engine.store.save(state)
+    if start_at_behavior:
+        engine.browser.failure = None
+        for attempt in range(50):
+            if state.validation_index == 6:
+                break
+            output = await engine.verify(state, None)
+            state = RunState.model_validate(output['data'])
+            assert state.phase == Phase.VERIFY, state.error
+        assert state.validation_index == 6
+        engine.browser.calls.clear()
+        engine.browser.failure = failure
     return engine, state
 
 
@@ -206,9 +217,7 @@ async def test_each_behavior_scenario_starts_from_an_independent_reset(tmp_path)
 
 @pytest.mark.parametrize('failure,step', [('no-forward', 1), ('no-reverse', 3), ('no-reverse-persistence', 4)])
 async def test_business_regression_cannot_be_hidden_by_final_state(tmp_path, failure, step):
-    engine, state = await verification_engine(tmp_path, failure)
-    state.validation_index = 6
-    engine.store.save(state)
+    engine, state = await verification_engine(tmp_path, failure, start_at_behavior=True)
     state = await verify_until_transition(engine, state)
     assert state.phase == Phase.DIAGNOSE and state.outcome != Outcome.FIX_VERIFIED
     validation = engine.get(state, state.validation_refs[-1])
