@@ -21,12 +21,13 @@ def _create(engine, state, **overrides):
     return create_harness_job(engine, state, **options)
 
 
-def test_legacy_configuration_preserves_state_without_runtime():
-    engine = SimpleNamespace()
-    state = object()
-    assert create_harness_job(engine, state, console_task_id='task',
-        local_commit_authorized=False, config=ClaudeSdkConfig()) is state
-    assert not hasattr(engine, 'harness')
+def test_unauthorized_job_rejects_before_attaching_runtime(tmp_path):
+    engine, state = make_engine(tmp_path)
+    original = state.model_dump(mode='json')
+    with pytest.raises(PermissionError, match='已授权本地提交'):
+        _create(engine, state, local_commit_authorized=False)
+    assert state.model_dump(mode='json') == original
+    assert getattr(engine, 'harness', None) is None
 
 
 def test_explicit_job_attaches_authority_runner_and_sqlite_projection(tmp_path, monkeypatch):

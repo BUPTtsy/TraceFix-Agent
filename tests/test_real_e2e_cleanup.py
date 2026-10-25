@@ -187,12 +187,14 @@ def test_real_e2e_database_override_is_bound_to_agent_and_state(tmp_path, monkey
         if 'bugboard/scripts/init_demo.py' in arguments:
             assert options['env']['TRACEFIX_DATABASE_URL'] == dsn
             Path(arguments[-1]).mkdir(parents=True)
-        if '--run' in arguments:
+        if 'tracefix.service.web_run' in arguments:
             assert options['env']['TRACEFIX_DATABASE_URL'] == dsn
+            request = json.loads(options['input'])
+            assert request['mode'] == 'repair' and request['data'] == options['env']['TRACEFIX_DATA']
             artifact = Path(options['env']['TRACEFIX_DATA']) / 'artifacts/bugboard/run_isolated'
             artifact.mkdir(parents=True)
-            return SimpleNamespace(returncode=0, stdout='')
-        return SimpleNamespace(returncode=0, stdout='existing-postgres' if 'ps' in arguments else '')
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        return SimpleNamespace(returncode=0, stdout='existing-postgres' if 'ps' in arguments else '', stderr='')
 
     def load_state(data_root, actual_dsn, run_id):
         assert actual_dsn == dsn and run_id == 'run_isolated'
@@ -221,12 +223,13 @@ def test_real_e2e_preserves_preexisting_postgres_on_failure(tmp_path, monkeypatc
         commands.append(arguments)
         if 'bugboard/scripts/init_demo.py' in arguments:
             Path(arguments[-1]).mkdir(parents=True)
-        if '--run' in arguments:
-            frozen = Path(arguments[arguments.index('--spec') + 1])
+        if 'tracefix.service.web_run' in arguments:
+            request = json.loads(options['input'])
+            frozen = Path(request['spec'])
             assert frozen != spec
             assert frozen.read_bytes() == spec.read_bytes()
             raise RuntimeError('injected launch failure')
-        return SimpleNamespace(returncode=0, stdout='existing-container' if 'ps' in arguments and already_running else '')
+        return SimpleNamespace(returncode=0, stdout='existing-container' if 'ps' in arguments and already_running else '', stderr='')
 
     monkeypatch.setitem(run_flow.__globals__, 'ROOT', tmp_path)
     monkeypatch.setitem(run_flow.__globals__, 'command', command)
