@@ -372,51 +372,21 @@ def local_engine(tmp_path, files=None):
     return engine, state, workspace.root / 'source.py'
 
 
-async def test_spawn_local_production_handler_updates_parent_only(tmp_path):
-    engine, state, source = local_engine(tmp_path)
-    runtime = build_runtime_tools(engine, state, None)
-    result = await runtime.pipeline().execute('Write', {'file_path': str(source), 'content': 'new\n'}, 'call-1')
-    assert not result.is_error and result.executed
-    assert engine.workspace.staged_content('source.py') == b'new\n'
-    assert source.read_text(encoding='utf-8') == 'baseline\n'
-    persisted = engine.store.load(state.run_id, state.scope_id)
-    assert len(state.action_fingerprints) == 1
-    assert persisted.action_fingerprints == state.action_fingerprints
-    assert persisted.revision == state.revision == 1
-    assert all(record['status'] == 'DONE' for record in engine.store.operations.values())
-    assert not [worker for worker in multiprocessing.active_children() if worker.name == 'tracefix-r05-effect']
-
-
-@pytest.mark.parametrize('changed', ['overlay', 'disk_with_overlay'])
-async def test_parent_overlay_change_during_prepare_is_not_overwritten(tmp_path, monkeypatch, changed):
-    import tracefix.tools.local as local_module
+@pytest.mark.parametrize('tool,arguments', [
+    ('Write', {'file_path': '/workspace/source.py', 'content': 'new\n'}),
+    ('Edit', {'file_path': '/workspace/source.py', 'old_string': 'baseline', 'new_string': 'edited'}),
+    ('NotebookEdit', {'notebook_path': '/workspace/analysis.ipynb', 'cell_number': 0, 'new_source': 'new'}),
+])
+async def test_production_runtime_rejects_removed_host_write_handlers(tmp_path, tool, arguments):
+    from tracefix.tools.core import ToolProtocolError
 
     engine, state, source = local_engine(tmp_path)
-    if changed == 'disk_with_overlay':
-        engine.workspace.stage('source.py', 'initial-overlay\n')
-    entered, release = asyncio.Event(), asyncio.Event()
-
-    async def prepare(kind, payload, **kwargs):
-        entered.set()
-        await release.wait()
-        return {'content': 'worker\n', 'before_hash': digest(payload['content'].encode('utf-8'))}
-
-    monkeypatch.setattr(local_module, 'run_effect', prepare)
     runtime = build_runtime_tools(engine, state, None)
-    pending = asyncio.create_task(runtime.pipeline().execute('Write', {
-        'file_path': str(source), 'content': 'worker\n'}, 'call'))
-    try:
-        await asyncio.wait_for(entered.wait(), 5)
-        if changed == 'overlay':
-            engine.workspace.stage('source.py', 'concurrent\n')
-        else:
-            source.write_text('concurrent-disk\n', encoding='utf-8')
-    finally:
-        release.set()
-        result = await pending
-    assert result.is_error and not result.executed
-    expected = b'concurrent\n' if changed == 'overlay' else b'initial-overlay\n'
-    assert engine.workspace.staged_content('source.py') == expected
+    with pytest.raises(ToolProtocolError):
+        await runtime.pipeline().execute(tool, arguments, 'removed-write')
+    assert source.read_bytes() == b'baseline\n'
+    assert not engine.store.operations
+    assert not state.action_fingerprints
 
 
 def _late_worker(request, folder):
@@ -528,28 +498,10 @@ async def test_production_timeout_cancel_blocks_new_call_and_epoch(tmp_path, can
                 'memory.note', {'text': 'different arguments'}, 'different-call')
     state = engine.store.load(state.run_id, state.scope_id)
     result = await build_runtime_tools(engine, state, None).pipeline().execute(
-        'Write', {'file_path': str(source), 'content': 'independent\n'}, 'independent-call')
+        'Read', {'file_path': str(source)}, 'independent-call')
     assert not result.is_error
     await asyncio.sleep(0.7)
     assert engine.memory.working_memory(state.scope_id, state.run_id)['finding'] == []
-
-
-async def test_parent_apply_requires_live_owned_fence(tmp_path, monkeypatch):
-    import tracefix.tools.local as local_module
-
-    engine, state, source = local_engine(tmp_path)
-
-    async def prepare(kind, payload, **kwargs):
-        operation_id, record = next(iter(engine.store.operations.items()))
-        engine.store.mark_unknown(state, operation_id, owner=record['owner_token'], reason='lost boundary')
-        return {'content': 'worker\n', 'before_hash': digest(payload['content'].encode('utf-8'))}
-
-    monkeypatch.setattr(local_module, 'run_effect', prepare)
-    with pytest.raises(EffectBoundaryError):
-        await build_runtime_tools(engine, state, None).pipeline().execute('Write', {
-            'file_path': str(source), 'content': 'worker\n'}, 'call')
-    assert engine.workspace.staged_content('source.py') is None
-    assert next(iter(engine.store.operations.values()))['status'] == 'UNKNOWN'
 
 
 async def test_memory_production_note_persists_child_receipt(tmp_path):
@@ -724,26 +676,6 @@ async def test_done_actions_allow_intentional_new_epoch_without_replaying_same_e
     assert len(performed) == 6
 
 
-async def test_spawn_edit_and_notebook_handlers_apply_parent_receipts(tmp_path):
-    notebook = json.dumps({'cells': [{'cell_type': 'code', 'source': ['old'],
-        'metadata': {'preserve': True}, 'outputs': [], 'execution_count': None, 'id': 'existing'}]})
-    engine, state, source = local_engine(tmp_path, {'analysis.ipynb': notebook})
-    notebook_path = engine.workspace.root / 'analysis.ipynb'
-    pipeline = build_runtime_tools(engine, state, None).pipeline()
-    edited = await pipeline.execute('Edit', {'file_path': str(source), 'old_string': 'baseline',
-                                           'new_string': 'edited'}, 'edit')
-    assert not edited.is_error
-    assert engine.workspace.staged_content('source.py') == source.read_bytes().replace(b'baseline', b'edited')
-    replaced = await pipeline.execute('NotebookEdit', {'notebook_path': str(notebook_path),
-        'cell_number': 0, 'new_source': 'new'}, 'notebook')
-    assert not replaced.is_error
-    staged = engine.workspace.staged_content('analysis.ipynb')
-    assert staged.endswith(b'\n')
-    cell = json.loads(staged)['cells'][0]
-    assert cell['source'] == ['new'] and cell['metadata'] == {'preserve': True}
-    assert cell['id'] == 'existing'
-
-
 async def test_unknown_actions_do_not_admit_new_epoch_or_sequence(ledger):
     original = state_for()
     ledger.save(original)
@@ -761,19 +693,18 @@ async def test_unknown_actions_do_not_admit_new_epoch_or_sequence(ledger):
                 'browser.action', {**intent_for('resource:browser'), **action}, failed)
 
 
-async def test_production_completed_call_id_rebinding_does_not_replay_new_epoch(tmp_path):
-    engine, state, source = local_engine(tmp_path)
-    arguments = {'file_path': str(source), 'content': 'once\n'}
-    first = await build_runtime_tools(engine, state, None).pipeline().execute('Write', arguments, 'first-call')
+async def test_memory_completed_call_id_rebinding_does_not_replay_new_epoch(tmp_path):
+    engine, state, _source = local_engine(tmp_path)
+    engine.memory = MemoryLibrary(tmp_path / 'memory.sqlite3')
+    arguments = {'kind': 'progress', 'text': 'record once'}
+    first = await build_runtime_tools(engine, state, None).pipeline().execute('memory.note', arguments, 'first-call')
     assert first.call_id == 'first-call'
-    engine.workspace.stage('source.py', 'must-survive-replay\n')
     changed = state.model_copy(update={'revision': 4, 'continuation_count': 2})
-    second = await build_runtime_tools(engine, changed, None).pipeline().execute('Write', arguments, 'new-call')
+    second = await build_runtime_tools(engine, changed, None).pipeline().execute('memory.note', arguments, 'new-call')
     assert second.call_id == 'new-call' and not second.is_error
-    assert engine.workspace.staged_content('source.py') == b'must-survive-replay\n'
+    assert len(engine.memory.working_memory(state.scope_id, state.run_id)['progress']) == 1
     assert len(engine.store.operations) == 1
     assert second.result == first.result
-    assert len(changed.action_fingerprints) == len(state.action_fingerprints) == 1
 
 
 def test_owned_crashed_started_requires_exit_identity_then_manual_reconcile(ledger):
