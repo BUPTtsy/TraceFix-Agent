@@ -233,7 +233,8 @@ async def executable_repair_fixture(tmp_path, *, runner_fail=None):
     repair.test_spec_hash = digest(spec)
     engine.store.save(repair)
     engine, repair, harness, _ = await create_harness_engine(tmp_path / 'sdk',
-        engine_state=(engine, repair), runner_factory=lambda workspace, source: FakeRunner(source, runner_fail))
+        engine_state=(engine, repair), runner_factory=lambda workspace, source: FakeRunner(
+            source, runner_fail if 'true' in workspace.read('src/value.ts') else None))
 
     class FindingExecutor(IncrementExecutor):
         async def start(self, request, emit):
@@ -249,12 +250,12 @@ async def executable_repair_fixture(tmp_path, *, runner_fail=None):
 async def test_fake_contract_source_repair_reproduces_and_verifies_before_fixed(tmp_path):
     engine, repair, library, finding = await executable_repair_fixture(tmp_path)
     assert repair.outcome is None and not repair.reproduced and repair.test_spec_ref
-    await engine.run(repair)
-    completed = engine.store.load(repair.run_id, repair.scope_id)
+    output = await engine.run(repair)
+    completed = RunState.model_validate(output['data'])
     assert completed.outcome == Outcome.FIX_VERIFIED
     assert completed.reproduced and completed.trial == 3 and completed.validation_refs
     fixed = library.finding(finding.id)
-    assert fixed.status == 'fixed' and fixed.repair_run_id == repair.run_id
+    assert fixed.status == 'fixed' and fixed.repair_run_id == completed.run_id
     assert fixed.patch_hash == completed.patch_hash and fixed.verification_refs == completed.validation_refs
     report = engine.get(completed, completed.report_ref)
     assert report['provenance']['verified'] and report['source_findings'][0]['id'] == finding.id
@@ -262,9 +263,12 @@ async def test_fake_contract_source_repair_reproduces_and_verifies_before_fixed(
 
 async def test_fake_contract_failed_repair_validation_keeps_source_unfixed(tmp_path):
     engine, repair, library, finding = await executable_repair_fixture(tmp_path, runner_fail='unit')
-    await engine.run(repair)
-    completed = engine.store.load(repair.run_id, repair.scope_id)
+    output = await engine.run(repair)
+    completed = RunState.model_validate(output['data'])
     assert completed.outcome != Outcome.FIX_VERIFIED
     assert library.finding(finding.id).status != 'fixed'
-    report = engine.get(completed, completed.report_ref)
-    assert report['patch_verification'] != 'verified' and not report['provenance']['verified']
+    assert not engine.verification_passed(completed)
+    session = engine.harness.session(completed)
+    assert session.feedback_ref
+    feedback = engine.get(completed, session.feedback_ref)
+    assert not engine.get(completed, feedback['verification_ref'])['passed']

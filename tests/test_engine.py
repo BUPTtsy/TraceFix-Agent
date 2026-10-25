@@ -450,7 +450,7 @@ async def test_engine_keeps_retry_attempts_in_one_logical_exchange(tmp_path):
 
 
 async def test_unsent_model_network_error_can_resume_without_completing_silently(tmp_path):
-    engine, state = make_engine(tmp_path)
+    engine, state = make_engine(tmp_path, bugfree=True)
 
     class RetryModel:
         def __init__(self, workspace):
@@ -476,7 +476,8 @@ async def test_unsent_model_network_error_can_resume_without_completing_silently
     await engine.run(resume='resume')
     resumed = engine.store.load(state.run_id, 'b')
     assert model.calls >= 2
-    assert resumed.run_status in {RunStatus.WAITING_APPROVAL, RunStatus.COMPLETED}
+    assert resumed.run_status == RunStatus.COMPLETED
+    assert resumed.outcome == Outcome.NO_BUG_FOUND
 
 
 async def test_unknown_operation_pause_can_be_cancelled_without_resume_replay(tmp_path):
