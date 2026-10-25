@@ -345,18 +345,23 @@ async def test_legacy_spec_without_behavior_fields_keeps_original_six_gates(tmp_
 
 
 async def test_post_patch_unbound_replay_preserves_frozen_plan_and_finishes_inconclusive(tmp_path):
-    engine, state = await verification_engine(tmp_path)
-    spec = engine.spec(state)
-    spec.behavior_scenarios[0].steps[0].action.locator = Locator(role='button', name='Missing control')
-    state.test_spec_ref = engine.put(state, spec.model_dump())
-    state.test_spec_hash = digest(spec)
-    state.validation_index = 6
+    engine, state = await verification_engine(tmp_path, start_at_behavior=True)
+    action = engine.browser.action
+
+    async def missing_control(selected):
+        observation = await action(selected)
+        observation['snapshot'] = '- heading "Task board" [ref=e1]'
+        return observation
+
+    engine.browser.action = missing_control
     replay_ref = state.replay_plan_ref
     engine.store.save(state)
     await engine.run(state)
     saved = engine.store.load(state.run_id, state.scope_id)
-    assert saved.outcome == Outcome.INCONCLUSIVE, saved.error
-    assert saved.run_status == RunStatus.COMPLETED
+    assert saved.outcome != Outcome.FIX_VERIFIED, saved.error
+    assert saved.run_status == RunStatus.PAUSED
+    assert saved.error_details['type'] == 'ReplayUnbound'
+    assert engine.harness.job(saved).status == 'BLOCKED'
     assert saved.replay_plan_ref == replay_ref and saved.reproduction_plan_frozen
 
 

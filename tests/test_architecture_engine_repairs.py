@@ -433,8 +433,8 @@ async def test_missing_behavior_checkpoints_rejects_without_indexing_empty_list(
     state.behavior_check_refs = []
     engine.store.save(state)
     output = await engine.verify(state, None)
-    assert output['next_node'] == 'check_suite'
-    rejected = await finish_verification_suite(engine, RunState(**output['data']))
+    assert output['next_node'] == 'harness_code'
+    rejected = RunState.model_validate(output['data'])
     assert rejected.phase == Phase.DIAGNOSE
     assert rejected.outcome != Outcome.FIX_VERIFIED and rejected.approval_ref is None
     assert not engine.verification_passed(rejected)
@@ -638,8 +638,8 @@ async def test_behavior_intermediate_failure_stops_before_next_action(verified_e
 
     engine.browser.action = fail_first_checkpoint
     output = await engine.verify(state, None)
-    assert output['next_node'] == 'check_suite' and attempted == ['observe']
-    failed = await finish_verification_suite(engine, RunState(**output['data']))
+    assert output['next_node'] == 'harness_code' and attempted == ['observe']
+    failed = RunState.model_validate(output['data'])
     assert failed.phase == Phase.DIAGNOSE and attempted == ['observe']
     assert failed.outcome != Outcome.FIX_VERIFIED and failed.approval_ref is None
     assert not engine.verification_passed(failed)
