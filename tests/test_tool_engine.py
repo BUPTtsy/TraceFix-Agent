@@ -25,7 +25,7 @@ async def test_gateway_reads_source_and_returns_typed_test_spec_submission(tmp_p
     source = tmp_path / 'src'
     source.mkdir()
     original = 'export const persisted = false;\n'
-    (source / 'value.ts').write_text(original, encoding='utf-8')
+    (source / 'value.ts').write_bytes(original.encode('utf-8'))
     workspace = Workspace(tmp_path, ['src/**'])
     state = RunState(phase=Phase.PREPARE, scope_id='scope', run_id='run',
         goal='验证原生只读工具执行和结构化规范提交', url='http://app:3000',
@@ -169,7 +169,9 @@ async def test_source_tools_assist_element_discovery_without_replacing_page_bind
         tool_calls.append(call('finish-after-rejection', 'FinishExploration', {
             'action': {'kind': 'finish'}, 'summary': '源码引用未执行，保留当前页面绑定'}))
         recovered = await engine.model_call(state, Decision, {'observation': current})
-        rejected = json.loads(requests[-1]['messages'][-1]['content'])
+        message = next(item for item in requests[-1]['messages']
+                       if item.get('tool_call_id') == 'reject-source-ref')
+        rejected = json.loads(message['content'])
         assert rejected['call_id'] == 'reject-source-ref' and rejected['isError'] is True
         assert rejected['executed'] is False and rejected['error']['executed'] is False
         assert recovered.action.kind == 'finish'
