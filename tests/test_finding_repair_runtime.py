@@ -11,6 +11,7 @@ from tracefix.runtime.finding_source import (SourceRunIdentity, create_finding_r
                                              rebind_finding_repair_revision)
 from tracefix.execution.workspace import Workspace
 from tests.test_finding_repair_source import source_fixture
+from tests.test_harness_graph import create_harness_engine, IncrementExecutor
 
 
 def runtime_rule(rule_id='feedback', *, detector='guided', **fields):
@@ -225,12 +226,29 @@ async def executable_repair_fixture(tmp_path, *, runner_fail=None):
 
     engine.model = RepairFixtureModel(workspace)
     repair.execution_mode = 'batch'
+    spec = RuntimeTestSpec(goal=repair.goal, assertions=[Assertion(
+        locator=Locator(role='checkbox', name='Complete task'), condition='checked')],
+        regression_assertions=[Assertion(locator=Locator(role='heading', name='Task board'))])
+    repair.test_spec_ref = engine.put(repair, spec.model_dump(mode='json'))
+    repair.test_spec_hash = digest(spec)
+    engine.store.save(repair)
+    engine, repair, harness, _ = await create_harness_engine(tmp_path / 'sdk',
+        engine_state=(engine, repair), runner_factory=lambda workspace, source: FakeRunner(source, runner_fail))
+
+    class FindingExecutor(IncrementExecutor):
+        async def start(self, request, emit):
+            result = await super().start(request, emit)
+            if request.role == 'initializer':
+                result.structured_output['work_items'] = result.structured_output['work_items'][:1]
+            return result
+
+    harness.runner = FindingExecutor()
     return engine, repair, library, finding
 
 
 async def test_fake_contract_source_repair_reproduces_and_verifies_before_fixed(tmp_path):
     engine, repair, library, finding = await executable_repair_fixture(tmp_path)
-    assert repair.outcome is None and not repair.reproduced and not repair.test_spec_ref
+    assert repair.outcome is None and not repair.reproduced and repair.test_spec_ref
     await engine.run(repair)
     completed = engine.store.load(repair.run_id, repair.scope_id)
     assert completed.outcome == Outcome.FIX_VERIFIED

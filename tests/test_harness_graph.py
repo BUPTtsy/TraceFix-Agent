@@ -145,8 +145,8 @@ class IncrementExecutor:
 
 
 async def create_harness_engine(tmp_path, *, final_verifier=None, fail_validation_once=False,
-                                configure=None, runner_factory=None):
-    engine, state = make_engine(tmp_path / 'engine')
+                                configure=None, runner_factory=None, engine_state=None):
+    engine, state = engine_state or make_engine(tmp_path / 'engine')
     store = MemoryHarnessStore(engine.artifacts)
     executor = IncrementExecutor()
     injected_failure = False

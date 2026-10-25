@@ -421,6 +421,7 @@ async def test_gateway_output_correction_stops_at_configured_attempt_bound(offli
 
 async def test_teacher_locator_that_repeatedly_cannot_bind_ends_loop_detected(tmp_path):
     engine,state=make_engine(tmp_path)
+    state.mode = 'test'
     class UnbindableLocatorModel(FakeModel):
         async def generate(self,schema,context,**kwargs):
             result=await super().generate(schema,context,**kwargs)
