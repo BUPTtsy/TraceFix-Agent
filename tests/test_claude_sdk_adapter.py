@@ -82,7 +82,8 @@ def adapter(messages):
 
 
 def test_backend_default_and_missing_config_fail_before_launch():
-    assert load_claude_sdk_config({}).backend == 'legacy'
+    with pytest.raises(ValidationError, match='模型'):
+        load_claude_sdk_config({})
     with pytest.raises(ValidationError, match='模型'):
         load_claude_sdk_config({'TRACEFIX_CODING_BACKEND': 'claude_sdk'})
 
@@ -109,7 +110,7 @@ def test_dedicated_base_url_and_key_come_from_env_file_settings():
     assert config.base_url == 'https://gateway.example/anthropic'
     assert config.credential_ref == 'env:TRACEFIX_CLAUDE_API_KEY'
     assert config.model_id == 'gateway-coder'
-    assert config.egress_allowlist == ['https://gateway.example']
+    assert config.egress_allowlist == ['https://gateway.example', 'https://mcp.context7.com']
     assert 'dedicated-secret' not in config.model_dump_json()
 
 
@@ -136,7 +137,7 @@ def test_direct_anthropic_defaults_to_anthropic_origin():
     config = load_claude_sdk_config(SDK_ENV | {'TRACEFIX_CLAUDE_MODEL': 'claude-sonnet-4-6',
         'TRACEFIX_CLAUDE_API_KEY': 'dedicated-secret'})
     assert config.base_url == ''
-    assert config.egress_allowlist == ['https://api.anthropic.com']
+    assert config.egress_allowlist == ['https://api.anthropic.com', 'https://mcp.context7.com']
 
 
 @pytest.mark.parametrize('base_url', ['http://gateway.example', 'https://user:secret@gateway.example',

@@ -1,4 +1,4 @@
-from tracefix.runtime.contracts import Outcome, Phase, RunState
+from tracefix.runtime.contracts import Outcome, Phase, RunState, RunStatus
 from tests.test_harness_graph import create_harness_engine
 
 
@@ -12,8 +12,11 @@ async def verified_sdk_candidate(tmp_path, *, configure=None, runner_factory=Non
     async def stop_before_acceptance(current, active):
         return current.output(active, 'end')
 
+    async def stop_verification(active, next_node):
+        return engine.output(active, 'end')
+
     if stop_before_verify:
-        engine.verify = stop_before_acceptance
+        engine.verify = stop_verification
     else:
         harness.review = stop_before_acceptance
     try:
@@ -23,6 +26,7 @@ async def verified_sdk_candidate(tmp_path, *, configure=None, runner_factory=Non
         engine.verify = verify
     active = RunState.model_validate(output['data'])
     assert active.phase == (Phase.VERIFY if stop_before_verify else Phase.REVIEW), active.error
+    assert active.run_status == RunStatus.RUNNING, active.error
     if not stop_before_verify:
         assert active.outcome == Outcome.FIX_VERIFIED, active.error
         assert engine.verification_passed(active)
