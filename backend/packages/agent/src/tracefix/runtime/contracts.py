@@ -579,7 +579,7 @@ TRANSITIONS = {
     Phase.DIAGNOSE: {Phase.PATCH, Phase.FINALIZE},
     Phase.PATCH: {Phase.DIAGNOSE, Phase.VERIFY, Phase.FINALIZE},
     Phase.VERIFY: {Phase.DIAGNOSE, Phase.REVIEW, Phase.FINALIZE},
-    Phase.REVIEW: {Phase.FINALIZE},
+    Phase.REVIEW: {Phase.DIAGNOSE, Phase.FINALIZE},
     Phase.FINALIZE: set(),
 }
 IMMUTABLE = {"run_id", "scope_id", "schema_version", "mode", "goal", "url", "repair_mode"}

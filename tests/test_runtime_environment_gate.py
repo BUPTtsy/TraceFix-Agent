@@ -184,10 +184,11 @@ async def test_live_sample_cannot_bypass_workspace_or_typed_evidence(verified_en
     assert engine.runner.inspect_calls == before + 1
 
 
-async def test_sdk_review_rejects_inspect_failure_before_committing(verified_engine, monkeypatch):
+@pytest.mark.parametrize('inspection', [RuntimeError('container missing'), 'changed-environment'])
+async def test_sdk_review_rejects_inspect_failure_before_committing(verified_engine, monkeypatch, inspection):
     engine, state = verified_engine
     original_head = engine.workspace.head()
-    engine.runner.inspect_results = [RuntimeError('container missing')]
+    engine.runner.inspect_results = [inspection]
     monkeypatch.setattr(engine.store, 'consume_approval', lambda *args: pytest.fail('SDK 不消费宿主审批'))
     output = await engine.harness.review(engine, state)
     rejected = type(state).model_validate(output['data'])
