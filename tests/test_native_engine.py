@@ -86,8 +86,12 @@ async def test_frozen_business_failure_counts_real_reproduction_trials(tmp_path,
 @pytest.mark.parametrize('kind', ['original', 'regression', 'behavior'])
 @pytest.mark.parametrize('check', ['postconditions', 'wait'])
 async def test_frozen_business_failure_becomes_failed_public_validation(tmp_path, kind, check):
-    action = failing_action(check)
-    visible = Assertion(locator=Locator(role='heading', name='Task board'))
+    condition = Assertion(locator=Locator(role='heading', name='Task board'))
+    action = BrowserAction(kind='click', locator=Locator(role='checkbox', name='Complete task'),
+        postconditions=[condition] if check == 'postconditions' else [],
+        wait=ObservableWait(assertions=[condition], timeout_seconds=1,
+            interval_seconds=0.01, max_observations=1) if check == 'wait' else None)
+    visible = Assertion(locator=Locator(role='checkbox', name='Complete task'))
     scenario = BehaviorScenario(id='settled-failure', steps=[
         BehaviorStep(action=action, assertions=[visible])])
 
@@ -123,12 +127,13 @@ async def test_frozen_business_failure_becomes_failed_public_validation(tmp_path
     frozen_plan = engine.get(state, state.replay_plan_ref)
     browser_action = engine.browser.action
 
-    async def reject_checked(action):
+    async def reject_heading(action):
         observation = await browser_action(action)
-        observation['snapshot'] = observation['snapshot'].replace(' [checked]', '')
+        observation['snapshot'] = '\n'.join(line for line in observation['snapshot'].splitlines()
+                                            if 'heading "Task board"' not in line)
         return observation
 
-    engine.browser.action = reject_checked
+    engine.browser.action = reject_heading
     engine.browser.calls.clear()
     engine.store.save(state)
     for attempt in range(10):
@@ -150,7 +155,7 @@ async def test_frozen_business_failure_becomes_failed_public_validation(tmp_path
         result = engine.get(state, result['checkpoint_refs'][0])
     assert result['business_check'] == check
     assert result['assertions'][0]['passed'] is False
-    assert result['assertions'][0]['assertion']['condition'] == 'checked'
+    assert result['assertions'][0]['assertion']['condition'] == 'visible'
     assert engine.get(state, state.replay_plan_ref) == frozen_plan
     assert [call['kind'] for call in engine.browser.calls].count('click') == 1
     assert all(record['status'] == 'DONE' for record in engine.store.operations.values())
