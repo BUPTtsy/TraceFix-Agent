@@ -83,7 +83,7 @@ async def test_frozen_business_failure_counts_real_reproduction_trials(tmp_path,
     assert all(record['status'] == 'DONE' for record in engine.store.operations.values())
 
 
-@pytest.mark.parametrize('kind', ['original', 'regression', 'behavior'])
+@pytest.mark.parametrize('kind', ['regression', 'behavior'])
 @pytest.mark.parametrize('check', ['postconditions', 'wait'])
 async def test_frozen_business_failure_becomes_failed_public_validation(tmp_path, kind, check):
     condition = Assertion(locator=Locator(role='heading', name='Task board'))
@@ -159,6 +159,32 @@ async def test_frozen_business_failure_becomes_failed_public_validation(tmp_path
     assert engine.get(state, state.replay_plan_ref) == frozen_plan
     assert [call['kind'] for call in engine.browser.calls].count('click') == 1
     assert all(record['status'] == 'DONE' for record in engine.store.operations.values())
+
+
+@pytest.mark.parametrize('check', ['postconditions', 'wait'])
+async def test_frozen_original_replay_drops_exploration_guards_without_changing_spec(tmp_path, check):
+    engine, state = await prepare_engine(tmp_path)
+    observation = engine.get(state, state.observation_ref)
+    condition = Assertion(locator=Locator(role='heading', name='Task board'))
+    action = BrowserAction(kind='click', observation_id=observation['id'], element_ref='e2',
+        locator=Locator(role='checkbox', name='Complete task'),
+        postconditions=[condition] if check == 'postconditions' else [],
+        wait=ObservableWait(assertions=[condition]) if check == 'wait' else None)
+    await engine.act(state, action)
+    state.phase = Phase.REPRODUCE
+    state.replay_plan_ref = engine.put(state, [action.model_dump(mode='json')])
+    original_spec_hash = state.test_spec_hash
+    engine.store.save(state)
+    frozen = await engine.freeze_reproduction_plan(state)
+    plan = engine.get(frozen, frozen.replay_plan_ref)
+    assert len(plan) == 1 and plan[0]['kind'] == 'click'
+    assert plan[0]['locator'] == action.locator.model_dump(mode='json')
+    assert plan[0]['observation_id'] is None and plan[0]['element_ref'] is None
+    assert plan[0]['preconditions'] == plan[0]['postconditions'] == [] and plan[0]['wait'] is None
+    assert engine.get(frozen, frozen.exploration_plan_ref) == [action.model_dump(mode='json')]
+    assert frozen.test_spec_hash == original_spec_hash and frozen.reproduction_plan_frozen
+    assert [call['kind'] for call in engine.browser.calls] == ['click']
+
 
 async def test_frozen_press_rebinds_current_observation_before_real_mcp_guard(tmp_path, monkeypatch):
     engine, state = await prepare_engine(tmp_path)

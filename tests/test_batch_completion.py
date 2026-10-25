@@ -6,7 +6,7 @@ from tracefix.knowledge.assembler import ContextWindowError
 from tracefix.model.gateway import ModelError
 from tracefix.runtime.contracts import Outcome, Phase, RunState, RunStatus, digest
 from tracefix.runtime.smoke import make_engine as make_smoke_engine
-from tests.support_sdk_candidate import verified_sdk_candidate
+from tests.support_sdk_candidate import finalize_sdk_candidate, verified_sdk_candidate
 from tests.test_harness_graph import create_harness_engine
 
 
@@ -283,6 +283,20 @@ async def test_interactive_unknown_operation_retains_manual_pause_contract(tmp_p
     assert paused.outcome is None
     assert paused.report_ref is None
 
+
+
+async def test_batch_optional_memory_failure_keeps_final_report(tmp_path):
+    engine, state = await verified_sdk_candidate(tmp_path)
+
+    def failed_memory(*args):
+        raise RuntimeError('记忆存储暂时不可用')
+
+    engine.retriever.candidate = failed_memory
+    finished = await finalize_sdk_candidate(engine, state)
+    assert finished.run_status == RunStatus.COMPLETED and finished.outcome == Outcome.FIX_VERIFIED
+    assert finished.report_ref
+    assert any(event['type'] == 'run.warning' and event['payload'].get('source') == 'report_memory'
+               for event in engine.store.trace(finished.run_id, finished.scope_id))
 
 
 async def test_sdk_batch_fix_finishes_without_interactive_approval(tmp_path):
