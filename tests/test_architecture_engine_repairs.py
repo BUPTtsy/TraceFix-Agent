@@ -282,14 +282,15 @@ async def test_integrity_damage_rejected_after_commit_at_finalize(verified_engin
     observation = engine.get(state, result['observation_ref'])
     ref = {'result': wrapper['artifact_ref'], 'png': observation['screenshot_ref'],
            'plan': state.replay_plan_ref, 'observation': result['observation_ref']}[target]
-    original_finalize = engine.finalize
+    original_branch = engine.workspace.branch
 
-    async def damage_before_final_report(current, next_node):
-        assert current.local_branch and engine.workspace.head() != current.patch_base_commit
-        (engine.artifacts.root / current.scope_id / current.run_id / ref).write_bytes(b'corrupt')
-        return await original_finalize(current, next_node)
+    def damage_after_commit(name):
+        branch = original_branch(name)
+        assert engine.workspace.head() != state.patch_base_commit
+        (engine.artifacts.root / state.scope_id / state.run_id / ref).write_bytes(b'corrupt')
+        return branch
 
-    engine.finalize = damage_before_final_report
+    engine.workspace.branch = damage_after_commit
     await finalize_sdk_candidate(engine, state)
     finished = engine.store.load(state.run_id, state.scope_id)
     assert finished.outcome == Outcome.INFRA_FAILURE
