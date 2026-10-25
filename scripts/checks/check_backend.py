@@ -1,6 +1,7 @@
 """Real HTTP integration test for the authored BugBoard fixture, without Docker."""
 import json
 import os
+import runpy
 import socket
 import subprocess
 import tempfile
@@ -11,11 +12,12 @@ from pathlib import Path
 
 def main():
     root=Path(__file__).resolve().parents[2]
+    target = runpy.run_path(str(root / 'bugboard/scripts/prepare_target.py'))['prepare_target'](check_cases=True)
     with tempfile.TemporaryDirectory(prefix='tracefix-backend-') as folder:
         with socket.socket() as sock:
             sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
         base=f'http://127.0.0.1:{port}'
-        proc=subprocess.Popen(['node','server/index.mjs'],cwd=root/'backend/apps/console-api',
+        proc=subprocess.Popen(['node','server/index.mjs'],cwd=target,
             env={**os.environ,'PORT':str(port),'BUGBOARD_DATA':str(Path(folder)/'data.json')},
             stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         def request(route,method='GET',data=None):
