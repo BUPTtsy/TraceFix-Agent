@@ -6,7 +6,7 @@ import pytest
 from tracefix.config import Project
 from tracefix.rules.analyzers import analyze_source
 from tracefix.rules.codegraph import CODEGRAPH_VERSION, CodeGraphError, RepositoryCodeGraph
-from tracefix.runtime.contracts import CheckJudgement, Phase, digest
+from tracefix.runtime.contracts import CheckJudgement, FileEdit, PatchProposal, Phase, digest
 from tracefix.runtime.smoke import make_engine
 from tracefix.tools.evidence import attach_source_evidence_tools
 from tracefix.tools.handlers import build_runtime_tools
@@ -70,14 +70,15 @@ def test_runtime_check_works_without_projects_or_indexes(tmp_path, monkeypatch, 
 
 
 @pytest.mark.parametrize('mode,phase', [('test', Phase.EXPLORE), ('repair', Phase.VERIFY)])
-async def test_code_analysis_reads_overlay_and_records_current_check_evidence(tmp_path, mode, phase):
+async def test_code_analysis_reads_materialized_candidate_and_records_current_check_evidence(tmp_path, mode, phase):
     engine, state = make_engine(tmp_path / mode)
     state.mode, state.phase, state.patch_hash = mode, phase, 'current-patch'
     engine.store.save(state)
     source = engine.workspace.root / 'src/value.ts'
     baseline = source.read_bytes()
     candidate = 'export const persisted = true;\n'
-    engine.workspace.stage('src/value.ts', candidate)
+    engine.workspace.apply(PatchProposal(summary='候选分析', evidence_refs=[], edits=[
+        FileEdit(path='src/value.ts', before_hash=digest(baseline), content=candidate)]))
     context = {'available_evidence_refs': ['existing-evidence']}
     previous_context = context
     runtime = build_runtime_tools(engine, state, CheckJudgement)
@@ -86,7 +87,7 @@ async def test_code_analysis_reads_overlay_and_records_current_check_evidence(tm
 
     receipt = await runtime.pipeline().execute('CodeAnalyze', {
         'paths': [str(source)], 'check': 'regex', 'config': {'pattern': 'persisted = true'},
-    }, 'analyze-overlay')
+    }, 'analyze-candidate')
 
     assert not receipt.is_error
     assert receipt.result['status'] == 'fail'
@@ -102,7 +103,7 @@ async def test_code_analysis_reads_overlay_and_records_current_check_evidence(tm
     assert context['available_evidence_refs'] == ['current-evidence', reference]
     assert context['evidence_refs'] == context['available_evidence_refs']
     assert previous_context == {'available_evidence_refs': ['existing-evidence']}
-    assert source.read_bytes() == baseline
+    assert source.read_bytes() == candidate.encode()
 
 
 async def test_code_analysis_rejects_outside_paths_and_preserves_analyzer_fallback(tmp_path, monkeypatch):
@@ -182,18 +183,20 @@ def test_codegraph_databases_are_repository_scoped_and_reused(tmp_path, codegrap
     assert not (first.root / '.codegraph').exists()
 
 
-async def test_codegraph_tool_indexes_complete_overlay_but_filters_symbol_results(tmp_path, codegraph_cli):
+async def test_codegraph_tool_indexes_complete_workspace_but_filters_symbol_results(tmp_path, codegraph_cli):
     engine, state = make_engine(tmp_path / 'run')
     state.phase = Phase.EXPLORE
     related = engine.workspace.root / 'src/related.ts'
     related.write_text('export function related() {}\n', encoding='utf-8')
     candidate = 'export const persisted = true;\n'
-    engine.workspace.stage('src/value.ts', candidate)
+    engine.workspace.apply(PatchProposal(summary='候选索引', evidence_refs=[], edits=[
+        FileEdit(path='src/value.ts', before_hash=digest(engine.workspace.read('src/value.ts').encode()),
+                 content=candidate)]))
     runtime = build_runtime_tools(engine, state, CheckJudgement)
     receipt = await runtime.pipeline().execute('CodeAnalyze', {
         'paths': [str(engine.workspace.root / 'src/value.ts')],
         'config': {'project_root': str(tmp_path / 'forbidden'), 'codegraph_command': 'not-allowed'},
-    }, 'graph-overlay')
+    }, 'graph-candidate')
     assert not receipt.is_error
     result = receipt.result
     assert result['status'] == 'pass' and result['parser'] == 'codegraph'
