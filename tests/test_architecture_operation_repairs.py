@@ -451,6 +451,8 @@ async def test_worker_and_descendant_exit_confirmed_on_all_paths(tmp_path, monke
     async with asyncio.timeout(5):
         while not (tmp_path / 'entered').exists():
             if task.done():
+                if mode == 'timeout':
+                    break
                 await task
             await asyncio.sleep(0.005)
     if mode == 'normal':
