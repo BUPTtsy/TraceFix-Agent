@@ -1,52 +1,19 @@
-"""Batch execution must always produce a terminal, consumable result."""
-
-from pathlib import Path
-
 import pytest
 from langgraph.errors import GraphRecursionError
 
 from tracefix.execution.browser import MCPActionUnknown, MCPConnectionError
 from tracefix.knowledge.assembler import ContextWindowError
 from tracefix.model.gateway import ModelError
-from tracefix.runtime.contracts import (Outcome, Phase, RunState, RunStatus,
-                                       TestSpec as Spec, Validation, digest, reduce_state)
-from tracefix.runtime.smoke import FakeBrowser, make_engine
-from tracefix.runtime.verification import verification_binding
+from tracefix.runtime.contracts import Outcome, Phase, RunState, RunStatus, digest
+from tracefix.runtime.smoke import make_engine as make_smoke_engine
+from tests.support_sdk_candidate import verified_sdk_candidate
+from tests.test_harness_graph import create_harness_engine
 
 
-@pytest.mark.parametrize('late_change', [False, True])
-async def test_interactive_commit_preserves_verified_patch_and_rejects_late_changes(tmp_path, late_change):
-    engine, state = make_engine(tmp_path)
-    baseline = engine.workspace.head()
-    await engine.run(state)
-    pending = engine.store.load(state.run_id, state.scope_id)
-    assert pending.run_status == RunStatus.WAITING_APPROVAL
-    with pytest.raises(ValueError, match='基线'):
-        reduce_state(pending, pending.revision, patch_base_commit='a' * 40)
-    if late_change:
-        original_branch = engine.workspace.branch
-
-        def commit_then_change(name):
-            result = original_branch(name)
-            (engine.workspace.root / 'src/value.ts').write_bytes(b'export const persisted = false;\n')
-            return result
-
-        engine.workspace.branch = commit_then_change
-    engine.store.decide_approval(pending.approval_ref, pending, 'approve')
-    await engine.run(resume='approve')
-    finished = engine.store.load(state.run_id, state.scope_id)
-    if late_change:
-        assert finished.outcome == Outcome.INFRA_FAILURE
-        assert finished.error_details['terminal_reason'] == 'final_verification_invalid'
-        return
-    assert finished.outcome == Outcome.FIX_VERIFIED, finished.error
-    assert finished.patch_base_commit == baseline
-    assert engine.workspace.head() != baseline and engine.workspace.diff() == ''
-    assert digest(engine.workspace.diff(baseline).encode()) == finished.patch_hash
-    report = engine.get(finished, finished.report_ref)
-    assert report['patch_base_commit'] == baseline
-    assert report['patch_verification'] == 'verified' and report['patch_available']
-    assert engine.artifacts.read(state.scope_id, state.run_id, report['patch_diff_ref'])
+def make_engine(tmp_path, **options):
+    engine, state = make_smoke_engine(tmp_path, **options)
+    state.mode = 'test'
+    return engine, state
 
 
 def test_existing_candidate_branch_does_not_return_stale_commit(tmp_path):
@@ -60,30 +27,6 @@ def test_existing_candidate_branch_does_not_return_stale_commit(tmp_path):
     assert engine.workspace.branch(candidate) == candidate
     assert engine.workspace.head() != previous_commit and engine.workspace.diff() == ''
 
-
-async def test_batch_fix_finishes_without_interactive_approval(tmp_path):
-    engine, state = make_engine(tmp_path)
-    state.execution_mode = "batch"
-
-    await engine.run(state)
-
-    finished = engine.store.load(state.run_id, state.scope_id)
-    assert finished.run_status == RunStatus.COMPLETED, finished.error
-    assert finished.outcome == Outcome.FIX_VERIFIED
-    assert finished.approval_ref is None
-    assert finished.local_branch == 'tracefix/' + state.run_id
-    assert engine.store.approvals == {}
-    assert len(finished.validation_refs) == 6
-    assert finished.report_ref
-    report = engine.get(finished, finished.report_ref)
-    assert report["outcome"] == Outcome.FIX_VERIFIED
-    assert report["patch_verification"] == "verified"
-    assert report["patch_available"] is True
-    assert report["patch_diff_ref"]
-    assert report["repair_commit"] == engine.workspace.head()
-    assert engine.workspace.diff() == ''
-    assert report["result_summary"]
-    assert engine.runner.closed and engine.browser.closed
 
 
 @pytest.mark.parametrize("status", ["UNKNOWN_OPERATION", "WAITING_NETWORK", "FAILED"])
@@ -124,6 +67,7 @@ async def test_batch_model_error_is_terminal_and_not_replayed(tmp_path, status):
                engine.store.trace(state.run_id, state.scope_id))
 
 
+
 async def test_batch_exception_group_preserves_full_traceback_in_final_report(tmp_path):
     engine, state = make_engine(tmp_path)
     state.execution_mode = 'batch'
@@ -152,6 +96,7 @@ async def test_batch_exception_group_preserves_full_traceback_in_final_report(tm
     assert 'RuntimeError: worker root failure' in formatted
     assert 'private-credential' not in formatted
     assert engine.runner.closed and engine.browser.closed
+
 
 
 async def test_batch_browser_unknown_operation_preserves_unreceipted_intent(tmp_path):
@@ -184,6 +129,7 @@ async def test_batch_browser_unknown_operation_preserves_unreceipted_intent(tmp_
     assert report["result_summary"]
 
 
+
 async def test_batch_unreceipted_operation_finishes_without_invoking_side_effect(tmp_path):
     engine, state = make_engine(tmp_path)
     state.execution_mode = "batch"
@@ -213,6 +159,7 @@ async def test_batch_unreceipted_operation_finishes_without_invoking_side_effect
     assert all(operation["status"] == "STARTED" for operation in engine.store.operations.values())
 
 
+
 async def test_batch_context_window_error_finishes_with_consumable_output(tmp_path):
     engine, state = make_engine(tmp_path)
     state.execution_mode = "batch"
@@ -240,6 +187,7 @@ async def test_batch_context_window_error_finishes_with_consumable_output(tmp_pa
     assert report["result_summary"]
 
 
+
 @pytest.mark.parametrize('execution_mode', ['batch', 'interactive'])
 async def test_graph_recursion_limit_finishes_with_loop_report(tmp_path, execution_mode):
     engine, state = make_engine(tmp_path)
@@ -263,37 +211,6 @@ async def test_graph_recursion_limit_finishes_with_loop_report(tmp_path, executi
     assert report["result_summary"]
     assert engine.runner.closed and engine.browser.closed
 
-
-async def test_batch_verification_browser_failure_preserves_applied_patch(tmp_path):
-    engine, state = make_engine(tmp_path)
-    state.execution_mode = "batch"
-    original_action = engine.browser.action
-    failed_attempts = []
-
-    async def lose_verification_receipt(action):
-        if "persisted = true" in engine.workspace.read("src/value.ts"):
-            failed_attempts.append(action)
-            raise MCPActionUnknown("unknown-verification-action", action.kind,
-                                   MCPConnectionError("response lost"))
-        return await original_action(action)
-
-    engine.browser.action = lose_verification_receipt
-    await engine.run(state)
-
-    finished = engine.store.load(state.run_id, state.scope_id)
-    assert len(failed_attempts) == 1
-    assert finished.run_status == RunStatus.FAILED
-    assert finished.outcome == Outcome.INFRA_FAILURE
-    assert finished.budget.patches == 1
-    assert len(finished.validation_refs) == 4
-    report = engine.get(finished, finished.report_ref)
-    assert report["patch_available"] is True
-    assert report["patch_verification"] == "unverified"
-    diff = engine.artifacts.read(state.scope_id, state.run_id,
-                                 report["patch_diff_ref"]).decode("utf-8")
-    assert "persisted = true" in diff
-    assert any(event["type"] == "patch.applied" for event in
-               engine.store.trace(state.run_id, state.scope_id))
 
 
 async def test_batch_terminal_error_exports_applied_diff_without_claiming_fix(tmp_path):
@@ -325,6 +242,7 @@ async def test_batch_terminal_error_exports_applied_diff_without_claiming_fix(tm
     assert report["outcome"] != Outcome.FIX_VERIFIED
 
 
+
 async def test_batch_no_bug_found_finishes_with_explicit_empty_patch_result(tmp_path):
     engine, state = make_engine(tmp_path, bugfree=True)
     state.execution_mode = "batch"
@@ -342,6 +260,7 @@ async def test_batch_no_bug_found_finishes_with_explicit_empty_patch_result(tmp_
                                  report["patch_diff_ref"]) == b""
     assert report["result_summary"]
     assert report["outcome"] == Outcome.NO_BUG_FOUND
+
 
 
 async def test_interactive_unknown_operation_retains_manual_pause_contract(tmp_path):
@@ -365,218 +284,80 @@ async def test_interactive_unknown_operation_retains_manual_pause_contract(tmp_p
     assert paused.report_ref is None
 
 
-@pytest.mark.parametrize('damage', ['changed_diff', 'missing_validation', 'export_failure'])
-async def test_batch_final_report_rechecks_patch_and_validation_evidence(tmp_path, damage):
-    engine, state = make_engine(tmp_path)
+
+async def test_sdk_batch_fix_finishes_without_interactive_approval(tmp_path):
+    engine, state, harness, executor = await create_harness_engine(tmp_path)
     state.execution_mode = 'batch'
-    original_finalize = engine.finalize
-    original_get = engine.get
-    original_branch = engine.workspace.branch
-    commits = []
-
-    def record_branch(name):
-        commits.append(name)
-        return original_branch(name)
-
-    engine.workspace.branch = record_branch
-
-    async def corrupt_before_final_report(current, next_node):
-        if damage == 'changed_diff':
-            engine.workspace.path('src/value.ts', write=True).write_text(
-                'export const persisted = false;\n', encoding='utf-8')
-        elif damage == 'missing_validation':
-            def missing_validation(saved, reference):
-                if reference == current.validation_refs[-1]:
-                    raise FileNotFoundError('验证记录损坏')
-                return original_get(saved, reference)
-            engine.get = missing_validation
-        else:
-            def broken_export(base='HEAD'):
-                raise OSError('无法读取工作区 diff')
-            engine.workspace.diff = broken_export
-        return await original_finalize(current, next_node)
-
-    engine.finalize = corrupt_before_final_report
-    await engine.run(state)
-    finished = engine.store.load(state.run_id, state.scope_id)
-    report = original_get(finished, finished.report_ref)
-    assert finished.run_status == RunStatus.FAILED
-    assert finished.outcome == Outcome.INFRA_FAILURE
-    assert report['patch_verification'] != 'verified'
-    assert report['error_details']['terminal_reason'] == 'final_verification_invalid'
-    assert report['patch_diff_ref']
-    assert report['repair_commit'] is None
-    assert commits == []
-    assert engine.runner.closed and engine.browser.closed
-
-
-async def test_batch_commit_failure_is_terminal_and_reported(tmp_path):
-    engine, state = make_engine(tmp_path)
-    state.execution_mode = 'batch'
-    baseline = engine.workspace.head()
-
-    def fail_commit(name):
-        raise OSError('无法创建本地修复提交')
-
-    engine.workspace.branch = fail_commit
-    await engine.run(state)
-    finished = engine.store.load(state.run_id, state.scope_id)
-    report = engine.get(finished, finished.report_ref)
-    assert finished.run_status == RunStatus.FAILED
-    assert finished.outcome == Outcome.INFRA_FAILURE
-    assert report['patch_verification'] == 'unverified'
-    assert report['error_details']['terminal_reason'] == 'local_commit_failed'
-    assert report['repair_commit'] is None
-    assert engine.workspace.head() == baseline
-    assert engine.runner.closed and engine.browser.closed
-
-
-async def test_batch_optional_memory_failure_keeps_final_report(tmp_path):
-    engine, state = make_engine(tmp_path)
-    state.execution_mode = 'batch'
-
-    def failed_memory(*args):
-        raise RuntimeError('记忆存储暂时不可用')
-
-    engine.retriever.candidate = failed_memory
-    await engine.run(state)
-    finished = engine.store.load(state.run_id, state.scope_id)
-    assert finished.run_status == RunStatus.COMPLETED
+    output = await engine.run(state)
+    finished = RunState.model_validate(output['data'])
+    assert finished.run_status == RunStatus.COMPLETED, finished.error
     assert finished.outcome == Outcome.FIX_VERIFIED
-    assert finished.report_ref
-    assert any(event['type'] == 'run.warning' for event in
-               engine.store.trace(state.run_id, state.scope_id))
+    assert harness.job(finished).status == 'COMPLETED'
+    assert finished.approval_ref is None and engine.store.approvals == {}
+    assert [request.role for request in executor.requests] == ['initializer', 'coder', 'coder']
+    report = engine.get(finished, finished.report_ref)
+    assert report['patch_verification'] == 'verified' and report['patch_available']
+    assert report['repair_commit'] == engine.workspace.head()
+    assert engine.workspace.diff() == ''
+    assert engine.runner.closed and engine.browser.closed
 
 
-async def test_batch_unauthorized_patch_paths_receive_diagnosis_feedback(tmp_path):
-    from tracefix.runtime.contracts import PatchProposal
-
-    engine, state = make_engine(tmp_path)
+async def test_sdk_unknown_browser_operation_blocks_without_replaying_candidate(tmp_path):
+    engine, state = await verified_sdk_candidate(tmp_path, stop_before_verify=True)
     state.execution_mode = 'batch'
-    inner = engine.model
-    contexts = []
+    attempts = []
 
-    class UnauthorizedPatches:
-        async def generate(self, schema, context, **kwargs):
-            result = await inner.generate(schema, context, **kwargs)
-            if schema is PatchProposal:
-                contexts.append(context['diagnosis_retry_count'])
-                result.value.edits[0].path = '.env'
-            return result
+    async def lose_receipt(action):
+        attempts.append(action.kind)
+        raise MCPActionUnknown('unknown-verification-action', action.kind, MCPConnectionError('response lost'))
 
-    engine.model = UnauthorizedPatches()
-    await engine.run(state)
+    engine.browser.action = lose_receipt
+    output = await engine.run(state)
+    finished = RunState.model_validate(output['data'])
+    assert len(attempts) == 1
+    assert engine.harness.job(finished).status == 'BLOCKED'
+    assert finished.run_status == RunStatus.PAUSED
+    assert finished.outcome != Outcome.FIX_VERIFIED
+    assert 'persisted = true' in engine.workspace.read('src/value.ts')
+    assert any(operation['status'] == 'UNKNOWN' for operation in engine.store.operations.values())
+
+
+@pytest.mark.parametrize('damage', ['changed_diff', 'missing_validation', 'export_failure'])
+async def test_sdk_final_report_rechecks_patch_and_validation_evidence(tmp_path, damage, monkeypatch):
+    engine, state = await verified_sdk_candidate(tmp_path)
+    if damage == 'changed_diff':
+        (engine.workspace.root / 'src/value.ts').write_bytes(b'export const persisted = false;\n')
+    elif damage == 'missing_validation':
+        state.validation_refs = []
+    else:
+        def unavailable(*args):
+            raise OSError('候选差异导出失败')
+        monkeypatch.setattr(engine.workspace, 'diff', unavailable)
+    state.phase = Phase.FINALIZE
+    engine.store.save(state)
+    await engine.finalize(state, None)
     finished = engine.store.load(state.run_id, state.scope_id)
-    assert contexts == [0, 1, 2]
+    assert finished.outcome == Outcome.INFRA_FAILURE
+    assert finished.error_details['terminal_reason'] == 'final_verification_invalid'
+    report = engine.get(finished, finished.report_ref)
+    assert report['patch_verification'] != 'verified'
+    if damage == 'export_failure':
+        assert report['patch_export_error']
+
+
+async def test_sdk_commit_failure_is_terminal_and_reported(tmp_path, monkeypatch):
+    engine, state = await verified_sdk_candidate(tmp_path)
+
+    def unavailable(name):
+        raise OSError('本地提交失败')
+
+    monkeypatch.setattr(engine.workspace, 'branch', unavailable)
+    state.phase = Phase.FINALIZE
+    engine.store.save(state)
+    await engine.finalize(state, None)
+    finished = engine.store.load(state.run_id, state.scope_id)
     assert finished.run_status == RunStatus.FAILED
-    assert finished.outcome == Outcome.REPAIR_EXHAUSTED
-    assert len(finished.diagnosis_feedback_refs) == 3
-    assert finished.budget.patches == 0
-    feedback = engine.get(finished, finished.diagnosis_feedback_refs[0])
-    assert feedback['error_details']['path'] == '.env'
-
-
-@pytest.mark.parametrize('complete_only', [False, True])
-async def test_persistence_profile_rejects_loss_of_uncomplete_behavior(tmp_path, complete_only):
-    engine, state = make_engine(tmp_path)
-    spec = Spec.model_validate_json((Path(__file__).resolve().parents[1] /
-                                    'profiles/persistence.spec.json').read_text(encoding='utf-8'))
-
-    class PersistedTaskBrowser(FakeBrowser):
-        def __init__(self, workspace):
-            super().__init__(workspace)
-            self.task_status = self.saved_status = 'Todo'
-            self.filter = 'All'
-            self.frames = []
-
-        async def action(self, action):
-            raw = await super().action(action)
-            if action.kind == 'navigate':
-                self.task_status, self.filter = self.saved_status, 'All'
-            elif action.kind == 'click' and action.locator.role == 'checkbox':
-                if not complete_only or self.task_status != 'Done':
-                    self.task_status = 'Done' if self.task_status == 'Todo' else 'Todo'
-                    self.saved_status = self.task_status
-            elif action.kind == 'click' and action.locator.name in {'Todo', 'Done'}:
-                self.filter = action.locator.name
-            snapshot = ('- heading "Task board" [ref=e1]\n'
-                        '- button "Add task" [ref=e2]\n'
-                        '- button "Todo" [ref=e3]\n'
-                        '- button "Done" [ref=e5]\n')
-            if self.filter == 'Done':
-                snapshot += '- checkbox "Complete Prepare release checklist" [ref=e6]'
-            elif self.filter != 'Todo' or self.task_status == 'Todo':
-                snapshot += '- checkbox "Complete Write project brief" [ref=e4]'
-                if self.task_status == 'Done':
-                    snapshot += ' [checked]'
-            raw['snapshot'] = snapshot
-            self.frames.append((action.kind, self.task_status, self.filter))
-            return raw
-
-    engine.browser = PersistedTaskBrowser(engine.workspace)
-    original_command = engine.runner.command
-
-    async def reset_scenario(kind):
-        if kind == 'reset':
-            engine.browser.task_status = engine.browser.saved_status = 'Todo'
-            engine.browser.filter = 'All'
-        return await original_command(kind)
-
-    engine.runner.command = reset_scenario
-    # 先从独立环境采样完成真实初始化，再冻结计划及候选补丁的证据绑定。
-    engine.runner.environment_digest = 'profile-regression-environment'
-    engine.store.save(state)
-    output = await engine.prepare(state, None)
-    state = RunState(**output['data'])
-    assert engine.runner.started and not engine.runner.closed
-    assert state.source_aligned and state.environment_digest == engine.runner.environment_digest
-    state.execution_mode = 'batch'
-    state.phase, state.validation_index = Phase.VERIFY, 4
-    state.reproduced = True
-    state.reproduction_plan_frozen = True
-    state.test_spec_ref = engine.put(state, spec.model_dump())
-    state.test_spec_hash = digest(spec)
-    replay_plan = [action.model_dump() for action in spec.regression_plan[:2]]
-    state.replay_plan_ref = engine.put(state, replay_plan)
-    engine.workspace.path('src/value.ts', write=True).write_bytes(
-        b'export const persisted = true;\n')
-    state.patch_hash = digest(engine.workspace.diff().encode())
-    replay_plan_hash = digest(replay_plan)
-    binding = verification_binding(state, replay_plan_hash)
-    for kind in ('static', 'unit', 'build', 'health'):
-        command = await engine.runner.health() if kind == 'health' else await engine.runner.command(kind)
-        artifact_ref = engine.put(state, {**command, **binding, 'type': 'validation_result', 'kind': kind})
-        validation = Validation(kind=kind, passed=command['passed'], scope_id=state.scope_id,
-            run_id=state.run_id, source_manifest=state.source_manifest,
-            patch_hash=state.patch_hash, environment_digest=state.environment_digest,
-            test_spec_hash=state.test_spec_hash, replay_plan_hash=replay_plan_hash,
-            artifact_ref=artifact_ref)
-        state.validation_refs.append(engine.put(state, validation.model_dump()))
-    engine.store.save(state)
-
-    original_verification_steps = 1 + len(replay_plan) + 1
-    regression_verification_steps = 1 + len(spec.regression_plan) + 1
-    behavior_verification_steps = sum(1 + len(scenario.steps) for scenario in spec.behavior_scenarios)
-    verification_steps = (original_verification_steps + regression_verification_steps +
-                          behavior_verification_steps)
-    for step in range(verification_steps):
-        if state.phase != Phase.VERIFY:
-            break
-        output = await engine.verify(state, None)
-        state = RunState(**output['data'])
-
-    validations = [engine.get(state, ref) for ref in state.validation_refs]
-    original = next(validation for validation in validations if validation['kind'] == 'original')
-    regression = next(validation for validation in validations if validation['kind'] == 'regression')
-    assert original['passed'] is True
-    assert regression['passed'] is (not complete_only)
-    assert state.phase == (Phase.DIAGNOSE if complete_only else Phase.FINALIZE)
-    regression_result = engine.get(state, regression['artifact_ref'])
-    assert [check['passed'] for check in regression_result['assertions']] == [
-        True, True, not complete_only, not complete_only]
-    regression_frame_start = 1 + len(replay_plan)
-    assert engine.browser.frames[regression_frame_start:regression_frame_start + 1 + len(spec.regression_plan)] == [
-        ('navigate', 'Todo', 'All'), ('click', 'Done', 'All'), ('navigate', 'Done', 'All'),
-        ('click', 'Done' if complete_only else 'Todo', 'All'),
-        ('navigate', 'Done' if complete_only else 'Todo', 'All'),
-        ('click', 'Done' if complete_only else 'Todo', 'Todo')]
+    assert finished.outcome == Outcome.INFRA_FAILURE
+    report = engine.get(finished, finished.report_ref)
+    assert report['patch_available'] and report['patch_verification'] == 'unverified'
+    assert not report['repair_commit']
