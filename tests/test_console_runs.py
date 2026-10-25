@@ -123,7 +123,8 @@ def test_http_project_binding_and_failed_launch(web_console):
     launch = client.post('/api/agent/start', json={'projectId': 'alpha', 'goal': '检验缺少配置时真实记录失败', 'mode': 'test'})
     assert launch.status_code == 202
     run_id = launch.json()['id']
-    for attempt in range(50):
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
         record = client.get('/api/runs/' + run_id).json()
         if record['status'] == 'failed':
             break

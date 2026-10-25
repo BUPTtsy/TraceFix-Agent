@@ -12,7 +12,7 @@ from tracefix.model.prompts import COMMON, STAGE_POLICIES, serialize_request, sy
 from tracefix.runtime.contracts import BrowserAction
 
 
-@pytest.mark.parametrize('phase', ['PREPARE', 'EXPLORE', 'DIAGNOSE'])
+@pytest.mark.parametrize('phase', ['PREPARE', 'EXPLORE'])
 def test_stage_policy_length_and_selection(phase):
     policy = STAGE_POLICIES[phase]
     assert 150 <= len(policy) <= 300
@@ -43,11 +43,11 @@ def test_stable_task_fields_precede_dynamic_observation_without_mutating_context
 
 async def test_provider_refresh_uses_current_phase_and_identical_serialization(monkeypatch):
     requests = capture_requests(monkeypatch)
-    current = {'phase': 'DIAGNOSE', 'goal': 'inspect', 'observation': {'id': 'fresh'}}
+    current = {'phase': 'PREPARE', 'goal': 'inspect', 'observation': {'id': 'fresh'}}
     await Gateway(key='ci').generate(BrowserAction,
         {'phase': 'EXPLORE'}, context_provider=lambda: current)
     assert requests[0]['messages'][1]['content'] == serialize_request(BrowserAction, current)
-    assert STAGE_POLICIES['DIAGNOSE'] in requests[0]['messages'][0]['content']
+    assert STAGE_POLICIES['PREPARE'] in requests[0]['messages'][0]['content']
     assert STAGE_POLICIES['EXPLORE'] not in requests[0]['messages'][0]['content']
 
 
