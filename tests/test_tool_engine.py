@@ -8,7 +8,7 @@ import pytest
 from tracefix.execution.repository import safe_index_files
 from tracefix.execution.workspace import Workspace, commit_workspace
 from tracefix.model import protocol
-from tracefix.model.gateway import Gateway, ModelError
+from tracefix.model.gateway import Gateway
 from tracefix.runtime.contracts import (BrowserAction, Decision,
                                        Phase, RunState, TestSpec as Spec, digest)
 from tracefix.runtime.smoke import make_engine
@@ -40,8 +40,8 @@ async def test_gateway_reads_source_and_returns_typed_test_spec_submission(tmp_p
     engine = SimpleNamespace(workspace=workspace, store=store, rule_resolver=None, memory=None)
     runtime = build_runtime_tools(engine, state, Spec, validate_output=validate_spec)
     pipeline = runtime.pipeline()
-    spec = Spec(goal=state.goal, assertions=[{'locator': {'role': 'checkbox', 'name': 'Complete task'},
-                                            'condition': 'checked'}])
+    checks = [{'locator': {'role': 'checkbox', 'name': 'Complete task'}, 'condition': 'checked'}]
+    spec = Spec(goal=state.goal, assertions=checks, regression_assertions=checks)
     responses = [
         httpx.Response(200, json={'id': 'read-response', 'object': 'chat.completion',
             'created': 0, 'model': 'tool-test', 'usage': {
@@ -166,10 +166,13 @@ async def test_source_tools_assist_element_discovery_without_replacing_page_bind
         current = engine.get(state, state.observation_ref)
         tool_calls.append(call('reject-source-ref', 'BrowserClick', {
             **arguments, 'observation_id': current['id'], 'element_ref': 'source-control-id'}))
-        with pytest.raises(ModelError) as rejected:
-            await engine.model_call(state, Decision, {'observation': current})
-        assert rejected.value.category == 'tool_execution'
-        assert rejected.value.details['executed'] is False
+        tool_calls.append(call('finish-after-rejection', 'FinishExploration', {
+            'action': {'kind': 'finish'}, 'summary': '源码引用未执行，保留当前页面绑定'}))
+        recovered = await engine.model_call(state, Decision, {'observation': current})
+        rejected = json.loads(requests[-1]['messages'][-1]['content'])
+        assert rejected['call_id'] == 'reject-source-ref' and rejected['isError'] is True
+        assert rejected['executed'] is False and rejected['error']['executed'] is False
+        assert recovered.action.kind == 'finish'
         assert len(engine.browser.calls) == 1 and state.budget.browser_actions == 1
     else:
         assert isinstance(result, Spec)
