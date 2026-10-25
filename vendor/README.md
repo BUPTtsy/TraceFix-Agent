@@ -22,3 +22,5 @@ ARM64、32 位 Python、其他 Python 小版本不在本 wheel 集合的目标�
 ```
 
 `vendor/` 被 `.gitignore` 忽略，新增 wheel 必须通过 `git add -f -- vendor/wheels-win_amd64/文件名.whl` 显式纳入版本控制，才能随 GitHub 检出分发。
+
+`claude_agent_sdk` 的 Windows wheel 内置 Claude Code 二进制，超过 GitHub 单文件 100 MB 限制，按根目录 `.gitattributes` 由 Git LFS 管理。克隆需安装 git-lfs（Git for Windows 自带）；未拉取 LFS 对象时该文件只是约 130 字节的指针，离线安装会失败，可执行 `git lfs pull` 补齐。CI 检出已开启 `lfs: true`。

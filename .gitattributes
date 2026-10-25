@@ -1,1 +1,1 @@
-vendor/wheels-win_amd64/claude_agent_sdk-0.2.168-py3-none-win_amd64.whl filter=lfs diff=lfs merge=lfs -text
+vendor/wheels-win_amd64/claude_agent_sdk-*.whl filter=lfs diff=lfs merge=lfs -text
