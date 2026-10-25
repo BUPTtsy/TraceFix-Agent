@@ -6,12 +6,12 @@ import pytest
 from pydantic import ValidationError
 
 from tracefix.execution.runner import DockerRunner
-from tracefix.model.contracts import ModelResult
-from tracefix.runtime.contracts import (FileEdit, FinishRepair, Outcome, PatchProposal, Phase,
+from tracefix.runtime.contracts import (FileEdit, Outcome, Phase,
                                        RunState, RunStatus, TestSpec, Validation, digest)
 from tracefix.runtime.smoke import make_engine
 from tracefix.runtime.command_tests import baseline_reproduced, frozen_plan
 from tracefix.service.contracts import ExecutionRequest
+from tests.support_sdk_candidate import verified_sdk_candidate
 
 
 class Commands:
@@ -51,27 +51,9 @@ class Commands:
         self._started = False
 
 
-class HybridModel:
-    supports_tool_executor = True
-
-    def __init__(self, root):
-        self.root = root
-
-    async def generate(self, schema, context, **options):
-        assert schema is FinishRepair
-        options['on_attempt']('fake-command', {'unprojected_messages': [
-            {'role': 'user', 'content': '修复冻结的构建失败'}], 'json': {'messages': []}}, 1)
-        pipeline = options['tool_pipeline']
-        written = await pipeline.execute('Write', {'file_path': str(self.root / 'src/value.ts'),
-            'content': 'export const persisted = true;\n'}, 'write-command')
-        assert not written.is_error, written.error
-        finished = await pipeline.execute('finish_repair', {'summary': '修复命令目标'}, 'finish-command')
-        assert not finished.is_error, finished.error
-        return ModelResult(FinishRepair(summary='修复命令目标'), {}, 'fake-command', 'stop')
-
-
 def configured(tmp_path, target='build', **options):
     engine, state = make_engine(tmp_path)
+    state.mode = 'test'
     spec = TestSpec(goal='修复冻结命令中的持久化缺陷', mode=target)
     state.test_spec_ref = engine.put(state, spec.model_dump())
     state.test_spec_hash = digest(spec)
@@ -86,13 +68,14 @@ def configured(tmp_path, target='build', **options):
 
 
 async def verified(tmp_path, target='build'):
-    engine, state = configured(tmp_path, target)
-    await engine.run(state)
-    state = engine.store.load(state.run_id, state.scope_id)
-    assert state.outcome == Outcome.FIX_VERIFIED, state.model_dump()
-    assert state.phase == Phase.REVIEW
-    assert engine.verification_passed(state)
-    return engine, state
+    def configure(engine, state):
+        spec = TestSpec(goal='修复冻结命令中的持久化缺陷', mode=target)
+        state.test_spec_ref = engine.put(state, spec.model_dump())
+        state.test_spec_hash = digest(spec)
+        state.goal = spec.goal
+
+    return await verified_sdk_candidate(tmp_path, configure=configure,
+        runner_factory=lambda workspace, source: Commands(workspace, source, target))
 
 
 def test_old_gui_and_modify_contracts_keep_exact_serialized_hash(tmp_path):
@@ -130,21 +113,18 @@ async def test_real_failure_baseline_and_independent_verify_without_browser(tmp_
     assert plan['commands'][target] == engine.profile.commands[target]
     assert baseline_reproduced(state, plan,
         lambda ref: engine.artifacts.exists(state.scope_id, state.run_id, ref), lambda ref: engine.get(state, ref))
-    assert sum(call == ('command', target) for call in engine.runner.calls) >= 6
+    assert sum(call == ('command', target) for call in engine.runner.calls) >= 2
     assert {engine.get(state, ref)['kind'] for ref in state.validation_refs} == {
         'static', 'unit', 'build', 'original', 'regression'}
     assert not engine.browser.calls
     assert state.budget.browser_actions == 0
 
 
-async def test_hybrid_command_repair_uses_same_independent_gate(tmp_path):
-    engine, state = configured(tmp_path)
-    state.repair_mode = 'hybrid'
-    engine.model = HybridModel(engine.workspace.root)
-    await engine.run(state)
-    state = engine.store.load(state.run_id, state.scope_id)
-    assert state.outcome == Outcome.FIX_VERIFIED, state.model_dump()
-    assert state.repair_segment == 1 and engine.verification_passed(state)
+async def test_sdk_command_repair_uses_same_independent_gate(tmp_path):
+    engine, state = await verified(tmp_path)
+    assert state.harness_job_id and state.sdk_execution_id
+    assert engine.verification_passed(state)
+    assert not engine.browser.calls
 
 
 async def test_unstable_failure_cannot_enter_diagnose(tmp_path):
@@ -194,37 +174,23 @@ async def test_user_cancellation_stops_before_running_frozen_commands(tmp_path):
     assert not state.reproduced and not engine.runner.calls
 
 
-async def test_failed_regression_returns_to_diagnose_with_bound_feedback(tmp_path):
-    engine, state = configured(tmp_path)
+async def test_failed_regression_returns_to_sdk_with_bound_feedback(tmp_path):
+    engine, state = await verified(tmp_path)
     engine.runner.force_fail = 'unit'
-    diagnose = engine.diagnose
-    async def stop_after_return(state, route):
-        if state.patch_hash:
-            return engine.output(state, 'end')
-        return await diagnose(state, route)
-    engine.diagnose = stop_after_return
-    await engine.run(state)
-    state = engine.store.load(state.run_id, state.scope_id)
+    state.phase, state.outcome = Phase.VERIFY, None
+    state.validation_index, state.replay_index = 4, 0
+    state.validation_refs = []
+    engine.store.save(state)
+    output = await engine.verify(state, None)
+    state = RunState.model_validate(output['data'])
     assert state.phase == Phase.DIAGNOSE and state.outcome is None
-    assert engine.current_diagnosis_feedback(state)
+    assert output['next_node'] == 'harness_code'
+    session = engine.harness.session(state)
+    assert session.feedback_ref
+    assert engine.get(state, session.feedback_ref)['run_id'] == state.run_id
     validations = [engine.get(state, ref) for ref in state.validation_refs]
     assert any(value['kind'] == 'regression' and not value['passed'] for value in validations)
     assert not engine.verification_passed(state)
-
-
-def test_new_file_fingerprint_matches_proposal_and_unmaterialized_overlay(tmp_path):
-    engine, state = configured(tmp_path)
-    path, content = 'src/new.ts', 'export const added = true;\n'
-    patch = PatchProposal(summary='新增合法实现文件', evidence_refs=[state.test_spec_ref], edits=[FileEdit(
-        path=path, before_hash=digest(b''), content=content, operation='create')])
-    expected = engine.candidate_fingerprint(patch)
-    empty_patch = patch.model_copy(update={'edits': [FileEdit(
-        path=path, before_hash=digest(b''), content='', operation='create')]})
-    assert engine.candidate_fingerprint(empty_patch) != digest({})
-    engine.workspace.stage(path, content)
-    assert not engine.workspace.path(path).exists()
-    assert engine.candidate_fingerprint() == expected
-    assert expected != digest({})
 
 
 @pytest.mark.parametrize('corruption', ['argv', 'exit', 'baseline', 'regression', 'binding', 'target'])

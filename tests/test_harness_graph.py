@@ -144,7 +144,8 @@ class IncrementExecutor:
             sdk_session_id='sdk-' + request.session_id, summary='SDK 候选', structured_output=output)
 
 
-async def create_harness_engine(tmp_path, *, final_verifier=None, fail_validation_once=False):
+async def create_harness_engine(tmp_path, *, final_verifier=None, fail_validation_once=False,
+                                configure=None, runner_factory=None):
     engine, state = make_engine(tmp_path / 'engine')
     store = MemoryHarnessStore(engine.artifacts)
     executor = IncrementExecutor()
@@ -158,7 +159,8 @@ async def create_harness_engine(tmp_path, *, final_verifier=None, fail_validatio
             current.model.decision_calls = 0
             bound_commit = source_identity
         current.workspace, current.source = workspace, source
-        current.runner = FakeRunner(digest(source))
+        current.runner = (runner_factory(workspace, digest(source)) if runner_factory
+                          else FakeRunner(digest(source)))
         original_command = current.runner.command
 
         async def command(kind):
@@ -180,6 +182,10 @@ async def create_harness_engine(tmp_path, *, final_verifier=None, fail_validatio
         egress_allowlist=['https://api.anthropic.com'])
     harness = HarnessRuntime(store, executor, config, tmp_path / 'h', rebind=rebind,
         final_verifier=final_verifier)
+    if configure is not None:
+        configure(engine, state)
+    if runner_factory is not None:
+        engine.runner = runner_factory(engine.workspace, state.source_manifest)
     engine.store.save(state)
     state = harness.attach(engine, state, console_task_id='console-task', local_commit_authorized=True)
     return engine, state, harness, executor

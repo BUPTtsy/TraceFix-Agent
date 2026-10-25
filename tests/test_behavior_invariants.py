@@ -8,6 +8,7 @@ from tracefix.runtime.contracts import (Assertion, BehaviorScenario, BehaviorSte
     FileEdit, Locator, Outcome, PatchProposal, Phase, RunState, RunStatus, TestSpec as FrozenTestSpec,
     Validation, digest, reduce_state, verification_gate)
 from tracefix.runtime.smoke import FakeBrowser, make_engine
+from tests.support_sdk_candidate import verified_sdk_candidate
 
 
 CONTROL = Locator(role='checkbox', name='Complete task')
@@ -48,25 +49,16 @@ class BehaviorBrowser(FakeBrowser):
 
 
 async def verification_engine(tmp_path, failure=None):
-    engine, state = make_engine(tmp_path)
-    # 通过真实初始化采样并启动环境，不能用摘要缓存或手写启动状态冒充实时环境。
-    engine.store.save(state)
-    output = await engine.prepare(state, None)
-    state = RunState(**output['data'])
+    def configure(engine, state):
+        spec = engine.spec(state).model_copy(update={'behavior_scenarios': [scenario()]})
+        state.test_spec_ref = engine.put(state, spec.model_dump())
+        state.test_spec_hash = digest(spec)
+
+    engine, state = await verified_sdk_candidate(tmp_path, configure=configure,
+                                                stop_before_verify=True)
     assert engine.runner.started and not engine.runner.closed
     assert state.source_aligned and state.environment_digest == engine.runner.environment_digest
-    spec = engine.spec(state).model_copy(update={'behavior_scenarios': [scenario()]})
-    state.test_spec_ref = engine.put(state, spec.model_dump())
-    state.test_spec_hash = digest(spec)
-    state.reproduction_plan_frozen = True
-    state.replay_plan_ref = engine.put(state, [step.action.model_dump() for step in scenario().steps[:2]])
-    state.phase = Phase.VERIFY
-    state.reproduced = True
     state.execution_mode = 'batch'
-    proposal = PatchProposal(summary='有效或无效业务修复候选', evidence_refs=['baseline.json'], edits=[
-        FileEdit(path='src/value.ts', before_hash=digest(engine.workspace.read('src/value.ts').encode()),
-                 content='export const persisted = true;\n')])
-    state.patch_hash = engine.workspace.apply(proposal)['patch_hash']
     engine.browser = BehaviorBrowser(engine.workspace, failure)
     original_command = engine.runner.command
 
@@ -82,7 +74,10 @@ async def verification_engine(tmp_path, failure=None):
 
 async def verify_until_transition(engine, state):
     for attempt in range(50):
-        output = await engine.verify(state, None)
+        if state.check_suite_stage == 'verify' and not state.check_suite_completed:
+            output = await engine.check_suite(state, None)
+        else:
+            output = await engine.verify(state, None)
         state = RunState(**output['data'])
         if state.phase != Phase.VERIFY:
             return state
@@ -316,18 +311,18 @@ async def test_spec_reader_is_required_when_a_frozen_spec_is_present(tmp_path):
 
 
 async def test_legacy_spec_without_behavior_fields_keeps_original_six_gates(tmp_path):
-    engine, state = make_engine(tmp_path)
-    raw = engine.get(state, state.test_spec_ref)
-    raw.pop('behavior_scenarios')
-    raw['max_steps'] = 20
-    state.test_spec_ref = engine.put(state, raw)
-    state.test_spec_hash = digest(raw)
+    def configure(engine, state):
+        raw = engine.get(state, state.test_spec_ref)
+        raw.pop('behavior_scenarios')
+        raw['max_steps'] = 20
+        state.test_spec_ref = engine.put(state, raw)
+        state.test_spec_hash = digest(FrozenTestSpec.model_validate(raw))
+
+    engine, state = await verified_sdk_candidate(tmp_path, configure=configure)
     assert engine.spec(state).behavior_scenarios == []
-    await engine.run(state)
-    saved = engine.store.load(state.run_id, state.scope_id)
-    assert saved.outcome == Outcome.FIX_VERIFIED, saved.error
-    assert len(saved.validation_refs) == 6
-    assert gate(engine, saved)
+    assert state.outcome == Outcome.FIX_VERIFIED, state.error
+    assert len(state.validation_refs) == 6
+    assert gate(engine, state)
 
 
 async def test_post_patch_unbound_replay_preserves_frozen_plan_and_finishes_inconclusive(tmp_path):

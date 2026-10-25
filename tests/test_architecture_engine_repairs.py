@@ -9,6 +9,7 @@ from tracefix.runtime.contracts import (Assertion, BehaviorScenario, BehaviorSte
     Locator, Outcome, Phase, RunState, RunStatus, TestSpec as FrozenSpec, Validation, digest)
 from tracefix.runtime.smoke import FakeRunner, PNG, make_engine
 from tracefix.runtime.verification import verification_binding
+from tests.support_sdk_candidate import finalize_sdk_candidate, verified_sdk_candidate
 
 
 KINDS = ['static', 'unit', 'build', 'health', 'original', 'regression', 'behavior']
@@ -103,14 +104,7 @@ def add_behavior_spec(engine, state):
 
 @pytest.fixture
 async def verified_engine(tmp_path):
-    engine, state = make_engine(tmp_path)
-    add_behavior_spec(engine, state)
-    await engine.run(state)
-    state = engine.store.load(state.run_id, state.scope_id)
-    assert state.run_status == RunStatus.WAITING_APPROVAL, state.error
-    assert state.phase == Phase.REVIEW and state.outcome == Outcome.FIX_VERIFIED
-    assert engine.verification_passed(state)
-    return engine, state
+    return await verified_sdk_candidate(tmp_path, configure=add_behavior_spec)
 
 
 def result_for(engine, state, kind):
@@ -195,12 +189,10 @@ async def test_producers_bind_actual_evidence_and_distinct_execution_plans(verif
         assert result['observation_hash'] == checkpoints[-1]['observation_hash']
 
 
-async def test_approved_local_commit_and_finalize_keep_b12_verified(verified_engine):
+async def test_sdk_local_commit_and_finalize_keep_b12_verified(verified_engine):
     engine, state = verified_engine
     base = state.patch_base_commit
-    engine.store.decide_approval(state.approval_ref, state, 'approve')
-    await engine.run(resume='approve')
-    finished = engine.store.load(state.run_id, state.scope_id)
+    finished = await finalize_sdk_candidate(engine, state)
     assert finished.run_status == RunStatus.COMPLETED and finished.outcome == Outcome.FIX_VERIFIED
     assert finished.patch_base_commit == base and engine.workspace.head() != base
     assert engine.workspace.diff() == ''
@@ -268,15 +260,14 @@ async def test_missing_command_fields_are_not_fabricated(verified_engine, field)
 
 
 @pytest.mark.parametrize('field', ['scope_id', 'run_id', 'replay_plan_hash', 'passed'])
-async def test_corrupt_wrapper_rejected_at_approval_before_commit(verified_engine, field):
+async def test_corrupt_wrapper_rejected_before_sdk_commit(verified_engine, field):
     engine, state = verified_engine
     wrapper_ref, wrapper, _ = result_for(engine, state, 'unit')
     wrapper[field] = 'wrong' if field != 'passed' else False
     state.validation_refs[state.validation_refs.index(wrapper_ref)] = engine.put(state, wrapper)
     engine.store.save(state)
     baseline_head = engine.workspace.head()
-    engine.store.decide_approval(state.approval_ref, state, 'approve')
-    await engine.run(resume='approve')
+    await finish_without_commit(engine, state)
     finished = engine.store.load(state.run_id, state.scope_id)
     assert finished.outcome != Outcome.FIX_VERIFIED
     assert engine.workspace.head() == baseline_head
@@ -299,8 +290,7 @@ async def test_integrity_damage_rejected_after_commit_at_finalize(verified_engin
         return await original_finalize(current, next_node)
 
     engine.finalize = damage_before_final_report
-    engine.store.decide_approval(state.approval_ref, state, 'approve')
-    await engine.run(resume='approve')
+    await finalize_sdk_candidate(engine, state)
     finished = engine.store.load(state.run_id, state.scope_id)
     assert finished.outcome == Outcome.INFRA_FAILURE
     assert finished.error_details['terminal_reason'] == 'final_verification_invalid'
