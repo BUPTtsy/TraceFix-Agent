@@ -87,13 +87,14 @@ def test_real_e2e_failure_preserves_batch_report_and_patch_refs(tmp_path, monkey
         commands.append(arguments)
         if 'bugboard/scripts/init_demo.py' in arguments:
             Path(arguments[-1]).mkdir(parents=True)
-        if '--run' in arguments:
-            assert arguments[arguments.index('--execution-mode') + 1] == 'batch'
-            frozen = Path(arguments[arguments.index('--spec') + 1])
+        if 'tracefix.service.web_run' in arguments:
+            request = json.loads(options['input'])
+            assert request['mode'] == 'repair'
+            frozen = Path(request['spec'])
             assert frozen != spec
             assert frozen.read_bytes() == spec.read_bytes()
             assert options['check'] is False
-            data_root = Path(arguments[arguments.index('--data') + 1])
+            data_root = Path(request['data'])
             artifacts = Artifacts(data_root / 'artifacts')
             diff_ref = artifacts.put('bugboard', 'run_batch_fixture', '', 'diff')
             state.report_ref = artifacts.put('bugboard', 'run_batch_fixture', {
