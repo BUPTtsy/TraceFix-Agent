@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tracefix.execution.browser import MCPBrowser
+from tracefix.execution.browser import MCPBrowser, resolve_locator
 from tracefix.runtime.contracts import (Assertion, BehaviorScenario, BehaviorStep, BrowserAction,
     Decision, Locator, ObservableWait, Phase, RunState, digest)
 from tracefix.runtime.engine import ActionBusinessFailure
@@ -101,10 +101,11 @@ async def test_frozen_business_failure_becomes_failed_public_validation(tmp_path
 
         async def model(schema, context, **options):
             result = await generate(schema, context, **options)
-            if schema is Decision and result.value.action.kind == 'click':
+            if schema is Decision and result.value.action.kind != 'finish':
+                observation = context['observation']
                 result.value.action = action.model_copy(update={
-                    'observation_id': result.value.action.observation_id,
-                    'element_ref': result.value.action.element_ref})
+                    'observation_id': observation['id'],
+                    'element_ref': resolve_locator(observation['snapshot'], action.locator)})
             return result
 
         engine.model.generate = model

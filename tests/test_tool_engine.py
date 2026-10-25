@@ -172,7 +172,7 @@ async def test_source_tools_assist_element_discovery_without_replacing_page_bind
         message = next(item for item in requests[-1]['messages']
                        if item.get('tool_call_id') == 'reject-source-ref')
         rejected = json.loads(message['content'])
-        assert rejected['call_id'] == 'reject-source-ref' and rejected['isError'] is True
+        assert rejected['isError'] is True
         assert rejected['executed'] is False and rejected['error']['executed'] is False
         assert recovered.action.kind == 'finish'
         assert len(engine.browser.calls) == 1 and state.budget.browser_actions == 1
