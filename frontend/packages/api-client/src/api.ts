@@ -1,7 +1,7 @@
 import {errorWithContext} from './errors';
 
 export type Service = 'test' | 'repair' | 'chat';
-export interface Project {id: string; repoId: string; root: string; profile: string | null; url: string | null; ready: boolean; issue: string | null; allowedFiles: string[]; commands: Record<string, string[]>; runCount: number; documentCount: number; checkoutMode?: 'existing' | 'managed'; cloneUrl?: string | null; defaultRef?: string | null; publishBranch?: boolean; requireApproval?: boolean; repositoryConfigVersion?: number | null}
+export interface Project {id: string; repoId: string; root: string; profile: string | null; url: string | null; ready: boolean; issue: string | null; allowedFiles: string[]; commands: Record<string, string[]>; runCount: number; checkoutMode?: 'existing' | 'managed'; cloneUrl?: string | null; defaultRef?: string | null; publishBranch?: boolean; requireApproval?: boolean; repositoryConfigVersion?: number | null}
 export interface RepositoryProfile {project: string; source_commit?: string; url: string; allowed_origins: string[]; commands: Record<string, string[]>; [key: string]: unknown}
 export interface RepositoryDraft {repo_id: string; root?: string; owner: string; repo: string; default_ref: string; checkout_mode: 'existing' | 'managed'; publish_branch: boolean; require_approval: boolean; profile: RepositoryProfile; allowed_files: string[]; allowed_urls: string[]; credential_ref: string | null; enabled: boolean}
 export interface Repository extends RepositoryDraft {version: number; commit: string | null; config_digest: string; profile_ref?: string | null}
@@ -10,9 +10,7 @@ export interface Publication {status: string; branch: string | null; commit: str
 // SDK Job 最终累计验收后、交付前的人工审批记录；决定后 status 为 approved/rejected，并带 decision 等字段。
 export interface DeliveryApproval {id: string; status: 'pending' | 'approved' | 'rejected'; job_id?: string; accepted_commit?: string | null; patch_hash?: string | null; publish_branch?: boolean; diff_ref?: string | null; requested_at?: string | null; decision?: 'approve' | 'reject'; decided_by?: string; decided_at?: string}
 export interface RunResult {runId: string; ready: boolean; outcome: string | null; summary: string | null; branch: string | null; commit: string | null; publication: Publication | null; patch: {ref: string; diff?: string; available: boolean; verification: string; branch?: string | null; commit?: string | null} | null}
-export interface Source {id: string; title: string; version: number}
-export interface KnowledgeUse {phase: string; queries: string[]; documents: Source[]; artifact_ref: string}
-export interface Run {id: string; projectId: string; agentRunId?: string; goal: string; mode: Service | 'unknown'; status: string; phase: string; outcome?: string; startedAt: string; finishedAt?: string; timeSource?: string; exitCode?: number; error?: string; branch?: string; continuationCount?: number; abnormalTermination?: boolean; continuationMarkers?: {instruction: string; previous_status: string; previous_error?: string; at: string}[]; knowledge: KnowledgeUse[]; logs?: string[]; artifacts?: {ref: string; label: string; bytes: number}[]}
+export interface Run {id: string; projectId: string; agentRunId?: string; goal: string; mode: Service | 'unknown'; status: string; phase: string; outcome?: string; startedAt: string; finishedAt?: string; timeSource?: string; exitCode?: number; error?: string; branch?: string; continuationCount?: number; abnormalTermination?: boolean; continuationMarkers?: {instruction: string; previous_status: string; previous_error?: string; at: string}[]; logs?: string[]; artifacts?: {ref: string; label: string; bytes: number}[]}
 export interface AgentStatus extends Partial<Run> {running: boolean; canStop?: boolean; canResume?: boolean; can_stop?: boolean; can_resume?: boolean; control_status?: string; resume_blockers?: string[]; coding_backend?: string; stopUnavailableReason?: string; stopError?: string | null}
 export interface Run {taskId?: string | null}
 // 引导状态来自持久化账本；retarget 排队后仍需 confirmed_at 才能在运行时替换目标。
@@ -131,14 +129,11 @@ export interface ReportImage {ref: string; hash: string; mime: 'image/png'; alt:
 export interface CheckReport {check_plan?: CheckItem[]; check_results?: CheckResult[]; check_summary?: CheckSummary; overall_status?: 'PASSED' | 'PASSED_WITH_FINDINGS' | 'FAILED' | 'INCONCLUSIVE'; images?: ReportImage[]; initial_check_results?: CheckResult[]; initial_check_summary?: CheckSummary}
 export interface Run extends CheckReport {issueReport?: ({summary: string; issues: ReportIssue[]; coverage: string; limits: string} & CheckReport) | null; reportError?: string | null}
 export interface Run {parentRunId?: string; additionalRuleIds?: string[]; ruleSnapshot?: {run_id: string; parent_run_id: string | null; snapshot_hash: string; refs: {id: string; version: number}[]} | null}
-export interface KnowledgeDocument {id: string; title: string; content: string; preview?: string; kind: 'repair' | 'testing' | 'experience'; projectId: string | null; tags: string[]; enabled: boolean; version: number; createdAt: string; updatedAt: string; sourceRunId: string | null}
-export type DocumentDraft = Omit<KnowledgeDocument, 'id' | 'createdAt' | 'updatedAt'> & {id?: string};
-export interface SearchHit extends Omit<KnowledgeDocument, 'content'> {excerpt: string; score: number; chunk: number}
 export type RuleStatus = 'draft' | 'enabled' | 'disabled' | 'archived';
 export interface DetectionRule {id: string; name: string; version: number; status: RuleStatus; category: string; severity: string; priority: number; pinned: boolean; scope: {level: string; project_ids: string[]; url_patterns: string[]; path_globs: string[]; frameworks: string[]}; phases: string[]; detection: {type: 'oracle' | 'static' | 'guided'; oracle?: Record<string, unknown>; static?: Record<string, unknown>; guided?: Record<string, unknown>}; fix_guidance: string; examples: Record<string, string>; tags: string[]; owner: string; created_at?: string; updated_at?: string}
 export interface RuleVersion {rule_id: string; version: number; body_hash: string; change_note: string; author: string; created_at: string}
 export interface RuleInsight {rule_id: string | null; total: number; reproduced: number; false_positive: number; fixed: number; reproduction_rate: number; false_positive_rate: number; fix_rate: number}
-export interface ChatMessage {role: 'user' | 'assistant'; content: string; reasoning?: string; sources?: Source[]}
+export interface ChatMessage {role: 'user' | 'assistant'; content: string; reasoning?: string}
 
 async function fetchResponse(url: string, options: RequestInit): Promise<Response> {
   try {return await fetch(url, options);}
@@ -225,11 +220,6 @@ export async function decideApproval(taskId: string, approvalId: string, decisio
   const status = String(decided.run.status);
   return {...decided.run, taskId, running: ['starting', 'running', 'paused', 'waiting_input', 'waiting_approval', 'stopping'].includes(status), canStop: status !== 'waiting_approval' && decided.run.can_stop === true, canResume: false};
 }
-export const loadDocuments = (projectId: string, query = '') => request<KnowledgeDocument[]>(`/api/knowledge?${new URLSearchParams({projectId, q: query})}`);
-export const loadDocument = (id: string) => request<KnowledgeDocument>(`/api/knowledge/${encodeURIComponent(id)}`);
-export const saveDocument = (document: DocumentDraft) => request<KnowledgeDocument>(`/api/knowledge${document.id ? '/' + encodeURIComponent(document.id) : ''}`, {method: document.id ? 'PUT' : 'POST', body: JSON.stringify(document)});
-export const deleteDocument = (id: string) => request<{ok: boolean}>(`/api/knowledge/${encodeURIComponent(id)}`, {method: 'DELETE'});
-export const searchDocuments = (projectId: string, query: string) => request<SearchHit[]>('/api/knowledge/search', {method: 'POST', body: JSON.stringify({projectId, query})});
 export const loadRules = (projectId: string, filters: {status?: string; q?: string; includeArchived?: boolean} = {}) => request<DetectionRule[]>(`/api/rules?${new URLSearchParams({projectId, ...(filters.status ? {status: filters.status} : {}), ...(filters.q ? {q: filters.q} : {}), ...(filters.includeArchived ? {includeArchived: 'true'} : {})})}`);
 export const loadRule = (id: string) => request<DetectionRule>(`/api/rules/${encodeURIComponent(id)}`);
 export const saveRule = (rule: Partial<DetectionRule> & {id?: string; expectedVersion?: number; changeNote?: string}) => {
@@ -245,14 +235,13 @@ export const loadRuleFindings = (id: string) => request<Array<Record<string, unk
 export const loadRulePreview = (id: string) => request<{prompt: string; items: Array<Record<string, unknown>>; rule_ids: string[]; tokens: number}>(`/api/rules/${encodeURIComponent(id)}/preview`);
 export const artifactUrl = (id: string, ref: string) => `/api/runs/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(ref)}`;
 
-export async function streamChat(message: string, history: ChatMessage[], projectId: string, useKnowledge: boolean, onDelta: (delta: string) => void, onSources: (sources: Source[]) => void, onReasoning?: (delta: string) => void) {
+export async function streamChat(message: string, history: ChatMessage[], projectId: string, onDelta: (delta: string) => void, onReasoning?: (delta: string) => void) {
   // 历史只发送角色与正文；reasoning 用专用回调展示，由服务端保存为审计记录，不重复注入历史。
-  const response = await fetchResponse('/api/chat', {method: 'POST', headers: {'Content-Type': 'application/json', Accept: 'text/event-stream'}, body: JSON.stringify({message, history: history.map(({role, content}) => ({role, content})), projectId, useKnowledge})});
+  const response = await fetchResponse('/api/chat', {method: 'POST', headers: {'Content-Type': 'application/json', Accept: 'text/event-stream'}, body: JSON.stringify({message, history: history.map(({role, content}) => ({role, content})), projectId})});
   if (!response.ok) {const data = await responseJson(response); throw new Error(`对话请求失败（HTTP ${response.status}）${data?.error ? '：' + data.error : ''}`);}
   if (response.headers.get('content-type')?.includes('application/json')) {
     const payload = await responseJson(response);
     if (payload.error) throw new Error(`对话服务返回错误：${payload.error}`);
-    if (payload.sources) onSources(payload.sources);
     if (payload.reasoning) onReasoning?.(payload.reasoning);
     if (payload.content) onDelta(payload.content);
     return;
@@ -271,7 +260,6 @@ export async function streamChat(message: string, history: ChatMessage[], projec
         if (payload.error) throw new Error(`对话服务返回错误：${payload.error}`);
         if (payload.reasoning) onReasoning?.(payload.reasoning);
         if (payload.delta) onDelta(payload.delta);
-        if (payload.sources) onSources(payload.sources);
       }
       if (done) break;
     }

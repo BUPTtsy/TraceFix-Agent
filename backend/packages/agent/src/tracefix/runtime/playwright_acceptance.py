@@ -93,7 +93,7 @@ def validate_execution(result: dict, request: dict, directory: Path) -> dict:
 class PlaywrightAcceptanceRunner:
     def __init__(self, package_root: Path | None = None, *, node_command: str = 'node',
                  timeout_seconds: float = 180, docker_runner=None):
-        self.package_root = package_root or Path(__file__).resolve().parents[6] / 'scripts/checks/interface-beta'
+        self.package_root = package_root or Path(__file__).resolve().parents[6] / 'backend/packages/acceptance-runner'
         self.node_command = node_command
         self.timeout_seconds = timeout_seconds
         self.docker_runner = docker_runner

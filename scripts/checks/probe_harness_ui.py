@@ -17,7 +17,7 @@ def main():
     run = {'id': 'console-sdk', 'taskId': 'task-sdk', 'agentRunId': 'console-sdk',
         'current_run_id': 'increment-two', 'projectId': 'probe', 'goal': '冻结 SDK 测试目标',
         'mode': 'repair', 'status': 'stopped', 'phase': 'DIAGNOSE',
-        'startedAt': '2026-10-20T00:00:00Z', 'knowledge': [], 'artifacts': [],
+        'startedAt': '2026-10-20T00:00:00Z', 'artifacts': [],
         'coding_backend': 'claude_sdk', 'control_status': 'STOPPED',
         'can_resume': True, 'can_stop': False, 'resume_blockers': [],
         'accepted_commit': 'a' * 40, 'quality': 'IN_PROGRESS'}
@@ -35,7 +35,7 @@ def main():
             run.update(status='running', control_status='RUNNING', can_resume=False, can_stop=True)
             value = {'task': {'id': 'task-sdk'}, 'run': run}
         elif path == '/projects':
-            value = [{'id': 'probe', 'ready': True, 'runCount': 1, 'documentCount': 0}]
+            value = [{'id': 'probe', 'ready': True, 'runCount': 1}]
         elif path == '/services':
             value = [{'id': 'repair', 'label': 'Repair 修复'}, {'id': 'chat', 'label': 'Chat 咨询'}]
         elif path == '/runs':

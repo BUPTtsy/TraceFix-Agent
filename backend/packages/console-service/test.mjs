@@ -148,7 +148,7 @@ print(json.dumps({'refs':[ref.model_dump() for ref in snapshot.refs],
     additionalRuleIds: 'invalid'}), error => error.status === 400);
 });
 
-test('TypeScript 控制台共享文档、运行和规则数据', () => {
+test('TypeScript 控制台共享运行和规则数据', () => {
   const root = fs.mkdtempSync(path.join(process.cwd(), '.tmp-console-test-'));
   let dispatch;
   try {
@@ -161,18 +161,17 @@ test('TypeScript 控制台共享文档、运行和规则数据', () => {
     dispatch = createConsoleService({projectsPath: path.join(profiles, 'projects.yaml'),
       dataRoot: path.join(root, 'data'), databasePath: path.join(root, 'data', 'console.sqlite3')});
     assert.equal(dispatch('projects')[0].ready, true);
+    assert.equal(Object.hasOwn(dispatch('projects')[0], 'documentCount'), false);
     assert.deepEqual(dispatch('rules').map(rule => rule.id).sort(), [
       'builtin_api_no_5xx', 'builtin_console_no_error', 'builtin_empty_state',
       'builtin_input_label', 'builtin_submit_feedback',
     ]);
 
-    const document = dispatch('document.save', {title: '保存状态', content: '刷新后完成状态丢失', tags: ['React'],
-      kind: 'repair', enabled: true, projectId: 'alpha'});
-    assert.equal(dispatch('search', {projectId: 'alpha', query: '刷新状态'})[0].id, document.id);
-    assert.equal(dispatch('document.save', {...document, content: '修复后的内容', id: document.id}).version, 2);
-    assert.throws(() => dispatch('document.save', {...document, id: document.id}), error => error.status === 409);
+    for (const removed of ['documents', 'document', 'document.save', 'document.delete', 'search'])
+      assert.throws(() => dispatch(removed, {projectId: 'alpha', query: '刷新状态'}), error => error.message === '未知控制台操作', removed);
 
-    const run = dispatch('run.create', {projectId: 'alpha', goal: '检查状态', mode: 'test'});
+    const run = dispatch('run.create', {projectId: 'alpha', goal: '检查状态', mode: 'test', knowledge: ['伪造证据']});
+    assert.equal(Object.hasOwn(run, 'knowledge'), false);
     dispatch('run.update', {id: run.id, changes: {status: 'failed', outcome: 'INFRA_FAILURE'}});
     const continued = dispatch('run.continue', {id: run.id, instruction: '重新检查'});
     assert.equal(continued.continuationCount, 1);
@@ -189,20 +188,16 @@ test('TypeScript 控制台共享文档、运行和规则数据', () => {
       error => error.status === 409);
 
     const python = process.platform === 'win32' ? path.resolve('../../../.venv/Scripts/python.exe') : path.resolve('../../../.venv/bin/python');
-    if (fs.existsSync(python)) {
-      const hasPythonRules = fs.existsSync(path.resolve('../agent/src/tracefix/rules/store.py'));
-      const script = hasPythonRules ?
-        'import json,sys; from tracefix.knowledge.documents import DocumentLibrary; from tracefix.rules.store import RuleLibrary; p=sys.argv[1]; print(json.dumps({"document":DocumentLibrary(p).document(sys.argv[2])["version"],"rule_hash":RuleLibrary(p).rule(sys.argv[3]).body_hash}))' :
-        'import json,sys; from tracefix.knowledge.documents import DocumentLibrary; p=sys.argv[1]; print(json.dumps({"document":DocumentLibrary(p).document(sys.argv[2])["version"]}))';
-      const result = spawnSync(python, ['-c', script, path.join(root, 'data', 'console.sqlite3'), document.id, rule.id],
+    if (fs.existsSync(python) && fs.existsSync(path.resolve('../agent/src/tracefix/rules/store.py'))) {
+      const script = 'import json,sys; from tracefix.rules.store import RuleLibrary; p=sys.argv[1]; print(json.dumps({"rule_hash":RuleLibrary(p).rule(sys.argv[2]).body_hash}))';
+      const result = spawnSync(python, ['-c', script, path.join(root, 'data', 'console.sqlite3'), rule.id],
         {cwd: path.resolve('../../..'), env: {...process.env, PYTHONPATH: path.resolve('../agent/src')}, encoding: 'utf8'});
       assert.equal(result.status, 0, result.stderr);
       const data = JSON.parse(result.stdout);
-      assert.equal(data.document, 2);
       const db = new DatabaseSync(path.join(root, 'data', 'console.sqlite3'));
       try {
         const row = db.prepare('SELECT body_hash FROM rule_versions WHERE rule_id=? AND version=?').get(rule.id, 2);
-      if (hasPythonRules) assert.equal(data.rule_hash, row.body_hash);
+        assert.equal(data.rule_hash, row.body_hash);
       } finally { db.close(); }
     }
   } finally { dispatch?.close(); fs.rmSync(root, {recursive: true, force: true}); }

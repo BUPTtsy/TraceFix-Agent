@@ -1,4 +1,4 @@
-"""事务化控制台记录，以及有界且按项目隔离的文档检索。"""
+"""事务化控制台运行记录与事件存储，并提供轻量词项提取。"""
 import json
 import os
 import re
@@ -23,7 +23,7 @@ def database_path():
 
 
 def terms(text):
-    """提取拉丁词和中文双字词，用于轻量级本地检索。"""
+    """提取拉丁词和中文双字词，用于轻量级本地检索（记忆检索等复用）。"""
     result = set(re.findall(r'[a-z0-9_]{2,}', text.lower()))
     for phrase in re.findall(r'[\u4e00-\u9fff]+', text):
         result.update(phrase[index:index + 2] for index in range(max(1, len(phrase) - 1)))
@@ -37,14 +37,13 @@ class ConflictError(ValueError):
 
 
 class DocumentLibrary:
-    """封装文档、运行记录和事件的 SQLite 事务操作。"""
+    """封装控制台运行记录和事件的 SQLite 事务操作。"""
 
     def __init__(self, path=None):
         """初始化数据库路径，并创建缺失的基础表。"""
         self.path = Path(path) if path is not None else database_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
-            connection.execute('CREATE TABLE IF NOT EXISTS documents (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
             connection.execute('CREATE TABLE IF NOT EXISTS console_runs (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
             connection.execute('CREATE TABLE IF NOT EXISTS console_events (run_id TEXT, seq INTEGER, event_key TEXT, data TEXT NOT NULL, PRIMARY KEY (run_id, seq), UNIQUE (run_id, event_key))')
 
@@ -57,71 +56,6 @@ class DocumentLibrary:
                 yield connection
         finally:
             connection.close()
-
-    def documents(self, project=None, include_disabled=True):
-        """按项目和启用状态筛选文档，并按更新时间倒序返回。"""
-        with self.connect() as connection:
-            records = [json.loads(row[0]) for row in connection.execute('SELECT data FROM documents')]
-        return sorted((record for record in records
-                       if (project is None or record['projectId'] in {None, project})
-                       and (include_disabled or record['enabled'])), key=lambda record: record['updatedAt'], reverse=True)
-
-    def document(self, document_id):
-        """读取单份文档，不存在时抛出明确的文件错误。"""
-        with self.connect() as connection:
-            row = connection.execute('SELECT data FROM documents WHERE id=?', (document_id,)).fetchone()
-        if row is None:
-            raise FileNotFoundError('文档不存在')
-        return json.loads(row[0])
-
-    def save_document(self, fields, document_id=None):
-        """校验并保存文档；更新已有文档时执行版本冲突保护。"""
-        title, content = fields.get('title', ''), fields.get('content', '')
-        tags = fields.get('tags', [])
-        if not isinstance(title, str) or not 1 <= len(title.strip()) <= 120:
-            raise ValueError('文档标题须为 1-120 字')
-        if not isinstance(content, str) or not content.strip() or len(content.encode('utf-8')) > 262144 or '\x00' in content:
-            raise ValueError('文档须为非空 UTF-8 文本，最大 256 KiB')
-        if not isinstance(tags, list) or len(tags) > 12 or any(not isinstance(tag, str) or not 1 <= len(tag.strip()) <= 30 for tag in tags):
-            raise ValueError('最多 12 个标签，每个标签 1-30 字')
-        if fields.get('kind') not in {'repair', 'testing', 'experience'} or not isinstance(fields.get('enabled'), bool):
-            raise ValueError('文档类型或启用状态无效')
-        with self.connect() as connection:
-            connection.execute('BEGIN IMMEDIATE')
-            previous = None
-            if document_id:
-                row = connection.execute('SELECT data FROM documents WHERE id=?', (document_id,)).fetchone()
-                if row is None:
-                    raise FileNotFoundError('文档不存在')
-                previous = json.loads(row[0])
-                if fields.get('version') != previous['version']:
-                    raise ConflictError('文档已被其他窗口更新，请重新打开后编辑')
-            now = timestamp()
-            record = {'id': document_id or str(uuid.uuid4()), 'title': title.strip(), 'content': content,
-                      'tags': list(dict.fromkeys(tag.strip() for tag in tags)), 'kind': fields['kind'],
-                      'enabled': fields['enabled'], 'projectId': fields.get('projectId') or None,
-                      'sourceRunId': previous['sourceRunId'] if previous else fields.get('sourceRunId') or None,
-                      'version': previous['version'] + 1 if previous else 1,
-                      'createdAt': previous['createdAt'] if previous else now, 'updatedAt': now}
-            connection.execute('INSERT OR REPLACE INTO documents VALUES (?,?)', (record['id'], json.dumps(record, ensure_ascii=False)))
-        return record
-
-    def search(self, query, project, limit=8):
-        """在项目可见文档中按标题、标签和内容片段进行有界排序。"""
-        query_terms = terms(query[:2000])
-        if not query_terms:
-            return []
-        candidates = []
-        for record in self.documents(project, include_disabled=False):
-            title_terms = terms(record['title'] + ' ' + ' '.join(record['tags']))
-            title_score = len(query_terms & title_terms) * 3
-            chunks = [record['content'][offset:offset + 1400] for offset in range(0, len(record['content']), 1200)]
-            ranked = [(title_score + len(query_terms & terms(chunk)), index, chunk) for index, chunk in enumerate(chunks)]
-            score, chunk_index, excerpt = max(ranked, key=lambda item: (item[0], -item[1]))
-            if score:
-                candidates.append({key: value for key, value in record.items() if key != 'content'} |
-                                  {'excerpt': excerpt, 'chunk': chunk_index, 'score': score})
-        return sorted(candidates, key=lambda item: (-item['score'], item['id']))[:max(1, min(limit, 20))]
 
     def runs(self, project=None):
         """返回项目过滤后的运行记录，并按启动时间倒序排列。"""
@@ -138,20 +72,18 @@ class DocumentLibrary:
             raise FileNotFoundError('运行记录不存在')
         return json.loads(row[0])
 
-    def update_run(self, run_id, fields, create=False, knowledge=None):
-        """在写事务中更新运行字段，并限制保留的知识条目数量。"""
+    def update_run(self, run_id, fields, create=False):
+        """在写事务中更新运行字段；``create`` 为真时缺失记录会被新建。"""
         with self.connect() as connection:
             connection.execute('BEGIN IMMEDIATE')
             row = connection.execute('SELECT data FROM console_runs WHERE id=?', (run_id,)).fetchone()
             if row is None and not create:
                 raise FileNotFoundError('运行记录不存在')
-            record = json.loads(row[0]) if row else {'id': run_id, 'startedAt': timestamp(), 'knowledge': [], 'logs': []}
+            record = json.loads(row[0]) if row else {'id': run_id, 'startedAt': timestamp(), 'logs': []}
             if record.get('stopRequestedAt') and fields.get('status') in {
                     'running', 'paused', 'waiting_input', 'waiting_approval'}:
                 fields = {**fields, 'status': 'stopping'}
             record.update(fields, updatedAt=timestamp())
-            if knowledge is not None:
-                record['knowledge'] = [*record.get('knowledge', []), knowledge][-30:]
             connection.execute('INSERT OR REPLACE INTO console_runs VALUES (?,?)', (run_id, json.dumps(record, ensure_ascii=False)))
         return record
 

@@ -43,7 +43,6 @@
 |---|---|---|
 | `TestSpec` | PREPARE（编译并冻结测试规范） | `contracts.py:137-155` |
 | `Decision` / `BrowserAction` | EXPLORE（通过原生工具进行多轮交互，最终 JSON 只含 `finish`） | `runtime/contracts.py:Decision`、`BrowserAction` |
-| `KnowledgeQueries` / `KnowledgeSelection` | EXPLORE、DIAGNOSE（知识文档检索） | `knowledge/selection.py:8-13` |
 | `PatchProposal` | DIAGNOSE（完整文件替换，最多 8 个文件） | `contracts.py:165-174` |
 
 默认只发送文本观测。未配置 `TRACEFIX_VISION_MODEL` 时截图仍存为证据，但不进入模型请求；显式配置视觉模型且请求携带图片时才使用它。`finish` 仅请求运行时执行确定性断言，不代表成功。

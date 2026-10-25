@@ -72,7 +72,7 @@ async def test_required_missing_node_preserves_inconclusive(tmp_path):
 def test_package_root_is_isolated():
     runner = PlaywrightAcceptanceRunner()
     assert (runner.package_root / 'package-lock.json').is_file()
-    assert runner.package_root.name == 'interface-beta'
+    assert runner.package_root.name == 'acceptance-runner'
 
 
 @pytest.mark.asyncio

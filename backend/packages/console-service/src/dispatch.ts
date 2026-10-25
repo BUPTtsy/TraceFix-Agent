@@ -207,8 +207,8 @@ export function createConsoleService(options: ConsoleOptions = {}) {
     }
     if (operation === 'repository.update') return repository('repository.update', {id: fields.id, patch: fields.patch});
     if (operation === 'repository.delete') {
-      if (database.runs(fields.id).length || database.documents().some(document => document.projectId === fields.id) ||
-          tasks.tasks(fields.id).length) throw new DataError('仓库已有关联任务、运行或知识文档，请停用仓库以保留历史记录', 409);
+      if (database.runs(fields.id).length || tasks.tasks(fields.id).length)
+        throw new DataError('仓库已有关联任务或运行，请停用仓库以保留历史记录', 409);
       const removed = repository('repository.delete', {id: fields.id});
       database.db.prepare('DELETE FROM repository_rule_settings WHERE project_id=?').run(fields.id);
       return removed;
@@ -243,10 +243,9 @@ export function createConsoleService(options: ConsoleOptions = {}) {
         tools: ['project.list_files', 'project.read_file', 'project.search']}};
     }
     if (operation === 'projects') {
-      const runs = database.runs(), documents = database.documents();
+      const runs = database.runs();
       return catalog().map(project => ({...project,
-        runCount: runs.filter(run => run.projectId === project.id).length,
-        documentCount: documents.filter(document => document.projectId === null || document.projectId === project.id).length}));
+        runCount: runs.filter(run => run.projectId === project.id).length}));
     }
     if (operation === 'runs') return database.runs(fields.projectId).map(run => refreshControl(run)).map(({logs, ...run}) =>
       ({...run, ...controlProjection(run), canContinue: canContinue(run.status, run.outcome)}));
@@ -369,7 +368,7 @@ export function createConsoleService(options: ConsoleOptions = {}) {
         goal: fields.goal.trim(), ...(parentRunId ? {parentRunId} : {}), additionalRuleIds,
         ...(fields.source_run_id ? {source_run_id: fields.source_run_id} : {}),
         status: 'running', phase: 'STARTING', outcome: null, finishedAt: null, startedAt: timestamp(),
-        knowledge: [], logs: [], origin: 'web', dataRoot, consoleDatabasePath: database.filename};
+        logs: [], origin: 'web', dataRoot, consoleDatabasePath: database.filename};
       return record;
     }
     if (operation === 'run.update') {
@@ -395,25 +394,6 @@ export function createConsoleService(options: ConsoleOptions = {}) {
           '用户已停止；进程退出，未生成完整收尾结果' : 'Agent 进程已结束，未记录最终结果；请查看日志'),
       });
       return database.updateRun(fields.id, changes);
-    }
-    if (operation === 'documents') {
-      const query = String(fields.query || '').trim().toLowerCase();
-      return database.documents(fields.projectId).filter(record =>
-        !query || (record.title + ' ' + record.content + ' ' + record.tags.join(' ')).toLowerCase().includes(query))
-        .map(({content, ...record}) => ({...record, preview: content.slice(0, 180)}));
-    }
-    if (operation === 'document') return database.document(fields.id);
-    if (operation === 'document.delete') return database.deleteDocument(fields.id);
-    if (operation === 'document.save' || operation === 'search') {
-      const projectId = fields.projectId || null;
-      if (projectId && !catalog().some(project => project.id === projectId)) throw new DataError('知识范围必须是已注册项目或全局');
-      if (operation === 'search') {
-        if (!projectId) throw new DataError('检索必须指定项目');
-        return database.search(fields.query || '', projectId);
-      }
-      const sourceRunId = fields.id ? database.document(fields.id).sourceRunId : fields.sourceRunId;
-      if (sourceRunId && database.run(sourceRunId).projectId !== projectId) throw new DataError('运行经验须先归档到来源项目');
-      return database.saveDocument(fields, fields.id);
     }
     if (operation === 'rules') return rules.rules(fields);
     if (operation === 'rule') return rules.rule(fields.id);

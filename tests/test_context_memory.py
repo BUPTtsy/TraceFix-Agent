@@ -1,5 +1,3 @@
-import json
-
 import pytest
 
 from tracefix.knowledge.assembler import ContextAssembler, ContextWindowError, TokenCounter, compact_steps
@@ -75,11 +73,19 @@ def test_memory_library_scopes_run_notes_and_requires_authorized_evidence(tmp_pa
         library.note('project-a', 'run-1', {'text': 'bad', 'evidence_refs': ['other']}, allowed_evidence_refs=['ev-1'])
 
 
-async def test_retriever_uses_sqlite_fallback_without_postgres(tmp_path):
+async def test_retriever_uses_sqlite_fallback_for_cross_run_experience_without_postgres(tmp_path):
     engine, state = make_engine(tmp_path / 'engine')
     memory = MemoryLibrary(tmp_path / 'memory.sqlite3')
+    memory.upsert({'id': 'lesson', 'scope_id': engine.context.active_scope, 'layer': 'M3',
+                   'kind': 'success_recipe', 'status': 'trusted',
+                   'revision': dict(engine.context.revisions)[engine.context.active_scope],
+                   'source_revision': state.source_manifest,
+                   'content': {'lesson': 'persisted value must survive reload'}})
     retriever = Retriever(engine.store, engine.scopes, engine.context, fallback=memory)
-    await retriever.index(engine.workspace, state.source_manifest)
-    values = await retriever.retrieve('persisted', state.source_manifest, limit=3)
-    assert values and json.loads(values[0]['content'])['path'] == 'src/value.ts'
+    # 默认检索层是 M3 跨 Run 经验；源码切块索引已由 CodeGraph 取代，不再写入这里。
+    values = await retriever.retrieve('persisted', state.source_manifest, limit=3, state=state)
+    assert [value['id'] for value in values] == ['lesson']
+    assert values[0]['applicability_status'] == 'exact'
     assert retriever.degradation()['reason'] == 'sqlite_fallback'
+    disabled = Retriever(engine.store, engine.scopes, engine.context, fallback=memory, cross_run=False)
+    assert await disabled.retrieve('persisted', state.source_manifest, state=state) == []

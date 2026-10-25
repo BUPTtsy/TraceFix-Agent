@@ -17,7 +17,6 @@
     "@tracefix/api-client": "*",
     "@tracefix/presentation": "*",
     "@tracefix/agent-ui": "*",
-    "@tracefix/knowledge-ui": "*",
     "@tracefix/rules-ui": "*",
     "@tracefix/runs-ui": "*"
   },

@@ -11,7 +11,6 @@
 | 概览与项目 | 查看运行概况、已注册项目和 Profile | `frontend/apps/web/src/App.tsx`、`frontend/packages/projects` |
 | Run 详情 | 查看轨迹、报告、diff，继续 / 派生 Run，提交引导 | `frontend/packages/runs/src/RunsPage.tsx` |
 | Agent 侧栏 | 启动 Test / Repair、停止活动进程、只读 Chat | `frontend/packages/agent/src/AgentDock.tsx` |
-| 知识库 | 本地文档、版本、启停与检索预览 | `frontend/packages/knowledge/src/KnowledgePage.tsx` |
 | 检测规则 | 规则编辑、版本、状态、统计和注入预览 | `frontend/packages/rules/src/RulesPage.tsx` |
 
 控制台与被测 BugBoard 目标已分目录；Node 服务仍有历史 `/api/tasks` 路由。存在页面或按钮只证明该调试入口，不能代替稳定任务 API 或真实业务验收。
@@ -26,7 +25,7 @@
 | `GET /api/runs/{id}/trace?after=SEQ` | 增量查询轨迹 |
 | `GET /api/runs/{id}/artifacts/{ref}` | 读取运行产物，受归属与路径校验 |
 | `POST /api/runs/{id}/continue`、`POST /api/runs/{id}/derive` | 已有继续 / 派生入口；来源继承与成功 Run 限制仍需遵守 |
-| `/api/rules`、`/api/knowledge`、`/api/projects` | 调试入口使用的规则、文档和项目数据 |
+| `/api/rules`、`/api/projects` | 调试入口使用的规则和项目数据 |
 | `POST /api/chat` | 只读项目 Chat / SSE；不能替代 Test / Repair 的运行事件验收 |
 
 对外 `/api/v1/tasks` 已增加基础生命周期接口：创建、单独启动、可选 `create_and_start`、编辑、停止和查询。运行中 `PUT` 编辑返回 409；终态编辑后回到 `created`，再次启动沿用 Task ID 并新建独立 Run ID，旧 Run 完整保留。稳定 result、持久化幂等与仓库注册仍待补齐；首版使用 HTTP + 轮询。具体请求和结果以[接口型 Beta 计划](../00-项目进度/接口型Beta最小补足与开发计划.md)为准。
@@ -39,7 +38,7 @@
 
 调用方根据 Agent 返回的状态和 outcome 提示未覆盖、不可复现、未验证、失败和结果未知，并自行决定是否应用补丁、创建 Git 提交或 PR。TraceFix 不管理用户、成员、角色、后台用户数据或计费，也不感知或判断调用方用户权限；需要身份和授权控制时由调用方在接口外自行处理。
 
-现有 Web 页面的完善不列为接口组件的上线缺口；仍可用于本地查看产物和验证调用行为。规则 / Task / Run 索引 / 文档当前使用 SQLite，仓库配置仍包含 YAML / JSON 注册表；SQLite 后续迁移 MySQL。
+现有 Web 页面的完善不列为接口组件的上线缺口；仍可用于本地查看产物和验证调用行为。规则 / Task / Run 索引当前使用 SQLite，仓库配置仍包含 YAML / JSON 注册表；SQLite 后续迁移 MySQL。
 
 ## 4. 调试与接入安全
 

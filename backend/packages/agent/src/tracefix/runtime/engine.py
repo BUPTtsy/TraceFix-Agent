@@ -24,7 +24,6 @@ from tracefix.execution.browser import (MCPActionNotDispatched, MCPActionUnknown
 from tracefix.model.gateway import ModelError, ModelOutputError
 from tracefix.model.chat_completions import reasoning_records
 from tracefix.knowledge.context import SkillCatalog, build_context
-from tracefix.knowledge.selection import select_documents
 from tracefix.rules import (Finding, RuleSnapshot, evaluate_oracle, evaluate_oracle_result,
                             evaluate_static_result)
 from tracefix.rules.resolver import render_rule_context, rule_applies
@@ -238,8 +237,6 @@ class Engine:
         self.assembler = ContextAssembler(context_window=int(os.getenv('TRACEFIX_CONTEXT_WINDOW', '131072')))
         self.memory = None
         self.retarget_child = None
-        self.documents = None
-        self.document_context = {}
         self._trace_sequences = {}
         self.event_adapter = EventAdapter(store)
         self.recovery = RecoveryController()
@@ -2313,11 +2310,9 @@ class Engine:
             return self.output(self.changed(s, observation_ref=ref, step=3), 'prelude')
         if not s.test_spec_ref:
             observation = self.get(s, s.observation_ref)
-            knowledge = await select_documents(self, s, observation)
             rules = self.active_rules(s, str(Phase.PREPARE))
             spec = await self.model_call(s, TestSpec, {'goal': s.goal, 'url': s.url,
                 'observation': observation,
-                'reference_documents': knowledge,
                 'detection_rules': [rule.summary() for rule in rules],
                 'instruction': '根据用户目标、首次只读观测及授权源码编译 TestSpec。用 Glob/Grep/Read 核对相关组件、可访问名称和事件绑定，不能仅凭截图判断可操作元素。授权动作必须使用 schema 枚举；'
                                '定位器使用页面中的完整可访问名称；保留用户要求的刷新后断言，并提供独立回归场景。'},
@@ -2372,7 +2367,6 @@ class Engine:
         plan = self.get(s, s.replay_plan_ref) if s.replay_plan_ref else []
         context = build_context(s, spec.model_dump(), obs, pairs=[{'action': a, 'result': 'see current observation'} for a in plan[-4:]],
                                 rules=self.active_rules(s, str(Phase.EXPLORE)))
-        context['reference_documents'] = await select_documents(self, s, obs)
         context['instruction'] = '结合最新页面语义观测与授权源码识别可操作元素；用 Glob/Grep/Read 核对文案、组件、事件绑定和状态条件，不能仅凭截图或源码猜测页面目标。浏览器动作必须通过原生浏览器工具执行，每次只调用一个工具，并等待最新观测。必须匹配当前 observation_id 和 element_ref。完成请求的交互后返回 finish；它只是请求运行时执行确定性断言检查。'
         decision = await self.model_call(s, Decision, context, image=image)
         self.validate_rule_refs(s, decision.rule_refs)

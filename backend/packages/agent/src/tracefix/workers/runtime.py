@@ -169,7 +169,6 @@ class IsolatedGuiScout:
                         self.engine.source, self.engine.graph.checkpointer,
                         rule_resolver=self.engine.rule_resolver, rule_library=self.engine.rule_library)
         worker.worker_model = getattr(self.engine, 'worker_model', None)
-        worker.documents = self.engine.documents
         worker.subagent_role = 'gui-scout'
         worker.subagent_depth = 1
         worker.worker_allowed_tools = list(task.tools)

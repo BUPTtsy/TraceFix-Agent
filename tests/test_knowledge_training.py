@@ -4,14 +4,13 @@ import pytest
 import os
 
 from tracefix.knowledge.context import build_context
-from tracefix.knowledge.retrieval import rrf, chunks
+from tracefix.knowledge.retrieval import rrf
 from tracefix.runtime.contracts import RunState
 
 
-def test_rrf_dedup_and_function_boundaries():
+def test_rrf_deduplicates_rankings_and_breaks_ties_by_id():
     assert rrf(['a','b','b'],['b','c'])[0]=='b'
-    cards=list(chunks('App.tsx','export function App() { return <h1>Hello</h1>; }\nexport const size = 10;'))
-    assert len(cards)==2 and cards[0]['start']==1
+    assert rrf(['b'],['a'])==['a','b']
 
 
 def test_context_deduplicates_pairs_without_losing_protected_spec():

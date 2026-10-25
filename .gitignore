@@ -48,7 +48,7 @@ tests/*
 !tests/test_code_analysis_tool.py
 !tests/test_target_preparation.py
 !tests/test_knowledge_training.py
-!tests/test_console_knowledge.py
+!tests/test_console_runs.py
 !tests/test_repository_publication.py
 !backend/apps/console-api/tests/
 !backend/apps/console-api/tests/**
@@ -75,6 +75,18 @@ pytest_*.txt
 .tqW/
 .tqX/
 .tqY/
+.tqK1-full.log
+.tqK1/
+.tqKB-node-step.log
+.tqKB-node.log
+.tqKB-pytest.log
+.tqKB2-pytest.log
+.tqKB2/
+.tqKB3-pytest.log
+.tqKB3/
+# pytest 短 basetemp 目录/日志（通配，避免每换一个名字就漏）
+.tq*/
+.tq*.log
 .tqC0/
 .tqC1/
 .tqK1-full.log

@@ -155,8 +155,8 @@ async function startAgent(goal, mode, projectId, continuation = null, derived = 
   if (childRunning(child)) await bridge('run.update', {id: runId, changes: {pid: child.pid}});
   } finally {launching = false;}
 }
-async function chatCompletion(message, history, projectId, useKnowledge, res) {
-  return runChatCompletion({message, history, projectId, useKnowledge, res, bridge, persistAudit: audit => {
+async function chatCompletion(message, history, projectId, res) {
+  return runChatCompletion({message, history, projectId, res, bridge, persistAudit: audit => {
     const database = new DatabaseSync(process.env.TRACEFIX_CONSOLE_DB, {timeout: 15000});
     try {
       database.exec('CREATE TABLE IF NOT EXISTS chat_model_exchanges (id TEXT PRIMARY KEY, project_id TEXT, data TEXT NOT NULL)');
@@ -208,11 +208,6 @@ const legacyHandler = async (req,res) => {
         ...(extension === '.html' ? {'Content-Security-Policy': "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; sandbox"} : {})});
       return res.end(Buffer.from(artifact.content, 'base64'));
     }
-    if (url.pathname === '/api/knowledge' && req.method === 'GET') return send(res, 200, await bridge('documents', {projectId: url.searchParams.get('projectId') || undefined, query: url.searchParams.get('q') || ''}));
-    if (url.pathname === '/api/knowledge' && req.method === 'POST') {
-      return send(res, 201, await bridge('document.save', {...await body(req), id: undefined}));
-    }
-    if (url.pathname === '/api/knowledge/search' && req.method === 'POST') return send(res, 200, await bridge('search', await body(req)));
     if (url.pathname === '/api/rules' && req.method === 'GET') return send(res, 200, await bridge('rules', {
       projectId: url.searchParams.get('projectId') || undefined,
       status: url.searchParams.get('status') || undefined, q: url.searchParams.get('q') || '',
@@ -242,12 +237,6 @@ const legacyHandler = async (req,res) => {
     if (ruleMatch && req.method === 'GET') return send(res, 200, await bridge('rule', {id: decodeURIComponent(ruleMatch[1])}));
     if (ruleMatch && req.method === 'PUT') return send(res, 200, await bridge('rule.update', {...await body(req), id: decodeURIComponent(ruleMatch[1])}));
     if (ruleMatch && req.method === 'DELETE') return send(res, 200, await bridge('rule.delete', {id: decodeURIComponent(ruleMatch[1])}));
-    const documentMatch = url.pathname.match(/^\/api\/knowledge\/([a-zA-Z0-9_-]+)$/);
-    if (documentMatch && req.method === 'GET') return send(res, 200, await bridge('document', {id: documentMatch[1]}));
-    if (documentMatch && req.method === 'DELETE') return send(res, 200, await bridge('document.delete', {id: documentMatch[1]}));
-    if (documentMatch && req.method === 'PUT') {
-      return send(res, 200, await bridge('document.save', {...await body(req), id: documentMatch[1]}));
-    }
     if (url.pathname === '/api/agent/status' && req.method === 'GET') return send(res, 200, await agentView());
     if (url.pathname === '/api/agent/start' && req.method === 'POST') {
       const fields = await body(req); const goal = typeof fields.goal === 'string' ? fields.goal.trim() : '';
@@ -282,7 +271,7 @@ const legacyHandler = async (req,res) => {
     if (url.pathname === '/api/chat' && req.method === 'POST') {
       const fields = await body(req); const message = typeof fields.message === 'string' ? fields.message.trim() : '';
       if (!message || message.length > 8000) return send(res, 400, {error: '请输入 1-8000 字的消息'});
-      return await chatCompletion(message, fields.history, fields.projectId, fields.useKnowledge === true, res);
+      return await chatCompletion(message, fields.history, fields.projectId, res);
     }
     if (url.pathname === '/__reset' && req.method === 'POST') {tasks=seed();await persist();return send(res,200,{ok:true});}
     if (url.pathname === '/api/tasks' && req.method === 'GET') return send(res,200,tasks);

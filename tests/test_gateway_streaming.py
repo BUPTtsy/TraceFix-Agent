@@ -239,7 +239,7 @@ async def test_chat_rejects_incomplete_or_invalid_response(monkeypatch, fragment
 async def test_chat_requires_successful_finish_and_done(monkeypatch):
     use_transport(monkeypatch, [final_stream(content='complete')])
     monkeypatch.setenv('TRACEFIX_API_KEY', 'fake')
-    events = [item async for item in stream_chat('hello', [], 'scope', None, False)]
+    events = [item async for item in stream_chat('hello', [], 'scope', None)]
     assert {'delta': 'complete'} in events
     assert events[-1]['turn_messages'][-1]['content'] == 'complete'
 

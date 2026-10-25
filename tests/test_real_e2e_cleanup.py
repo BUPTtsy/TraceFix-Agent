@@ -118,6 +118,8 @@ def test_real_e2e_preflight_does_not_run_flow(tmp_path, monkeypatch, capsys):
     main = module['main']
     monkeypatch.setitem(main.__globals__, 'load_local_env', lambda: None)
     monkeypatch.setitem(main.__globals__, 'prerequisites', lambda: [])
+    # preflight-only 先于依赖安装，不得检查 runner 依赖。
+    monkeypatch.setitem(main.__globals__, 'runtime_prerequisites', lambda: pytest.fail('preflight must not check runner dependencies'))
     monkeypatch.setitem(main.__globals__, 'run_flow', lambda *args: pytest.fail('preflight must not launch real E2E'))
     output = tmp_path / 'report.json'
 
@@ -125,6 +127,35 @@ def test_real_e2e_preflight_does_not_run_flow(tmp_path, monkeypatch, capsys):
 
     assert json.loads(output.read_text(encoding='utf-8'))['status'] == 'ready'
     assert 'REAL_E2E: READY' in capsys.readouterr().out
+
+
+def test_real_e2e_runtime_prerequisites_follow_runner_dependency_file(tmp_path, monkeypatch):
+    module = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'scripts/checks/verify_real_e2e.py'))
+    runtime_prerequisites = module['runtime_prerequisites']
+    monkeypatch.setitem(runtime_prerequisites.__globals__, 'ROOT', tmp_path)
+    assert runtime_prerequisites() == ['Playwright 验收运行器依赖（npm ci --prefix backend/packages/acceptance-runner）']
+    cli = tmp_path / 'backend/packages/acceptance-runner/node_modules/@playwright/test/cli.js'
+    cli.parent.mkdir(parents=True)
+    cli.touch()
+    assert runtime_prerequisites() == []
+
+
+def test_real_e2e_required_reports_missing_runner_dependencies_without_running_flow(tmp_path, monkeypatch, capsys):
+    module = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'scripts/checks/verify_real_e2e.py'))
+    main = module['main']
+    item = 'Playwright 验收运行器依赖（npm ci --prefix backend/packages/acceptance-runner）'
+    monkeypatch.setitem(main.__globals__, 'load_local_env', lambda: None)
+    monkeypatch.setitem(main.__globals__, 'prerequisites', lambda: [])
+    monkeypatch.setitem(main.__globals__, 'runtime_prerequisites', lambda: [item])
+    monkeypatch.setitem(main.__globals__, 'run_flow', lambda *args: pytest.fail('missing runner dependencies must not launch real E2E'))
+    output = tmp_path / 'report.json'
+
+    assert main(['--required', '--output', str(output)]) == 2
+
+    report = json.loads(output.read_text(encoding='utf-8'))
+    assert report['status'] == 'failed'
+    assert item in report['missing']
+    assert item in capsys.readouterr().out
 
 
 def test_real_e2e_uses_postgres_password_for_compose_and_dsn(monkeypatch):

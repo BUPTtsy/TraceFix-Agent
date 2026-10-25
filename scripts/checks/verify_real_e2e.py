@@ -150,6 +150,14 @@ def prerequisites() -> list[str]:
     return missing
 
 
+def runtime_prerequisites() -> list[str]:
+    # 仅真实执行前检查：nightly 的 --preflight-only 先于依赖安装步骤，不能要求它。
+    # 验收浏览器在镜像内，宿主只需要 acceptance-runner 的 npm 依赖；缺失会让验收 inconclusive。
+    if (ROOT / "backend/packages/acceptance-runner/node_modules/@playwright/test/cli.js").is_file():
+        return []
+    return ["Playwright 验收运行器依赖（npm ci --prefix backend/packages/acceptance-runner）"]
+
+
 def write_json(path: Path, value: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -387,7 +395,7 @@ def main(argv=None) -> int:
     parser.add_argument("--output", type=Path, default=ROOT / "artifacts/real-e2e/report.json")
     args = parser.parse_args(argv)
     load_local_env()
-    missing = prerequisites()
+    missing = prerequisites() + ([] if args.preflight_only else runtime_prerequisites())
     if missing:
         status = "failed" if args.required else "skipped"
         report = {"status": status, "case": args.case, "missing": missing,

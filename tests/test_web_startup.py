@@ -128,6 +128,9 @@ def bootstrap_fixture(tmp_path, monkeypatch):
     python.parent.mkdir(parents=True)
     python.touch()
     (tmp_path / '.env').write_text('TRACEFIX_API_KEY=fixture\n', encoding='utf-8')
+    runner_cli = tmp_path / 'backend/packages/acceptance-runner/node_modules/@playwright/test/cli.js'
+    runner_cli.parent.mkdir(parents=True)
+    runner_cli.touch()
     prerequisites = []
     calls = []
     monkeypatch.setattr(module, 'prerequisites', lambda **kwargs: (prerequisites.append(kwargs) or {}, True))
@@ -177,8 +180,17 @@ def test_console_only_does_not_require_docker_or_key(tmp_path, monkeypatch):
     assert not any('bugboard/scripts/init_demo.py' in command for command in calls)
     assert not any('bugboard/scripts/prepare_target.py' in command for command in calls)
     assert not any('scripts/codegraph/deploy_codegraph.py' in command for command in calls)
+    assert not any('acceptance-runner' in ' '.join(command) for command in calls)
     assert calls[-1][-2:] == ['scripts/bootstrap/services.py', '--dev']
     assert (tmp_path / '.env').read_text(encoding='utf-8') == 'TRACEFIX_API_KEY=\n'
+
+
+def test_console_only_does_not_install_acceptance_runner(tmp_path, monkeypatch):
+    module, calls, _ = bootstrap_fixture(tmp_path, monkeypatch)
+    (tmp_path / 'backend/packages/acceptance-runner/node_modules/@playwright/test/cli.js').unlink()
+    assert module.main(['--console-only', '--plain']) == 0
+    assert any(command[:2] == ['npm', 'ci'] for command in calls)
+    assert not any('acceptance-runner' in ' '.join(command) for command in calls)
 
 
 def test_full_web_installs_runtime_before_preparing_target(tmp_path, monkeypatch):
@@ -189,8 +201,33 @@ def test_full_web_installs_runtime_before_preparing_target(tmp_path, monkeypatch
                  if 'scripts/codegraph/deploy_codegraph.py' in command)
     prepare = next(index for index, command in enumerate(calls)
                    if 'bugboard/scripts/prepare_target.py' in command)
-    assert install < check < prepare
-    assert sum(command[:2] == ['npm', 'ci'] for command in calls) == 1
+    runner = calls.index(['npm', 'ci', '--prefix', 'backend/packages/acceptance-runner'])
+    assert install < check < runner < prepare
+    assert calls.count(['npm', 'ci', '--include=optional']) == 1
+    assert calls.count(['npm', 'ci', '--prefix', 'backend/packages/acceptance-runner']) == 1
+    assert sum(command[:2] == ['npm', 'ci'] for command in calls) == 2
+
+
+def test_missing_acceptance_runner_stops_web_before_database_or_services(tmp_path, monkeypatch):
+    module, calls, _ = bootstrap_fixture(tmp_path, monkeypatch)
+    (tmp_path / 'backend/packages/acceptance-runner/node_modules/@playwright/test/cli.js').unlink()
+    with pytest.raises(RuntimeError, match='缺少 Playwright 验收运行器依赖'):
+        module.main(['--web', '--skip-install', '--skip-build', '--plain'])
+    assert any('scripts/codegraph/deploy_codegraph.py' in command for command in calls)
+    assert not any(command[0] == 'docker' for command in calls)
+    assert not any('scripts/bootstrap/services.py' in command for command in calls)
+    assert not any(command[:2] == ['npm', 'ci'] for command in calls)
+
+
+@pytest.mark.parametrize('skip_install', [False, True])
+def test_full_web_progress_steps_match_executed_steps(tmp_path, monkeypatch, capsys, skip_install):
+    module, _, _ = bootstrap_fixture(tmp_path, monkeypatch)
+    assert module.main(['--web', '--skip-build', '--plain', *(['--skip-install'] if skip_install else [])]) == 0
+    output = capsys.readouterr().out
+    expected = 11 if skip_install else 14
+    assert f'启动准备完成 · {expected}/{expected} 步骤' in output
+    assert ('检查 Playwright 验收运行器依赖' in output) == skip_install
+    assert ('安装 Playwright 验收运行器依赖' in output) == (not skip_install)
 
 
 def test_missing_runtime_stops_web_before_database_or_services(tmp_path, monkeypatch):

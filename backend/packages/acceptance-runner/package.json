@@ -1,5 +1,5 @@
 {
-  "name": "tracefix-interface-beta-checks",
+  "name": "tracefix-acceptance-runner",
   "version": "1.0.0",
   "private": true,
   "type": "module",

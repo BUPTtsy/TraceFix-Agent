@@ -120,9 +120,8 @@ def dispatch(operation, fields, *, library=None, projects_path=None, data_root=N
         return {'imported': imported}
     if operation == 'projects':
         projects = catalog()
-        runs, documents = library.runs(), library.documents()
-        return [{**project, 'runCount': sum(run['projectId'] == project['id'] for run in runs),
-                 'documentCount': sum(document['projectId'] in {None, project['id']} for document in documents)} for project in projects]
+        runs = library.runs()
+        return [{**project, 'runCount': sum(run['projectId'] == project['id'] for run in runs)} for project in projects]
     if operation == 'runs':
         return [{key: value for key, value in record.items() if key != 'logs'} |
                 {'canContinue': can_continue(record['status'], record.get('outcome'))}
@@ -152,9 +151,8 @@ def dispatch(operation, fields, *, library=None, projects_path=None, data_root=N
                            ('check_plan', 'check_results', 'check_summary', 'overall_status', 'images',
                             'initial_check_results', 'initial_check_summary')
                            if key in report})
-            knowledge_refs = {entry['artifact_ref'] for entry in record.get('knowledge', [])}
             record['artifacts'] = [{'ref': ref, 'label': entry['用途'], 'bytes': entry['字节数']} for ref, entry in index.items()
-                                   if ref.endswith(('.diff', '.html')) or ref == report_ref or ref in knowledge_refs or ref in issue_refs or ref in check_refs
+                                   if ref.endswith(('.diff', '.html')) or ref == report_ref or ref in issue_refs or ref in check_refs
                                    or any(name in entry['用途'] for name in ('修复报告数据', '完整事件数据', '继续执行前状态', '_阶段轨迹'))]
         return record
     if operation == 'run.trace':
@@ -213,11 +211,13 @@ def dispatch(operation, fields, *, library=None, projects_path=None, data_root=N
         project = next((item for item in catalog() if item['id'] == fields.get('projectId')), None)
         if project is None or not project['ready']:
             raise ValueError(project['issue'] if project else '请选择已注册的项目')
+        # 运行记录已不再携带知识库来源；调用方伪造的 knowledge 不进入持久化记录。
+        fields = {key: value for key, value in fields.items() if key != 'knowledge'}
         return library.update_run(str(uuid.uuid4()), {**fields, 'profile': project['profile'], 'registry': project['registry'],
                                   'status': 'running', 'phase': 'STARTING', 'outcome': None, 'finishedAt': None,
                                   'origin': 'web', 'dataRoot': str(data_root)}, create=True)
     if operation == 'run.update':
-        return library.update_run(fields['id'], fields['changes'])
+        return library.update_run(fields['id'], {key: value for key, value in fields['changes'].items() if key != 'knowledge'})
     if operation == 'run.ended':
         record = library.run(fields['id'])
         changes = {'exitCode': fields.get('exitCode'), 'pid': None, 'processEndedAt': timestamp()}
@@ -225,29 +225,6 @@ def dispatch(operation, fields, *, library=None, projects_path=None, data_root=N
             changes.update(status='cancelled' if record['status'] == 'stopping' else 'failed', finishedAt=timestamp(),
                            error=fields.get('error') or record.get('error') or 'Agent 进程已结束，未记录最终结果；请查看日志')
         return library.update_run(fields['id'], changes)
-    if operation == 'documents':
-        records = library.documents(fields.get('projectId'))
-        query = fields.get('query', '').strip().casefold()
-        return [{key: value for key, value in record.items() if key != 'content'} |
-                {'preview': record['content'][:180]} for record in records
-                if not query or query in (record['title'] + ' ' + record['content'] + ' ' + ' '.join(record['tags'])).casefold()]
-    if operation == 'document':
-        return library.document(fields['id'])
-    if operation in {'document.save', 'search'}:
-        projects = {project['id'] for project in catalog()}
-        project_id = fields.get('projectId') or None
-        if project_id is not None and project_id not in projects:
-            raise ValueError('知识范围必须是已注册项目或全局')
-        if operation == 'search':
-            if not project_id:
-                raise ValueError('检索必须指定项目')
-            return library.search(fields.get('query', ''), project_id)
-        source_run_id = library.document(fields['id'])['sourceRunId'] if fields.get('id') else fields.get('sourceRunId')
-        if source_run_id:
-            source = library.run(source_run_id)
-            if source['projectId'] != project_id:
-                raise ValueError('运行经验须先归档到来源项目')
-        return library.save_document(fields, fields.get('id'))
     if operation == 'rules':
         return [rule.model_dump(mode='json') for rule in rule_library.rules(
             project_id=fields.get('projectId'), status=fields.get('status'),

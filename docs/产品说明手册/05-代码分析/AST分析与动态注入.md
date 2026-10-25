@@ -15,20 +15,17 @@
 
 | 能力 | 实现 | 证据 | 状态 |
 |---|---|---|---|
-| 解析 | tree-sitter + tree-sitter-typescript，只解析 `.ts` / `.tsx` | `knowledge/retrieval.py:39-44`、`pyproject.toml:14` | 🟡 |
-| 其他语言 | `.js` `.jsx` `.mjs` `.vue` `.svelte` `.html` `.css` `.scss` `.json` 等全部按 80 行固定窗口切块，没有任何语法信息 | `retrieval.py:46-47` | 🔴 |
-| 切块 | TS 按根节点的直接子节点切块，每块再按 100 行拆分 | `retrieval.py:44,49` | 🟡 |
-| 存储与检索 | `memory_items`（M1 层），词法 tsvector + pgvector 向量，RRF 融合 | `retrieval.py:11-16,60-116`、`storage/schema.sql:17-25` | 🟡 |
-| 使用位置 | 只在 DIAGNOSE 中用于决定「优先读取哪些文件卡片」 | `runtime/engine.py:502-507` | 🟡 |
-| 依赖 | 没有 Postgres 时 `index()` / `retrieve()` 直接返回空，并且**不产生任何告警** | `retrieval.py:61-63,83-84` | 🔴 |
+| M1 代码切块索引与召回 | `retrieval.py` 的 tree-sitter 切块 `chunks()` 与 `Retriever.index`（PostgreSQL/pgvector 或 SQLite FTS5 的代码卡片索引）已删除；它在生产链路里本来就没有被调用 | — | 已移除 |
+| 代码召回与结构查询 | CodeGraph 持久图谱：`code.analyze` 提供符号、上下文、调用方、被调用方与影响范围查询；SDK 编码 worker 编码前预查 CodeGraph，在字符预算内压缩为 code_map 注入 coder 提示词并保存为制品 | `rules/codegraph.py`、`runtime/code_map.py`（提交 `9d8b8b6`）、`scripts/codegraph/README.md` | 🟡 |
+| 语法与前端语义规则 | tree-sitter 仍用于局部补丁语法防线和受限前端规则（`syntax` / `elements` / `a11y_name` / `event_binding`），不再用于建索引 | `rules/analyzers.py`、`pyproject.toml` | 🟡 |
 | 补丁格式 | 完整文件替换 + before_hash | `contracts.py:165-174` | 🟡（大文件 token 开销高） |
-| 符号表、引用、调用图、类型信息 | 无 | — | 🔴 |
+| 符号表、引用、调用图、类型信息 | 符号、调用方 / 被调用方与影响范围由 CodeGraph 提供；类型信息仍无 | `rules/codegraph.py` | 🟡 |
 | 框架语义（模板元素、事件绑定、组件、路由、状态、i18n） | 无 | — | 🔴 |
 | GUI 元素 → 源码映射 | 无 | — | 🔴 |
 | console 堆栈 → 源码（source map） | 无 | — | 🔴 |
 | 只读 DOM 检查 | 浏览器动作只有 navigate / click / type / select / press / observe / finish，不能读取元素属性和样式 | `runtime/contracts.py:110` | 🔴 |
 
-以演示项目为例：`bugboard/target` 是 React 19 + Vite + TypeScript 项目。其中 `src/*.tsx` 和 `src/api.ts` 能按顶层声明切块；`src/style.css`、`index.html`、`server/*.mjs`（服务端路由）都只有行窗口。
+各语言的结构覆盖以 CodeGraph 当前版本的实际语言支持为准，本文尚未逐语言核对；原先「`src/*.tsx` 按顶层声明切块、其余文件只有行窗口」的演示项目对照随 M1 切块索引一并失效。下文第 2 节起的统一代码模型与自建索引是早期目标设计，写于 CodeGraph 方案落地之前，本文没有重新评估它与 CodeGraph 的关系。
 
 > 本版修正：上一版提出借助 JSX `__source` 从 DOM 属性直接拿到源码位置，这条路不成立。一是 `__source` 从来不会写到 DOM 上；二是 React 19 已从 Fiber 移除 `_debugSource`，19.2 起 `jsxDEV` 也不再接收源码位置参数。而演示项目用的正是 React 19。本版改为 TraceFix 自己的编译期插桩，见 `GUI到代码定位.md` 7.2 节。
 
@@ -51,7 +48,7 @@
 | 框架与工程层（L2） | 框架适配器：组件、模板元素、事件绑定、跨组件事件、状态读写、i18n。工程适配器：路由表、模块解析（别名 / monorepo / 自动导入）、构建配置 | UCM 中的框架事实 |
 | 结构层（L2） | 统一代码模型：files / fragments / symbols / refs / elements / routes / requests / texts / styles | 与语言无关的事实表 |
 | 解析层（L1） | tree-sitter 多语言解析；嵌入语言递归解析与坐标映射；按内容哈希缓存 | 语法树、虚拟文档 |
-| 文本层（L0） | 任意文本文件：全文检索、行窗口切块（现有能力保留为兜底） | 文本卡片 |
+| 文本层（L0） | 任意文本文件：全文检索、行窗口切块（原 M1 行窗口切块已删除，文本级兜底由 Read / Grep 承担） | 文本卡片 |
 
 - **索引存储**：每个工作区快照一份 SQLite 文件，放在工作区之外（如 `<run_dir>/code-index.sqlite`），不会进入 `source_manifest` 和补丁，也不依赖 Postgres。跨 Run 的记忆仍放在 Postgres（团队模式）。
 - **复用**：同一仓库、同一 commit 的索引可以跨 Run 复用（按 `source_manifest` 命中）。

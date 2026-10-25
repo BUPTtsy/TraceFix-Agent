@@ -96,7 +96,7 @@ try {
   await page.route('**/api/v1/tasks', async route => {
     if (route.request().method() !== 'POST') return route.continue();
     taskPayload = route.request().postDataJSON();
-    return route.fulfill({status: 201, contentType: 'application/json', body: JSON.stringify({task: {id: 'mock-task'}, run: {id: 'mock-run', taskId: 'mock-task', projectId, mode: 'repair', goal: taskPayload.goal, status: 'completed', phase: 'DONE', knowledge: [], startedAt: new Date().toISOString()}, replayed: false})});
+    return route.fulfill({status: 201, contentType: 'application/json', body: JSON.stringify({task: {id: 'mock-task'}, run: {id: 'mock-run', taskId: 'mock-task', projectId, mode: 'repair', goal: taskPayload.goal, status: 'completed', phase: 'DONE', startedAt: new Date().toISOString()}, replayed: false})});
   });
   await page.getByLabel('新的运行目标', {exact: true}).fill('验证远程仓库配置与规则传递');
   const taskResponse = page.waitForResponse(item => item.url().endsWith('/api/v1/tasks') && item.request().method() === 'POST');
@@ -107,7 +107,7 @@ try {
   assert.equal(taskPayload.create_and_start, true);
   assert.deepEqual(taskPayload.additionalRuleIds, []);
   await page.setViewportSize({width: 1440, height: 1000});
-  const mockRun = {id: 'mock-run', taskId: 'mock-task', projectId, mode: 'repair', goal: '浏览器模拟：修复状态持久化', status: 'completed', phase: 'DONE', outcome: 'FIX_VERIFIED', knowledge: [], artifacts: [], startedAt: new Date().toISOString()};
+  const mockRun = {id: 'mock-run', taskId: 'mock-task', projectId, mode: 'repair', goal: '浏览器模拟：修复状态持久化', status: 'completed', phase: 'DONE', outcome: 'FIX_VERIFIED', artifacts: [], startedAt: new Date().toISOString()};
   await page.route('**/api/runs', route => route.fulfill({status: 200, json: [mockRun]}));
   await page.route('**/api/runs/mock-run', route => route.fulfill({status: 200, json: mockRun}));
   await page.route('**/api/runs/mock-run/trace?*', route => route.fulfill({status: 200, json: []}));

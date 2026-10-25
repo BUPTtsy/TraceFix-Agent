@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 from types import SimpleNamespace
 
 import httpx
@@ -78,7 +79,7 @@ async def test_chat_streams_before_finish_and_keeps_tool_result_in_next_request(
 
     tools = pipeline(read)
     tools.emit = lambda kind, payload: tool_events.append((kind, payload))
-    async for event in stream_tool_chat('read please', [], 'scope', None, tools, False):
+    async for event in stream_tool_chat('read please', [], 'scope', None, tools):
         events.append(event)
         if event.get('delta') == '文':
             displayed.set()
@@ -103,7 +104,7 @@ async def test_chat_does_not_execute_unfinished_tool_stream(monkeypatch):
         pytest.fail('incomplete stream must not execute a tool')
 
     with pytest.raises(PydanticAIAdapterError, match='响应未完成') as raised:
-        async for event in stream_tool_chat('read', [], 'scope', None, pipeline(read), False):
+        async for event in stream_tool_chat('read', [], 'scope', None, pipeline(read)):
             assert 'turn_messages' not in event
     assert raised.value.status == 'UNKNOWN_OPERATION'
 
@@ -120,7 +121,7 @@ async def test_chat_tool_failure_receipt_is_terminal_and_preserved(monkeypatch):
 
     events = []
     with pytest.raises(PydanticAIAdapterError) as raised:
-        async for event in stream_tool_chat('read', [], 'scope', None, pipeline(read), False):
+        async for event in stream_tool_chat('read', [], 'scope', None, pipeline(read)):
             events.append(event)
     assert any(event.get('failed') == 1 for event in events)
     assert len(requests) == 1
@@ -128,22 +129,22 @@ async def test_chat_tool_failure_receipt_is_terminal_and_preserved(monkeypatch):
     assert 'read blocked' in str(raised.value.details)
 
 
-async def test_chat_filters_hidden_retrieval_records_from_refs_and_model_request(monkeypatch):
+async def test_chat_sends_only_the_user_message_and_still_persists_audit(monkeypatch, tmp_path):
     requests = transport(monkeypatch, [reply([
         sse({'content': 'public reply'}), sse(finish='stop'), b'data: [DONE]\n\n'])])
-    documents = SimpleNamespace(search=lambda *args: [
-        {'id': 'public', 'title': 'visible', 'version': 1, 'excerpt': 'public document'},
-        {'id': 'hidden', 'title': 'private scores', 'version': 1, 'held_out': True, 'excerpt': 'secret score'},
-        {'id': 'encoded', 'title': 'hidden JSON', 'version': 1,
-         'excerpt': '{"metadata":{"split":"held_out"},"score":999}'}])
-    events = [event async for event in stream_tool_chat('question', [], 'scope', documents,
+    # library 只提供审计库路径；Chat 不再检索知识文档，也不再产生 sources 事件。
+    library = SimpleNamespace(path=tmp_path / 'chat-audit.sqlite3')
+    events = [event async for event in stream_tool_chat('question', [], 'scope', library,
                                                        pipeline(lambda *args: {}))]
-    assert events[0]['sources'] == [{'id': 'public', 'title': 'visible', 'version': 1}]
-    assert 'secret score' not in str(requests) and 'score' not in str(requests)
+    assert all('sources' not in event for event in events)
+    assert ''.join(event.get('delta', '') for event in events) == 'public reply'
+    assert '检索参考文档' not in str(requests) and '知识文档' not in str(requests)
+    with sqlite3.connect(library.path) as connection:
+        assert connection.execute('SELECT COUNT(*) FROM chat_model_exchanges').fetchone()[0] == 1
 
 
 async def test_chat_rejects_empty_final_response(monkeypatch):
     transport(monkeypatch, [reply([sse(finish='stop'), b'data: [DONE]\n\n'])])
     with pytest.raises(PydanticAIAdapterError, match='未返回正文'):
-        async for event in stream_tool_chat('question', [], 'scope', None, pipeline(lambda *args: {}), False):
+        async for event in stream_tool_chat('question', [], 'scope', None, pipeline(lambda *args: {})):
             assert 'turn_messages' not in event

@@ -6,7 +6,7 @@ TraceFix 是 GUI 检测—修复平台中的 Agent 执行组件，面向受控 R
 
 > 接口现状（2026-10-10，`main@b622dfd`）：`/api/v1/tasks` 提供创建、独立启动、编辑、停止与查询；创建默认不执行，可通过 `create_and_start` 合并创建和启动。Task 保存执行定义，每次启动生成新的 Run。B1 仓库注册、查询、更新 / 禁用及 Run 配置冻结已实现；B2 独立 GitHub MCP 只读 connector 已通过 Mock 验证，运行生命周期接线与真实读取验收仍待完成。稳定 result、持久化幂等等按[接口型 Beta 计划](docs/产品说明手册/00-项目进度/接口型Beta最小补足与开发计划.md)收口。
 
-> 存储方向：规则、Task / Run 索引和知识文档当前使用 SQLite，后续迁移至 MySQL；仓库配置当前仍包含 YAML / JSON，运行时的 PostgreSQL checkpoint 保持现有实现。
+> 存储方向：规则、Task / Run 索引和运行事件当前使用 SQLite，后续迁移至 MySQL；仓库配置当前仍包含 YAML / JSON，运行时的 PostgreSQL checkpoint 保持现有实现。
 
 > 当前版本：`v0.1.1` · 早期开发版本
 
@@ -30,7 +30,7 @@ TraceFix 是 GUI 检测—修复平台中的 Agent 执行组件，面向受控 R
 - **类型化验证门**：统一汇总静态检查、单元测试、构建、健康检查、原问题、回归和行为结果。
 - **仓库与运行隔离**：通过 Profile 描述启动命令、工作区、文件与网络范围和测试规范，每个 Run 保留独立产物。
 - **仓库规则与任务**：维护仓库对应的检查规则和任务定义，创建与启动分开；运行中禁止编辑，停止后编辑并重新启动从头执行，历史 Run 保留。
-- **知识库与规则快照**：为仓库维护 Markdown 知识、规则版本，并在 Run 中记录实际使用内容。
+- **规则与 Skill 快照**：为仓库维护规则版本，并在 Run 中记录实际使用的规则版本，以及 Skill 的版本与内容哈希。
 - **规则与 Finding 修复来源**：Test / Repair 的内部输入可追加选择规则，PREPARE 冻结完整正文与版本；逐问题 Finding 绑定规则、仓库、Run 和证据，独立 Repair 重新复现并通过确定性 gate 后才回写 `fixed`。内部契约、覆盖状态和 B4 接入边界见[规则与独立 Repair 来源链](docs/产品说明手册/03-Agent运行时/规则Finding与独立Repair来源链.md)。
 - **对外接口与研发入口**：复用 Node HTTP API 提供 Agent 调用与结果查询；Web 作为调试、演示和兼容入口，稳定外部契约按接口型 Beta 计划补齐。
 - **可替换的模型接口**：使用 OpenAI-compatible Chat Completions 接口，通过 PydanticAI 执行原生工具调用。
@@ -129,7 +129,7 @@ Linux/macOS：
 bash scripts/bootstrap/start.sh --web
 ```
 
-首次启动会根据 `.env.example` 创建 `.env`，并准备 Node/Python 依赖、数据库、沙箱镜像和演示工作区。填写 `TRACEFIX_API_KEY` 后再次运行即可。默认控制台地址为 [http://127.0.0.1:3000](http://127.0.0.1:3000)。
+首次启动会根据 `.env.example` 创建 `.env`，并准备 Node/Python 依赖、Playwright 验收运行器依赖、数据库、沙箱镜像和演示工作区。填写 `TRACEFIX_API_KEY` 后再次运行即可。默认控制台地址为 [http://127.0.0.1:3000](http://127.0.0.1:3000)。
 
 常用启动选项：
 
@@ -151,7 +151,7 @@ npm ci
 npm run dev
 ```
 
-打开 [http://127.0.0.1:5173](http://127.0.0.1:5173)。开发模式下 Vite 将 API 请求转发到 `http://127.0.0.1:3000`。项目、知识库、规则和历史 Run 不需要模型 API；Chat 需要模型配置，Test / Repair 还需要 Agent、Docker 和目标项目环境。
+打开 [http://127.0.0.1:5173](http://127.0.0.1:5173)。开发模式下 Vite 将 API 请求转发到 `http://127.0.0.1:3000`。项目、规则和历史 Run 不需要模型 API；Chat 需要模型配置，Test / Repair 还需要 Agent、Docker 和目标项目环境；其界面验收还需执行 `npm ci --prefix backend/packages/acceptance-runner`（bootstrap 完整模式会自动安装）。
 
 构建并运行生产预览：
 
@@ -214,7 +214,7 @@ TRACEFIX_TEXT_MODEL=deepseek-chat
 | `TRACEFIX_CONSOLE_DB` | Web 控制台 SQLite 文件位置。 |
 | `TRACEFIX_WORKER_*` | 为 Worker 覆盖模型网关；未填写的字段继承主配置。 |
 | `TRACEFIX_WEB_SEARCH_API_KEY` | 配置后启用 WebSearch；留空则不注册搜索工具。 |
-| `TRACEFIX_EMBEDDING_URL` / `TRACEFIX_EMBEDDING_REVISION` | 配置可选的 dense RAG 服务及固定版本。 |
+| `TRACEFIX_EMBEDDING_URL` / `TRACEFIX_EMBEDDING_REVISION` | 配置可选的稠密向量服务及固定版本。目前只服务于跨 Run 修复记忆（M3）的向量检索，而 M3 暂无晋升路径，配置后没有实际效果；去留待决，见[差距清单](docs/产品说明手册/00-项目进度/差距清单.md) G-34。 |
 | `TRACEFIX_GIT_AUTHOR_NAME` / `TRACEFIX_GIT_AUTHOR_EMAIL` | 设置审批后本地提交的 Git 作者信息，不修改 Git 全局配置。 |
 | `TRACEFIX_INPUT_USD_PER_M` / `TRACEFIX_OUTPUT_USD_PER_M` | 设置用量账本的 token 价格元数据，用于成本估算展示。 |
 
@@ -239,7 +239,7 @@ python -m pytest -q tests/test_pydantic_model_execution.py tests/test_pydantic_a
 tracefix/
 ├── frontend/
 │   ├── apps/web/             React Web 调试工作台
-│   └── packages/             API、展示层、Agent UI、知识库、规则和 Run UI
+│   └── packages/             API、展示层、Agent UI、规则和 Run UI
 ├── backend/
 │   ├── apps/console-api/     Node HTTP/SSE 接口层
 │   ├── packages/console-service/ 共享数据服务
@@ -278,7 +278,7 @@ python -m pytest -q
 | [规则与独立 Repair 来源链](docs/产品说明手册/03-Agent运行时/规则Finding与独立Repair来源链.md) | B3 内部规则快照、逐 Finding 来源、独立修复、覆盖与 B4 接线 |
 | [WINDOWS_START.md](WINDOWS_START.md) | Windows 环境准备与常见问题 |
 | [配置与边界](docs/项目配置与操作边界.md) | 项目 Profile、操作范围和运行时约束 |
-| [Web 工作台与知识库](docs/Web工作台与知识库.md) | 控制台页面、共享数据和浏览器验收 |
+| [Web 控制台](docs/产品说明手册/08-交互设计/Web控制台.md) | 控制台页面、接口现状和调试入口边界 |
 | [框架接入说明](docs/agent-framework-migration.md) | PydanticAI、LangGraph、DeepAgents 的执行边界 |
 | [统一检查套件与前端代码分析](docs/统一检查套件与前端代码分析.md) | CheckPlan、逐项检查、Test/Repair 复用、CodeAnalyze 和报告契约 |
 | [工具能力与阶段审计](docs/工具能力与阶段审计.md) | 各阶段完整工具清单、工具执行过程和 placeholder 能力边界 |

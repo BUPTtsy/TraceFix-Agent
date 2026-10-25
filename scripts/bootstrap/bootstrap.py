@@ -16,6 +16,8 @@ import unicodedata
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+ACCEPTANCE_RUNNER = 'backend/packages/acceptance-runner'
+ACCEPTANCE_RUNNER_CLI = f'{ACCEPTANCE_RUNNER}/node_modules/@playwright/test/cli.js'
 sys.path.insert(0, str(ROOT / 'backend/packages/agent/src'))
 
 from tracefix.messages import ChineseArgumentParser
@@ -217,7 +219,7 @@ def main(argv=None):
     else:
         total += 5 + (2 if not options.skip_build else 1)
         total += 1 + int(not options.skip_install)
-        total += 1
+        total += 2  # 初始化演示项目 + Playwright 验收运行器依赖（安装或检查各占一步）
     progress = StartupProgress(total, plain=options.plain)
 
     def check_prerequisites():
@@ -269,6 +271,13 @@ def main(argv=None):
         run([python, 'scripts/bootstrap/services.py', *(['--dev'] if options.dev else [])])
         return 0
     progress.run('检查 CodeGraph 运行依赖', [python, 'scripts/codegraph/deploy_codegraph.py', '--check'])
+    if options.skip_install:
+        def check_acceptance_runner():
+            if not (ROOT / ACCEPTANCE_RUNNER_CLI).is_file():
+                raise RuntimeError(f'缺少 Playwright 验收运行器依赖：请不带 --skip-install 执行一次，或运行 npm ci --prefix {ACCEPTANCE_RUNNER}')
+        progress.perform('检查 Playwright 验收运行器依赖', check_acceptance_runner)
+    else:
+        progress.run('安装 Playwright 验收运行器依赖', [npm, 'ci', '--prefix', ACCEPTANCE_RUNNER])
     progress.run('部署并检查 Context7 MCP', [python, 'scripts/context7/deploy_context7_mcp.py', '--prepare'])
     progress.run('检查模型配置', [python, '-c', "from dotenv import load_dotenv; import os; load_dotenv('.env', encoding='utf-8-sig'); assert os.getenv('TRACEFIX_API_KEY'), '请先在 .env 中填写 TRACEFIX_API_KEY'"])
     progress.run('启动 PostgreSQL', ['docker', 'compose', '--env-file', '.env', 'up', '-d', '--wait', 'postgres'])

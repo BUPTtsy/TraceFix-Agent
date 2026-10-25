@@ -37,7 +37,7 @@ TRACEFIX_API_KEY=你的密钥
 .\start-windows.cmd
 ```
 
-启动器会创建 `.venv\Scripts\python.exe`，安装依赖、启动 PostgreSQL、从独立 GitHub 仓库拉取固定测试基线、构建隔离应用/浏览器镜像、生成 B01 缺陷仓库，再启动 TraceFix Web 控制台。默认地址为 http://127.0.0.1:3000，在页面选择项目、Test / Repair 模式与任务。
+启动器会创建 `.venv\Scripts\python.exe`，安装依赖（含 Playwright 验收运行器依赖）、启动 PostgreSQL、从独立 GitHub 仓库拉取固定测试基线、构建隔离应用/浏览器镜像、生成 B01 缺陷仓库，再启动 TraceFix Web 控制台。默认地址为 http://127.0.0.1:3000，在页面选择项目、Test / Repair 模式与任务。
 
 支持运行本地 PowerShell 脚本的机器也可以使用：
 
@@ -63,7 +63,7 @@ TRACEFIX_API_KEY=你的密钥
 .\start-windows.cmd --skip-install --skip-build
 ```
 
-仅使用项目、知识库和历史运行管理时，可运行：
+仅使用项目、规则和历史运行管理时，可运行：
 
 ```powershell
 .\start-windows.cmd --console-only --skip-install

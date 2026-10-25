@@ -10,19 +10,19 @@
 | `frontend/packages/api-client` | `@tracefix/api-client` | HTTP/SSE 客户端、接口类型、错误包装 |
 | `frontend/packages/presentation` | `@tracefix/presentation` | 状态、阶段和事件展示文案 |
 | `frontend/packages/agent` | `@tracefix/agent-ui` | Agent 对话与运行控制界面 |
-| `frontend/packages/knowledge` | `@tracefix/knowledge-ui` | 知识文档管理界面 |
 | `frontend/packages/rules` | `@tracefix/rules-ui` | 检测规则管理界面 |
 | `frontend/packages/runs` | `@tracefix/runs-ui` | 运行记录、轨迹、产物及续执行界面 |
 
-各前台功能包通过 `package.json` 声明依赖及源码导出，由 Web 应用统一进行 TypeScript 检查和打包。现有 Agent、知识界面对运行包的展示函数依赖予以保留。
+各前台功能包通过 `package.json` 声明依赖及源码导出，由 Web 应用统一进行 TypeScript 检查和打包。现有 Agent 界面对运行包的展示函数依赖予以保留。
 
 ## 后台
 
 | 目录 | 软件包 | 职责 |
 | --- | --- | --- |
 | `backend/apps/console-api` | `@tracefix/console-api` | HTTP 控制面、鉴权、模型聊天代理、Agent 进程桥接与静态页面服务 |
-| `backend/packages/console-service` | `@tracefix/console-service` | 项目配置、SQLite 文档/运行/规则数据、产物读取 |
+| `backend/packages/console-service` | `@tracefix/console-service` | 项目配置、SQLite 运行/规则数据、产物读取 |
 | `backend/packages/agent/src/tracefix` | `tracefix-agent` | Python Agent 发行包，导入名维持 `tracefix.*` |
+| `backend/packages/acceptance-runner` | `tracefix-acceptance-runner` | Playwright 验收 Oracle，由 `PlaywrightAcceptanceRunner` 调用（本地 node 或只读挂载进浏览器容器）；独立锁文件，不加入 npm workspaces |
 | `backend/skills` | Agent 流程资源 | 13 个分阶段 Skill 目录；索引只读 `name`/`description`，正文按触发器加载；由 `--skills` 配置资源根 |
 
 Python 发行包中的 `runtime`、`agents`、`connectors`、`execution`、`model`、`knowledge`、`rules`、`storage` 是功能子包；`service/session.py` 保存 Web 所需的运行会话，`service/web_run.py` 通过 JSON stdin 承接旧版 Web 运行接口，Python CLI 已移除。`agents` 保存框架适配器：Gateway 的模型执行接入 PydanticAI，只读 Worker 的调查接入 DeepAgents。`connectors/github_mcp.py` 提供独立的 GitHub MCP 只读 stdio 契约。它们共享运行契约，因此保持统一发行与安装，不将其声明为独立部署服务。根 `pyproject.toml` 指向源码目录，SQL schema 仍随 `tracefix.storage` 打包。
@@ -75,6 +75,8 @@ npm run dev
 ```
 
 生产方式本地预览：先 `npm run build`，再 `npm start`。单独构建前台可使用 `npm run build --workspace @tracefix/web`。
+
+`backend/packages/acceptance-runner` 不是 npm workspace，根目录 `npm ci` 不会安装它。Test / Repair 的界面验收在浏览器镜像内执行，宿主只需执行 `npm ci --prefix backend/packages/acceptance-runner`；bootstrap 完整模式和 nightly 真实 E2E 会自动安装，缺失时验收结果为 inconclusive。
 
 Python 3.12 环境安装依赖后执行 `python -m pip install --no-deps -e .`，迁移前已有 editable install 也需要重装一次。现有测试从根目录执行 `python -m pytest`。离线引擎检查使用 pytest 中的 Fake 测试；bootstrap 默认启动 Web 控制台。
 

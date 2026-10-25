@@ -97,7 +97,7 @@ class Session:
         from tracefix.storage.checkpoints import postgres_checkpointer
         dsn = getattr(self.args, 'database_url', None) or os.getenv('TRACEFIX_DATABASE_URL', '')
         if not dsn:
-            raise ValueError('请配置 TRACEFIX_DATABASE_URL 才能执行 Test / Repair；项目、知识库和 Chat 可独立使用')
+            raise ValueError('请配置 TRACEFIX_DATABASE_URL 才能执行 Test / Repair；项目和 Chat 可独立使用')
         resources = AsyncExitStack()
         try:
             store = PostgresStore(dsn)
@@ -165,7 +165,7 @@ class Session:
             fields['additionalRuleIds'] = self.additional_rule_ids
         self.documents.update_run(self.console_run_id, redact(fields), create=True)
 
-    def publish_console(self, event=None, error=None):
+    def publish_console(self, error=None):
         if not self.console_run_id or not self.run_id:
             return
         state = self.state()
@@ -197,8 +197,7 @@ class Session:
             changes['status'] = str(state.run_status).lower()
         changes['pid'] = os.getpid() if state.run_status in {
             RunStatus.RUNNING, RunStatus.PAUSED, RunStatus.WAITING_INPUT, RunStatus.WAITING_APPROVAL} and not error else None
-        knowledge = event.get('payload') if event and event['type'] == 'knowledge.selected' else None
-        self.documents.update_run(self.console_run_id, redact(changes), knowledge=knowledge)
+        self.documents.update_run(self.console_run_id, redact(changes))
 
     def transfer_console_run(self, previous, child):
         """Keep Web process ownership attached to a derived Run."""
@@ -239,8 +238,8 @@ class Session:
     def notify(self, event):
         if self.console_run_id:
             self.documents.append_event(self.console_run_id, event)
-        if event['type'] in {'state.changed', 'knowledge.selected', 'run.finished'}:
-            self.publish_console(event)
+        if event['type'] in {'state.changed', 'run.finished'}:
+            self.publish_console()
 
     def active(self):
         if self.task and not self.task.done():
@@ -491,7 +490,6 @@ class Session:
             rule_resolver=rule_resolver, rule_library=rule_library)
         self.engine.worker_model = configured_worker_model()
         self.engine.memory = memory
-        self.engine.documents = self.documents
         if self.runtime_services is not None:
             self.engine.runtime_services = self.runtime_services
         self.engine.current_run = state.run_id

@@ -57,7 +57,7 @@ test('artifact closure preserves bytes, authorizes siblings and rejects escapes'
     fs.writeFileSync(path.join(sibling, '0001_report.json'), raw); fs.writeFileSync(path.join(sibling, '文件索引.json'), JSON.stringify({'0001_report.json': {'用途': '收尾_修复报告数据', SHA256: createHash('sha256').update(raw).digest('hex'), '字节数': raw.length}}));
   }
   const database = new DatabaseSync(databasePath);
-  for (const [id, projectId, agentRunId] of [['current', 'alpha', 'run_current'], ['other', 'alpha', 'run_other'], ['cross_scope', 'beta', 'run_current']]) database.prepare('INSERT INTO console_runs VALUES (?,?)').run(id, JSON.stringify({id, projectId, agentRunId, reportRef: '0001_report.json', status: 'completed', startedAt: new Date().toISOString(), knowledge: [], logs: []}));
+  for (const [id, projectId, agentRunId] of [['current', 'alpha', 'run_current'], ['other', 'alpha', 'run_other'], ['cross_scope', 'beta', 'run_current']]) database.prepare('INSERT INTO console_runs VALUES (?,?)').run(id, JSON.stringify({id, projectId, agentRunId, reportRef: '0001_report.json', status: 'completed', startedAt: new Date().toISOString(), logs: []}));
   database.close();
   const encoded = JSON.parse(JSON.stringify(service('artifact', {id: 'current', ref: '0005_image.png'})));
   assert.equal(encoded.encoding, 'base64'); assert.deepEqual(Buffer.from(encoded.content, 'base64'), png);

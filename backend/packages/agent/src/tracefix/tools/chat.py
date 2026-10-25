@@ -7,10 +7,8 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 
-from pydantic import Field
-
 from tracefix.execution.workspace import Workspace
-from tracefix.runtime.contracts import Contract, Phase
+from tracefix.runtime.contracts import Phase
 from tracefix.tools.local import GlobInput, GrepInput, LocalTools, ReadInput
 from tracefix.tools.core import ToolPipeline, ToolRegistry, ToolRejected, build_tool
 from tracefix.knowledge.workset import visible_record
@@ -24,11 +22,6 @@ PRIVATE_PATH = re.compile(
     r'(^|[._-])(oracle|oracles|held_out|held-out|heldout|hidden|private|final_scoring|final-scoring)([._-]|$)',
     re.I,
 )
-
-
-class DocumentSearchInput(Contract):
-    query: str = Field(min_length=1, max_length=2000)
-    limit: int = Field(default=5, ge=1, le=20)
 
 
 class ChatWorkspace(Workspace):
@@ -90,7 +83,7 @@ class ChatLocalTools(LocalTools):
             yield path
 
 
-def build_chat_tools(scopes, ctx, library, artifacts, session_id, *, emit=None, use_knowledge=True):
+def build_chat_tools(scopes, ctx, artifacts, session_id, *, emit=None):
     workspace = ChatWorkspace(scopes, ctx)
     local = ChatLocalTools(SimpleNamespace(workspace=workspace), {})
     registry, handlers = ToolRegistry(), {}
@@ -115,13 +108,6 @@ def build_chat_tools(scopes, ctx, library, artifacts, session_id, *, emit=None, 
          GlobInput, local.glob)
     bind('Grep', '在当前项目内进行正则内容搜索；path 是绝对路径，可用 glob/type 缩小范围。',
          GrepInput, local.grep)
-    if use_knowledge:
-        def search(arguments):
-            return {'documents': [record for record in library.search(arguments.query, ctx.active_scope, arguments.limit)
-                                  if visible_record(record)]}
-
-        bind('DocumentSearch', '检索当前项目和公开全局知识文档，返回正文摘录及真实版本来源。',
-             DocumentSearchInput, search)
 
     def store_result(result):
         return artifacts.put(ctx.active_scope, session_id, result, label='Chat工具完整结果')

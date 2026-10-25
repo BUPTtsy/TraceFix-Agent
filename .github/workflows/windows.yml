@@ -48,11 +48,7 @@ jobs:
       - name: Prepare pinned test repository and verify all mutation baselines
         run: ./.venv/Scripts/python.exe bugboard/scripts/prepare_target.py --verify-cases
       - name: Unit and platform tests
-        # 知识库功能待后续迭代决定，暂不执行该完整修复上下文测试；其余知识库测试保留。
-        run: >-
-          ./.venv/Scripts/python.exe -m pytest -q
-          --deselect=tests/test_console_knowledge.py::test_full_engine_uses_selected_documents_in_browser_and_patch_context
-          --junitxml=artifacts/pytest-results.xml
+        run: ./.venv/Scripts/python.exe -m pytest -q --junitxml=artifacts/pytest-results.xml
       - name: Upload Python JUnit results
         if: ${{ always() && hashFiles('artifacts/pytest-results.xml') != '' }}
         uses: actions/upload-artifact@v6

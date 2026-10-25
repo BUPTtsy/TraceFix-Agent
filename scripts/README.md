@@ -2,20 +2,22 @@
 
 `scripts/` 集中存放启动、检查和维护脚本；Agent 运行时工具实现在 `backend/packages/agent/src/tracefix/runtime/`。所有命令默认从仓库根执行。
 
+Playwright 验收运行器位于 `backend/packages/acceptance-runner/`；`checks/interface-beta/` 只保留隔离/接口验收的 Python 探针。
+
 | 目录 | 职责 |
 | --- | --- |
 | `bootstrap` | Windows/Unix Web 启动、依赖准备 |
-| `checks` | 模型连接、HTTP 集成、Web 规则/知识/续执行及跨包验收 |
+| `checks` | 模型连接、HTTP 集成、Web 规则/续执行及跨包验收 |
 | `github` | 远程测试项目准备 |
 | `maintenance` | 保留的人工暂存辅助脚本，包含 Git 索引写入，按需手动运行 |
 
-演示初始化工具位于 `bugboard/scripts/init_demo.py`。`bootstrap` 默认准备完整 Agent 环境并启动 Web 控制台；`--console-only` 仅启动控制台，不检查模型密钥或 Docker。离线引擎检查通过 pytest 执行。
+演示初始化工具位于 `bugboard/scripts/init_demo.py`。`bootstrap` 默认准备完整 Agent 环境（含 `backend/packages/acceptance-runner` 的 `npm ci`；`--skip-install` 时只检查其依赖是否存在）并启动 Web 控制台；`--console-only` 仅启动控制台，不检查模型密钥或 Docker。离线引擎检查通过 pytest 执行。
 
 ## 真实 E2E 验收
 
 GitHub 夜间流水线需要在 **Settings → Secrets and variables → Actions → Secrets → New repository secret** 中配置 `TRACEFIX_API_KEY`，值为有效的模型 API 密钥。当前默认供应商为 DeepSeek，因此默认配置需要 DeepSeek API 密钥。仓库本地 `.env` 不会自动传入 GitHub Actions，Actions 的 Variables 也不能替代工作流引用的同名 Secret。Organization secret 必须授权当前仓库；Environment secret 只有在 job 配置了对应 `environment` 时才可读取，当前工作流未绑定 environment，建议使用 Repository secret。
 
-可选的 `TRACEFIX_BASE_URL` 和 `TRACEFIX_TEXT_MODEL` 使用 Actions Variables，默认分别为 `https://api.deepseek.com` 和 `deepseek-chat`。密钥配置后可在 Actions 页面手动重新运行失败的 workflow。工作流在安装项目依赖前通过 `--required --preflight-only` 检查前置条件，缺项时保留失败报告并输出配置提示；检查就绪仅表示可以开始执行，不代表真实 E2E 已通过。日志显示 `REAL_E2E: FAILED — TRACEFIX_API_KEY` 时说明密钥未注入或为空，尚未调用模型。
+可选的 `TRACEFIX_BASE_URL` 和 `TRACEFIX_TEXT_MODEL` 使用 Actions Variables，默认分别为 `https://api.deepseek.com` 和 `deepseek-chat`。密钥配置后可在 Actions 页面手动重新运行失败的 workflow。工作流在安装项目依赖前通过 `--required --preflight-only` 检查前置条件，缺项时保留失败报告并输出配置提示；检查就绪仅表示可以开始执行，不代表真实 E2E 已通过。工作流在安装依赖后用 `npm ci --prefix backend/packages/acceptance-runner` 安装验收运行器依赖，真实执行前（非 `--preflight-only`）会检查它，缺失同样报告为缺项，避免模型跑完才发现界面验收 inconclusive。日志显示 `REAL_E2E: FAILED — TRACEFIX_API_KEY` 时说明密钥未注入或为空，尚未调用模型。
 
 Windows 在项目根目录运行：
 

@@ -56,7 +56,7 @@ handlers[definition.spec.name] = definition.handler
 | `ToolSearch` | 查询当前阶段已授权工具与 schema | Supervisor；关键词或 `select:工具名` |
 | `Skill` | 加载阶段化 Skill 和声明引用，冻结 Run 快照 | Supervisor；不扩大工具或文件权限 |
 
-此外，已有规则、记忆、`context.expand` 和阶段提交工具按资源/阶段启用。浏览器工具由 Gateway 提供原生 schema，经已有策略与 MCP 执行。
+此外，已有规则、记忆、`context.expand` 和阶段提交工具按资源/阶段启用。记忆工具中，`memory.note` 写入 L1 Run 工作记忆，`memory.search` 检索当前 Run、同 Job 及本作用域可信记忆；跨 Run 的 M3 经验目前没有晋升路径，其检索结果恒为空（待决，见产品说明手册差距清单 G-34）。浏览器工具由 Gateway 提供原生 schema，经已有策略与 MCP 执行。
 
 任务板和待办清单以 `task_board_ref` / `todo_list_ref` 保存完整 artifact 引用，恢复同一 Run 时保留，派生新 Run 时清空。任务依赖须存在于本 Run，禁止自身依赖和依赖环；未完成依赖会阻止推进任务状态。规划状态不会加入 `evidence_refs`，不会改变 Run phase/outcome、冻结测试或验证结论。任务状态更新的幂等键包含任务板版本，以支持状态变化后的相同参数重试。
 

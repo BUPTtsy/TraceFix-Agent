@@ -61,22 +61,12 @@ function redact(value: any): any {
   return value;
 }
 
-function terms(text: string): Set<string> {
-  const result = new Set(text.toLowerCase().match(/[a-z0-9_]{2,}/g) || []);
-  for (const phrase of text.match(/[\u4e00-\u9fff]+/g) || [])
-    for (let index = 0; index < Math.max(1, phrase.length - 1); index++) result.add(phrase.slice(index, index + 2));
-  return result;
-}
-
-const overlap = (left: Set<string>, right: Set<string>) => [...left].filter(term => right.has(term)).length;
-
 export class ConsoleDatabase {
   readonly db: DatabaseSync;
   constructor(readonly filename: string) {
     fs.mkdirSync(path.dirname(filename), {recursive: true});
     this.db = new DatabaseSync(filename, {timeout: 15000});
     this.db.exec('PRAGMA busy_timeout=15000');
-    this.db.exec('CREATE TABLE IF NOT EXISTS documents (id TEXT PRIMARY KEY, data TEXT NOT NULL)');
     this.db.exec('CREATE TABLE IF NOT EXISTS console_runs (id TEXT PRIMARY KEY, data TEXT NOT NULL)');
     this.db.exec('CREATE TABLE IF NOT EXISTS console_events (run_id TEXT, seq INTEGER, event_key TEXT, data TEXT NOT NULL, PRIMARY KEY (run_id, seq), UNIQUE (run_id, event_key))');
   }
@@ -84,65 +74,6 @@ export class ConsoleDatabase {
     this.db.exec('BEGIN IMMEDIATE');
     try { const result = work(); this.db.exec('COMMIT'); return result; }
     catch (error) { this.db.exec('ROLLBACK'); throw error; }
-  }
-  documents(projectId?: string, includeDisabled = true): RecordData[] {
-    return (this.db.prepare('SELECT data FROM documents').all() as {data: string}[])
-      .map(row => JSON.parse(row.data))
-      .filter(record => (!projectId || record.projectId === null || record.projectId === projectId) &&
-        (includeDisabled || record.enabled))
-      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-  }
-  document(id: string): RecordData {
-    const row = this.db.prepare('SELECT data FROM documents WHERE id=?').get(id) as {data: string} | undefined;
-    if (!row) throw new DataError('文档不存在', 404);
-    return JSON.parse(row.data);
-  }
-  saveDocument(fields: RecordData, id?: string): RecordData {
-    const {title, content, tags, kind, enabled} = fields;
-    if (typeof title !== 'string' || !title.trim() || title.trim().length > 120) throw new DataError('文档标题须为 1-120 字');
-    if (typeof content !== 'string' || !content.trim() || Buffer.byteLength(content) > 262144 || content.includes('\0'))
-      throw new DataError('文档须为非空 UTF-8 文本，最大 256 KiB');
-    if (!Array.isArray(tags) || tags.length > 12 || tags.some(tag => typeof tag !== 'string' || !tag.trim() || tag.trim().length > 30))
-      throw new DataError('最多 12 个标签，每个标签 1-30 字');
-    if (!['repair', 'testing', 'experience'].includes(kind) || typeof enabled !== 'boolean') throw new DataError('文档类型或启用状态无效');
-    return this.transaction(() => {
-      const previous = id ? this.document(id) : null;
-      if (previous && fields.version !== previous.version) throw new DataError('文档已被其他窗口更新，请重新打开后编辑', 409);
-      const now = timestamp();
-      const record = {
-        id: id || randomUUID(), title: title.trim(), content, tags: [...new Set(tags.map(tag => tag.trim()))], kind, enabled,
-        projectId: fields.projectId || null, sourceRunId: previous?.sourceRunId || fields.sourceRunId || null,
-        version: previous ? previous.version + 1 : 1, createdAt: previous?.createdAt || now, updatedAt: now,
-      };
-      this.db.prepare('INSERT OR REPLACE INTO documents VALUES (?,?)').run(record.id, JSON.stringify(record));
-      return record;
-    });
-  }
-  deleteDocument(id: string): RecordData {
-    return this.transaction(() => {
-      this.document(id);
-      if (this.runs().some(run => (run.knowledge || []).some((use: RecordData) =>
-        (use.documents || []).some((document: RecordData) => document.id === id))))
-        throw new DataError('已被运行引用的文档不能删除，请停用以保留来源记录', 409);
-      this.db.prepare('DELETE FROM documents WHERE id=?').run(id);
-      return {ok: true};
-    });
-  }
-  search(query: string, projectId: string, limit = 8): RecordData[] {
-    const queryTerms = terms(query.slice(0, 2000));
-    if (!queryTerms.size) return [];
-    const matches: RecordData[] = [];
-    for (const record of this.documents(projectId, false)) {
-      const titleScore = overlap(queryTerms, terms(record.title + ' ' + record.tags.join(' '))) * 3;
-      let best: RecordData | null = null;
-      for (let offset = 0, index = 0; offset < record.content.length; offset += 1200, index++) {
-        const excerpt = record.content.slice(offset, offset + 1400);
-        const score = titleScore + overlap(queryTerms, terms(excerpt));
-        if (!best || score > best.score) best = {excerpt, chunk: index, score};
-      }
-      if (best?.score) { const {content, ...summary} = record; matches.push({...summary, ...best}); }
-    }
-    return matches.sort((left, right) => right.score - left.score || left.id.localeCompare(right.id)).slice(0, Math.max(1, Math.min(limit, 20)));
   }
   runs(projectId?: string): RecordData[] {
     return (this.db.prepare('SELECT data FROM console_runs').all() as {data: string}[]).map(row => JSON.parse(row.data))
@@ -159,7 +90,7 @@ export class ConsoleDatabase {
       let previous: RecordData;
       try { previous = this.run(id); }
       catch (error) { if (!create || !(error instanceof DataError) || error.status !== 404) throw error;
-        previous = {id, startedAt: timestamp(), knowledge: [], logs: []}; }
+        previous = {id, startedAt: timestamp(), logs: []}; }
       const record = {...previous, ...fields, updatedAt: timestamp()};
       this.db.prepare('INSERT OR REPLACE INTO console_runs VALUES (?,?)').run(id, JSON.stringify(record));
       return record;

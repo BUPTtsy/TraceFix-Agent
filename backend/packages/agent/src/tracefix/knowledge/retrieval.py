@@ -1,8 +1,9 @@
-"""按作用域过滤的词法与稠密检索；RRF 分数不是概率。
+"""按作用域过滤的跨 Run 经验检索与候选写入；RRF 分数不是概率。
 
-检索层先依据冻结的作用域和源码版本过滤候选，再合并 PostgreSQL 的词法/
-向量结果；数据库不可用时切换到 MemoryLibrary 的 SQLite FTS5 回退，并在
-调用方留下 degraded 事件所需的能力说明。
+检索层先依据冻结的作用域和源码版本过滤 M3 经验候选，再合并 PostgreSQL 的
+词法/向量结果；数据库不可用时切换到 MemoryLibrary 的 SQLite FTS5 回退，并在
+调用方留下 degraded 事件所需的能力说明。代码结构理解由 CodeGraph 承担，本
+模块不再对源码切块建索引。
 """
 import json
 import os
@@ -55,32 +56,8 @@ class EmbeddingAdapter:
             return vector
 
 
-def chunks(path: str, text: str):
-    """优先按 TS/TSX 声明边界切分，其他文本使用有界行窗口作为回退。
-
-    每个卡片携带行范围和文件 hash，供模型引用源码时回溯到授权文件及其
-    具体快照；窗口上限避免单个文件吞掉整个上下文预算。
-    """
-    ranges = []
-    if path.endswith((".ts", ".tsx")):
-        from tree_sitter import Language, Parser
-        import tree_sitter_typescript as ts
-        parser = Parser(Language(ts.language_tsx() if path.endswith('.tsx') else ts.language_typescript()))
-        tree = parser.parse(text.encode())
-        ranges = [(node.start_point.row, node.end_point.row + 1) for node in tree.root_node.children]
-    lines = text.splitlines()
-    if not ranges:
-        ranges = [(i, min(i+80, len(lines))) for i in range(0, len(lines), 80)]
-    for start, end in ranges:
-        for i in range(start, end, 100):
-            body = '\n'.join(lines[i:min(i+100,end)])
-            if body.strip():
-                yield {"path": path, "start": i+1, "end": min(i+100,end), "content": body,
-                       "file_hash": digest(text.encode())}
-
-
 class Retriever:
-    """维护作用域隔离的知识索引，并合并词法和向量候选。
+    """维护作用域隔离的跨 Run 经验检索，并合并词法和向量候选。
 
     ``fallback`` 是 PostgreSQL 失败后的显式 SQLite 后端；``postgres_failed``
     一旦置位，本次运行后续操作固定走回退，避免在半失败连接上反复重试。
@@ -113,64 +90,11 @@ class Retriever:
             }
         return {
             'reason': 'postgres_unavailable',
-            'disabled_capabilities': ['code_index', 'code_retrieval', 'repair_memory_read', 'repair_memory_write'],
-            'message': '代码检索与修复记忆未启用：当前运行未连接 PostgreSQL。诊断将直接读取当前授权文件，项目文档检索仍可用。配置 PostgreSQL 后重新运行以恢复这些能力。',
+            'disabled_capabilities': ['repair_memory_read', 'repair_memory_write'],
+            'message': '修复记忆的读写未启用：当前运行未连接 PostgreSQL。配置 PostgreSQL 后重新运行以恢复该能力。',
         }
 
-    async def index(self, workspace, revision):
-        """索引工作区；PostgreSQL 异常时切换 SQLite 并重试一次。"""
-        try:
-            return await self._index(workspace, revision)
-        except psycopg.Error:
-            if self.fallback is None:
-                raise
-            self.postgres_failed = True
-            return await self._index(workspace, revision)
-
-    async def _index(self, workspace, revision):
-        """按源版本写入工作区卡片，并删除该版本已经消失的卡片。
-
-        当前源码快照写入 M1 trusted 卡片；旧 source_revision 不删除，供
-        证据回放和版本过滤继续使用。
-        """
-        self.scopes.assert_current(self.ctx)
-        if not self.postgres_available():
-            if self.fallback is not None:
-                await self.index_local(workspace, revision)
-            return
-        current_ids = []
-        for path in workspace.files():
-            text = workspace.read(path)
-            for card in chunks(path, text):
-                key = digest([self.ctx.active_scope, revision, card])
-                current_ids.append(key)
-                content = json.dumps(card, ensure_ascii=False)
-                vector = await self.embedding.encode(content) if self.embedding else None
-                self.store.conn.execute("""INSERT INTO memory_items
-                  (id,scope_id,layer,kind,logical_key,visibility,status,revision,source_revision,content,content_hash,embedding)
-                  VALUES (%s,%s,'M1','fact',%s,'LOCAL','trusted',%s,%s,%s,%s,%s::vector)
-                  ON CONFLICT(id) DO NOTHING""", (key, self.ctx.active_scope, path,
-                  dict(self.ctx.revisions)[self.ctx.active_scope], revision, content, digest(content), json.dumps(vector) if vector else None))
-        # 旧源码快照保持不可变并按版本过滤；同一快照删除的文件只会出现在显式 overlay 索引刷新中。
-        self.store.conn.execute("DELETE FROM memory_items WHERE scope_id=%s AND layer='M1' AND source_revision=%s AND NOT (id=ANY(%s))",
-                                (self.ctx.active_scope, revision, current_ids))
-
-    async def index_local(self, workspace, revision):
-        """使用本地 SQLite 索引同一批 M1 卡片，保持作用域和版本字段一致。"""
-        current_ids = []
-        for path in workspace.files():
-            for card in chunks(path, workspace.read(path)):
-                key = digest([self.ctx.active_scope, revision, card])
-                current_ids.append(key)
-                content = json.dumps(card, ensure_ascii=False)
-                vector = await self.embedding.encode(content) if self.embedding else None
-                self.fallback.upsert({'id': key, 'scope_id': self.ctx.active_scope,
-                    'layer': 'M1', 'kind': 'fact', 'logical_key': path, 'status': 'trusted',
-                    'revision': dict(self.ctx.revisions)[self.ctx.active_scope],
-                    'source_revision': revision, 'content': content, 'embedding': vector})
-        self.fallback.prune_index(self.ctx.active_scope, revision, current_ids)
-
-    async def retrieve(self, query, source_revision, layer="M1", limit=10, *, state=None, phase=None,
+    async def retrieve(self, query, source_revision, layer="M3", limit=10, *, state=None, phase=None,
                        allow_compatible=False, artifact_exists=None, artifact_read=None):
         """执行检索并在数据库错误后固定切换到本地回退。"""
         if layer in {'M3', 'L2', 'L3'} and not cross_run_enabled(self.cross_run):
@@ -187,7 +111,7 @@ class Retriever:
                                         allow_compatible=allow_compatible,
                                         artifact_exists=artifact_exists, artifact_read=artifact_read)
 
-    async def _retrieve(self, query, source_revision, layer="M1", limit=10, *, state=None, phase=None,
+    async def _retrieve(self, query, source_revision, layer="M3", limit=10, *, state=None, phase=None,
                         allow_compatible=False, artifact_exists=None, artifact_read=None):
         """先在 SQL 中完成可见性过滤，再合并词法和稠密排名结果。
 

@@ -213,10 +213,10 @@ test('Run 控制入口拒绝调用方伪造身份、仓库快照和证据归属'
   assert.equal(created.origin, 'web');
   assert.notEqual(created.startedAt, forged.startedAt);
   assert.deepEqual(created.logs, []);
-  assert.deepEqual(created.knowledge, []);
+  assert.equal('knowledge' in created, false);
   assert.deepEqual(created.additionalRuleIds, []);
   const injectedKeys = ['consoleRunId', 'agentRunId', 'reportRef', 'artifacts', 'repoSnapshotRef',
-    'memorySnapshotRef', 'sourceManifest', 'evidenceRefs', 'inheritedEvidenceRefs', 'scopeId', 'parentRunId'];
+    'memorySnapshotRef', 'sourceManifest', 'evidenceRefs', 'inheritedEvidenceRefs', 'scopeId', 'parentRunId', 'knowledge'];
   for (const record of [created, service('runs', {projectId: 'beta'})[0]])
     for (const key of injectedKeys) assert.equal(Object.hasOwn(record, key), false, key);
   assert.deepEqual(service('run', {id: created.id}).artifacts, []);

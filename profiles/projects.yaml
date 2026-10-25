@@ -1,8 +1,66 @@
 projects:
-  - id: bugboard
-    repo_id: bugboard-demo
-    root: ../.tracefix/demo-repo
-    allowed_files: ["src/**", "server/**"]
-    memory_revision: 1
-    access_epoch: 1
-    agent_instructions: AGENTS.md
+- id: test-bug-repo
+  parent_id: null
+  repo_id: bupttsy/test-bug-repo
+  root: D:\tracefix\.tracefix\repositories\test-bug-repo
+  memory_revision: 1
+  access_epoch: 1
+  allowed_files:
+  - src/**
+  - server/**
+  shared_paths: []
+  agent_instructions: AGENTS.md
+  repository_config:
+    version: 1
+    repo_id: test-bug-repo
+    projectId: test-bug-repo
+    root: D:\tracefix\.tracefix\repositories\test-bug-repo
+    owner: bupttsy
+    repo: test-bug-repo
+    default_ref: main
+    commit: e7a9c04002a2d51a14d37da1f4808c2ee4695c57
+    profile_ref: null
+    profile:
+      project: test-bug-repo
+      source_commit: e7a9c04002a2d51a14d37da1f4808c2ee4695c57
+      url: http://app:3000
+      allowed_origins:
+      - http://app:3000
+      image: tracefix-bugboard:1.0
+      browser_image: tracefix-browser:1.0
+      commands:
+        prepare:
+        - node
+        - --version
+        start:
+        - node
+        - scripts/serve.mjs
+        reset:
+        - node
+        - scripts/reset.mjs
+        static:
+        - node
+        - node_modules/typescript/bin/tsc
+        - --noEmit
+        unit:
+        - node
+        - --test
+        - tests/tasks.test.mjs
+        build:
+        - node
+        - scripts/build.mjs
+      health_path: /health
+      version_path: /version
+      port: 3000
+      timeout_seconds: 120
+      screenshot_redaction: public_demo
+    allowed_files:
+    - src/**
+    - server/**
+    allowed_urls:
+    - http://app:3000
+    credential_ref: deployment/test-bug
+    enabled: true
+    checkout_mode: managed
+    publish_branch: false
+    config_digest: 98dc3d581ff35bc00b9a2d79905ab2d429e76e2e677c4409dd79c27e43d87b7f

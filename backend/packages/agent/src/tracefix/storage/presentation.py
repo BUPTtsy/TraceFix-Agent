@@ -15,11 +15,12 @@ LABELS = {
     'RUNNING': '运行中', 'WAITING_INPUT': '等待输入', 'WAITING_APPROVAL': '等待审批',
     'PAUSED': '已暂停', 'COMPLETED': '已结束', 'CANCELLED': '已取消', 'ABNORMAL': '异常结束', 'FAILED': '运行失败', 'SUPERSEDED': '已替换',
     'request': '模型输入', 'response': '模型输出', 'error': '错误信息',
-    'record': '记录', 'test': '测试', 'repair': '修复', 'chat': '对话', 'knowledge.selected': '知识来源已选择',
-    'evidence.damaged': '证据损坏', 'retrieval.degraded': '代码检索与修复记忆未启用',
+    'record': '记录', 'test': '测试', 'repair': '修复', 'chat': '对话',
+    'evidence.damaged': '证据损坏', 'retrieval.degraded': '修复记忆未启用',
     # 标签用于解释实际降级能力，事件类型与 fallback 原因仍保留原始契约值。
     'memory.degraded': '记忆检索已降级', 'sqlite_fallback': '已回退到 SQLite 本地检索',
     'disabled_capabilities': '未启用的能力', 'postgres_unavailable': '未连接 PostgreSQL',
+    # 旧报告的降级事件仍可能带有 code_index / code_retrieval，保留标签以便历史记录显示中文。
     'code_index': '代码索引', 'code_retrieval': '代码检索',
     'repair_memory_read': '读取修复记忆', 'repair_memory_write': '写入修复记忆',
     'vector_retrieval': '向量检索',

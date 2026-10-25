@@ -1,9 +1,10 @@
-"""分层保存 Run/Job 记忆，并提供按作用域过滤的 SQLite FTS5 项目检索。
+"""分层保存 Run/Job 记忆，并提供按作用域过滤的 SQLite FTS5 经验检索。
 
 本模块提供本地可审计的分层记忆：L1 是单次 Run 的工作记忆，L2 是同一
-Job 可复用的记忆，L3 是需要审核后才能成为可信知识的候选/长期记忆。
-SQLite 同时作为 PostgreSQL 不可用时的本地检索回退，并沿用作用域、版本
-和证据引用约束。
+Job 可复用的记忆，L3（M3 跨 Run 经验）是需要审核后才能成为可信知识的
+候选/长期记忆。SQLite 同时作为 PostgreSQL 不可用时的本地检索回退，并
+沿用作用域、版本和证据引用约束。源码结构理解由 CodeGraph 承担，这里不
+再保存代码切块索引。
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ class MemoryNote(Contract):
 
 
 class MemoryLibrary:
-    """维护 L1/L2 记录与 L3 本地索引的 SQLite 存储。
+    """维护 L1/L2 记录与 M3 经验本地索引的 SQLite 存储。
 
     表结构中的 ``source_manifest``、``revision`` 和 ``scope_id`` 用来阻止
     不同源码快照或不同作用域的记忆混用；FTS5 只负责候选召回，最终可见性
@@ -208,7 +209,7 @@ class MemoryLibrary:
         return selected[:max(0, limit)]
 
     def upsert(self, record):
-        """插入本地索引项并维护 FTS5 词法字段；结构化内容经脱敏后序列化。"""
+        """插入本地经验索引项并维护 FTS5 词法字段；结构化内容经脱敏后序列化。"""
         record = dict(record)
         if record['layer'] in {'M3', 'L2', 'L3'}:
             if not cross_run_enabled(self.cross_run):
@@ -239,15 +240,6 @@ class MemoryLibrary:
                environment_digest,test_spec_hash,verification_refs)
               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', values)
 
-    def prune_index(self, scope_id, source_revision, current_ids):
-        """删除当前源码版本中已不存在的卡片，保留旧版本的不可变快照。"""
-        with self.connect() as connection:
-            rows = connection.execute('SELECT id FROM local_memory_items WHERE scope_id=? AND layer=? AND source_revision=?',
-                                      (scope_id, 'M1', source_revision)).fetchall()
-            current_id_set = set(current_ids)
-            connection.executemany('DELETE FROM local_memory_items WHERE id=?',
-                                   [(row['id'],) for row in rows if row['id'] not in current_id_set])
-
     @staticmethod
     def _visible(context, source_revision, layer, *, cross_run=True, allow_compatible=False):
         """构造统一可见性谓词：作用域、祖先继承、可信状态、版本和过期时间。"""
@@ -266,7 +258,7 @@ class MemoryLibrary:
         source_parameters = [] if layer == 'M3' and allow_compatible else [source_revision]
         return where, [*parameters, layer, *source_parameters, time.time()]
 
-    def retrieve(self, query, context, source_revision, layer='M1', limit=10, vector=None,
+    def retrieve(self, query, context, source_revision, layer='M3', limit=10, vector=None,
                  *, cross_run=True, allow_compatible=False, state=None, phase=None,
                  artifact_exists=None, artifact_read=None):
         """在 SQLite 中合并 FTS5 词法与可选向量结果，并以 RRF 风格稳定排序。
