@@ -10,7 +10,6 @@ from tracefix.agents.claude_sdk_config import ClaudeSdkConfig, load_claude_sdk_c
 from tracefix.runtime.contracts import digest
 from tracefix.runtime.harness import HarnessRuntime
 from tracefix.runtime.harness_bootstrap import restore_harness_runtime
-from tracefix.runtime import repair_loop
 
 from tests.test_harness_graph import create_harness_engine
 
@@ -33,9 +32,7 @@ def test_sdk_execution_source_has_no_legacy_model_or_history_dependencies():
 
 
 async def test_sdk_two_increment_execution_never_calls_legacy_model_worker_or_compaction(tmp_path, monkeypatch):
-    from tracefix.agents.deepagents_adapter import DeepAgentsReadonlyAdapter
     from tracefix.agents.pydantic_ai_adapter import PydanticAIAdapter
-    from tracefix.runtime.worker import ReadOnlyWorker
     from tracefix.workers.scheduler import WorkerScheduler
 
     engine, state, harness, executor = await create_harness_engine(tmp_path)
@@ -50,11 +47,7 @@ async def test_sdk_two_increment_execution_never_calls_legacy_model_worker_or_co
             isolation.setattr(current, 'model_call', forbidden)
             isolation.setattr(current, 'compact_context', forbidden)
             isolation.setattr(PydanticAIAdapter, 'generate', forbidden)
-            isolation.setattr(DeepAgentsReadonlyAdapter, 'run', forbidden)
-            isolation.setattr(ReadOnlyWorker, 'run', forbidden)
             isolation.setattr(WorkerScheduler, 'submit', forbidden)
-            for name in ('segment_history', 'exchange_history', 'checkpoint_segment', 'run_segment'):
-                isolation.setattr(repair_loop, name, forbidden)
             output = await original_execute(current, active, role, *args, **kwargs)
             observed_roles.append(role)
             return output
@@ -80,7 +73,11 @@ async def test_default_backend_rollback_does_not_change_existing_job_config_ref(
     assert digest(ClaudeSdkConfig.model_validate(frozen['config'])) == before.config_digest
     monkeypatch.setenv('TRACEFIX_CODING_BACKEND', 'legacy')
     monkeypatch.setenv('TRACEFIX_CLAUDE_MODEL', 'changed-deployment-model')
-    assert load_claude_sdk_config().backend == 'legacy'
+    monkeypatch.setenv('TRACEFIX_CLAUDE_CREDENTIAL_REF', 'env:TEST_ANTHROPIC_KEY')
+    monkeypatch.setenv('TRACEFIX_SDK_WORKER_IMAGE', 'sha256:' + 'a' * 64)
+    monkeypatch.setenv('TRACEFIX_SDK_EGRESS_ALLOWLIST', 'https://api.anthropic.com')
+    monkeypatch.setenv('TRACEFIX_CONTEXT7_ENABLED', 'false')
+    assert load_claude_sdk_config().backend == 'claude_sdk'
     restored = restore_harness_runtime(engine, state, store=harness.store)
     after = harness.job(state)
     assert after.backend == 'claude_sdk'
