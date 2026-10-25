@@ -4,10 +4,10 @@ import pytest
 from pydantic import ValidationError
 
 from tracefix.execution.browser import assertions
-from tracefix.runtime.contracts import (Assertion, BehaviorScenario, BehaviorStep, BrowserAction,
+from tracefix.runtime.contracts import (Assertion, BehaviorScenario, BehaviorStep, BrowserAction, Decision,
     FileEdit, Locator, Outcome, PatchProposal, Phase, RunState, RunStatus, TestSpec as FrozenTestSpec,
     Validation, digest, reduce_state, verification_gate)
-from tracefix.runtime.smoke import FakeBrowser, make_engine
+from tracefix.runtime.smoke import FakeBrowser, FakeModel, make_engine
 from tests.support_sdk_candidate import verified_sdk_candidate
 
 
@@ -49,10 +49,19 @@ class BehaviorBrowser(FakeBrowser):
 
 
 async def verification_engine(tmp_path, failure=None):
+    class BehaviorModel(FakeModel):
+        async def generate(self, schema, context, **options):
+            result = await super().generate(schema, context, **options)
+            if schema is Decision:
+                actions = [step.action for step in scenario().steps[:2]] + [BrowserAction(kind='finish')]
+                result.value.action = actions[min(self.decision_calls - 1, len(actions) - 1)]
+            return result
+
     def configure(engine, state):
         spec = engine.spec(state).model_copy(update={'behavior_scenarios': [scenario()]})
         state.test_spec_ref = engine.put(state, spec.model_dump())
         state.test_spec_hash = digest(spec)
+        engine.model = BehaviorModel(engine.workspace)
 
     engine, state = await verified_sdk_candidate(tmp_path, configure=configure,
                                                 stop_before_verify=True)
