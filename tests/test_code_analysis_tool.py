@@ -187,11 +187,12 @@ async def test_codegraph_tool_indexes_complete_workspace_but_filters_symbol_resu
     engine, state = make_engine(tmp_path / 'run')
     state.phase = Phase.EXPLORE
     related = engine.workspace.root / 'src/related.ts'
-    related.write_text('export function related() {}\n', encoding='utf-8')
     candidate = 'export const persisted = true;\n'
     engine.workspace.apply(PatchProposal(summary='候选索引', evidence_refs=['baseline'], edits=[
         FileEdit(path='src/value.ts', before_hash=digest(engine.workspace.read('src/value.ts').encode()),
-                 content=candidate)]))
+                 content=candidate),
+        FileEdit(path='src/related.ts', operation='create', before_hash=digest(b''),
+                 content='export function related() {}\n')]))
     runtime = build_runtime_tools(engine, state, CheckJudgement)
     receipt = await runtime.pipeline().execute('CodeAnalyze', {
         'paths': [str(engine.workspace.root / 'src/value.ts')],

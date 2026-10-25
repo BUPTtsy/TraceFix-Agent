@@ -48,7 +48,7 @@ class BehaviorBrowser(FakeBrowser):
         return raw
 
 
-async def verification_engine(tmp_path, failure=None):
+async def verification_engine(tmp_path, failure=None, scenarios=None):
     class BehaviorModel(FakeModel):
         async def generate(self, schema, context, **options):
             result = await super().generate(schema, context, **options)
@@ -63,7 +63,7 @@ async def verification_engine(tmp_path, failure=None):
             return result
 
     def configure(engine, state):
-        spec = engine.spec(state).model_copy(update={'behavior_scenarios': [scenario()]})
+        spec = engine.spec(state).model_copy(update={'behavior_scenarios': scenarios or [scenario()]})
         state.test_spec_ref = engine.put(state, spec.model_dump())
         state.test_spec_hash = digest(spec)
         engine.model = BehaviorModel(engine.workspace)
@@ -190,9 +190,7 @@ async def test_behavior_verification_requires_independent_live_environment(tmp_p
 
 
 async def test_each_behavior_scenario_starts_from_an_independent_reset(tmp_path):
-    engine, state = await verification_engine(tmp_path)
-    spec = engine.spec(state)
-    spec.behavior_scenarios = [
+    scenarios = [
         BehaviorScenario(id='forward', steps=[scenario().steps[0]]),
         BehaviorScenario(id='fresh-start', steps=[
             BehaviorStep(action=BrowserAction(kind='observe'),
@@ -200,9 +198,7 @@ async def test_each_behavior_scenario_starts_from_an_independent_reset(tmp_path)
             scenario().steps[0],
         ]),
     ]
-    state.test_spec_ref = engine.put(state, spec.model_dump())
-    state.test_spec_hash = digest(spec)
-    engine.store.save(state)
+    engine, state = await verification_engine(tmp_path, scenarios=scenarios)
     state = await verify_until_transition(engine, state)
     assert state.outcome == Outcome.FIX_VERIFIED
     assert len(state.validation_refs) == 8 and gate(engine, state)
