@@ -77,7 +77,7 @@ async def test_code_analysis_reads_materialized_candidate_and_records_current_ch
     source = engine.workspace.root / 'src/value.ts'
     baseline = source.read_bytes()
     candidate = 'export const persisted = true;\n'
-    engine.workspace.apply(PatchProposal(summary='候选分析', evidence_refs=[], edits=[
+    engine.workspace.apply(PatchProposal(summary='候选分析', evidence_refs=['baseline'], edits=[
         FileEdit(path='src/value.ts', before_hash=digest(baseline), content=candidate)]))
     context = {'available_evidence_refs': ['existing-evidence']}
     previous_context = context
@@ -189,7 +189,7 @@ async def test_codegraph_tool_indexes_complete_workspace_but_filters_symbol_resu
     related = engine.workspace.root / 'src/related.ts'
     related.write_text('export function related() {}\n', encoding='utf-8')
     candidate = 'export const persisted = true;\n'
-    engine.workspace.apply(PatchProposal(summary='候选索引', evidence_refs=[], edits=[
+    engine.workspace.apply(PatchProposal(summary='候选索引', evidence_refs=['baseline'], edits=[
         FileEdit(path='src/value.ts', before_hash=digest(engine.workspace.read('src/value.ts').encode()),
                  content=candidate)]))
     runtime = build_runtime_tools(engine, state, CheckJudgement)

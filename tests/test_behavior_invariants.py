@@ -3,7 +3,7 @@ import copy
 import pytest
 from pydantic import ValidationError
 
-from tracefix.execution.browser import assertions
+from tracefix.execution.browser import assertions, resolve_locator
 from tracefix.runtime.contracts import (Assertion, BehaviorScenario, BehaviorStep, BrowserAction, Decision,
     FileEdit, Locator, Outcome, PatchProposal, Phase, RunState, RunStatus, TestSpec as FrozenTestSpec,
     Validation, digest, reduce_state, verification_gate)
@@ -54,7 +54,12 @@ async def verification_engine(tmp_path, failure=None):
             result = await super().generate(schema, context, **options)
             if schema is Decision:
                 actions = [step.action for step in scenario().steps[:2]] + [BrowserAction(kind='finish')]
-                result.value.action = actions[min(self.decision_calls - 1, len(actions) - 1)]
+                action = actions[min(self.decision_calls - 1, len(actions) - 1)]
+                if action.locator:
+                    observation = context['observation']
+                    action = action.model_copy(update={'observation_id': observation['id'],
+                        'element_ref': resolve_locator(observation['snapshot'], action.locator)})
+                result.value.action = action
             return result
 
     def configure(engine, state):

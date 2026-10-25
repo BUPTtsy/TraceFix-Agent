@@ -50,7 +50,7 @@ def test_custom_paths_add_to_defaults_and_patch_preflight_is_atomic(tmp_path):
     with pytest.raises(ProtectedPathError):
         scopes.path(scopes.context('app'), 'src/permissions.ts', write=True)
     with pytest.raises(ProtectedPathError):
-        workspace.apply(PatchProposal(summary='原子保护测试', evidence_refs=[], edits=[
+        workspace.apply(PatchProposal(summary='原子保护测试', evidence_refs=['baseline'], edits=[
             FileEdit(path=relative, before_hash=digest(b'baseline'), content='changed')
             for relative in ('src/value.ts', 'src/permissions.ts')]))
     assert workspace.read('src/value.ts') == 'baseline'
