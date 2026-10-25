@@ -5,9 +5,10 @@ import pytest
 
 from tracefix.execution.browser import MCPBrowser
 from tracefix.runtime.contracts import (Assertion, BehaviorScenario, BehaviorStep, BrowserAction,
-    FileEdit, Locator, ObservableWait, PatchProposal, Phase, RunState, digest)
+    Decision, Locator, ObservableWait, Phase, RunState, digest)
 from tracefix.runtime.engine import ActionBusinessFailure
 from tracefix.runtime.smoke import PNG, make_engine
+from tests.support_sdk_candidate import verified_sdk_candidate
 
 
 async def prepare_engine(root):
@@ -85,44 +86,61 @@ async def test_frozen_business_failure_counts_real_reproduction_trials(tmp_path,
 @pytest.mark.parametrize('kind', ['original', 'regression', 'behavior'])
 @pytest.mark.parametrize('check', ['postconditions', 'wait'])
 async def test_frozen_business_failure_becomes_failed_public_validation(tmp_path, kind, check):
-    engine, state = await prepare_engine(tmp_path)
     action = failing_action(check)
     visible = Assertion(locator=Locator(role='heading', name='Task board'))
     scenario = BehaviorScenario(id='settled-failure', steps=[
         BehaviorStep(action=action, assertions=[visible])])
-    spec = engine.spec(state).model_copy(update={
-        'assertions': [visible], 'regression_assertions': [visible],
-        'regression_plan': [action], 'behavior_scenarios': [scenario]})
-    state.test_spec_ref = engine.put(state, spec.model_dump(mode='json'))
-    state.test_spec_hash = digest(spec)
-    state.phase = Phase.VERIFY
-    state.reproduction_plan_frozen = True
-    state.reproduced = state.source_aligned = True
-    state.environment_digest = 'fixture-environment'
-    state.replay_plan_ref = engine.put(state, [action.model_dump(mode='json')])
-    proposal = PatchProposal(summary='保留业务缺陷的失败候选', evidence_refs=[state.observation_ref],
-        edits=[FileEdit(path='src/value.ts',
-            before_hash=digest(engine.workspace.read('src/value.ts').encode()),
-            content='export const persisted = false;\nexport const probe = false;\n')])
-    state.patch_ref = engine.put(state, proposal.model_dump(mode='json'))
-    state.patch_base_commit = engine.workspace.head()
-    state.patch_hash = engine.workspace.apply(proposal)['patch_hash']
-    state.validation_index = {'original': 4, 'regression': 5, 'behavior': 6}[kind]
-    state.replay_index = 0
+
+    def configure(engine, state):
+        spec = engine.spec(state).model_copy(update={
+            'regression_assertions': [visible], 'regression_plan': [action],
+            'behavior_scenarios': [scenario]})
+        state.test_spec_ref = engine.put(state, spec.model_dump(mode='json'))
+        state.test_spec_hash = digest(spec)
+        generate = engine.model.generate
+
+        async def model(schema, context, **options):
+            result = await generate(schema, context, **options)
+            if schema is Decision and result.value.action.kind == 'click':
+                result.value.action = action.model_copy(update={
+                    'observation_id': result.value.action.observation_id,
+                    'element_ref': result.value.action.element_ref})
+            return result
+
+        engine.model.generate = model
+
+    engine, state = await verified_sdk_candidate(tmp_path, configure=configure,
+                                                stop_before_verify=True)
+    target_index = {'original': 4, 'regression': 5, 'behavior': 6}[kind]
+    for attempt in range(30):
+        if state.validation_index == target_index:
+            break
+        output = await engine.verify(state, None)
+        state = RunState.model_validate(output['data'])
+        assert state.phase == Phase.VERIFY, state.error
+    assert state.validation_index == target_index and state.replay_index == 0
+    frozen_plan = engine.get(state, state.replay_plan_ref)
+    browser_action = engine.browser.action
+
+    async def reject_checked(action):
+        observation = await browser_action(action)
+        observation['snapshot'] = observation['snapshot'].replace(' [checked]', '')
+        return observation
+
+    engine.browser.action = reject_checked
+    engine.browser.calls.clear()
     engine.store.save(state)
     output = await engine.verify(state, None)
     state = RunState(**output['data'])
     output = await engine.verify(state, None)
     state = RunState(**output['data'])
-    assert state.phase == Phase.DIAGNOSE
+    assert state.phase == Phase.DIAGNOSE and output['next_node'] == 'harness_code'
     validation = engine.get(state, state.validation_refs[-1])
     assert validation['kind'] == kind and validation['passed'] is False
-    feedback = engine.get(state, state.diagnosis_feedback_refs[-1])
-    assert feedback['status'] == 'failed'
-    assert feedback['failure_class'] == 'counterevidence'
-    assert feedback['next_phase'] == 'diagnose'
-    assert feedback['failed_assertions'][0]['assertion']['condition'] == 'checked'
-    assert feedback['failed_candidate'] is True
+    feedback = engine.get(state, engine.harness.session(state).feedback_ref)
+    record = engine.get(state, feedback['verification_ref'])
+    assert record['passed'] is False and record['commands']
+    assert state.validation_refs[-1] in record['regression_refs']
     result = engine.get(state, validation['artifact_ref'])
     assert result['passed'] is False
     assert result['observation_ref'] == state.observation_ref
@@ -130,7 +148,8 @@ async def test_frozen_business_failure_becomes_failed_public_validation(tmp_path
         result = engine.get(state, result['checkpoint_refs'][0])
     assert result['business_check'] == check
     assert result['assertions'][0]['passed'] is False
-    assert engine.get(state, state.replay_plan_ref)[0] == action.model_dump(mode='json')
+    assert result['assertions'][0]['assertion']['condition'] == 'checked'
+    assert engine.get(state, state.replay_plan_ref) == frozen_plan
     assert [call['kind'] for call in engine.browser.calls].count('click') == 1
     assert all(record['status'] == 'DONE' for record in engine.store.operations.values())
 
