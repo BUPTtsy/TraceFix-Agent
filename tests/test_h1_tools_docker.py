@@ -55,7 +55,7 @@ async def test_real_docker_verifies_exported_sdk_candidate_and_typescript(tmp_pa
         mutated = baseline.decode().replace('return title.trim();', 'return title;')
         assert mutated != baseline.decode()
         sdk = SDKWorkspace.create(workspace, tmp_path / 'sdk')
-        (sdk.source / 'server/tasks.mjs').write_text(mutated, encoding='utf-8')
+        (sdk.source / 'server/tasks.mjs').write_bytes(mutated.encode('utf-8'))
         proposal = export_candidate(sdk, workspace, summary='U01 候选', evidence_refs=[state.repo_snapshot_ref])
         candidate = materialize_candidate(sdk, proposal, tmp_path / 'candidate')
         candidate.apply(proposal)
