@@ -79,7 +79,6 @@ def _delegate_arguments(task_id='worker-1'):
         'allowed_tools': ['code.read', 'code.references'],
         'allowed_files': ['src/Filter.tsx'],
         'allowed_artifacts': [],
-        'writable_files': [],
         'depends_on': [],
         'expected_output': '返回带有文件行号和证据引用的调查结论、未决问题与后续建议',
         'completion_criteria': ['所有结论均有授权文件或 artifact 引用'],
@@ -114,6 +113,7 @@ async def test_delegate_tools_are_strict_and_parallel(offline_gateway):
         'AgentDelegate', 'AgentJoin']
     parameters = requests[0]['tools'][0]['function']['parameters']
     assert parameters['additionalProperties'] is False
+    assert 'writable_files' not in parameters['properties']
     assert all(tool['function']['parameters']['additionalProperties'] is False
                for tool in requests[0]['tools'])
     assert {'task_id', 'role', 'objective', 'prompt', 'phase', 'allowed_tools',
