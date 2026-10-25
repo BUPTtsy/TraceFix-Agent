@@ -106,10 +106,13 @@ async def test_frozen_spec_or_inherited_success_never_substitutes_independent_ba
     assert runner.calls == []
 
 
-async def test_prepare_actively_executes_baseline_after_environment_and_before_patch(acceptance_engine):
+async def test_prepare_requires_sdk_configuration_and_independent_baseline_before_patch(acceptance_engine):
     engine, state, _, runner, _ = acceptance_engine
-    output = await engine.prepare(state, None)
-    state = RunState(**output['data'])
+    with pytest.raises(PermissionError, match='Claude Agent SDK'):
+        await engine.prepare(state, None)
+    assert runner.calls == [] and not state.patch_hash
+    assert engine.runner.started and state.source_aligned
+    state = await engine.execute_finding_acceptance(state)
     assert len(runner.calls) == 1
     assert runner.calls[0][1]['stage'] == 'baseline' and runner.calls[0][1]['patch_hash'] is None
     assert state.finding_acceptance_ref and state.finding_reproduction_ref
