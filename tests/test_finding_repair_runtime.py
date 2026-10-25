@@ -232,9 +232,19 @@ async def executable_repair_fixture(tmp_path, *, runner_fail=None):
     repair.test_spec_ref = engine.put(repair, spec.model_dump(mode='json'))
     repair.test_spec_hash = digest(spec)
     engine.store.save(repair)
+    def candidate_runner(workspace, source):
+        runner = FakeRunner(source)
+        command = runner.command
+
+        async def candidate_command(kind):
+            runner.fail = runner_fail if 'true' in workspace.read('src/value.ts') else None
+            return await command(kind)
+
+        runner.command = candidate_command
+        return runner
+
     engine, repair, harness, _ = await create_harness_engine(tmp_path / 'sdk',
-        engine_state=(engine, repair), runner_factory=lambda workspace, source: FakeRunner(
-            source, runner_fail if 'true' in workspace.read('src/value.ts') else None))
+        engine_state=(engine, repair), runner_factory=candidate_runner)
 
     class FindingExecutor(IncrementExecutor):
         async def start(self, request, emit):
