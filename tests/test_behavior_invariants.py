@@ -335,7 +335,7 @@ async def test_legacy_spec_without_behavior_fields_keeps_original_six_gates(tmp_
         raw.pop('behavior_scenarios')
         raw['max_steps'] = 20
         state.test_spec_ref = engine.put(state, raw)
-        state.test_spec_hash = digest(FrozenTestSpec.model_validate(raw))
+        state.test_spec_hash = digest(raw)
 
     engine, state = await verified_sdk_candidate(tmp_path, configure=configure)
     assert engine.spec(state).behavior_scenarios == []
