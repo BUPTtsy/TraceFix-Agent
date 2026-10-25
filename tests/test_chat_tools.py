@@ -33,7 +33,8 @@ async def test_chat_tools_offer_only_scoped_read_tools_and_preserve_result_conte
     result = await pipeline.execute('Read', {'file_path': str(source)}, 'read-1')
     assert result.result['raw_content'] == 'answer = 42\n'
     assert result.result['before_hash'] == digest(source.read_bytes())
-    assert result.result['overlay'] is False and result.executed is True
+    assert result.result['content_version'] == digest(source.read_bytes())
+    assert result.executed is True
     assert json.loads(result.to_content())['result']['raw_content'] == 'answer = 42\n'
     assert [kind for kind, payload in events] == ['tool.started', 'tool.completed']
     with pytest.raises(ToolProtocolError):
