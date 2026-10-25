@@ -4,6 +4,7 @@ from tracefix.config import Project
 from tracefix.execution.repository import run_git, safe_commit, safe_index_files
 from tracefix.execution.workspace import ProtectedPathError, Workspace, is_frozen_path, is_protected_path
 from tracefix.knowledge.scope import ScopeResolver
+from tracefix.runtime.contracts import FileEdit, PatchProposal, digest
 
 
 @pytest.mark.parametrize('relative', [
@@ -37,7 +38,7 @@ def test_protection_does_not_freeze_business_names(tmp_path, relative):
     assert workspace.path(relative, write=True) == scopes.path(scopes.context('app'), relative, write=True)
 
 
-def test_custom_paths_add_to_defaults_and_stage_many_is_atomic(tmp_path):
+def test_custom_paths_add_to_defaults_and_patch_preflight_is_atomic(tmp_path):
     for relative in ('src/value.ts', 'src/permissions.ts', '.github/ci.yml'):
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -49,9 +50,11 @@ def test_custom_paths_add_to_defaults_and_stage_many_is_atomic(tmp_path):
     with pytest.raises(ProtectedPathError):
         scopes.path(scopes.context('app'), 'src/permissions.ts', write=True)
     with pytest.raises(ProtectedPathError):
-        workspace.stage_many({'src/value.ts': b'changed', 'src/permissions.ts': b'changed'})
-    assert workspace.staged_content('src/value.ts') is None
-    assert workspace.overlay_revision == 0
+        workspace.apply(PatchProposal(summary='原子保护测试', evidence_refs=[], edits=[
+            FileEdit(path=relative, before_hash=digest(b'baseline'), content='changed')
+            for relative in ('src/value.ts', 'src/permissions.ts')]))
+    assert workspace.read('src/value.ts') == 'baseline'
+    assert workspace.read('src/permissions.ts') == 'baseline'
     with pytest.raises(ProtectedPathError):
         workspace.path('.github/ci.yml', write=True)
 
@@ -79,13 +82,12 @@ def test_export_and_resume_keep_repository_protection(tmp_path, monkeypatch):
     config = registry.register({'repo_id': 'app', 'root': str(source), 'owner': 'owner', 'repo': 'app',
         'default_ref': 'main', 'allowed_files': ['**'], 'allowed_urls': ['http://app:3000'],
         'profile': {'commands': {name: ['node', name] for name in ('start', 'reset', 'static', 'unit', 'build')}},
-        'repair_mode': 'hybrid', 'protected_paths': ['src/permissions.ts']})
-    assert config['repair_mode'] == 'hybrid'
-    updated = registry.update('app', {'repair_mode': 'pipeline'})
+        'protected_paths': ['src/permissions.ts']})
+    updated = registry.update('app', {'require_approval': True})
     assert updated['protected_paths'] == ['src/permissions.ts']
     assert updated['config_digest'] != config['config_digest']
     frozen = registry.freeze('app', 'run_h0')
-    assert frozen['repository_config']['repair_mode'] == 'pipeline'
+    assert frozen['repository_config']['require_approval'] is True
     assert frozen['repository_config']['protected_paths'] == ['src/permissions.ts']
     config = updated
     project = Project(id='app', repo_id='owner/app', root=source, allowed_files=['**'], repository_config=config)
@@ -94,7 +96,7 @@ def test_export_and_resume_keep_repository_protection(tmp_path, monkeypatch):
     workspace, snapshot = Workspace.export(scopes, ctx, 'main', tmp_path / 'workspace')
     assert workspace.protected_paths == ['src/permissions.ts']
     with pytest.raises(ProtectedPathError):
-        workspace.stage('src/permissions.ts', b'changed')
+        workspace.path('src/permissions.ts', write=True)
     restored = Workspace(workspace.root, ['**'])
     restored.validate_repository(scopes, ctx, snapshot)
     assert restored.protected_paths == ['src/permissions.ts']
