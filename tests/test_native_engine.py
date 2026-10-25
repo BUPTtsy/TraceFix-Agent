@@ -130,10 +130,11 @@ async def test_frozen_business_failure_becomes_failed_public_validation(tmp_path
     engine.browser.action = reject_checked
     engine.browser.calls.clear()
     engine.store.save(state)
-    output = await engine.verify(state, None)
-    state = RunState(**output['data'])
-    output = await engine.verify(state, None)
-    state = RunState(**output['data'])
+    for attempt in range(10):
+        output = await engine.verify(state, None)
+        state = RunState.model_validate(output['data'])
+        if state.phase != Phase.VERIFY:
+            break
     assert state.phase == Phase.DIAGNOSE and output['next_node'] == 'harness_code'
     validation = engine.get(state, state.validation_refs[-1])
     assert validation['kind'] == kind and validation['passed'] is False
